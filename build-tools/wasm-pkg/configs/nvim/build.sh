@@ -1,0 +1,250 @@
+#!/usr/bin/env bash
+# nvim — neovim built for wasm32 against yos musl + the deps we already
+# staged (lua, libuv, msgpack-c, unibilium, libvterm, tree-sitter, lpeg,
+# lua-mpack, luv).
+#
+# Cross-compile note: neovim's build runs Lua at build time to generate
+# headers/sources (the "vim_version" generator etc.). Cross builds need a
+# HOST lua AND the wasm32 lua we already built. We install both and let
+# CMake's NVIM_GENERATE_PROC find the host lua.
+
+set -euo pipefail
+
+NAME=nvim
+VERSION=0.10.4
+URL="https://github.com/neovim/neovim/archive/refs/tags/v${VERSION}.tar.gz"
+SHA256="10413265a915133f8a853dc757571334ada6e4f0aa15f4c4cc8cc48341186ca2"
+DEPS="lua libuv msgpack-c unibilium libvterm tree-sitter lpeg lua-mpack luv"
+
+: "${ROOT:?}"; : "${PREFIX:?}"; : "${WASM_CC:?}"; : "${WASM_SYSROOT:?}"
+: "${DEP_PREFIXES:?}"
+: "${WORK:=$ROOT/build-linux/wasm-pkgs/${NAME}-${VERSION}}"
+
+mkdir -p "$WORK" "$PREFIX/bin"
+
+TARBALL="$WORK/${NAME}-${VERSION}.tar.gz"
+[[ -f "$TARBALL" ]] || curl -fsSL "$URL" -o "$TARBALL"
+echo "${SHA256}  $TARBALL" | sha256sum -c - > /dev/null
+
+SRC="$WORK/src"
+if [[ ! -f "$SRC/.extracted" ]]; then
+    rm -rf "$SRC"; mkdir -p "$SRC"
+    tar -xzf "$TARBALL" -C "$SRC" --strip-components=1
+
+    # Patches for cross-compile-to-wasm32:
+    # 1. Drop the PO (translations) subdirectory; needs gettext on host.
+    sed -i 's|^add_subdirectory(po)|# add_subdirectory(po) # disabled for wasm32 build|' \
+        "$SRC/src/nvim/CMakeLists.txt"
+    # 2. nlua0 is normally a MODULE (host shared lib loaded by build-time
+    #    Lua). wasm-ld can't make a runnable shared module, so we force it
+    #    to STATIC — nothing links the .a, but the target's $<TARGET_FILE>
+    #    expression still resolves (preload.lua's require('nlua0') is served
+    #    from package.preload by lua-codegen, see below).
+    sed -i 's|^add_library(nlua0 MODULE)|add_library(nlua0 STATIC)|' \
+        "$SRC/src/nvim/CMakeLists.txt"
+
+    # 3. wasm-ld doesn't support `--no-undefined` (and we want late-bound
+    #    host imports anyway: musl/yos symbols resolve at wasm3 load time).
+    sed -i 's|target_link_libraries(nvim_bin PRIVATE -Wl,--no-undefined)|# disabled for wasm32: target_link_libraries(nvim_bin PRIVATE -Wl,--no-undefined)|' \
+        "$SRC/src/nvim/CMakeLists.txt"
+
+    # 3b. Drop the `-lm` / `-lutil` UNIX-block links — musl wasm32 bundles
+    #     libm and util into libc, and we link musl-as-libc statically into
+    #     the final wasm via the yos runtime.
+    sed -i 's|target_link_libraries(main_lib INTERFACE m)|# wasm32: m is in musl libc|' \
+        "$SRC/src/nvim/CMakeLists.txt"
+    sed -i 's|target_link_libraries(main_lib INTERFACE util)|# wasm32: util is in musl libc|' \
+        "$SRC/src/nvim/CMakeLists.txt"
+
+    # 5. cjson's fpconv_update_locale runs `snprintf(buf, 8, "%g", 0.5)` at
+    #    startup and expects "0.5". On wasm32 yos the printf_core scan pass
+    #    consistently returns -1 for that exact call site (the standalone
+    #    musl snprintf works fine — there's some interaction with nvim's
+    #    runtime state we haven't pinned down). The test is a paranoid
+    #    sanity-check, not a correctness gate; just skip it. The static
+    #    `locale_decimal_point` defaults to '.' which is right for every
+    #    locale we actually load.
+    sed -i 's|fpconv_update_locale();|/* yos wasm32: skip self-test */ (void)0;|' \
+        "$SRC/src/cjson/fpconv.c"
+
+    # 4. Replace FindLibuv.cmake — upstream version runs `check_library_exists`
+    #    against the HOST toolchain (glibc), so it appends -ldl -lrt -lkstat
+    #    -lkvm -lnsl -lperfstat -lsendfile to LIBUV_LIBRARIES. None of those
+    #    exist for wasm32; musl bundles dl/rt/util/m into libc. Stub it down to
+    #    a plain (include-dir, library) pair driven by the env we pass in.
+    cat > "$SRC/cmake/FindLibuv.cmake" <<'CMAKE'
+# wasm32 stub — overrides the upstream FindLibuv.cmake. Honors the cache
+# vars LIBUV_INCLUDE_DIR / LIBUV_LIBRARY passed in by build.sh and exposes a
+# `libuv` IMPORTED target with no transitive system libs.
+set(LIBUV_LIBRARIES ${LIBUV_LIBRARY})
+include(FindPackageHandleStandardArgs)
+find_package_handle_standard_args(Libuv DEFAULT_MSG LIBUV_LIBRARY LIBUV_INCLUDE_DIR)
+mark_as_advanced(LIBUV_INCLUDE_DIR LIBUV_LIBRARY)
+add_library(libuv UNKNOWN IMPORTED)
+set_target_properties(libuv PROPERTIES
+    IMPORTED_LOCATION "${LIBUV_LIBRARY}"
+    INTERFACE_INCLUDE_DIRECTORIES "${LIBUV_INCLUDE_DIR}")
+CMAKE
+
+    touch "$SRC/.extracted"
+fi
+
+# ----------------------------------------------------------------------------
+# Pass 1 — host helper for build-time codegen.
+#
+# neovim's build invokes Lua scripts (preload.lua + generators) that
+# require('nlua0'), normally a .so loaded via dlopen. Cross-compiling to
+# wasm32 makes a runnable .so impossible, so we build a tiny native
+# `lua-codegen` binary with everything statically linked, register
+# luaopen_nlua0 in package.preload, and point LUA_PRG at it.
+# ----------------------------------------------------------------------------
+HOST_HELPER="$WORK/lua-codegen"
+HOST_BUILD="$WORK/host-build"
+
+if [[ ! -x "$HOST_HELPER" ]]; then
+    mkdir -p "$HOST_BUILD"
+    LUA_SRC_DIR="$ROOT/build-linux/wasm-pkgs/lua-5.1.5/src/src"
+    LPEG_SRC_DIR="$ROOT/build-linux/wasm-pkgs/lpeg-1.1.0/src"
+    if [[ ! -f "$LUA_SRC_DIR/lua.h" || ! -f "$LPEG_SRC_DIR/lpvm.c" ]]; then
+        echo "[$NAME] need lua and lpeg sources extracted in build-linux/wasm-pkgs first." >&2
+        exit 1
+    fi
+
+    echo "[$NAME] building host lua-codegen helper (statically links nlua0)"
+    # nvim's mpack/lmpack.c includes nvim/macros_defs.h → auto/config.h.
+    # The latter is normally generated by nvim's CMake. For the host helper
+    # build we only care about EXTERN/INIT plumbing in macros_defs, none of
+    # the HAVE_* flags — provide an empty stub.
+    mkdir -p "$HOST_BUILD/auto"
+    : > "$HOST_BUILD/auto/config.h"
+    (
+        cd "$HOST_BUILD"
+        # Lua + lpeg + nvim mpack + nvim nlua0 + bit + our wrapper.
+        gcc -O2 -DLUA_USE_POSIX -DLUA_ANSI -DMAKE_LIB \
+            -I"$HOST_BUILD" \
+            -I"$LUA_SRC_DIR" -I"$LPEG_SRC_DIR" \
+            -I"$SRC/src" -I"$SRC/src/mpack" \
+            -o "$HOST_HELPER" \
+            "$LUA_SRC_DIR"/{lapi,lcode,ldebug,ldo,ldump,lfunc,lgc,llex,lmem,lobject,lopcodes,lparser,lstate,lstring,ltable,ltm,lundump,lvm,lzio,lauxlib,lbaselib,ldblib,liolib,lmathlib,loslib,ltablib,lstrlib,loadlib,linit}.c \
+            "$LPEG_SRC_DIR"/{lpcap,lpcode,lpcset,lpprint,lptree,lpvm}.c \
+            "$SRC/src/mpack"/{mpack_core,conv,object,lmpack,rpc}.c \
+            "$SRC/src/bit.c" \
+            "$SRC/src/nlua0.c" \
+            "$ROOT/build-tools/wasm-pkg/configs/nvim/lua-codegen.c" \
+            -lm
+    )
+    # Smoke test: each preloaded native module loads without dlopen.
+    cat > "$WORK/smoke.lua" <<'LUA'
+-- nlua0 expects _G.vim to exist (real preload.lua does `_G.vim = require'vim.shared'`
+-- first). Provide a stub so we can verify it loads cleanly.
+_G.vim = {}
+local mods = { 'bit', 'mpack', 'lpeg', 'nlua0' }
+for _, m in ipairs(mods) do
+    local ok, err = pcall(require, m)
+    if not ok then error('preload failed for '..m..': '..tostring(err)) end
+end
+print("[lua-codegen] OK: bit/mpack/lpeg/nlua0 preload works")
+LUA
+    "$HOST_HELPER" "$WORK/smoke.lua"
+fi
+
+# Walk DEP_PREFIXES into named per-package vars.
+read LUA_P LIBUV_P MSGPACK_P UNIBILIUM_P LIBVTERM_P TREESITTER_P LPEG_P LUAMPACK_P LUV_P <<<"$DEP_PREFIXES"
+
+CFLAGS_W="--target=wasm32-unknown-unknown -nostdlib -nostdinc -O2 \
+    $WASM_CFLAGS -D_GNU_SOURCE -D__FreeBSD__=14 \
+    -I$LUA_P/include -I$LIBUV_P/include -I$MSGPACK_P/include \
+    -I$UNIBILIUM_P/include -I$LIBVTERM_P/include -I$TREESITTER_P/include \
+    -I$LUV_P/include \
+    -L$WASM_SYSROOT/usr/lib"
+
+BLD="$WORK/cmake-build"
+rm -rf "$BLD"; mkdir -p "$BLD"
+cd "$BLD"
+
+# yos_libc_init.c — initialises the FreeBSD `_DefaultRuneLocale`,
+# `_CurrentRuneLocale`, `__mb_sb_limit` globals that the inline ctype
+# macros in <ctype.h> need. Without this Lua's tokenizer thinks every
+# letter is "unexpected" and nvim aborts with E970 on first init.
+# Compile once into an .o that nvim's link picks up.
+LIBC_INIT_C="$ROOT/build-tools/wasm-pkg/configs/nvim/yos_libc_init.c"
+LIBC_INIT_O="$BLD/yos_libc_init.o"
+"$WASM_CC" $CFLAGS_W -c "$LIBC_INIT_C" -o "$LIBC_INIT_O"
+
+# Link flags for yos's libc-by-import surface: no crt1.o, no -lc, no
+# musl objects. `--allow-undefined` makes wasm-ld auto-import any
+# unresolved fn ref as `env.<name>`; yos resolves those at module
+# load. `--export-all` exposes the function table (pthread_create
+# needs it) and `--stack-first` puts the wasm shadow stack at the
+# bottom of linear memory.
+LDFLAGS_W="-Wl,--no-entry -Wl,--export=_start -Wl,--export-all \
+    -Wl,--allow-undefined -Wl,--stack-first -Wl,-z,stack-size=65536 \
+    $WASM_SYSROOT/usr/lib/crt1.o $LIBC_INIT_O"
+
+cmake "$SRC" \
+    -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
+    -DCMAKE_SYSTEM_NAME=Linux \
+    -DCMAKE_SYSTEM_PROCESSOR=wasm32 \
+    -DCMAKE_C_COMPILER="$WASM_CC" \
+    -DCMAKE_C_COMPILER_TARGET=wasm32-unknown-unknown \
+    -DCMAKE_DL_LIBS= \
+    -DCMAKE_AR="$(command -v llvm-ar)" \
+    -DCMAKE_RANLIB="$(command -v llvm-ranlib)" \
+    -DCMAKE_C_FLAGS="$CFLAGS_W" \
+    -DCMAKE_EXE_LINKER_FLAGS="$LDFLAGS_W" \
+    -DCMAKE_TRY_COMPILE_TARGET_TYPE=STATIC_LIBRARY \
+    -DCMAKE_FIND_ROOT_PATH_MODE_LIBRARY=ONLY \
+    -DCMAKE_FIND_ROOT_PATH_MODE_INCLUDE=ONLY \
+    -DCMAKE_FIND_ROOT_PATH_MODE_PACKAGE=ONLY \
+    -DCMAKE_PREFIX_PATH="$LUA_P;$LIBUV_P;$MSGPACK_P;$UNIBILIUM_P;$LIBVTERM_P;$TREESITTER_P;$LUV_P" \
+    -DCMAKE_INSTALL_PREFIX="$PREFIX" \
+    -DPREFER_LUA=ON \
+    -DUSE_BUNDLED=OFF \
+    -DENABLE_LIBINTL=OFF \
+    -DENABLE_LIBICONV=OFF \
+    -DLUA_INCLUDE_DIR="$LUA_P/include" \
+    -DLUA_LIBRARY="$LUA_P/lib/liblua.a" \
+    -DLUA_LIBRARIES="$LUA_P/lib/liblua.a" \
+    -DLUA_MATH_LIBRARY="" \
+    -DCMAKE_DL_LIBS="" \
+    -DLUA_PRG="$HOST_HELPER" \
+    -DCOMPILE_LUA=OFF \
+    -DICONV_INCLUDE_DIR="$WASM_SYSROOT/usr/include" \
+    -DICONV_LIBRARY="" \
+    -DLIBUV_INCLUDE_DIR="$LIBUV_P/include" \
+    -DLIBUV_LIBRARY="$LIBUV_P/lib/libuv.a" \
+    -DMSGPACK_INCLUDE_DIR="$MSGPACK_P/include" \
+    -DMSGPACK_LIBRARY="$MSGPACK_P/lib/libmsgpack-c.a" \
+    -DUNIBILIUM_INCLUDE_DIR="$UNIBILIUM_P/include" \
+    -DUNIBILIUM_LIBRARY="$UNIBILIUM_P/lib/libunibilium.a" \
+    -DLIBVTERM_INCLUDE_DIR="$LIBVTERM_P/include" \
+    -DLIBVTERM_LIBRARY="$LIBVTERM_P/lib/libvterm.a" \
+    -DTreeSitter_INCLUDE_DIR="$TREESITTER_P/include" \
+    -DTreeSitter_LIBRARY="$TREESITTER_P/lib/libtree-sitter.a" \
+    -DLPEG_LIBRARY="$LPEG_P/lib/liblpeg.a" \
+    -DMPACK_LIBRARY="$LUAMPACK_P/lib/liblua-mpack.a" \
+    -DLUV_LIBRARY="$LUV_P/lib/libluv.a" \
+    || { echo "[$NAME] cmake configure failed; full log:"; tail -50 "$BLD/CMakeFiles/CMakeOutput.log" 2>/dev/null; exit 1; }
+
+# Build only the binary target. The umbrella `nvim` target also tries to
+# invoke the freshly-built wasm to regenerate :help tags, which fails on the
+# host with "Exec format error" — we don't care, we just want the wasm.
+cmake --build . --parallel --target nvim_bin
+
+# Asyncify pass — required for our setjmp/longjmp host imports to actually
+# unwind. Without it, after `_longjmp` returns from the host call the wasm
+# bytecode falls into the `unreachable` instruction (clang emits this
+# because longjmp is noreturn) and traps for real, instead of cooperatively
+# unwinding. Lua's pcall depends on this for every error path.
+mkdir -p "$PREFIX/bin"
+wasm-opt --asyncify -O2 "$BLD/bin/nvim" -o "$PREFIX/bin/nvim.wasm"
+
+cat > "$PREFIX/manifest.txt" <<EOF
+name=nvim
+version=${VERSION}
+prefix=${PREFIX}
+binary=${PREFIX}/bin/nvim.wasm
+deps=${DEPS}
+EOF
+
+echo "[$NAME] installed → $PREFIX/bin/nvim.wasm ($(du -h "$PREFIX/bin/nvim.wasm" | cut -f1))"

@@ -183,10 +183,20 @@ custom_mem:
   - munlockall
 
 # ─── Allocator (mimalloc over wasm linear memory) ─────────────────────
-# TODO: src/yos/impl/alloc.c not yet implemented. Until it lands, the
-# allocator family is stubbed out (-ENOSYS). Move back to custom_alloc
-# once mimalloc-over-linear-memory is wired in.
-custom_alloc: []
+# Bridges route to yos_<name>(ctx, ...) in src/yos/impl/alloc.c. mimalloc
+# manages an arena carved out of the guest's wasm linear memory; bodies
+# convert host pointers ↔ wasm offsets at the boundary.
+custom_alloc:
+  - malloc
+  - free
+  - calloc
+  - realloc
+  - reallocarray
+  - posix_memalign
+  - aligned_alloc
+  - memalign
+  - valloc
+  - malloc_usable_size
 
 # ─── Signal handling ──────────────────────────────────────────────────
 custom_sig:
@@ -275,6 +285,15 @@ stub:
   - epoll_ctl
   - epoll_wait
   - epoll_pwait
+  # kqueue family — FreeBSD-only event API. nvim/libuv was built with
+  # -D__FreeBSD__=14 so it picks the kqueue backend. Stubbed for now so
+  # the import resolves; libuv will fail event-loop init with -ENOSYS
+  # rather than trapping. Real impl = host-side kqueue→epoll translator
+  # (Linux), or passthrough on FreeBSD/macOS hosts. Not yet written.
+  - kqueue
+  - kqueue1
+  - kqueuex
+  - kevent
   - inotify_init
   - inotify_init1
   - inotify_add_watch
@@ -282,6 +301,37 @@ stub:
   - splice
   - tee
   - vmsplice
+  # FreeBSD sigset_t is 16 bytes (__uint32_t[4]) but Linux sigset_t is
+  # 128 bytes (unsigned long[16]). Auto-passthrough corrupts memory.
+  # impl/signal.c binds layout-aware impls via yos_signal_link.
+  # sigprocmask + sigpending are already in custom_sig (impl/sig.c).
+  - pthread_sigmask
+  - sigemptyset
+  - sigfillset
+  - sigaddset
+  - sigdelset
+  - sigismember
+  # sysctl + sysctlbyname moved to runtime_owned (impl/sysctl.c).
+  - setproctitle
+  # FreeBSD-internal helpers (rarely called in user code).
+  - charsettype
+  - getbytefromcharset
+  - tocharset
+  - tree2cset
+  - ___runetype
+  - ___tolower
+  - ___toupper
+  - __srget
+  - __swbuf
+  - __xuname
+  # Linux-only that nvim/libuv reaches for; safe to stub.
+  - sched_getcpu
+  - copy_file_range
+  - recvmmsg
+  - sendmmsg
+  - accept4
+  # __cxa_atexit moved to runtime_owned (impl/callback.c).
+  - __stack_chk_fail
   # FreeBSD vs Linux signature mismatches — auto-bridge can't render
   # them safely. Stub for now; once we have per-platform bridge bodies
   # we can implement them properly.
@@ -298,23 +348,56 @@ stub:
   - futimes
   - lutimes
   - utimes
+  # Locale-aware ctype family — glibc macros expand to (locale)->__ctype_b
+  # but bridge.py passes the locale_t arg as void*, which can't dereference
+  # the struct member. Stub until bridge.py learns to cast wasm pointers
+  # to the proper host opaque type per parameter.
+  - isalnum_l
+  - isalpha_l
+  - isblank_l
+  - iscntrl_l
+  - isdigit_l
+  - isgraph_l
+  - islower_l
+  - isprint_l
+  - ispunct_l
+  - isspace_l
+  - isupper_l
+  - isxdigit_l
+  - iswalnum_l
+  - iswalpha_l
+  - iswblank_l
+  - iswcntrl_l
+  - iswctype_l
+  - iswdigit_l
+  - iswgraph_l
+  - iswlower_l
+  - iswprint_l
+  - iswpunct_l
+  - iswspace_l
+  - iswupper_l
+  - iswxdigit_l
+  - tolower_l
+  - toupper_l
+  - towlower_l
+  - towupper_l
+  - towctrans
+  - towctrans_l
+  # Wide-char variadic-like fns. Take va_list as a regular arg, but
+  # bridge.py mis-renders the wrapper-vs-body arg count for them.
+  - vfwprintf
+  - vfwscanf
+  - vswprintf
+  - vswscanf
+  - vwprintf
+  - vwscanf
+  # regexec — bridge.py mis-renders signature (regmatch_t * + size_t).
+  - regexec
   - tmpnam
   - pthread_getcpuclockid
   - pthread_getschedparam
   - pthread_setschedparam
   - setlinebuf        # void on Linux, int on FreeBSD (return-type mismatch)
-  # Allocator family — until impl/alloc.c lands, return -ENOSYS so
-  # nothing silently calls host malloc and returns a useless host ptr.
-  - malloc
-  - free
-  - calloc
-  - realloc
-  - reallocarray
-  - posix_memalign
-  - aligned_alloc
-  - memalign
-  - valloc
-  - malloc_usable_size
   # Subsystem entries we don't have yet — stubbed to keep the build
   # green while we land them one at a time. Each move from `stub` to
   # `custom_<area>` requires the matching yos_<name>(ctx, ...) entry
@@ -374,6 +457,41 @@ runtime_owned:
   - __yos_envc
   - __yos_envp_setup
   - syscall  # the *libc fn* by this name; we intentionally do not export it
+  # strto* family — host writes 8-byte endptr through 4-byte wasm slot,
+  # smashing the stack. impl/strto.c does proper wasm-offset writeback.
+  - strtol
+  - strtoll
+  - strtoul
+  - strtoull
+  - strtoimax
+  - strtoumax
+  - strtoq
+  - strtouq
+  - strtod
+  - strtof
+  # qsort/bsearch take a function-pointer arg; bridge.py can't translate
+  # a wasm function-table index into a host function pointer. impl/
+  # callback.c implements them with m3_Call on the wasm comparator.
+  # atexit family — registered as no-op (we exit via host).
+  - qsort
+  - bsearch
+  - atexit
+  - __cxa_atexit
+  - at_quick_exit
+  # sysctl + sysctlbyname — FreeBSD-specific, impl/sysctl.c handles
+  # KERN_PROC_PATHNAME (used by uv_exepath) and stubs others to ENOSYS.
+  - sysctl
+  - sysctlbyname
+  # FreeBSD's `int *__error(void)` — the `errno` macro accessor. main.c
+  # binds it to a trampoline that returns the per-ctx errno_off slot.
+  - __error
+  # FreeBSD's __assert(func, file, line, expr) — the `assert` macro
+  # backend. main.c binds it to a trampoline that prints + aborts so we
+  # see which assertion fired.
+  - __assert
+  # abort — main.c binds a trampoline that prints the wasm backtrace
+  # before aborting so we see WHERE the abort came from.
+  - abort
   # ── pthread family (bound by yos_pthread_host_link) ────────────────
   - pthread_create
   - pthread_join

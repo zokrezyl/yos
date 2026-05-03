@@ -212,13 +212,16 @@ def _arg_translation(name: str, idx: int, gt: dict, ht: dict, types: dict) -> tu
     if gk == 'void' and hk == 'void':
         return ('', '')
 
-    # pointer args: translate wasm offset to host pointer.
+    # pointer args: translate wasm offset to host pointer. Wasm NULL
+    # (offset 0) MUST stay NULL in host space — passing
+    # `ctx->memory + 0` would have host libc dereference offset 0
+    # (typically the TLS pointer slot) and either read garbage or
+    # write garbage back, corrupting nearby live data. nvim's
+    # strtoimax(p, NULL, base) was the canary that surfaced this.
     if gk == 'pointer' and hk == 'pointer':
         host_ptr_type = _host_type(ht, types) or 'void *'
-        # Accept any guest pointer of the same level as the host's,
-        # cast at the call site. Layout compatibility was already
-        # confirmed by the comparator; we trust it here.
-        setup = f'    {host_ptr_type} {var}_h = ({host_ptr_type})(ctx->memory + {var});'
+        setup = (f'    {host_ptr_type} {var}_h = {var} ? '
+                 f'({host_ptr_type})(ctx->memory + {var}) : NULL;')
         return (setup, f'{var}_h')
 
     # builtin / builtin: width-only conversion via cast at the call.
@@ -396,12 +399,19 @@ def _emit_bridge(name: str, gf: dict, hf: dict, gtypes: dict, htypes: dict,
         body_lines.append(f'    return (uint32_t)({first_arg_var} + '
                           f'((const char *)_r - (const char *){host_first}));')
     else:
-        # If host return is signed and could indicate -1 error → remap errno.
+        # Error reporting: write mapped errno to the per-ctx wasm slot
+        # so the FreeBSD `errno` macro (#define errno (*__error()))
+        # works in the guest. Use errno-based detection — a negative
+        # return is NOT a reliable error indicator (strtoimax(-42)
+        # returns -42 with errno=0; sin(-x), etc.). The bridge that
+        # called us cleared errno before invoking the host function;
+        # we only write the slot if the host actually set one.
         if any(b in (hret or '') for b in ('int', 'long', 'ssize_t', 'off_t', 'pid_t')):
-            body_lines.append('    if (_r < 0) {')
+            body_lines.append('    if (errno) {')
             body_lines.append('        extern int yos_remap_errno_h2g(int);')
-            body_lines.append('        extern int errno;')
-            body_lines.append('        return ({wret})(-yos_remap_errno_h2g(errno));'.format(wret=wret))
+            body_lines.append('        int _e = yos_remap_errno_h2g(errno);')
+            body_lines.append('        if (ctx && ctx->memory && ctx->errno_off)')
+            body_lines.append('            *(int *)(ctx->memory + ctx->errno_off) = _e;')
             body_lines.append('    }')
         body_lines.append(f'    return ({wret})_r;')
     body_lines.append('}')
@@ -425,7 +435,9 @@ def _arg_translation_full(name, idx, gt, ht, g_types, h_types):
         return ('', '')
     if gk == 'pointer' and hk == 'pointer':
         host_ptr_type = _host_type(ht, h_types) or 'void *'
-        setup = f'    {host_ptr_type} {var}_h = ({host_ptr_type})(ctx->memory + {var});'
+        # Wasm NULL stays NULL host-side. See _arg_translation comment.
+        setup = (f'    {host_ptr_type} {var}_h = {var} ? '
+                 f'({host_ptr_type})(ctx->memory + {var}) : NULL;')
         return (setup, f'{var}_h')
     if gk == 'builtin' and hk == 'builtin':
         host_t = _host_type(ht, h_types) or 'int'
@@ -534,6 +546,12 @@ def _emit_m3_wrapper(name: str, ret_char: str, arg_chars: list[str]) -> str:
         '    (void)_ctx; (void)_mem;',
         '    struct yos_exec_ctx *ctx = '
         '(struct yos_exec_ctx *)m3_GetUserData(runtime);',
+        '    extern const char *yos_brg_last_call;',
+        '    extern int yos_brg_trace;',
+        f'    yos_brg_last_call = "{name}";',
+        '    if (yos_brg_trace) {',
+        f'        fprintf(stderr, "yos_brg: {name}\\n");',
+        '    }',
     ]
     if ret_char != 'v':
         lines.append(f'    {pop_type[ret_char]} *raw_return = '

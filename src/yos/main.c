@@ -127,20 +127,22 @@ static m3ApiRawFunction(m3_main_argc_argv)
     m3ApiGetArg(int32_t, argc);
     m3ApiGetArg(int32_t, argv);
 
-    /* Diagnostic: print what argv nvim is actually receiving. */
-    {
+    /* Diagnostic: trace the argv nvim is receiving. Only printed when
+     * the project-wide trace switch (YTRACE_DEFAULT_ON=yes) is on —
+     * normal runs stay quiet. */
+    if (ydebug_enabled()) {
         struct yos_exec_ctx *ctx = (struct yos_exec_ctx *)m3_GetUserData(runtime);
         uint32_t ms = 0;
         ctx->memory = m3_GetMemory(runtime, &ms, 0);
         ctx->memory_size = ms;
-        fprintf(stderr, "yos: main(argc=%d, argv=0x%x)\n", argc, argv);
+        ydebug("main(argc=%d, argv=0x%x)\n", argc, argv);
         uint32_t *av = (uint32_t *)(ctx->memory + (uint32_t)argv);
         for (int i = 0; i < argc && i < 4; i++) {
             uint32_t s_off = av[i];
             const char *s = (s_off && s_off < ms)
                           ? (const char *)(ctx->memory + s_off)
                           : "<bad>";
-            fprintf(stderr, "yos:   argv[%d] off=0x%x \"%s\"\n", i, s_off, s);
+            ydebug("  argv[%d] off=0x%x \"%s\"\n", i, s_off, s);
         }
     }
 
@@ -187,6 +189,95 @@ static m3ApiRawFunction(m3_t2_demo)
     int32_t out = 0;
     m3_GetResultsV(f, &out);
     m3ApiReturn(out);
+}
+
+/* env.__error: FreeBSD's errno accessor — `int *__error(void)`. The
+ * FreeBSD <errno.h> macro `#define errno (*__error())` lowers every
+ * `errno` reference to a call here. We return the wasm offset of the
+ * per-ctx errno slot reserved at load time; bridges write the mapped
+ * host errno into that slot on error paths. */
+static m3ApiRawFunction(m3_yos_error)
+{
+    m3ApiReturnType(int32_t);
+    struct yos_exec_ctx *ctx = (struct yos_exec_ctx *)m3_GetUserData(runtime);
+    m3ApiReturn((int32_t)ctx->errno_off);
+}
+
+/* Last bridge call name — set by every generated m3w_<X> wrapper before
+ * dispatching. main.c's abort/assert handlers print it so we know which
+ * libc function nvim called immediately before bailing out. */
+const char *yos_brg_last_call = "<none>";
+
+/* Set to 1 to log every bridge call. Pulled from YOS_BRG_TRACE env var
+ * in main(). Useful for debugging "what did the wasm just try to call"
+ * crashes. Very noisy — disable for normal runs. */
+int yos_brg_trace = 0;
+
+/* env.__stack_chk_fail: clang's stack-protector emits a call here
+ * when the canary is corrupted. noreturn — print + die. */
+static m3ApiRawFunction(m3_yos_stack_chk_fail)
+{
+    fprintf(stderr, "yos: __stack_chk_fail() — guest stack canary corrupted\n");
+    m3ApiTrap("__stack_chk_fail");
+}
+
+/* env.abort: nvim/libuv calls abort() on lots of unrecoverable paths
+ * without a diagnostic message. Print a wasm backtrace so we see WHICH
+ * function decided to give up before the host process dies. */
+static m3ApiRawFunction(m3_yos_abort)
+{
+    fprintf(stderr, "yos: abort() called from wasm — last bridge: %s — backtrace:\n",
+            yos_brg_last_call);
+    fflush(stderr);
+    IM3BacktraceInfo bt = m3_GetBacktrace(runtime);
+    if (!bt) {
+        fprintf(stderr, "yos:   (m3_GetBacktrace returned NULL)\n");
+    } else if (!bt->frames) {
+        fprintf(stderr, "yos:   (bt->frames is NULL; lastFrame=%p)\n",
+                (void *)bt->lastFrame);
+    } else {
+        IM3BacktraceFrame f = bt->frames;
+        int i = 0;
+        while (f && i < 64) {
+            const char *fn = f->function ? m3_GetFunctionName(f->function) : "?";
+            fprintf(stderr, "yos:   #%d %s\n", i++, fn);
+            f = f->next;
+        }
+    }
+    fflush(stderr);
+    /* Use m3ApiTrap so the runtime unwinds + reports cleanly instead
+     * of host abort() which kills any remaining diagnostic. */
+    m3ApiTrap("wasm called abort()");
+}
+
+/* env.__assert: FreeBSD's assert backend.
+ *   void __assert(const char *func, const char *file, int line,
+ *                 const char *expr);
+ * The FreeBSD <assert.h> macro lowers `assert(e)` to a call here on
+ * failure. Diagnose loudly so a stalled wasm program tells us WHICH
+ * assertion fired, then abort the host process. */
+static m3ApiRawFunction(m3_yos_assert)
+{
+    m3ApiGetArg(uint32_t, func_off);
+    m3ApiGetArg(uint32_t, file_off);
+    m3ApiGetArg(int32_t,  line);
+    m3ApiGetArg(uint32_t, expr_off);
+
+    struct yos_exec_ctx *ctx = (struct yos_exec_ctx *)m3_GetUserData(runtime);
+    uint32_t mem_size = 0;
+    ctx->memory = m3_GetMemory(runtime, &mem_size, 0);
+    ctx->memory_size = mem_size;
+
+    const char *func = (func_off && func_off < mem_size)
+                     ? (const char *)(ctx->memory + func_off) : "?";
+    const char *file = (file_off && file_off < mem_size)
+                     ? (const char *)(ctx->memory + file_off) : "?";
+    const char *expr = (expr_off && expr_off < mem_size)
+                     ? (const char *)(ctx->memory + expr_off) : "?";
+
+    fprintf(stderr, "yos: ASSERT %s:%d in %s: %s\n",
+            file, line, func, expr);
+    m3ApiTrap("__assert");
 }
 
 /* stub for unresolved imports */
@@ -566,9 +657,8 @@ m3ApiRawFunction(m3_yos_argv_setup)
     ctx->memory = m3_GetMemory(runtime, &mem_size, 0);
     ctx->memory_size = mem_size;
 
-    fprintf(stderr,
-            "yos: argv_setup: argv_ptr=0x%x mem_size=0x%x heap_end=0x%x\n",
-            argv_ptr, mem_size, ctx->heap_end);
+    ydebug("argv_setup: argv_ptr=0x%x mem_size=0x%x heap_end=0x%x\n",
+           argv_ptr, mem_size, ctx->heap_end);
     if (argv_ptr + 4u * (uint32_t)(ctx->argc + 1) > mem_size) {
         fprintf(stderr,
                 "yos: argv_setup: argv_ptr out of range; trapping\n");
@@ -669,6 +759,27 @@ void yos_link_imports(IM3Module module, struct yos_exec_ctx *ctx)
                          "i()", m3_yos_envc, ctx);
     m3_LinkRawFunctionEx(module, "env", "__yos_envp_setup",
                          "v(i)", m3_yos_envp_setup, ctx);
+    m3_LinkRawFunction(module, "env", "__error", "i()", m3_yos_error);
+    m3_LinkRawFunction(module, "env", "__assert", "v(iiii)", m3_yos_assert);
+    m3_LinkRawFunction(module, "env", "abort", "v()", m3_yos_abort);
+    m3_LinkRawFunction(module, "env", "__stack_chk_fail", "v()", m3_yos_stack_chk_fail);
+    /* FreeBSD signal helpers — sigset_t layout differs between FreeBSD
+     * (16 bytes) and Linux (128 bytes), so direct passthrough corrupts
+     * memory. These tiny shims operate on the FreeBSD-shape mask in the
+     * guest's linear memory.
+     *
+     * pthread_sigmask / sigprocmask: no-op success (we don't actually
+     * mask anything host-side). The guest sees its sigset_t bits if it
+     * passes one in, but we don't apply them. nvim's main path doesn't
+     * rely on real signal masking. */
+    extern void yos_signal_link(IM3Module mod);
+    yos_signal_link(module);
+    extern void yos_callback_link(IM3Module mod);
+    yos_callback_link(module);
+    extern void yos_sysctl_link(IM3Module mod);
+    yos_sysctl_link(module);
+    extern void yos_strto_link(IM3Module mod);
+    yos_strto_link(module);
     m3_LinkRawFunction(module, "env", "setjmp", "i(i)", m3_setjmp);
     m3_LinkRawFunction(module, "env", "longjmp", "v(ii)", m3_longjmp);
     m3_LinkRawFunction(module, "env", "_setjmp", "i(i)", m3_setjmp);
@@ -699,8 +810,12 @@ void yos_link_imports(IM3Module module, struct yos_exec_ctx *ctx)
                                           /*tls_arena_size=*/0);
             ctx->rt->pthread_host = ph;
         }
-        if (ph)
-            (void)yos_pthread_host_link (ph, module);
+        if (ph) {
+            M3Result lerr = yos_pthread_host_link (ph, module);
+            if (lerr) {
+                fprintf(stderr, "yos: pthread_host_link failed: %s\n", lerr);
+            }
+        }
     }
 
     /* Soft-f128 builtins. clang's wasm32 ABI makes `long double` =
@@ -877,6 +992,13 @@ static int load_wasm_module(struct yos_exec_ctx *ctx, IM3Environment env,
     *thread_ptr = 0x100;
     memset(ctx->memory + 0x100, 0, 256);
 
+    /* Errno slot for the FreeBSD `errno` macro (= `*__error()`). Sits
+     * inside the TLS block we just zeroed at 0x100..0x200 — picked an
+     * 8-byte-aligned offset past the self-pointer at 0x100. Bridges
+     * write here on error; main.c binds env.__error to a trampoline
+     * that returns this offset. */
+    ctx->errno_off = 0x108;
+
     extern void yos_fd_table_init(struct yos_exec_ctx *);
     yos_fd_table_init(ctx);
 
@@ -907,6 +1029,11 @@ int main(int argc, char **argv)
         fprintf(stderr, "usage: yos <program.wasm>\n");
         return 1;
     }
+
+    /* YOS_BRG_TRACE=1 makes every generated bridge log its name. Lets us
+     * see exactly what libc function the wasm guest called last when it
+     * crashes without a useful host-visible error. */
+    if (getenv("YOS_BRG_TRACE")) yos_brg_trace = 1;
 
     /* Initialize global runtime */
     memset(&g_runtime, 0, sizeof(g_runtime));

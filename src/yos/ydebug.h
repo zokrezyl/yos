@@ -1,9 +1,16 @@
 /*
  * YOS Debug Output
  *
- * In default builds, debug output is gated at RUNTIME by the YOS_DEBUG
- * env var (set YOS_DEBUG=1 to enable). The format string and arg
+ * In default builds, debug output is gated at RUNTIME by the
+ * `YTRACE_DEFAULT_ON` env var (set `YTRACE_DEFAULT_ON=yes` to enable).
+ * Matches the project-wide trace convention used across yos / yetty —
+ * one switch turns every trace point on. The format string and arg
  * evaluation still cost something even when disabled.
+ *
+ * Quiet by default: yos prints nothing to stderr in normal runs except
+ * actual user-visible errors. Anything diagnostic / informational must
+ * go through `ydebug()` — never raw `fprintf(stderr, "yos: ...")`.
+ * That rule is enforced by the build/dev section of ./CLAUDE.md.
  *
  * In RELEASE builds (`-DYOS_RELEASE`), every ydebug() call is compiled
  * to nothing — the format string and the side-effect-free args are
@@ -23,6 +30,7 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 #ifdef YOS_RELEASE
 
@@ -34,8 +42,9 @@ static int _ydebug_enabled = -1;  /* -1 = not initialized */
 
 static inline int ydebug_enabled(void) {
     if (_ydebug_enabled < 0) {
-        const char *env = getenv("YOS_DEBUG");
-        _ydebug_enabled = (env && env[0] == '1');
+        const char *env = getenv("YTRACE_DEFAULT_ON");
+        _ydebug_enabled = (env && (strcmp(env, "yes") == 0
+                                || strcmp(env, "1")   == 0));
     }
     return _ydebug_enabled;
 }

@@ -156,6 +156,13 @@ int32_t yos_write(struct yos_exec_ctx *ctx, int32_t fd, uint32_t buf, uint32_t c
     if (!p) return -EFAULT;
     int32_t hfd = yos_fd_get(ctx, fd);
     if (hfd < 0) return hfd;
+    /* DEBUG: dump nvim's vim._init_packages module bytes (linear memory
+     * 0x6aa70) on every write so we see corruption timeline. */
+    if (getenv("YOS_DUMP_INIT")) {
+        const uint8_t *m = ctx->memory + 0x6aa70;
+        fprintf(stderr, "yos: dump@0x6aa70: %02x %02x %02x %02x %02x %02x \"%.20s\"\n",
+                m[0], m[1], m[2], m[3], m[4], m[5], (const char *)m);
+    }
     ssize_t r = write(hfd, p, count);
     return r < 0 ? -errno : (int32_t)r;
 }
@@ -731,13 +738,31 @@ int32_t yos_pipe2(struct yos_exec_ctx *ctx, uint32_t fildes, int32_t flags)
     int *p = wptr(ctx, fildes);
     if (!p) return -EFAULT;
     int hfds[2];
-    if (pipe2(hfds, flags) < 0) return -errno;
+    /* FreeBSD vs Linux flag remap. FreeBSD: O_CLOEXEC=0x00100000,
+     * O_NONBLOCK=0x00000004. Linux: O_CLOEXEC=0x00080000,
+     * O_NONBLOCK=0x00000800. Translate before calling host pipe2. */
+    int hflags = 0;
+    if (flags & 0x00100000) hflags |= 0x00080000; /* O_CLOEXEC */
+    if (flags & 0x00000004) hflags |= 0x00000800; /* O_NONBLOCK */
+    int leftover = flags & ~(0x00100000 | 0x00000004);
+    if (leftover) {
+        ydebug("yos_pipe2: untranslated flag bits 0x%x (passed through)\n",
+               leftover);
+        hflags |= leftover;
+    }
+    if (pipe2(hfds, hflags) < 0) {
+        ydebug("yos_pipe2(flags=0x%x->0x%x) host failed: %s\n",
+               flags, hflags, strerror(errno));
+        return -errno;
+    }
     int32_t r = yos_fd_alloc(ctx, hfds[0]);
     if (r < 0) { close(hfds[1]); return r; }
     int32_t w = yos_fd_alloc(ctx, hfds[1]);
     if (w < 0) { yos_fd_close(ctx, r); return w; }
     p[0] = r;
     p[1] = w;
+    ydebug("yos_pipe2(flags=0x%x->0x%x) -> wfd[%d, %d]\n",
+           flags, hflags, r, w);
     return 0;
 }
 

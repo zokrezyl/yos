@@ -621,16 +621,27 @@ mono_now_ns (void)
     return (int64_t) ts.tv_sec * 1000000000LL + (int64_t) ts.tv_nsec;
 }
 
-// pthread_cond_timedwait(cond*, mutex*, abstime_ns_i64) -> i32
-// Returns 0 on signal, ETIMEDOUT (110) on timeout, -1 on bad args.
+// pthread_cond_timedwait(cond*, mutex*, timespec*) -> i32
+// FreeBSD i386 struct timespec: int64 tv_sec + long tv_nsec. We read
+// it from wasm memory and convert to ns. Returns 0 on signal,
+// ETIMEDOUT (110) on timeout, -1 on bad args.
 static m3ApiRawFunction (host_pthread_cond_timedwait)
 {
     m3ApiReturnType (int32_t)
     m3ApiGetArgMem  (uint32_t *, c)
     m3ApiGetArgMem  (uint32_t *, m)
-    m3ApiGetArg     (int64_t,    abstime_ns)
+    m3ApiGetArgMem  (uint8_t  *, ts_p)
 
-    if (!c || !m) m3ApiReturn (-1);
+    if (!c || !m || !ts_p) m3ApiReturn (-1);
+
+    /* FreeBSD wasm32 timespec layout: 8-byte int64 tv_sec at offset 0,
+     * 4-byte int32 tv_nsec at offset 8 (alignment of int64_t on i386
+     * is 4). Total 12 bytes. */
+    int64_t tv_sec;
+    int32_t tv_nsec;
+    memcpy(&tv_sec,  ts_p + 0, 8);
+    memcpy(&tv_nsec, ts_p + 8, 4);
+    int64_t abstime_ns = tv_sec * 1000000000LL + (int64_t)tv_nsec;
 
     int64_t now = mono_now_ns ();
     int64_t timeout = abstime_ns - now;
@@ -983,7 +994,11 @@ static m3ApiRawFunction (host_pthread_getspecific)
 #define LINK(name, sig, fn)                                                \
     do {                                                                   \
         M3Result _r = m3_LinkRawFunctionEx (mod, "env", name, sig, fn, h); \
-        if (_r && _r != m3Err_functionLookupFailed) return _r;             \
+        if (_r && _r != m3Err_functionLookupFailed) {                      \
+            fprintf(stderr, "yos pthread LINK(%s, %s) failed: %s\n",       \
+                    name, sig, _r);                                        \
+            return _r;                                                     \
+        }                                                                  \
     } while (0)
 
 static M3Result
@@ -1007,7 +1022,7 @@ host_link_imports (yos_pthread_host * h, IM3Module mod)
     LINK ("pthread_cond_init",       "i(**)",  host_pthread_cond_init);
     LINK ("pthread_cond_destroy",    "i(*)",   host_pthread_cond_destroy);
     LINK ("pthread_cond_wait",       "i(**)",  host_pthread_cond_wait);
-    LINK ("pthread_cond_timedwait",  "i(**I)", host_pthread_cond_timedwait);
+    LINK ("pthread_cond_timedwait",  "i(***)", host_pthread_cond_timedwait);
     LINK ("pthread_cond_signal",     "i(*)",   host_pthread_cond_signal);
     LINK ("pthread_cond_broadcast",  "i(*)",   host_pthread_cond_broadcast);
 

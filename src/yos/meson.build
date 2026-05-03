@@ -53,6 +53,11 @@ yos_runtime_sources = files(
   'impl/sig.c',
   'impl/f128.c',
   'impl/aliases.c',
+  'impl/alloc.c',
+  'impl/callback.c',
+  'impl/signal.c',
+  'impl/strto.c',
+  'impl/sysctl.c',
   'impl/tier2.c',
   'impl/printf.c',
   'vfs/file.c',
@@ -72,6 +77,7 @@ yos_exe = executable(
   dependencies : [
     wasm3_dep,
     api_bridge_dep,      # m3w_<fn> wrappers + yos_brg_link_imports()
+    mimalloc_dep,        # impl/alloc.c — guest malloc backed by mimalloc
     threads_dep,
     m_dep,
   ],

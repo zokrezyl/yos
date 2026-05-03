@@ -31,6 +31,48 @@
 
 # ─── extract: guest + host API yaml ──────────────────────────────────
 
+# Top-level headers we want extract.py to walk on BOTH sides. Every
+# header in this list must exist on the guest (FreeBSD i386) and is
+# expected (or harmless) on the host. Mismatches surface as
+# guest_only / host_only entries in analyse-report.yaml.
+api_top_headers = [
+  'stdio.h', 'stdlib.h', 'string.h', 'strings.h',
+  'unistd.h', 'fcntl.h', 'errno.h', 'time.h', 'signal.h',
+  'pthread.h', 'semaphore.h',
+  'math.h', 'ctype.h', 'wchar.h', 'wctype.h',
+  'inttypes.h', 'stdint.h', 'stddef.h', 'limits.h',
+  'dirent.h', 'dlfcn.h', 'fnmatch.h', 'glob.h', 'iconv.h',
+  'locale.h', 'langinfo.h', 'libgen.h',
+  'netdb.h', 'ifaddrs.h', 'poll.h',
+  'pwd.h', 'grp.h', 'regex.h', 'search.h',
+  'setjmp.h', 'assert.h', 'sched.h',
+  'termios.h', 'utime.h',
+]
+
+# Top-level header subdirs to walk recursively. Same on both sides.
+# Some (sys/event.h, vm/) only exist on FreeBSD; that's fine, the host
+# extract just won't see them.
+api_top_dirs = [
+  'sys/', 'arpa/', 'net/', 'netinet/',
+]
+
+# FreeBSD-only header subdirs (machine/, x86/, vm/, netinet6/) — extract
+# from the guest only.
+api_guest_only_dirs = [
+  'machine/', 'x86/', 'vm/', 'netinet6/',
+]
+
+# Build the --restrict-to argument vector once per side. Meson doesn't
+# have list-flatten, so we splat manually below.
+guest_restrict_args = []
+foreach h : api_top_headers + api_top_dirs + api_guest_only_dirs
+  guest_restrict_args += ['--restrict-to', h]
+endforeach
+host_restrict_args = []
+foreach h : api_top_headers + api_top_dirs
+  host_restrict_args += ['--restrict-to', h]
+endforeach
+
 guest_api_yaml = custom_target(
   'guest-api-i386-freebsd',
   input            : freebsd_headers_i386,
@@ -43,19 +85,7 @@ guest_api_yaml = custom_target(
     '--root-marker',  'usr/include/',
     '--target',       'wasm32-unknown-unknown',
     '--enum',
-    '--restrict-to',  'sys/',
-    '--restrict-to',  'machine/',
-    '--restrict-to',  'x86/',
-    '--restrict-to',  'arpa/',
-    '--restrict-to',  'net/',
-    '--restrict-to',  'netinet/',
-    '--restrict-to',  'netinet6/',
-    '--restrict-to',  'vm/',
-    '--restrict-to',  'stdio.h', '--restrict-to', 'stdlib.h',
-    '--restrict-to',  'string.h', '--restrict-to', 'unistd.h',
-    '--restrict-to',  'fcntl.h', '--restrict-to', 'errno.h',
-    '--restrict-to',  'time.h',  '--restrict-to', 'signal.h',
-    '--restrict-to',  'pthread.h',
+    guest_restrict_args,
     '--out',          '@OUTPUT@',
   ],
   build_by_default : false,
@@ -77,15 +107,7 @@ host_api_yaml = custom_target(
     '--root-marker',  '/usr/local/include/',
     '--root-marker',  'include/',
     '--enum',
-    '--restrict-to',  'sys/',
-    '--restrict-to',  'arpa/',
-    '--restrict-to',  'net/',
-    '--restrict-to',  'netinet/',
-    '--restrict-to',  'stdio.h', '--restrict-to', 'stdlib.h',
-    '--restrict-to',  'string.h', '--restrict-to', 'unistd.h',
-    '--restrict-to',  'fcntl.h', '--restrict-to', 'errno.h',
-    '--restrict-to',  'time.h',  '--restrict-to', 'signal.h',
-    '--restrict-to',  'pthread.h',
+    host_restrict_args,
     '--out',          '@OUTPUT@',
   ],
   build_by_default : false,

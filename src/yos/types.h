@@ -199,6 +199,23 @@ struct yos_exec_ctx {
     void *timer_ids[YOS_TIMER_MAX];
     pthread_mutex_t timer_lock;
     int             timer_lock_init;
+
+    /* Wasm offset of the int-sized slot that backs the FreeBSD `errno`
+     * macro (#define errno (*__error())). yos___error(ctx) returns this
+     * offset; bridges write here on error paths so client code's
+     * `errno` reads the right value. Per-ctx for now (single-thread
+     * correct); pthread workers need their own slot — TODO. */
+    uint32_t errno_off;
+
+    /* Guest-facing allocator state (impl/alloc.c, mimalloc-backed).
+     * mi_heap is `mi_heap_t *`; mi_arena_id is `mi_arena_id_t` (int).
+     * Kept opaque to avoid pulling mimalloc.h into types.h.
+     * mi_arena_lo/hi bracket the wasm offsets reserved as mimalloc's
+     * arena — bridges in impl/alloc.c lazy-init on first malloc. */
+    void    *mi_heap;
+    int      mi_arena_id;
+    uint32_t mi_arena_lo;
+    uint32_t mi_arena_hi;
 };
 
 /* Global runtime state */
