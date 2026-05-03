@@ -3,6 +3,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
+#include <stdatomic.h>
 #include <sys/syscall.h>
 #include <unistd.h>
 
@@ -223,6 +224,95 @@ const char *yos_brg_last_call = "<none>";
  * crashes. Very noisy — disable for normal runs. */
 int yos_brg_trace = 0;
 
+/* Ring buffer of the last N bridge calls per host thread. Each m3w_*
+ * wrapper calls yos_brg_record(name); on a __stack_chk_fail trap we
+ * dump the buffer so we can see which bridges (and which thread) led
+ * up to the corruption. Cross-thread bridge interleaving is the
+ * primary suspect for the kind of canary smashes nvim hits in the
+ * channel_job_start path — the parent and the asyncify-fork "child"
+ * both run host glibc concurrently, and any FILE-table or stdio
+ * race shows up as a smashed canary later. */
+#define YOS_BRG_RING 1024
+struct yos_brg_rec {
+    const char *name;
+    pid_t       tid;
+    uint64_t    seq;
+    uint64_t    args[4];          /* up to 4 first wasm-ABI args (raw u32 widened) */
+};
+static struct yos_brg_rec yos_brg_ring[YOS_BRG_RING];
+static _Atomic uint64_t   yos_brg_ring_seq = 0;
+/* Most-recently-recorded slot, so per-bridge `_sp` peeks land in the
+ * right slot. yos_brg_record advances the global sequence and
+ * stores its index here for the bridge to fill in args. */
+static __thread uint32_t  yos_brg_my_slot = 0;
+
+static inline pid_t yos_brg_gettid(void) {
+    return (pid_t)syscall(SYS_gettid);
+}
+
+void yos_brg_record(const char *name)
+{
+    uint64_t s = atomic_fetch_add(&yos_brg_ring_seq, 1);
+    struct yos_brg_rec *r = &yos_brg_ring[s % YOS_BRG_RING];
+    r->name = name;
+    r->tid  = yos_brg_gettid();
+    r->seq  = s;
+    r->args[0] = r->args[1] = r->args[2] = r->args[3] = 0;
+    yos_brg_my_slot = (uint32_t)(s % YOS_BRG_RING);
+}
+
+void yos_brg_record_args(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3)
+{
+    struct yos_brg_rec *r = &yos_brg_ring[yos_brg_my_slot];
+    r->args[0] = a0; r->args[1] = a1; r->args[2] = a2; r->args[3] = a3;
+}
+
+/* Dump a host-side string buffer at a wasm offset, escaping non-print
+ * chars; used to interpret pointer-shaped bridge args. */
+static void yos_brg_dump_strarg(FILE *out, struct yos_exec_ctx *ctx,
+                                uint64_t off, int max)
+{
+    if (!ctx || !ctx->memory || off == 0 || off >= ctx->memory_size) {
+        fprintf(out, "<%lx>", (unsigned long)off);
+        return;
+    }
+    fputc('"', out);
+    const char *p = (const char *)(ctx->memory + off);
+    for (int i = 0; i < max && p[i]; i++) {
+        unsigned c = (unsigned char)p[i];
+        if (c >= 32 && c < 127) fputc((int)c, out);
+        else fprintf(out, "\\x%02x", c);
+    }
+    fputc('"', out);
+}
+
+static void yos_brg_dump_ring(FILE *out, int n, struct yos_exec_ctx *ctx)
+{
+    uint64_t end = atomic_load(&yos_brg_ring_seq);
+    if (end == 0) { fprintf(out, "yos:   (no bridge calls recorded)\n"); return; }
+    if (n > YOS_BRG_RING) n = YOS_BRG_RING;
+    if ((uint64_t)n > end) n = (int)end;
+    fprintf(out, "yos: last %d bridge calls (most recent first):\n", n);
+    for (int i = 0; i < n; i++) {
+        uint64_t s = end - 1 - i;
+        struct yos_brg_rec *r = &yos_brg_ring[s % YOS_BRG_RING];
+        fprintf(out, "yos:   #%u tid=%d %-12s a0=%lx a1=%lx a2=%lx a3=%lx",
+                (unsigned)(end - r->seq), (int)r->tid,
+                r->name ? r->name : "?",
+                (unsigned long)r->args[0],
+                (unsigned long)r->args[1],
+                (unsigned long)r->args[2],
+                (unsigned long)r->args[3]);
+        /* Common cases: fopen path, getenv name, fclose handle. */
+        if (r->name && (!strcmp(r->name, "fopen") || !strcmp(r->name, "getenv")
+                     || !strcmp(r->name, "open") || !strcmp(r->name, "stat"))) {
+            fputc(' ', out);
+            yos_brg_dump_strarg(out, ctx, r->args[0], 80);
+        }
+        fputc('\n', out);
+    }
+}
+
 static int main_get_asyncify_state(IM3Runtime rt);
 
 /* env.__stack_chk_fail: clang's stack-protector emits a call here
@@ -246,6 +336,16 @@ static m3ApiRawFunction(m3_yos_stack_chk_fail)
         "yos: __stack_chk_fail() — guest stack canary corrupted\n"
         "yos: last bridge before trap: %s\n",
         yos_brg_last_call ? yos_brg_last_call : "(none)");
+    {
+        struct yos_exec_ctx *ctx =
+            (struct yos_exec_ctx *)m3_GetUserData(runtime);
+        if (ctx) {
+            uint32_t mem_size = 0;
+            ctx->memory = m3_GetMemory(runtime, &mem_size, 0);
+            ctx->memory_size = mem_size;
+        }
+        yos_brg_dump_ring(stderr, 256, ctx);
+    }
     fflush(stderr);
     m3ApiTrap("__stack_chk_fail");
 }

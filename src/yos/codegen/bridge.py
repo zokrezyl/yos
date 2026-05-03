@@ -619,7 +619,9 @@ def _emit_m3_wrapper(name: str, ret_char: str, arg_chars: list[str]) -> str:
         '(struct yos_exec_ctx *)m3_GetUserData(runtime);',
         '    extern const char *yos_brg_last_call;',
         '    extern int yos_brg_trace;',
+        '    extern void yos_brg_record(const char *);',
         f'    yos_brg_last_call = "{name}";',
+        f'    yos_brg_record("{name}");',
         '    if (yos_brg_trace) {',
         f'        fprintf(stderr, "yos_brg: {name}\\n");',
         '    }',
@@ -634,6 +636,17 @@ def _emit_m3_wrapper(name: str, ret_char: str, arg_chars: list[str]) -> str:
         lines.append(f'    {pop_type[c]} {an} = '
                      f'*({pop_type[c]}*)(_sp++);')
         arg_names.append(an)
+    # Stash up to 4 raw arg values into the ring slot so the trap
+    # handler can show what each call was actually doing. Cast to
+    # uint64_t so any of i32/i64/f32/f64 lands in a uniform field.
+    lines.append('    extern void yos_brg_record_args(uint64_t,uint64_t,uint64_t,uint64_t);')
+    a_arr = []
+    for i in range(4):
+        if i < len(arg_names):
+            a_arr.append(f'(uint64_t)a{i}')
+        else:
+            a_arr.append('0')
+    lines.append('    yos_brg_record_args(' + ', '.join(a_arr) + ');')
 
     call = f'yos_{name}(ctx{("," if arg_names else "")} '
     call += ', '.join(arg_names) + ')'
