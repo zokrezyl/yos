@@ -183,6 +183,28 @@ api_bridge_outputs = custom_target(
   console          : true,
 )
 
+# ─── struct_convert: per-field host↔wasm32 layout copiers ──────────
+#
+# Many bridge fns take a struct arg whose host and wasm32 layouts
+# differ in size, field offset, or field type. struct_convert.py
+# walks the extracted struct definitions and emits two copiers per
+# struct (cv_<name>_h2w / cv_<name>_w2h). The bridge bodies for
+# affected fns then allocate a host scratch struct, call host libc,
+# and h2w-copy back.
+api_struct_convert_outputs = custom_target(
+  'api-struct-convert',
+  input            : [guest_api_yaml, host_api_yaml],
+  output           : ['yos_struct_convert.h', 'yos_struct_convert.c'],
+  command          : [
+    py, files('struct_convert.py'),
+    '--guest-api', '@INPUT0@',
+    '--host-api',  '@INPUT1@',
+    '--out-dir',   '@OUTDIR@',
+  ],
+  build_by_default : false,
+  console          : true,
+)
+
 alias_target('api-generate', api_generate_outputs, api_bridge_outputs)
 alias_target('api-bridge',   api_bridge_outputs)
 
@@ -200,8 +222,9 @@ yos_impl_inc  = include_directories('..')
 
 api_bridge_lib = static_library(
   'yos_api_bridge',
-  api_bridge_outputs[1],   # yos_bridge.c
-  api_generate_outputs[1], # yos_remap.c
+  api_bridge_outputs[1],         # yos_bridge.c
+  api_generate_outputs[1],       # yos_remap.c
+  api_struct_convert_outputs[1], # yos_struct_convert.c
   include_directories : [yos_types_inc, yos_inc, yos_impl_inc],
   dependencies        : [wasm3_dep],
   c_args : [

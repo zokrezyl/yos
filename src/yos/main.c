@@ -213,11 +213,19 @@ const char *yos_brg_last_call = "<none>";
  * crashes. Very noisy — disable for normal runs. */
 int yos_brg_trace = 0;
 
-/* env.__stack_chk_fail: clang's stack-protector emits a call here
- * when the canary is corrupted. noreturn — print + die. */
+/* env.__stack_chk_fail: in vanilla wasm-ld output this is the
+ * stack-protector failure handler, but Binaryen-asyncified binaries
+ * (e.g. nvim) ALSO call here from asyncify's "unexpected state"
+ * branches — global 969 is the asyncify state global, not an SSP
+ * cookie. We can't tell from the host side which kind of mismatch
+ * the guest hit; both are fatal, so just print and trap. */
 static m3ApiRawFunction(m3_yos_stack_chk_fail)
 {
-    fprintf(stderr, "yos: __stack_chk_fail() — guest stack canary corrupted\n");
+    fprintf(stderr,
+        "yos: __stack_chk_fail() — guest stack canary OR asyncify state mismatch\n"
+        "yos: last bridge before trap: %s\n",
+        yos_brg_last_call ? yos_brg_last_call : "(none)");
+    fflush(stderr);
     m3ApiTrap("__stack_chk_fail");
 }
 

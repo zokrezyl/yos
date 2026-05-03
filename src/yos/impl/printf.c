@@ -36,19 +36,36 @@
 
 #include "yos/types.h"
 
-/* Read one i32 / i64 / f64 slot from the guest's va_list region. Each
- * slot is 8 bytes regardless of the actual size. Caller advances. */
+/* Read one slot from the guest's va_list region.
+ *
+ * Clang's wasm32 variadic ABI packs each variadic arg at its NATURAL
+ * alignment, then advances by the type's size — NOT a fixed 8-byte
+ * slot. So:
+ *   int / pointer (i32):   align 4, size 4
+ *   long long (i64):       align 8, size 8
+ *   double (f64):           align 8, size 8
+ *
+ * We were treating every slot as 8 bytes, which silently drifted the
+ * read offset for any format like `"%s_%d"` (the `%d` ended up reading
+ * past the int into adjacent memory). The clearenv FreeBSD test pinned
+ * this — `snprintf("%s_%d", "TEST", i)` always returned "TEST_0". */
+static inline void va_align(uint32_t *off, uint32_t a) {
+    *off = (*off + a - 1) & ~(a - 1);
+}
 static inline uint32_t va_i32(struct yos_exec_ctx *ctx, uint32_t *off) {
+    va_align(off, 4);
     uint32_t v = *(uint32_t *)(ctx->memory + *off);
-    *off += 8;
+    *off += 4;
     return v;
 }
 static inline uint64_t va_i64(struct yos_exec_ctx *ctx, uint32_t *off) {
+    va_align(off, 8);
     uint64_t v = *(uint64_t *)(ctx->memory + *off);
     *off += 8;
     return v;
 }
 static inline double va_f64(struct yos_exec_ctx *ctx, uint32_t *off) {
+    va_align(off, 8);
     double v = *(double *)(ctx->memory + *off);
     *off += 8;
     return v;

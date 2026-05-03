@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 #include "yos/types.h"
 #include "yos/ydebug.h"
+#include "impl/errno_helpers.h"
 #include "vfs/mount.h"
 #include "vfs/file.h"
 #include "vfs/procfs.h"
@@ -225,8 +226,8 @@ int32_t yos_link(struct yos_exec_ctx *ctx, uint32_t oldname, uint32_t newname)
 int32_t yos_unlink(struct yos_exec_ctx *ctx, uint32_t pathname)
 {
     const char *s = wstr(ctx, pathname);
-    if (!s) return -EFAULT;
-    return unlink(s) < 0 ? -errno : 0;
+    if (!s) return yos_errno_neg(ctx, EFAULT);
+    return yos_errno_check(ctx, unlink(s));
 }
 
 int32_t yos_chdir(struct yos_exec_ctx *ctx, uint32_t filename)

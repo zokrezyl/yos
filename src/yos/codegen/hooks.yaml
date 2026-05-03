@@ -43,6 +43,14 @@ custom_proc:
   - getegid
   - raise
   - killpg
+  # impl/env.c — env table backed by wasm linear memory.
+  - getenv
+  - setenv
+  - unsetenv
+  - putenv
+  - clearenv
+  # impl/random.c — proper EFAULT on NULL.
+  - getentropy
   - fork
   - vfork
   - execve
@@ -262,17 +270,25 @@ custom_sig:
 # names refer to converters emitted into struct_convert.{c,h} by our
 # generate_struct_convert.py.
 struct_convert:
+  # struct stat
   stat:           {out: statbuf, type: stat}
   fstat:          {out: statbuf, type: stat}
   lstat:          {out: statbuf, type: stat}
   fstatat:        {out: statbuf, type: stat}
+  # struct timespec
   clock_gettime:  {out: tp,      type: timespec}
   clock_getres:   {out: res,     type: timespec}
   nanosleep:      {in:  rqtp,    out: rmtp, type: timespec}
+  # struct timeval
   gettimeofday:   {out: tv,      type: timeval}
+  # struct rusage / rlimit
   getrusage:      {out: usage,   type: rusage}
   getrlimit:      {out: rlim,    type: rlimit}
   setrlimit:      {in:  rlim,    type: rlimit}
+  # struct tm — auto-bridge wrote 56 host bytes into 44-byte wasm slot
+  # and tripped the stack canary on nvim startup.
+  localtime_r:    {out: result,  type: tm}
+  gmtime_r:       {out: result,  type: tm}
 
 # ─── Tier 2: implementation comes from FreeBSD libc source files ──────
 # bridge.py emits an m3w_<name> wrapper that dispatches into yos's
@@ -450,11 +466,10 @@ stub:
   - alphasort
   - versionsort
   # Host structs with embedded pointers (8B host vs 4B wasm) overflow
-  # the wasm-side struct slot when auto-bridge passes through. Stubbed
-  # until struct_convert generation handles them.
-  # struct tm: 56B host vs 44B wasm (long+char*).
-  - localtime_r
-  - gmtime_r
+  # the wasm-side struct slot when auto-bridge passes through. The
+  # *_r variants now go through struct_convert; the value-returning
+  # ones (localtime, gmtime, asctime, ctime) need a static-buffer
+  # convention we don't model yet — keep stubbed.
   - localtime
   - gmtime
   - asctime

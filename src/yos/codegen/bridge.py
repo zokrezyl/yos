@@ -130,6 +130,13 @@ def _host_type(t: dict, types: dict) -> str | None:
         return t.get('name') or None
     if k == 'enum':
         return 'int'
+    if k in ('struct', 'union'):
+        # Struct/union by value isn't bridgeable, but a *pointer* to
+        # one is — the recursive caller in the pointer branch needs
+        # us to render `struct <name>` so it can append " *".
+        n = t.get('name')
+        if n:
+            return f'{k} {n}'
     return None
 
 
@@ -265,6 +272,7 @@ def _emit_bridge(name: str, gf: dict, hf: dict, gtypes: dict, htypes: dict,
     arg_decls = ['struct yos_exec_ctx *ctx']
     setups: list[str] = []
     call_args: list[str] = []
+    post_writebacks: list[str] = []
     can_emit = has_public_header
 
     g_args = gf.get('args', [])
@@ -272,8 +280,6 @@ def _emit_bridge(name: str, gf: dict, hf: dict, gtypes: dict, htypes: dict,
     for i, (ga, ha) in enumerate(zip(g_args, h_args)):
         gt = gtypes.get(ga['type_uid']);  ht = htypes.get(ha['type_uid'])
         decl = _bridge_arg_decl(ga.get('name'), i, gt, gtypes)
-        tr   = _arg_translation(ga.get('name'), i, gt, ht, gtypes if False else gtypes, )
-        # ↑ pass gtypes for resolve; host uses htypes — fix:
         tr = _arg_translation_full(ga.get('name'), i, gt, ht, gtypes, htypes)
         if decl is None or tr is None:
             can_emit = False
@@ -285,11 +291,13 @@ def _emit_bridge(name: str, gf: dict, hf: dict, gtypes: dict, htypes: dict,
             # error. Keep building the decl list with safe i32
             # defaults so the body's signature matches the wrapper.
             decl = decl or f'uint32_t a{i}'
-            tr = ('', f'a{i}')
+            tr = ('', f'a{i}', '')
         arg_decls.append(decl)
         if tr[0]:
             setups.append(tr[0])
         call_args.append(tr[1])
+        if len(tr) >= 3 and tr[2]:
+            post_writebacks.append(tr[2])
 
     # Variadic: clang's wasm32 ABI adds an implicit `i32 va_list_ptr`
     # at the end of the call. We accept it as an extra unused parameter
@@ -381,6 +389,7 @@ def _emit_bridge(name: str, gf: dict, hf: dict, gtypes: dict, htypes: dict,
             + ('\n'.join(setups) + '\n' if setups else '')
             + f'    (void)ctx;\n'
             + f'    {call};\n'
+            + ('\n'.join(post_writebacks) + '\n' if post_writebacks else '')
             + f'}}'
         )
         return f'void yos_{name}({", ".join(arg_decls)});', body
@@ -390,6 +399,7 @@ def _emit_bridge(name: str, gf: dict, hf: dict, gtypes: dict, htypes: dict,
     body_lines.append('    (void)ctx;')
     body_lines.extend(setups)
     body_lines.append(f'    {hret} _r = {call};')
+    body_lines.extend(post_writebacks)
     if ret_kind == 'first_arg_alias':
         # memset/memcpy/strcpy/...: return is the first ptr arg as
         # passed in. Just return that argument's wasm offset.
@@ -429,9 +439,11 @@ def _emit_bridge(name: str, gf: dict, hf: dict, gtypes: dict, htypes: dict,
 def _arg_translation_full(name, idx, gt, ht, g_types, h_types):
     """Same as _arg_translation but with separate type registries.
 
-    The earlier helper used a single types dict; bridges read guest
-    types from one yaml and host types from another, so we accept
-    both registries to resolve correctly.
+    Returns a 3-tuple (setup, host_call_expr, post_writeback). The
+    post-writeback is C lines emitted AFTER the host call returns,
+    used by the narrow-pointer thunk below to copy a host-wider
+    scalar back into a guest-narrower wasm slot. Most args don't
+    need any post step and return ''.
     """
     gt = _resolve(gt, g_types)
     ht = _resolve(ht, h_types)
@@ -440,20 +452,54 @@ def _arg_translation_full(name, idx, gt, ht, g_types, h_types):
         return None
     gk, hk = gt.get('kind'), ht.get('kind')
     if gk == 'void' and hk == 'void':
-        return ('', '')
+        return ('', '', '')
     if gk == 'pointer' and hk == 'pointer':
+        # Narrow-pointer thunk: pointer to a builtin scalar where the
+        # host writes more bytes than the wasm slot reserves. Classic
+        # case: `time(time_t *)` — FreeBSD i386 time_t is __int32_t
+        # (4 bytes) but Linux x86_64 time_t is `long` (8 bytes), so
+        # the host stores 8 bytes through a 4-byte wasm pointer and
+        # smashes the next stack slot. Detected from the per-pointee
+        # `size` recorded by extract.py; if guest < host, route
+        # through a host-side stack temp and narrow-copy back. We
+        # treat any size mismatch as inout: read N=guest_size bytes
+        # from wasm into the temp first (so input-only and inout
+        # callers see the right starting value), let host write the
+        # full host_size, then narrow-cast back unless the pointee is
+        # const-qualified (input-only — skip the writeback).
+        g_pointee = _resolve(g_types.get(gt.get('pointee_uid')), g_types)
+        h_pointee = _resolve(h_types.get(ht.get('pointee_uid')), h_types)
+        if (g_pointee and h_pointee
+                and g_pointee.get('kind') == 'builtin'
+                and h_pointee.get('kind') == 'builtin'
+                and g_pointee.get('size') and h_pointee.get('size')
+                and g_pointee.get('size') != h_pointee.get('size')):
+            guest_t = _guest_type(g_pointee, g_types) or 'int'
+            host_t  = _host_type(h_pointee, h_types) or 'int'
+            is_const = bool(gt.get('pointee_is_const')) or bool(g_pointee.get('is_const'))
+            setup_lines = [
+                f'    /* narrow-ptr thunk: guest {guest_t} ({g_pointee.get("size")}B)'
+                f' vs host {host_t} ({h_pointee.get("size")}B) — route through'
+                f' a host-width temp and narrow-copy back. */',
+                f'    {host_t} {var}_v = ({host_t})*({guest_t} *)(ctx->memory + {var});',
+                f'    {host_t} *{var}_h = &{var}_v;',
+            ]
+            setup = '\n'.join(setup_lines)
+            post  = ('' if is_const
+                     else f'    *({guest_t} *)(ctx->memory + {var}) = ({guest_t}){var}_v;')
+            return (setup, f'{var}_h', post)
         host_ptr_type = _host_type(ht, h_types) or 'void *'
         # See _arg_translation comment: don't NULL-translate; custom
         # impls handle the few fns where NULL passthrough matters.
         setup = f'    {host_ptr_type} {var}_h = ({host_ptr_type})(ctx->memory + {var});'
-        return (setup, f'{var}_h')
+        return (setup, f'{var}_h', '')
     if gk == 'builtin' and hk == 'builtin':
         host_t = _host_type(ht, h_types) or 'int'
-        return ('', f'({host_t}){var}')
+        return ('', f'({host_t}){var}', '')
     if gk == 'enum' and hk in ('builtin', 'enum'):
-        return ('', f'({_host_type(ht, h_types) or "int"}){var}')
+        return ('', f'({_host_type(ht, h_types) or "int"}){var}', '')
     if hk == 'enum' and gk in ('builtin', 'enum'):
-        return ('', f'(int){var}')
+        return ('', f'(int){var}', '')
     return None
 
 
@@ -670,8 +716,188 @@ def _emit_link_imports(sigs: dict[str, tuple[str, list[str]]]) -> str:
     return '\n'.join(head_with_count + body + tail)
 
 
+def _emit_struct_convert_body(name: str, gf: dict, hf: dict,
+                              g_types: dict, h_types: dict,
+                              meta: dict,
+                              decls: list, defs: list) -> bool:
+    """Emit a bridge body that uses cv_<type>_h2w / cv_<type>_w2h
+    converters to marshal a struct arg whose layout differs between
+    host and wasm32. Returns True on success.
+
+    `meta` shape (from hooks.yaml struct_convert section):
+        {type: 'stat',     out: 'statbuf'}        # OUT-only
+        {type: 'rlimit',   in:  'rlim'}           # IN-only
+        {type: 'timespec', in:  'rqtp', out: 'rmtp'}  # IN-OUT
+    """
+    sc_type = meta.get('type')
+    in_arg  = meta.get('in')
+    out_arg = meta.get('out')
+    if not sc_type:
+        return False
+
+    # Render the wasm-ABI parameter list.
+    wargs = []
+    for i, ga in enumerate(gf.get('args', [])):
+        gt = g_types.get(ga['type_uid'])
+        d = _bridge_arg_decl(ga.get('name'), i, gt, g_types)
+        if d is None:
+            return False
+        wargs.append(d)
+
+    wret = _wasm_type(g_types.get(gf['ret']), g_types) or 'int32_t'
+    sig  = (f'{wret} yos_{name}(struct yos_exec_ctx *ctx'
+            f'{(", " + ", ".join(wargs)) if wargs else ""})')
+    decls.append(sig + ';')
+
+    # Find the pointer-to-<sc_type> arg index. Our yaml extractor
+    # often loses parameter names (most decls become {name:''}), so
+    # name-based matching from hooks.yaml is unreliable. Match by
+    # POINTEE TYPE instead: there's almost always exactly one
+    # pointer-to-`sc_type` argument; that's the in/out slot.
+    struct_arg_idx = -1
+    for i, ga in enumerate(gf.get('args', [])):
+        gt = _resolve(g_types.get(ga['type_uid']), g_types)
+        if gt and gt.get('kind') == 'pointer':
+            pointee = _resolve(g_types.get(gt.get('pointee_uid')), g_types)
+            if pointee and pointee.get('kind') == 'struct' \
+                    and pointee.get('name') == sc_type:
+                struct_arg_idx = i
+                break
+
+    # Build the host-call argument list. For each guest arg:
+    #   - if it's the in/out struct arg: use &host_scratch
+    #   - else: pass the wasm value (with cast if needed)
+    call_args = []
+    struct_wname = None
+    extra_setups: list[str] = []
+    extra_posts: list[str] = []
+    for i, ga in enumerate(gf.get('args', [])):
+        wname = wargs[i].split()[-1]
+        if i == struct_arg_idx:
+            call_args.append(f'&host_{sc_type}_scratch')
+            struct_wname = wname
+            continue
+        gt = g_types.get(ga['type_uid'])
+        ht = h_types.get(hf['args'][i].get('type_uid')) if i < len(hf.get('args', [])) else None
+        host_t = _host_type(ht, h_types) if ht else None
+        # Reuse the narrow-pointer thunk (pointer-to-builtin where the
+        # host scalar is wider than the guest scalar — e.g. `const
+        # time_t *` where wasm time_t is 4B and host time_t is 8B).
+        # Without this, the host reads/writes 8 bytes through a
+        # 4-byte wasm pointer and either pulls junk high bits in
+        # (input) or smashes the next stack slot (output).
+        tr = _arg_translation_full(ga.get('name'), i, gt, ht, g_types, h_types)
+        if tr is not None and tr[0] and tr[1] != wname and 'narrow-ptr thunk' in (tr[0] or ''):
+            # Indent the setup so it lines up inside the function body.
+            for line in tr[0].splitlines():
+                extra_setups.append(line if line.startswith('    ') else '    ' + line)
+            call_args.append(tr[1])
+            if tr[2]:
+                extra_posts.append(tr[2] if tr[2].startswith('    ') else '    ' + tr[2])
+            continue
+        if ht and ht.get('kind') == 'pointer':
+            # Translate wasm offset to host pointer for non-struct
+            # pointer args (e.g. `const char *path` for stat).
+            call_args.append(f'({host_t or "void *"})(ctx->memory + {wname})')
+        elif host_t:
+            call_args.append(f'({host_t}){wname}')
+        else:
+            call_args.append(wname)
+
+    # Compose the body.
+    body_lines = [
+        f'{sig} {{',
+        '    extern int errno;',
+        f'    struct {sc_type} host_{sc_type}_scratch;',
+    ]
+    if struct_arg_idx < 0:
+        # Couldn't find the struct arg — bail out, caller falls
+        # through to passthrough/TODO stub.
+        return False
+
+    if in_arg:
+        body_lines.append(
+            f'    cv_{sc_type}_w2h(&host_{sc_type}_scratch, '
+            f'(const uint8_t *)(ctx->memory + {struct_wname}));'
+        )
+    else:
+        # OUT-only: zero scratch in case host fn returns early.
+        body_lines.append(
+            f'    memset(&host_{sc_type}_scratch, 0, sizeof host_{sc_type}_scratch);'
+        )
+
+    # Narrow-pointer thunks for non-struct args (e.g. localtime_r's
+    # `const time_t *` where wasm time_t is 4B but host is 8B).
+    body_lines.extend(extra_setups)
+
+    body_lines.append('    errno = 0;')
+    hret = _host_type(h_types.get(hf['ret']), h_types) or 'int'
+    # Detect when the host return is a pointer (e.g. localtime_r,
+    # gmtime_r return `struct tm *`). For those, success is "non-NULL
+    # return pointing at our scratch", and the wasm guest expects the
+    # offset of its own out-struct slot — NOT a meaningless cast of
+    # the host pointer to int. Truncating an 8-byte pointer to a
+    # 4-byte int also corrupts adjacent memory if the caller
+    # interprets it as a pointer.
+    h_ret_resolved = _resolve(h_types.get(hf['ret']), h_types)
+    ret_is_ptr = bool(h_ret_resolved and h_ret_resolved.get('kind') == 'pointer')
+    call = f'{name}({", ".join(call_args)})'
+    body_lines.append(f'    {hret} _r = {call};')
+
+    if out_arg:
+        # Copy back on success. For void-returning fns (rare) always
+        # copy. For pointer-returning fns: success is `_r != NULL`.
+        # For int-returning, only on _r >= 0 — failure paths mustn't
+        # trample the guest's slot.
+        if hret == 'void':
+            cond = ''
+        elif ret_is_ptr:
+            cond = '    if (_r)\n    '
+        else:
+            cond = '    if (_r >= 0)\n    '
+        body_lines.append(
+            f'{cond}    cv_{sc_type}_h2w((uint8_t *)(ctx->memory + {struct_wname}), '
+            f'&host_{sc_type}_scratch);'
+        )
+
+    # Narrow-pointer post-writebacks (e.g. inout time_t *). Most
+    # struct_convert IN-only thunks emit nothing here, but keep the
+    # plumbing symmetric.
+    body_lines.extend(extra_posts)
+
+    # Errno mapping. Only meaningful for int-returning fns; pointer-
+    # returning fns signal failure with NULL and may set errno too,
+    # but we still want to copy that across.
+    if any(b in (hret or '') for b in ('int', 'long', 'ssize_t', 'off_t', 'pid_t')) \
+            or ret_is_ptr:
+        body_lines.append('    if (errno) {')
+        body_lines.append('        extern int yos_remap_errno_h2g(int);')
+        body_lines.append('        int _e = yos_remap_errno_h2g(errno);')
+        body_lines.append('        if (ctx && ctx->memory && ctx->errno_off)')
+        body_lines.append('            *(int *)(ctx->memory + ctx->errno_off) = _e;')
+        body_lines.append('    }')
+
+    if wret == 'void':
+        body_lines.append('    (void)_r;')
+    elif ret_is_ptr and out_arg:
+        # Pointer-returning struct_convert fns: convention is "return
+        # the out-arg buffer on success, NULL on failure". Hand the
+        # guest its own out-buffer offset back so `r == &tm` holds.
+        body_lines.append(f'    return _r ? {struct_wname} : 0u;')
+    elif ret_is_ptr:
+        # Pointer return with no out-arg buffer to alias to: bail
+        # out, no faithful translation possible without an allocator.
+        body_lines.append(f'    return 0u;')
+    else:
+        body_lines.append(f'    return ({wret})_r;')
+    body_lines.append('}')
+    defs.append('\n'.join(body_lines))
+    return True
+
+
 def emit_bridge(analyse: dict, guest_api: dict, host_api: dict,
-                hooks: dict[str, str] | None = None) -> tuple[str, str, dict, str]:
+                hooks: dict[str, str] | None = None,
+                sc_meta: dict[str, dict] | None = None) -> tuple[str, str, dict, str]:
     hooks = hooks or {}
     g_fns, h_fns = guest_api.get('functions', {}), host_api.get('functions', {})
     g_types, h_types = guest_api.get('types', {}), host_api.get('types', {})
@@ -900,10 +1126,27 @@ def emit_bridge(analyse: dict, guest_api: dict, host_api: dict,
             sigs[name] = wsig
             continue
 
-        # ── struct_convert: TODO. Falls through to passthrough for now;
-        # the wasm32<->host64 conversion will land in a follow-up. ────
-        # ── Passthrough (or struct_convert TODO): existing emitter
-        # writes a yos_<name>(ctx, ...) body that calls host libc. ────
+        # ── struct_convert: bridge body uses cv_<name>_h2w / w2h to
+        # marshal the differing host/wasm32 layouts. Driven by the
+        # struct_convert: section of hooks.yaml — each entry names the
+        # wasm32 struct (`type:`), and which arg is `in:` / `out:`.
+        # We allocate a host scratch struct, w2h the input, call host
+        # libc, h2w the output. ────────────────────────────────────────
+        if category == 'struct_convert' and sc_meta and name in sc_meta:
+            meta = sc_meta[name]
+            if hf and _emit_struct_convert_body(
+                    name, gf, hf, g_types, h_types, meta,
+                    decls, defs):
+                counts['struct_convert'] = counts.get('struct_convert', 0) + 1
+                sigs[name] = wsig
+                continue
+            # If the smart body couldn't be emitted (signature edge
+            # case), fall through to passthrough — caller still gets
+            # SOME bridge, possibly with the layout bug, but at
+            # least the build doesn't break.
+
+        # ── Passthrough: existing emitter writes a yos_<name>(ctx, ...)
+        # body that calls host libc. ─────────────────────────────────
         if not hf:
             counts['skipped'] += 1
             continue
@@ -962,6 +1205,7 @@ def emit_bridge(analyse: dict, guest_api: dict, host_api: dict,
          + '#include "yos/types.h"  /* full struct yos_exec_ctx for ctx->memory */\n'
          + '#include "wasm3.h"     /* m3ApiRawFunction, m3_LinkRawFunction, ... */\n'
          + '#include "impl/tier2.h" /* yos_tier2_resolve_once for from_freebsd_src */\n'
+         + '#include "yos_struct_convert.h" /* cv_<name>_h2w / w2h */\n'
          + include_block + '\n'
          + 'extern int yos_remap_errno_h2g(int);\n\n'
          + '/* ---- bridge bodies (call host libc) ---- */\n\n'
@@ -977,11 +1221,15 @@ def emit_bridge(analyse: dict, guest_api: dict, host_api: dict,
     return h, c, counts, guest_h
 
 
-def _load_hooks(path: Path | None) -> dict[str, str]:
-    """Read hooks.yaml and produce a flat name -> category map.
-    Default category for any name not listed is 'passthrough'."""
+def _load_hooks(path: Path | None) -> tuple[dict[str, str], dict[str, dict]]:
+    """Read hooks.yaml. Returns (cat_map, struct_convert_meta).
+
+      cat_map[name] = category string ('passthrough' for anything not
+      listed). struct_convert_meta[name] = {'in': str?, 'out': str?,
+      'type': str}.
+    """
     if path is None:
-        return {}
+        return {}, {}
     raw = yaml.safe_load(path.read_text()) or {}
     cat_map: dict[str, str] = {}
     list_cats = ('custom_proc', 'custom_pthread', 'custom_vfs',
@@ -990,12 +1238,12 @@ def _load_hooks(path: Path | None) -> dict[str, str]:
     for cat in list_cats:
         for name in raw.get(cat) or []:
             cat_map[name] = cat
-    # struct_convert and from_freebsd_src use name -> {meta} mappings
-    for name in (raw.get('struct_convert') or {}):
+    sc_meta = raw.get('struct_convert') or {}
+    for name in sc_meta:
         cat_map[name] = 'struct_convert'
     for name in (raw.get('from_freebsd_src') or {}):
         cat_map[name] = 'from_freebsd_src'
-    return cat_map
+    return cat_map, sc_meta
 
 
 def main() -> int:
@@ -1010,9 +1258,9 @@ def main() -> int:
     with args.analyse.open()   as f: analyse   = yaml.safe_load(f)
     with args.guest_api.open() as f: guest_api = yaml.safe_load(f)
     with args.host_api.open()  as f: host_api  = yaml.safe_load(f)
-    hooks = _load_hooks(args.hooks)
+    hooks, sc_meta = _load_hooks(args.hooks)
 
-    h, c, counts, guest_h = emit_bridge(analyse, guest_api, host_api, hooks)
+    h, c, counts, guest_h = emit_bridge(analyse, guest_api, host_api, hooks, sc_meta)
     args.out_dir.mkdir(parents=True, exist_ok=True)
     (args.out_dir / 'yos_bridge.h').write_text(h)
     (args.out_dir / 'yos_bridge.c').write_text(c)

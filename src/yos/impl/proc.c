@@ -145,7 +145,6 @@ int32_t yos_exit(struct yos_exec_ctx *ctx, int32_t code)
 
 int32_t yos_fork(struct yos_exec_ctx *ctx)
 {
-    fprintf(stderr, "*** YOS_FORK CALLED ***\n");
     if (!ctx->proc || !ctx->rt) {
         ydebug("fork: invalid context\n");
         return -EINVAL;
