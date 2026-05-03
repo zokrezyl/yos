@@ -1,0 +1,416 @@
+# src/yos/codegen/hooks.yaml — per-libc-function routing rules.
+#
+# Default for any libc function NOT listed here is `passthrough`:
+# bridge.py emits a wasm3 raw-function wrapper (m3w_<name>) that
+# pops args, translates wasm pointers, and calls the host libc
+# function directly. That covers the bulk of the surface (string
+# ops, math, scalar I/O, etc.) for free.
+#
+# Categories below name the EXCEPTIONS — functions that need
+# something other than a plain host-libc call. The key in each
+# bucket is the exact libc-function name (matches the wasm import
+# name on `env.<name>`).
+#
+# Routing destinations:
+#   custom_vfs       -> yos_<name>(ctx, ...)  defined in src/yos/impl/vfs.c
+#   custom_proc      -> yos_<name>(ctx, ...)              src/yos/impl/proc.c
+#   custom_pthread   -> yos_<name>(ctx, ...)              src/yos/impl/pthread.c
+#   custom_mem       -> yos_<name>(ctx, ...)              src/yos/impl/mem.c
+#   custom_alloc     -> yos_<name>(ctx, ...)              src/yos/impl/alloc.c
+#                      (mimalloc-over-wasm-linear-memory)
+#   custom_sig       -> yos_<name>(ctx, ...)              src/yos/impl/sig.c
+#   struct_convert   passthrough + wasm32<->host struct conversion
+#                    around named in-/out-parameters
+#   variadic         bridge.py emits NOTHING; m3w_<name> is hand-
+#                    written in src/yos/impl/vararg.c (printf family)
+#   stub             m3w_<name> body returns -ENOSYS at runtime
+#                    (Linux-only or unportable functions)
+#   runtime_owned    bridge.py emits NOTHING; main.c binds the wasm
+#                    import directly (e.g. `setjmp`, `longjmp`,
+#                    `__yos_argc`, …)
+#
+# Naming rule: the symbol bridge.py routes to is ALWAYS `yos_<name>`
+# (no `_proc_`, `_vfs_`, `_mem_` infix). One file per area in
+# src/yos/impl/ groups them by category, but the function name itself
+# is bare `yos_fork`, `yos_open`, `yos_brk`, etc.
+
+# ─── Process / thread / exec / wait / signal-by-pid ───────────────────
+custom_proc:
+  - fork
+  - vfork
+  - execve
+  - execv
+  - execvp
+  - execvpe
+  - exit
+  - _exit
+  - _Exit
+  - getpid
+  - getppid
+  - getpgid
+  - getpgrp
+  - getsid
+  - setpgid
+  - setsid
+  - gettid
+  - kill
+  - killpg
+  - tkill
+  - tgkill
+  - raise
+  - waitpid
+  - wait
+  - wait3
+  - wait4
+  - waitid
+
+# ─── pthread ──────────────────────────────────────────────────────────
+# pthread_* are bound to wasm imports by `yos_pthread_host_link()` in
+# src/yos/impl/pthread.c (the L1 host wrappers). bridge.py must NOT
+# emit anything for these names — the host runtime owns them. We
+# changed `yos_pthread_host_link` itself to bind under the bare names
+# (env.pthread_create, env.pthread_mutex_lock, …) instead of the
+# prefixed `env.yos_pthread_*` names yos-private's musl shim used.
+runtime_owned_pthread: &runtime_owned_pthread
+  - pthread_create
+  - pthread_join
+  - pthread_detach
+  - pthread_self
+  - pthread_equal
+  - pthread_exit
+  - pthread_cancel
+  - pthread_kill
+  - pthread_mutex_init
+  - pthread_mutex_destroy
+  - pthread_mutex_lock
+  - pthread_mutex_trylock
+  - pthread_mutex_unlock
+  - pthread_cond_init
+  - pthread_cond_destroy
+  - pthread_cond_wait
+  - pthread_cond_timedwait
+  - pthread_cond_signal
+  - pthread_cond_broadcast
+  - pthread_rwlock_init
+  - pthread_rwlock_destroy
+  - pthread_rwlock_rdlock
+  - pthread_rwlock_wrlock
+  - pthread_rwlock_unlock
+  - pthread_rwlock_tryrdlock
+  - pthread_rwlock_trywrlock
+  - pthread_key_create
+  - pthread_key_delete
+  - pthread_setspecific
+  - pthread_getspecific
+  - pthread_once
+  - pthread_attr_init
+  - pthread_attr_destroy
+  - pthread_attr_setdetachstate
+  - pthread_attr_getdetachstate
+  - pthread_attr_setstacksize
+  - pthread_attr_getstacksize
+  - pthread_attr_setstackaddr
+  - pthread_attr_getstackaddr
+
+# ─── VFS (fd virtualisation, cwd-relative paths) ──────────────────────
+custom_vfs:
+  - open
+  - openat
+  - creat
+  - close
+  - read
+  - pread
+  - readv
+  - preadv
+  - write
+  - pwrite
+  - writev
+  - pwritev
+  - lseek
+  - dup
+  - dup2
+  - dup3
+  - pipe
+  - pipe2
+  - fcntl
+  - ioctl
+  - access
+  - faccessat
+  - chdir
+  - fchdir
+  - getcwd
+  - mkdir
+  - mkdirat
+  - rmdir
+  - unlink
+  - unlinkat
+  - link
+  - linkat
+  - symlink
+  - symlinkat
+  - readlink
+  - readlinkat
+  - rename
+  - renameat
+  - chmod
+  - fchmod
+  - fchmodat
+  - chown
+  - fchown
+  - fchownat
+  - lchown
+  - umask
+  - truncate
+  - ftruncate
+  - fsync
+  - fdatasync
+  - sync
+  - isatty
+
+# ─── Memory ───────────────────────────────────────────────────────────
+custom_mem:
+  - brk
+  - sbrk
+  - mmap
+  - mmap2
+  - munmap
+  - mprotect
+  - mremap
+  - madvise
+  - mlock
+  - munlock
+  - mlockall
+  - munlockall
+
+# ─── Allocator (mimalloc over wasm linear memory) ─────────────────────
+# TODO: src/yos/impl/alloc.c not yet implemented. Until it lands, the
+# allocator family is stubbed out (-ENOSYS). Move back to custom_alloc
+# once mimalloc-over-linear-memory is wired in.
+custom_alloc: []
+
+# ─── Signal handling ──────────────────────────────────────────────────
+custom_sig:
+  - sigaction
+  - sigprocmask
+  - sigpending
+  - sigsuspend
+  - sigaltstack
+  - sigwait
+  - sigwaitinfo
+  - sigtimedwait
+  - signal
+
+# ─── Stat / time / rusage struct conversion ───────────────────────────
+# Each entry is name -> { which params need conversion, type-name }.
+# The bridge body wraps the host call with wasm32_to_host / host_to_-
+# wasm32 calls around the named arguments. Output parameters are
+# zeroed before the call and copied out only on success. The struct
+# names refer to converters emitted into struct_convert.{c,h} by our
+# generate_struct_convert.py.
+struct_convert:
+  stat:           {out: statbuf, type: stat}
+  fstat:          {out: statbuf, type: stat}
+  lstat:          {out: statbuf, type: stat}
+  fstatat:        {out: statbuf, type: stat}
+  clock_gettime:  {out: tp,      type: timespec}
+  clock_getres:   {out: res,     type: timespec}
+  nanosleep:      {in:  rqtp,    out: rmtp, type: timespec}
+  gettimeofday:   {out: tv,      type: timeval}
+  getrusage:      {out: usage,   type: rusage}
+  getrlimit:      {out: rlim,    type: rlimit}
+  setrlimit:      {in:  rlim,    type: rlimit}
+
+# ─── Tier 2: implementation comes from FreeBSD libc source files ──────
+# bridge.py emits an m3w_<name> wrapper that dispatches into yos's
+# sidecar wasm3 instance (libc-pure.wasm, built by build-tools/
+# freebsd-libc/). The sidecar may itself import lower-level libc fns
+# (e.g. printf calls write); those resolve back through this same yos
+# import surface, landing in Tier 1 / Tier 3 as appropriate.
+#
+# Each entry maps `name -> { src: <path under FreeBSD source tree> }`.
+# Today's set is intentionally tiny — we add functions on demand as
+# nvim's deps surface them. Scalar-only signatures are easiest; fns
+# with pointer args need cross-runtime memory marshalling that we'll
+# add when the first such function lands.
+from_freebsd_src:
+  abs:     {src: stdlib/abs.c}
+  # strlcpy is here too once we wire cross-runtime pointer marshalling.
+  # strlcpy: {src: string/strlcpy.c}
+
+# ─── Variadic — codegen skips emission; bodies hand-written ───────────
+variadic:
+  - printf
+  - fprintf
+  - sprintf
+  - snprintf
+  - dprintf
+  - vprintf
+  - vfprintf
+  - vsprintf
+  - vsnprintf
+  - vdprintf
+  - asprintf
+  - vasprintf
+  - scanf
+  - fscanf
+  - sscanf
+  - vscanf
+  - vfscanf
+  - vsscanf
+  - syslog
+  - vsyslog
+  - execl
+  - execlp
+  - execle
+
+# ─── Stub: -ENOSYS at runtime ─────────────────────────────────────────
+# Linux-only or otherwise non-portable. Listed explicitly so they
+# don't accidentally fall through to passthrough and call host glibc
+# directly on a non-Linux build.
+stub:
+  - process_vm_readv
+  - process_vm_writev
+  - epoll_create
+  - epoll_create1
+  - epoll_ctl
+  - epoll_wait
+  - epoll_pwait
+  - inotify_init
+  - inotify_init1
+  - inotify_add_watch
+  - inotify_rm_watch
+  - splice
+  - tee
+  - vmsplice
+  # FreeBSD vs Linux signature mismatches — auto-bridge can't render
+  # them safely. Stub for now; once we have per-platform bridge bodies
+  # we can implement them properly.
+  - swapon
+  - swapoff
+  - mount
+  - umount
+  - umount2
+  - ptrace
+  - sendfile
+  - setpgrp           # Linux: setpgrp(); FreeBSD: setpgrp(pid, pgid)
+  - socketpair        # Linux returns int, FreeBSD differs in 4th arg
+  - if_indextoname
+  - futimes
+  - lutimes
+  - utimes
+  - tmpnam
+  - pthread_getcpuclockid
+  - pthread_getschedparam
+  - pthread_setschedparam
+  - setlinebuf        # void on Linux, int on FreeBSD (return-type mismatch)
+  # Allocator family — until impl/alloc.c lands, return -ENOSYS so
+  # nothing silently calls host malloc and returns a useless host ptr.
+  - malloc
+  - free
+  - calloc
+  - realloc
+  - reallocarray
+  - posix_memalign
+  - aligned_alloc
+  - memalign
+  - valloc
+  - malloc_usable_size
+  # Subsystem entries we don't have yet — stubbed to keep the build
+  # green while we land them one at a time. Each move from `stub` to
+  # `custom_<area>` requires the matching yos_<name>(ctx, ...) entry
+  # in the corresponding src/yos/impl/<area>.c.
+  - dup
+  - fchdir
+  - fsync
+  - fdatasync
+  - sync
+  - isatty
+  - umask
+  - pread
+  - pwrite
+  - fread
+  - fwrite
+  - fread_unlocked
+  - fwrite_unlocked
+  - getuid
+  - geteuid
+  - getgid
+  - getegid
+  - sbrk
+  - raise
+  - killpg
+  - sigaltstack
+  - sigsuspend
+  - sigwait
+  - sigwaitinfo
+  - sigtimedwait
+  - sigpending
+  - signal
+  - sigreturn
+  - sigstack
+  - execv
+  - execvp
+  - execvpe
+  - alarm
+  - sleep
+  - ualarm
+  - revoke
+  - wait        # yos-private has wait4 only; map at next iteration
+  - wait3
+
+# ─── Runtime-owned: the host yos binary binds these directly ──────────
+# (setjmp/longjmp via asyncify, the obsolete __yos_argc helpers, plus
+# the entire pthread family — those are bound by yos_pthread_host_link
+# from src/yos/impl/pthread.c).
+runtime_owned:
+  - setjmp
+  - _setjmp
+  - sigsetjmp
+  - longjmp
+  - _longjmp
+  - siglongjmp
+  - __yos_argc
+  - __yos_argv_setup
+  - __yos_envc
+  - __yos_envp_setup
+  - syscall  # the *libc fn* by this name; we intentionally do not export it
+  # ── pthread family (bound by yos_pthread_host_link) ────────────────
+  - pthread_create
+  - pthread_join
+  - pthread_detach
+  - pthread_self
+  - pthread_equal
+  - pthread_exit
+  - pthread_cancel
+  - pthread_kill
+  - pthread_mutex_init
+  - pthread_mutex_destroy
+  - pthread_mutex_lock
+  - pthread_mutex_trylock
+  - pthread_mutex_unlock
+  - pthread_cond_init
+  - pthread_cond_destroy
+  - pthread_cond_wait
+  - pthread_cond_timedwait
+  - pthread_cond_signal
+  - pthread_cond_broadcast
+  - pthread_rwlock_init
+  - pthread_rwlock_destroy
+  - pthread_rwlock_rdlock
+  - pthread_rwlock_wrlock
+  - pthread_rwlock_unlock
+  - pthread_rwlock_tryrdlock
+  - pthread_rwlock_trywrlock
+  - pthread_key_create
+  - pthread_key_delete
+  - pthread_setspecific
+  - pthread_getspecific
+  - pthread_once
+  - pthread_attr_init
+  - pthread_attr_destroy
+  - pthread_attr_setdetachstate
+  - pthread_attr_getdetachstate
+  - pthread_attr_setstacksize
+  - pthread_attr_getstacksize
+  - pthread_attr_setstackaddr
+  - pthread_attr_getstackaddr

@@ -1,0 +1,22 @@
+# yos meson options.
+#
+# Set on the meson command line, e.g.:
+#   meson setup build-linux -Dfreebsd_version=14.2
+
+option('freebsd_version',
+  type        : 'string',
+  value       : '14.4',
+  description : 'FreeBSD source release tag to fetch for guest sysroot extraction. Available as of 2026-04: 13.5, 14.3, 14.4, 15.0.',
+)
+
+option('freebsd_src_url',
+  type        : 'string',
+  value       : 'https://download.freebsd.org/releases/amd64/@VERSION@-RELEASE/src.txz',
+  description : 'URL template for the FreeBSD src.txz tarball (@VERSION@ is substituted with freebsd_version).',
+)
+
+option('freebsd_src_sha256',
+  type        : 'string',
+  value       : '1b337069331dbf0791dc43129900377da256ba1ec0ef94e0d3f6e6232de84fe2',
+  description : 'sha256 of the src.txz tarball. Empty = unverified first-fetch (the helper will print the observed sha256 for you to pin).',
+)
