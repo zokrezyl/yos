@@ -145,6 +145,7 @@ int32_t yos_exit(struct yos_exec_ctx *ctx, int32_t code)
 
 int32_t yos_fork(struct yos_exec_ctx *ctx)
 {
+    fprintf(stderr, "*** YOS_FORK CALLED ***\n");
     if (!ctx->proc || !ctx->rt) {
         ydebug("fork: invalid context\n");
         return -EINVAL;
@@ -989,6 +990,40 @@ int32_t yos_execve(struct yos_exec_ctx *ctx, uint32_t filename, uint32_t argv_pt
 
     /* Return 0 (success) - syscall handler will trap to stop WASM execution */
     return 0;
+}
+
+/* execv(path, argv) — POSIX wrapper around execve with the caller's
+ * existing env. We pass envp=0 to yos_execve which means "no env
+ * replacement" (the reloaded module inherits ctx->envp). */
+int32_t yos_execv(struct yos_exec_ctx *ctx, uint32_t path, uint32_t argv_ptr)
+{
+    return yos_execve(ctx, path, argv_ptr, 0);
+}
+
+/* execvp(file, argv) — searches PATH if `file` has no slash. We don't
+ * implement PATH search yet; if the caller passes an absolute or
+ * relative path with a slash (which is what libuv / nvim does for the
+ * self-respawn path), it works. Bare file names return -ENOENT. */
+int32_t yos_execvp(struct yos_exec_ctx *ctx, uint32_t file, uint32_t argv_ptr)
+{
+    const char *fn = (const char *)(ctx->memory + file);
+    if (!strchr(fn, '/')) {
+        ydebug("execvp(%s): PATH search not implemented; ENOENT\n", fn);
+        return -ENOENT;
+    }
+    return yos_execve(ctx, file, argv_ptr, 0);
+}
+
+/* execvpe(file, argv, envp) — same as execvp but with explicit envp. */
+int32_t yos_execvpe(struct yos_exec_ctx *ctx, uint32_t file,
+                    uint32_t argv_ptr, uint32_t envp)
+{
+    const char *fn = (const char *)(ctx->memory + file);
+    if (!strchr(fn, '/')) {
+        ydebug("execvpe(%s): PATH search not implemented; ENOENT\n", fn);
+        return -ENOENT;
+    }
+    return yos_execve(ctx, file, argv_ptr, envp);
 }
 
 /* deliver_to_proc: send `sig` to one guest proc via pthread_kill on its

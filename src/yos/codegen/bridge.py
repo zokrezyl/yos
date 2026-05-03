@@ -212,16 +212,16 @@ def _arg_translation(name: str, idx: int, gt: dict, ht: dict, types: dict) -> tu
     if gk == 'void' and hk == 'void':
         return ('', '')
 
-    # pointer args: translate wasm offset to host pointer. Wasm NULL
-    # (offset 0) MUST stay NULL in host space — passing
-    # `ctx->memory + 0` would have host libc dereference offset 0
-    # (typically the TLS pointer slot) and either read garbage or
-    # write garbage back, corrupting nearby live data. nvim's
-    # strtoimax(p, NULL, base) was the canary that surfaced this.
+    # pointer args: translate wasm offset to host pointer. We do NOT
+    # convert wasm offset 0 to NULL: most input-pointer fns (strlen,
+    # strchr, …) crash on NULL, and the guest passing 0 typically
+    # means "I have a real pointer to memory[0]" rather than NULL.
+    # The handful of fns where NULL passthrough actually matters
+    # (strtoimax / strtol with endptr=NULL, posix_spawn etc.) have
+    # custom impls in src/yos/impl/.
     if gk == 'pointer' and hk == 'pointer':
         host_ptr_type = _host_type(ht, types) or 'void *'
-        setup = (f'    {host_ptr_type} {var}_h = {var} ? '
-                 f'({host_ptr_type})(ctx->memory + {var}) : NULL;')
+        setup = f'    {host_ptr_type} {var}_h = ({host_ptr_type})(ctx->memory + {var});'
         return (setup, f'{var}_h')
 
     # builtin / builtin: width-only conversion via cast at the call.
@@ -277,7 +277,15 @@ def _emit_bridge(name: str, gf: dict, hf: dict, gtypes: dict, htypes: dict,
         tr = _arg_translation_full(ga.get('name'), i, gt, ht, gtypes, htypes)
         if decl is None or tr is None:
             can_emit = False
-            break
+            # Don't break — the body falls back to the TODO stub but
+            # the wrapper uses the FULL signature (computed from
+            # _wasm_sig). If we break here, arg_decls is short and
+            # yos_<name>(ctx, a0, a1) is generated while m3w_<name>
+            # passes (ctx, a0, a1, a2, a3) → "too many args" compile
+            # error. Keep building the decl list with safe i32
+            # defaults so the body's signature matches the wrapper.
+            decl = decl or f'uint32_t a{i}'
+            tr = ('', f'a{i}')
         arg_decls.append(decl)
         if tr[0]:
             setups.append(tr[0])
@@ -435,9 +443,9 @@ def _arg_translation_full(name, idx, gt, ht, g_types, h_types):
         return ('', '')
     if gk == 'pointer' and hk == 'pointer':
         host_ptr_type = _host_type(ht, h_types) or 'void *'
-        # Wasm NULL stays NULL host-side. See _arg_translation comment.
-        setup = (f'    {host_ptr_type} {var}_h = {var} ? '
-                 f'({host_ptr_type})(ctx->memory + {var}) : NULL;')
+        # See _arg_translation comment: don't NULL-translate; custom
+        # impls handle the few fns where NULL passthrough matters.
+        setup = f'    {host_ptr_type} {var}_h = ({host_ptr_type})(ctx->memory + {var});'
         return (setup, f'{var}_h')
     if gk == 'builtin' and hk == 'builtin':
         host_t = _host_type(ht, h_types) or 'int'
@@ -854,22 +862,38 @@ def emit_bridge(analyse: dict, guest_api: dict, host_api: dict,
                 counts['skipped'] += 1
                 continue
             wret = _wasm_type(g_types.get(gf['ret']), g_types) or 'int32_t'
-            # Pointer returns get NULL, not -ENOSYS — guests deref the
-            # result and crash on -38.
+            # Stub return value:
+            #   pointer  → NULL (caller dereferences; -38 looks like a
+            #             plausible address and crashes the next deref)
+            #   integer  → -1, with errno set to ENOSYS in the per-ctx
+            #             slot (POSIX libc convention — many callers
+            #             test `rc == -1` rather than `rc < 0`; libuv's
+            #             `if (kqueue() == -1)` was the canary)
+            #   void     → no return statement
             g_ret_resolved2 = _resolve(g_types.get(gf['ret']), g_types)
-            stub_lit = '0' if (g_ret_resolved2 and
-                               g_ret_resolved2.get('kind') == 'pointer') else '(-38)'
+            is_ptr = (g_ret_resolved2 and
+                      g_ret_resolved2.get('kind') == 'pointer')
             sig  = (f'{wret} yos_{name}(struct yos_exec_ctx *ctx'
                     f'{(", " + ", ".join(wargs)) if wargs else ""})')
             decls.append(sig + ';')
-            ret_line = (f'    return ({wret}){stub_lit};\n'
-                        if wret != 'void' else '')
+            if wret == 'void':
+                body_extra = ''
+            elif is_ptr:
+                body_extra = f'    return ({wret})0;\n'
+            else:
+                body_extra = (
+                    '    extern int yos_remap_errno_h2g(int);\n'
+                    '    if (ctx && ctx->memory && ctx->errno_off)\n'
+                    '        *(int *)(ctx->memory + ctx->errno_off) =\n'
+                    '            yos_remap_errno_h2g(38 /* ENOSYS */);\n'
+                    f'    return ({wret})-1;\n'
+                )
             defs.append(
                 f'{sig} {{\n'
                 f'    /* {name}: hooks.yaml -> stub (Linux-only or unportable). */\n'
                 f'    (void)ctx;\n'
                 + ''.join(f'    (void){a.split()[-1]};\n' for a in wargs)
-                + ret_line
+                + body_extra
                 + f'}}'
             )
             counts['enosys_stub'] += 1

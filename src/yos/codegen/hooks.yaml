@@ -36,6 +36,13 @@
 
 # ─── Process / thread / exec / wait / signal-by-pid ───────────────────
 custom_proc:
+  # impl/posix.c
+  - getuid
+  - geteuid
+  - getgid
+  - getegid
+  - raise
+  - killpg
   - fork
   - vfork
   - execve
@@ -114,6 +121,43 @@ runtime_owned_pthread: &runtime_owned_pthread
 
 # ─── VFS (fd virtualisation, cwd-relative paths) ──────────────────────
 custom_vfs:
+  - socketpair  # impl/posix.c
+  # FILE* family — impl/file.c. Guest sees small-int handles into a
+  # host FILE* table; passing those to host libc as FILE* would
+  # segfault since our handles aren't real FILE struct addresses.
+  - fopen
+  - freopen
+  - fdopen
+  - fclose
+  - fread
+  - fwrite
+  - fread_unlocked
+  - fwrite_unlocked
+  - fgetc
+  - getc
+  - getc_unlocked
+  - fputc
+  - putc
+  - putc_unlocked
+  - ungetc
+  - fgets
+  - fputs
+  - fflush
+  - feof
+  - ferror
+  - clearerr
+  - fileno
+  - fseek
+  - fseeko
+  - ftell
+  - ftello
+  - rewind
+  - setbuf
+  - setvbuf
+  - setbuffer
+  - setlinebuf
+  - getline
+  - getdelim
   - open
   - openat
   - creat
@@ -285,15 +329,7 @@ stub:
   - epoll_ctl
   - epoll_wait
   - epoll_pwait
-  # kqueue family — FreeBSD-only event API. nvim/libuv was built with
-  # -D__FreeBSD__=14 so it picks the kqueue backend. Stubbed for now so
-  # the import resolves; libuv will fail event-loop init with -ENOSYS
-  # rather than trapping. Real impl = host-side kqueue→epoll translator
-  # (Linux), or passthrough on FreeBSD/macOS hosts. Not yet written.
-  - kqueue
-  - kqueue1
-  - kqueuex
-  - kevent
+  # kqueue family — moved to runtime_owned (impl/kqueue.c).
   - inotify_init
   - inotify_init1
   - inotify_add_watch
@@ -343,7 +379,7 @@ stub:
   - ptrace
   - sendfile
   - setpgrp           # Linux: setpgrp(); FreeBSD: setpgrp(pid, pgid)
-  - socketpair        # Linux returns int, FreeBSD differs in 4th arg
+  # socketpair handled in impl/posix.c (custom_vfs).
   - if_indextoname
   - futimes
   - lutimes
@@ -397,31 +433,63 @@ stub:
   - pthread_getcpuclockid
   - pthread_getschedparam
   - pthread_setschedparam
-  - setlinebuf        # void on Linux, int on FreeBSD (return-type mismatch)
+  # setlinebuf moved to custom_vfs (impl/file.c).
   # Subsystem entries we don't have yet — stubbed to keep the build
   # green while we land them one at a time. Each move from `stub` to
   # `custom_<area>` requires the matching yos_<name>(ctx, ...) entry
   # in the corresponding src/yos/impl/<area>.c.
-  - dup
-  - fchdir
-  - fsync
-  - fdatasync
-  - sync
-  - isatty
-  - umask
-  - pread
-  - pwrite
-  - fread
-  - fwrite
-  - fread_unlocked
-  - fwrite_unlocked
-  - getuid
-  - geteuid
-  - getgid
-  - getegid
-  - sbrk
-  - raise
-  - killpg
+  # NOTE: many basic POSIX fns that were stubbed here actually pass
+  # through to host libc cleanly — they were over-stubbed in an
+  # earlier sweep. Removed: dup, fchdir, fsync, fdatasync, sync,
+  # isatty, umask, pread, pwrite, getuid, geteuid, getgid, getegid,
+  # sbrk, raise, killpg. Those are now auto-passthrough bridges.
+  # fread/fwrite stay stubbed (need FILE* table).
+  # FILE* family routed to impl/file.c — moved to custom_vfs below.
+  # alphasort/versionsort are comparator fns scandir uses; stubbed
+  # because they take a fn pointer that we'd need to translate.
+  - alphasort
+  - versionsort
+  # Host structs with embedded pointers (8B host vs 4B wasm) overflow
+  # the wasm-side struct slot when auto-bridge passes through. Stubbed
+  # until struct_convert generation handles them.
+  # struct tm: 56B host vs 44B wasm (long+char*).
+  - localtime_r
+  - gmtime_r
+  - localtime
+  - gmtime
+  - asctime
+  - asctime_r
+  - ctime
+  - ctime_r
+  - strftime
+  - strptime
+  # struct passwd: ~30B host vs ~20B wasm (5 pointers + uid/gid).
+  - getpwnam
+  - getpwnam_r
+  - getpwuid
+  - getpwuid_r
+  - getpwent
+  - setpwent
+  - endpwent
+  # struct group: similar pointer-heavy.
+  - getgrnam
+  - getgrnam_r
+  - getgrgid
+  - getgrgid_r
+  - getgrent
+  # struct hostent / addrinfo / etc.
+  - gethostbyname
+  - gethostbyname_r
+  - gethostbyaddr
+  - getaddrinfo
+  - freeaddrinfo
+  - getnameinfo
+  - getifaddrs
+  - freeifaddrs
+  - getprotobyname
+  - getprotobynumber
+  # struct utsname differs between FreeBSD/Linux.
+  - uname
   - sigaltstack
   - sigsuspend
   - sigwait
@@ -431,9 +499,11 @@ stub:
   - signal
   - sigreturn
   - sigstack
-  - execv
-  - execvp
-  - execvpe
+  # execv / execvp / execvpe — implemented in impl/proc.c (custom_proc).
+  # socketpair, dup, fchdir, fsync, fdatasync, sync, isatty, umask,
+  # pread, pwrite, raise, killpg, getuid, geteuid, getgid, getegid,
+  # sbrk — implemented in impl/posix.c (custom_vfs / custom_proc /
+  # custom_mem / custom_sig per hooks.yaml).
   - alarm
   - sleep
   - ualarm
@@ -469,12 +539,13 @@ runtime_owned:
   - strtouq
   - strtod
   - strtof
-  # qsort/bsearch take a function-pointer arg; bridge.py can't translate
-  # a wasm function-table index into a host function pointer. impl/
-  # callback.c implements them with m3_Call on the wasm comparator.
+  # qsort/bsearch/scandir take fn-pointer args; bridge.py can't
+  # translate a wasm function-table index into a host fn pointer.
+  # impl/callback.c implements them with m3_Call on the wasm fn.
   # atexit family — registered as no-op (we exit via host).
   - qsort
   - bsearch
+  - scandir
   - atexit
   - __cxa_atexit
   - at_quick_exit
@@ -482,6 +553,11 @@ runtime_owned:
   # KERN_PROC_PATHNAME (used by uv_exepath) and stubs others to ENOSYS.
   - sysctl
   - sysctlbyname
+  # kqueue family — impl/kqueue.c translates to host epoll on Linux.
+  - kqueue
+  - kqueue1
+  - kqueuex
+  - kevent
   # FreeBSD's `int *__error(void)` — the `errno` macro accessor. main.c
   # binds it to a trampoline that returns the per-ctx errno_off slot.
   - __error

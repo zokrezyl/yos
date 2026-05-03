@@ -137,6 +137,51 @@ static m3ApiRawFunction(m3_yos_bsearch)
     m3ApiReturn(0);
 }
 
+/* scandir(path, namelist_off, filter_idx, compar_idx) — enumerate
+ * directory entries.
+ *
+ * The bridge can't pass `compar` and `filter` directly because they
+ * are wasm function-table indices, not host function pointers. We
+ * implement scandir using opendir+readdir+sort, calling back into
+ * the wasm filter via m3_Call when appropriate.
+ *
+ * The result must be stored as an array of `struct dirent *` in the
+ * GUEST's wasm memory. Since we don't have a guest-side allocator
+ * we can directly call from here, and dirent layout differs between
+ * glibc and FreeBSD anyway, the simplest correct path is:
+ *
+ *   - allocate one big block via the guest allocator (yos_malloc)
+ *   - lay out FreeBSD-shape dirents back-to-back
+ *   - write a per-entry pointer array immediately after
+ *   - store the array's wasm offset into *namelist_off
+ *
+ * For now we return 0 (empty result, no allocation needed) — nvim
+ * uses scandir for plugin/runtime discovery and tolerates an empty
+ * directory. Full impl is follow-up work. */
+extern uint32_t yos_malloc(struct yos_exec_ctx *ctx, uint32_t size);
+
+static m3ApiRawFunction(m3_yos_scandir)
+{
+    m3ApiReturnType(int32_t);
+    m3ApiGetArg(uint32_t, path_off);
+    m3ApiGetArg(uint32_t, namelist_off);
+    m3ApiGetArg(uint32_t, filter_idx);
+    m3ApiGetArg(uint32_t, compar_idx);
+    (void)path_off; (void)filter_idx; (void)compar_idx;
+
+    struct yos_exec_ctx *ctx = (struct yos_exec_ctx *)m3_GetUserData(runtime);
+    uint32_t mem_size = 0;
+    ctx->memory = m3_GetMemory(runtime, &mem_size, 0);
+    ctx->memory_size = mem_size;
+
+    /* Set *namelist = NULL so the caller treats the result as empty. */
+    if (namelist_off && namelist_off + 4 <= mem_size) {
+        *(uint32_t *)(ctx->memory + namelist_off) = 0;
+    }
+    /* 0 entries — caller skips iteration cleanly. */
+    m3ApiReturn(0);
+}
+
 /* atexit / __cxa_atexit / at_quick_exit — register a wasm callback
  * to run at exit. We don't actually run them (yos exits via host
  * exit() which doesn't go back into wasm). Return success silently
@@ -151,6 +196,7 @@ void yos_callback_link(IM3Module mod)
 {
     m3_LinkRawFunction(mod, "env", "qsort",         "v(iiii)",   m3_yos_qsort);
     m3_LinkRawFunction(mod, "env", "bsearch",       "i(iiiii)",  m3_yos_bsearch);
+    m3_LinkRawFunction(mod, "env", "scandir",       "i(iiii)",   m3_yos_scandir);
     m3_LinkRawFunction(mod, "env", "atexit",        "i(i)",      m3_yos_atexit_noop);
     m3_LinkRawFunction(mod, "env", "__cxa_atexit",  "i(iii)",    m3_yos_atexit_noop);
     m3_LinkRawFunction(mod, "env", "at_quick_exit", "i(i)",      m3_yos_atexit_noop);
