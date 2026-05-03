@@ -44,6 +44,21 @@ extern int32_t yos_vsprintf(struct yos_exec_ctx *ctx,
 extern int32_t yos_vsnprintf(struct yos_exec_ctx *ctx,
                              uint32_t dst, uint32_t n, uint32_t fmt, uint32_t va);
 
+/* exec family — must trap to unwind out of wasm so the host's exec
+ * pump can load the new module. yos_execve* set exec_pending=1 and
+ * return 0; if we just RETURN that 0 to wasm, libc/libuv's caller
+ * sees "execvp returned successfully" which by POSIX means it
+ * FAILED (real execvp never returns), so libuv writes errno into
+ * its error pipe and _exit(127)s the child without giving us a
+ * chance to load the new module. Trapping here stops wasm execution
+ * immediately; the host loop sees exec_pending and proceeds to
+ * load the new module — `res` from the trap is discarded when
+ * exec_pending is true. */
+extern int32_t yos_execvp(struct yos_exec_ctx *ctx, uint32_t file, uint32_t argv_ptr);
+extern int32_t yos_execv (struct yos_exec_ctx *ctx, uint32_t path, uint32_t argv_ptr);
+extern int32_t yos_execve(struct yos_exec_ctx *ctx, uint32_t file, uint32_t argv, uint32_t envp);
+extern int32_t yos_execvpe(struct yos_exec_ctx *ctx, uint32_t file, uint32_t argv, uint32_t envp);
+
 /* Helper: refresh ctx->memory for the wrappers below. */
 static inline void pfx_refresh(IM3Runtime rt, struct yos_exec_ctx *ctx) {
     uint32_t ms = 0;
@@ -51,11 +66,23 @@ static inline void pfx_refresh(IM3Runtime rt, struct yos_exec_ctx *ctx) {
     ctx->memory_size = ms;
 }
 
+/* Forward decls — definitions further down. The variadic trampolines need
+ * to feed the bridge ring buffer too so YOS_BRG_TRACE / crash dumps see
+ * printf-family activity. */
+extern const char *yos_brg_last_call;
+extern int yos_brg_trace;
+extern void yos_brg_record(const char *name);
+#define PFX_TRACE(name) do {                                       \
+    yos_brg_last_call = (name); yos_brg_record(name);              \
+    if (yos_brg_trace) fprintf(stderr, "yos_brg: %s\n", (name));   \
+} while (0)
+
 static m3ApiRawFunction(m3_printf) {
     m3ApiReturnType(int32_t);
     m3ApiGetArg(uint32_t, fmt); m3ApiGetArg(uint32_t, va);
     struct yos_exec_ctx *ctx = (struct yos_exec_ctx *)m3_GetUserData(runtime);
     pfx_refresh(runtime, ctx);
+    PFX_TRACE("printf");
     m3ApiReturn(yos_printf(ctx, fmt, va));
 }
 static m3ApiRawFunction(m3_fprintf) {
@@ -64,6 +91,7 @@ static m3ApiRawFunction(m3_fprintf) {
     m3ApiGetArg(uint32_t, va);
     struct yos_exec_ctx *ctx = (struct yos_exec_ctx *)m3_GetUserData(runtime);
     pfx_refresh(runtime, ctx);
+    PFX_TRACE("fprintf");
     m3ApiReturn(yos_fprintf(ctx, fp, fmt, va));
 }
 static m3ApiRawFunction(m3_sprintf) {
@@ -72,6 +100,7 @@ static m3ApiRawFunction(m3_sprintf) {
     m3ApiGetArg(uint32_t, va);
     struct yos_exec_ctx *ctx = (struct yos_exec_ctx *)m3_GetUserData(runtime);
     pfx_refresh(runtime, ctx);
+    PFX_TRACE("sprintf");
     m3ApiReturn(yos_sprintf(ctx, dst, fmt, va));
 }
 static m3ApiRawFunction(m3_snprintf) {
@@ -80,6 +109,7 @@ static m3ApiRawFunction(m3_snprintf) {
     m3ApiGetArg(uint32_t, fmt); m3ApiGetArg(uint32_t, va);
     struct yos_exec_ctx *ctx = (struct yos_exec_ctx *)m3_GetUserData(runtime);
     pfx_refresh(runtime, ctx);
+    PFX_TRACE("snprintf");
     m3ApiReturn(yos_snprintf(ctx, dst, n, fmt, va));
 }
 static m3ApiRawFunction(m3_vprintf) {
@@ -87,6 +117,7 @@ static m3ApiRawFunction(m3_vprintf) {
     m3ApiGetArg(uint32_t, fmt); m3ApiGetArg(uint32_t, va);
     struct yos_exec_ctx *ctx = (struct yos_exec_ctx *)m3_GetUserData(runtime);
     pfx_refresh(runtime, ctx);
+    PFX_TRACE("vprintf");
     m3ApiReturn(yos_vprintf(ctx, fmt, va));
 }
 static m3ApiRawFunction(m3_vfprintf) {
@@ -95,6 +126,7 @@ static m3ApiRawFunction(m3_vfprintf) {
     m3ApiGetArg(uint32_t, va);
     struct yos_exec_ctx *ctx = (struct yos_exec_ctx *)m3_GetUserData(runtime);
     pfx_refresh(runtime, ctx);
+    PFX_TRACE("vfprintf");
     m3ApiReturn(yos_vfprintf(ctx, fp, fmt, va));
 }
 static m3ApiRawFunction(m3_vsprintf) {
@@ -111,7 +143,59 @@ static m3ApiRawFunction(m3_vsnprintf) {
     m3ApiGetArg(uint32_t, fmt); m3ApiGetArg(uint32_t, va);
     struct yos_exec_ctx *ctx = (struct yos_exec_ctx *)m3_GetUserData(runtime);
     pfx_refresh(runtime, ctx);
+    PFX_TRACE("vsnprintf");
     m3ApiReturn(yos_vsnprintf(ctx, dst, n, fmt, va));
+}
+
+/* exec family — trap on success so libuv's child can't fall through
+ * to its post-execvp "exec failed" error-pipe + _exit(127) path.
+ * yos_execve* set exec_pending=1 and return 0; that 0 looks like
+ * a successful return from execvp() to libc/libuv, which by POSIX
+ * means it FAILED (real execvp never returns). Trapping here stops
+ * wasm execution immediately; the host loop checks exec_pending
+ * before treating the trap as a real error and proceeds to load
+ * the new module. */
+static m3ApiRawFunction(m3_execvp) {
+    m3ApiReturnType(int32_t);
+    m3ApiGetArg(uint32_t, file); m3ApiGetArg(uint32_t, argv);
+    struct yos_exec_ctx *ctx = (struct yos_exec_ctx *)m3_GetUserData(runtime);
+    pfx_refresh(runtime, ctx);
+    PFX_TRACE("execvp");
+    int32_t rc = yos_execvp(ctx, file, argv);
+    if (ctx->exec_pending) m3ApiTrap("exec");
+    m3ApiReturn(rc);
+}
+static m3ApiRawFunction(m3_execv) {
+    m3ApiReturnType(int32_t);
+    m3ApiGetArg(uint32_t, path); m3ApiGetArg(uint32_t, argv);
+    struct yos_exec_ctx *ctx = (struct yos_exec_ctx *)m3_GetUserData(runtime);
+    pfx_refresh(runtime, ctx);
+    PFX_TRACE("execv");
+    int32_t rc = yos_execv(ctx, path, argv);
+    if (ctx->exec_pending) m3ApiTrap("exec");
+    m3ApiReturn(rc);
+}
+static m3ApiRawFunction(m3_execve) {
+    m3ApiReturnType(int32_t);
+    m3ApiGetArg(uint32_t, file); m3ApiGetArg(uint32_t, argv);
+    m3ApiGetArg(uint32_t, envp);
+    struct yos_exec_ctx *ctx = (struct yos_exec_ctx *)m3_GetUserData(runtime);
+    pfx_refresh(runtime, ctx);
+    PFX_TRACE("execve");
+    int32_t rc = yos_execve(ctx, file, argv, envp);
+    if (ctx->exec_pending) m3ApiTrap("exec");
+    m3ApiReturn(rc);
+}
+static m3ApiRawFunction(m3_execvpe) {
+    m3ApiReturnType(int32_t);
+    m3ApiGetArg(uint32_t, file); m3ApiGetArg(uint32_t, argv);
+    m3ApiGetArg(uint32_t, envp);
+    struct yos_exec_ctx *ctx = (struct yos_exec_ctx *)m3_GetUserData(runtime);
+    pfx_refresh(runtime, ctx);
+    PFX_TRACE("execvpe");
+    int32_t rc = yos_execvpe(ctx, file, argv, envp);
+    if (ctx->exec_pending) m3ApiTrap("exec");
+    m3ApiReturn(rc);
 }
 
 /* env.__main_argc_argv: clang's wasm32 command-exec-model renames a
@@ -147,26 +231,41 @@ static m3ApiRawFunction(m3_main_argc_argv)
         }
     }
 
-    static IM3Function f_main;
-    if (!f_main) {
-        M3Result r = m3_FindFunction(&f_main, runtime, "__main_argc_argv");
-        if (r || !f_main) r = m3_FindFunction(&f_main, runtime, "main");
-        if (r || !f_main) {
-            fprintf(stderr, "yos: __main_argc_argv: no main in module\n");
-            m3ApiReturn(-1);
-        }
+    /* MUST be a per-runtime lookup, not static. After fork the child has
+     * its OWN runtime with its OWN compiled `main` function pointer; a
+     * static cache populated by the parent thread's first call would make
+     * the child invoke the parent's compiled main, which silently runs in
+     * the wrong runtime context (asyncify state, globals, memory all from
+     * the wrong runtime). Symptom: the child appears to run main "fresh"
+     * after fork instead of rewinding to the captured fork callsite, and
+     * never reaches its post-fork execvp(). */
+    IM3Function f_main = NULL;
+    M3Result r = m3_FindFunction(&f_main, runtime, "__main_argc_argv");
+    if (r || !f_main) r = m3_FindFunction(&f_main, runtime, "main");
+    if (r || !f_main) {
+        fprintf(stderr, "yos: __main_argc_argv: no main in module\n");
+        m3ApiReturn(-1);
     }
-    M3Result r = m3_CallV(f_main, argc, argv);
+    r = m3_CallV(f_main, argc, argv);
     if (r) {
-        fprintf(stderr, "yos: main trapped: %s\n", r);
-        IM3BacktraceInfo bt = m3_GetBacktrace(runtime);
-        if (bt && bt->frames) {
-            IM3BacktraceFrame f = bt->frames;
-            int i = 0;
-            while (f && i < 32) {
-                const char *fn = f->function ? m3_GetFunctionName(f->function) : "?";
-                fprintf(stderr, "yos: bt #%d %s\n", i++, fn);
-                f = f->next;
+        /* Intentional traps (exec) are part of normal control flow, not
+         * errors — the host loop catches them via exec_pending and loads
+         * the new module. Silently propagate; no scary backtrace. */
+        struct yos_exec_ctx *ctx2 =
+            (struct yos_exec_ctx *)m3_GetUserData(runtime);
+        int silent = (r && strcmp(r, "exec") == 0)
+                  || (ctx2 && ctx2->exec_pending);
+        if (!silent) {
+            fprintf(stderr, "yos: main trapped: %s\n", r);
+            IM3BacktraceInfo bt = m3_GetBacktrace(runtime);
+            if (bt && bt->frames) {
+                IM3BacktraceFrame f = bt->frames;
+                int i = 0;
+                while (f && i < 32) {
+                    const char *fn = f->function ? m3_GetFunctionName(f->function) : "?";
+                    fprintf(stderr, "yos: bt #%d %s\n", i++, fn);
+                    f = f->next;
+                }
             }
         }
         m3ApiReturn(-1);
@@ -317,9 +416,20 @@ static int main_get_asyncify_state(IM3Runtime rt);
 
 /* env.__stack_chk_fail: clang's stack-protector emits a call here
  * when the canary at function entry doesn't match the canary at
- * function exit. With YOS_STACK_CHK_IGNORE=1 we WARN once and
- * return — useful only as a debugging aid to discover what the
- * guest does NEXT after the smash. */
+ * function exit. nvim's wasm-libc apparently uses memory[0..3] as
+ * its canary storage, but address 0 doubles as the wasm-libc thread-
+ * struct pointer slot — every libc operation that allocates or
+ * re-references the per-thread state writes a new pointer there,
+ * which makes any function whose frame straddles such a write trip
+ * a false canary smash on exit (nvim's `channel_job_start` is the
+ * first long-lived caller after the asyncify-fork dance). With
+ * YOS_STACK_CHK_IGNORE=1 we WARN once and return — useful only
+ * as a debugging aid to discover what the guest does NEXT after
+ * the smash. Default behaviour (false-positive guard): silently
+ * succeed, since the next instruction is `unreachable` only when
+ * clang knows stack_chk_fail is noreturn — for nvim's wasm32 build
+ * that path still ends in an unreachable trap, but at least we
+ * don't print the scary backtrace each time. */
 static m3ApiRawFunction(m3_yos_stack_chk_fail)
 {
     static int warned = 0;
@@ -994,6 +1104,13 @@ void yos_link_imports(IM3Module module, struct yos_exec_ctx *ctx)
     m3_LinkRawFunction(module, "env", "vfprintf",  "i(iii)",  m3_vfprintf);
     m3_LinkRawFunction(module, "env", "vsprintf",  "i(iii)",  m3_vsprintf);
     m3_LinkRawFunction(module, "env", "vsnprintf", "i(iiii)", m3_vsnprintf);
+
+    /* exec family — must bind BEFORE yos_brg_link_imports so our trapping
+     * versions win over the auto-generated non-trapping ones. */
+    m3_LinkRawFunction(module, "env", "execvp",  "i(ii)",  m3_execvp);
+    m3_LinkRawFunction(module, "env", "execv",   "i(ii)",  m3_execv);
+    m3_LinkRawFunction(module, "env", "execve",  "i(iii)", m3_execve);
+    m3_LinkRawFunction(module, "env", "execvpe", "i(iii)", m3_execvpe);
 
     /* Auto-generated bridges for the FreeBSD-libc-name import surface.
      * For guests that import each libc fn by name (env.write, env.read,

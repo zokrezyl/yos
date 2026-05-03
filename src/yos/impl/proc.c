@@ -542,6 +542,21 @@ static void *fork_thread_func(void *arg)
          * itself at memory_size/2 by clearing the watermark. */
         child_ctx->mmap_top = 0;
         child_ctx->free_count = 0;
+        /* Stale setjmp slots from the pre-execve image refer to
+         * jmp_buf addresses in the OLD module's stack. After execve
+         * they are dead but sj_alloc_slot still treats them as
+         * occupied — the next setjmp gets pushed to a high slot index
+         * whose asyncify_buf offset (mem_size - (4+i)*64K) lands in
+         * a region the new module already uses. Reset them here so
+         * the freshly loaded module starts with a clean slot pool. */
+        memset(child_ctx->sj_slots, 0, sizeof(child_ctx->sj_slots));
+        child_ctx->setjmp_pending = 0;
+        child_ctx->setjmp_pending_slot = -1;
+        child_ctx->longjmp_pending = 0;
+        child_ctx->longjmp_target  = 0;
+        child_ctx->longjmp_value   = 0;
+        child_ctx->sj_discard_ptr  = 0;
+        child_ctx->asyncify_ptr    = 0;
 
         uint32_t *thread_ptr = (uint32_t *)(child_ctx->memory + 0);
         *thread_ptr = 0x100;
@@ -589,6 +604,26 @@ void yos_fork_pump(struct yos_exec_ctx *ctx)
         /* Copy memory AFTER unwind */
         uint32_t mem_size;
         uint8_t *mem = m3_GetMemory(wrt, &mem_size, 0);
+        /* Check if asyncify save overflowed our buffer. The save area
+         * lives at [asyncify_ptr+8, asyncify_ptr+ASYNCIFY_BUF_SIZE).
+         * Overflow here writes past the buffer into whatever sits below
+         * (often the sj_slot region, the wasm stack, or the data section
+         * including __stack_chk_guard) and shows up later as random
+         * canary smashes. */
+        {
+            uint32_t *hdr = (uint32_t *)(mem + ctx->asyncify_ptr);
+            uint32_t used = hdr[0] - (ctx->asyncify_ptr + 8);
+            uint32_t cap  = hdr[1] - (ctx->asyncify_ptr + 8);
+            if (hdr[0] > hdr[1] || used > cap) {
+                fprintf(stderr,
+                        "yos: fork asyncify save OVERFLOWED — used=%u cap=%u "
+                        "(buffer at %u, ASYNCIFY_BUF_SIZE=%d). Increase "
+                        "ASYNCIFY_BUF_SIZE.\n",
+                        used, cap, ctx->asyncify_ptr, ASYNCIFY_BUF_SIZE);
+            } else {
+                ydebug("fork asyncify save used=%u/%u bytes\n", used, cap);
+            }
+        }
         uint8_t *mem_copy = malloc(mem_size);
         if (!mem_copy) {
             struct yos_proc *child = yos_proc_find(ctx->rt, ctx->fork_return);

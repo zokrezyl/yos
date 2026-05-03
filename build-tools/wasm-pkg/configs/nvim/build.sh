@@ -56,6 +56,24 @@ if [[ ! -f "$SRC/.extracted" ]]; then
     sed -i 's|target_link_libraries(main_lib INTERFACE util)|# wasm32: util is in musl libc|' \
         "$SRC/src/nvim/CMakeLists.txt"
 
+    # 4b. Disable -fstack-protector{,-strong} for wasm32. clang's stack
+    #     protector for wasm32 emits canary checks that load from
+    #     memory[0..3] (the wasm-libc thread-pointer slot). Because that
+    #     same slot is updated by libc whenever it allocates a new
+    #     thread struct (e.g. libuv's post-fork bookkeeping in
+    #     channel_job_start), the canary at function entry no longer
+    #     matches at function exit and __stack_chk_fail trips on a
+    #     false positive. wasm bounds-checks every memory access so
+    #     stack canaries add nothing useful here; turn them off.
+    sed -i 's|target_compile_options(main_lib INTERFACE -fstack-protector-strong)|target_compile_options(main_lib INTERFACE -fno-stack-protector) # wasm32: see build.sh patch 4b|' \
+        "$SRC/src/nvim/CMakeLists.txt"
+    sed -i 's|target_link_libraries(main_lib INTERFACE -fstack-protector-strong)|# wasm32: see build.sh patch 4b|' \
+        "$SRC/src/nvim/CMakeLists.txt"
+    sed -i 's|target_compile_options(main_lib INTERFACE -fstack-protector --param ssp-buffer-size=4)|target_compile_options(main_lib INTERFACE -fno-stack-protector) # wasm32: see build.sh patch 4b|' \
+        "$SRC/src/nvim/CMakeLists.txt"
+    sed -i 's|target_link_libraries(main_lib INTERFACE -fstack-protector --param ssp-buffer-size=4)|# wasm32: see build.sh patch 4b|' \
+        "$SRC/src/nvim/CMakeLists.txt"
+
     # 5. cjson's fpconv_update_locale runs `snprintf(buf, 8, "%g", 0.5)` at
     #    startup and expects "0.5". On wasm32 yos the printf_core scan pass
     #    consistently returns -1 for that exact call site (the standalone
@@ -152,11 +170,22 @@ fi
 read LUA_P LIBUV_P MSGPACK_P UNIBILIUM_P LIBVTERM_P TREESITTER_P LPEG_P LUAMPACK_P LUV_P <<<"$DEP_PREFIXES"
 
 CFLAGS_W="--target=wasm32-unknown-unknown -nostdlib -nostdinc -O2 \
+    -fno-stack-protector \
     $WASM_CFLAGS -D_GNU_SOURCE -D__FreeBSD__=14 \
     -I$LUA_P/include -I$LIBUV_P/include -I$MSGPACK_P/include \
     -I$UNIBILIUM_P/include -I$LIBVTERM_P/include -I$TREESITTER_P/include \
     -I$LUV_P/include \
     -L$WASM_SYSROOT/usr/lib"
+# -fno-stack-protector: clang's -fstack-protector for wasm32 emits
+# canary checks that load from address 0. nvim's wasi/freebsd-libc
+# uses the SAME slot (memory[0..3]) as its thread-struct pointer, so
+# any libc operation that updates the thread struct (libuv's post-
+# fork bookkeeping in particular) writes a fresh heap pointer there
+# and trips a false-positive canary smash on exit of any function
+# whose frame straddled the write — channel_job_start being the
+# first long-lived caller after our asyncify-fork. Stack protectors
+# don't add safety in this build (everything's in linear memory and
+# wasm bounds-checks already), so disabling them is the right call.
 
 BLD="$WORK/cmake-build"
 rm -rf "$BLD"; mkdir -p "$BLD"

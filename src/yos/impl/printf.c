@@ -268,16 +268,19 @@ int32_t yos_fprintf(struct yos_exec_ctx *ctx,
     return yos_vfprintf(ctx, fp, fmt_off, va_off);
 }
 
+/* impl/file.c reserves handle 2 = stdout (1 = stdin, 3 = stderr); using
+ * 1 here used to silently send every printf to host stdin, which dropped
+ * `nvim --version` etc. on the floor. */
 int32_t yos_printf(struct yos_exec_ctx *ctx,
                    uint32_t fmt_off, uint32_t va_off)
 {
-    return yos_vfprintf(ctx, /*stdout-ish*/ 1, fmt_off, va_off);
+    return yos_vfprintf(ctx, 2, fmt_off, va_off);
 }
 
 int32_t yos_vprintf(struct yos_exec_ctx *ctx,
                     uint32_t fmt_off, uint32_t va_off)
 {
-    return yos_vfprintf(ctx, 1, fmt_off, va_off);
+    return yos_vfprintf(ctx, 2, fmt_off, va_off);
 }
 
 int32_t yos_vsnprintf(struct yos_exec_ctx *ctx,
