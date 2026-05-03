@@ -36,7 +36,7 @@ static pthread_mutex_t yos_file_lock = PTHREAD_MUTEX_INITIALIZER;
 
 extern int yos_fd_get(struct yos_exec_ctx *ctx, int wasm_fd);
 
-static FILE *handle_to_file(uint32_t h)
+FILE *yos_handle_to_file(uint32_t h)
 {
     /* Pre-bound stream handles: 1 = stdin, 2 = stdout, 3 = stderr. */
     if (h == 1) return stdin;
@@ -45,6 +45,7 @@ static FILE *handle_to_file(uint32_t h)
     if (h < 4 || h >= YOS_FILE_MAX) return NULL;
     return yos_files[h];
 }
+#define handle_to_file yos_handle_to_file
 
 static uint32_t alloc_handle(FILE *f)
 {

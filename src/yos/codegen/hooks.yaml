@@ -49,8 +49,14 @@ custom_proc:
   - unsetenv
   - putenv
   - clearenv
-  # impl/random.c — proper EFAULT on NULL.
+  # impl/random.c — proper EFAULT on NULL + arc4random direct via
+  # getentropy (sidestep glibc's atfork-confused arc4random state).
   - getentropy
+  - arc4random
+  - arc4random_buf
+  - arc4random_uniform
+  # impl/posix.c — FreeBSD libc only; glibc has no fmtcheck.
+  - fmtcheck
   - fork
   - vfork
   - execve

@@ -158,6 +158,16 @@ static m3ApiRawFunction(m3_main_argc_argv)
     M3Result r = m3_CallV(f_main, argc, argv);
     if (r) {
         fprintf(stderr, "yos: main trapped: %s\n", r);
+        IM3BacktraceInfo bt = m3_GetBacktrace(runtime);
+        if (bt && bt->frames) {
+            IM3BacktraceFrame f = bt->frames;
+            int i = 0;
+            while (f && i < 32) {
+                const char *fn = f->function ? m3_GetFunctionName(f->function) : "?";
+                fprintf(stderr, "yos: bt #%d %s\n", i++, fn);
+                f = f->next;
+            }
+        }
         m3ApiReturn(-1);
     }
     int32_t rc = 0;
@@ -213,16 +223,27 @@ const char *yos_brg_last_call = "<none>";
  * crashes. Very noisy — disable for normal runs. */
 int yos_brg_trace = 0;
 
-/* env.__stack_chk_fail: in vanilla wasm-ld output this is the
- * stack-protector failure handler, but Binaryen-asyncified binaries
- * (e.g. nvim) ALSO call here from asyncify's "unexpected state"
- * branches — global 969 is the asyncify state global, not an SSP
- * cookie. We can't tell from the host side which kind of mismatch
- * the guest hit; both are fatal, so just print and trap. */
+static int main_get_asyncify_state(IM3Runtime rt);
+
+/* env.__stack_chk_fail: clang's stack-protector emits a call here
+ * when the canary at function entry doesn't match the canary at
+ * function exit. With YOS_STACK_CHK_IGNORE=1 we WARN once and
+ * return — useful only as a debugging aid to discover what the
+ * guest does NEXT after the smash. */
 static m3ApiRawFunction(m3_yos_stack_chk_fail)
 {
+    static int warned = 0;
+    if (getenv("YOS_STACK_CHK_IGNORE")) {
+        if (!warned) {
+            fprintf(stderr,
+                "yos: __stack_chk_fail (IGNORED — last bridge: %s)\n",
+                yos_brg_last_call ? yos_brg_last_call : "(none)");
+            warned = 1;
+        }
+        m3ApiSuccess();
+    }
     fprintf(stderr,
-        "yos: __stack_chk_fail() — guest stack canary OR asyncify state mismatch\n"
+        "yos: __stack_chk_fail() — guest stack canary corrupted\n"
         "yos: last bridge before trap: %s\n",
         yos_brg_last_call ? yos_brg_last_call : "(none)");
     fflush(stderr);
@@ -652,6 +673,19 @@ m3ApiRawFunction(m3_yos_argc)
     m3ApiReturn(ctx->argc);
 }
 
+/* __yos_env_reload() — test harness hook: dump per-process env and
+ * re-import from host environ. See yos_env_reload in impl/env.c. */
+extern void yos_env_reload(struct yos_exec_ctx *ctx);
+m3ApiRawFunction(m3_yos_env_reload)
+{
+    struct yos_exec_ctx *ctx = (struct yos_exec_ctx *)m3_GetUserData(runtime);
+    uint32_t mem_size = 0;
+    ctx->memory = m3_GetMemory(runtime, &mem_size, 0);
+    ctx->memory_size = mem_size;
+    yos_env_reload(ctx);
+    m3ApiSuccess();
+}
+
 /* __yos_argv_setup(char **argv) - copy argv strings to wasm memory */
 m3ApiRawFunction(m3_yos_argv_setup)
 {
@@ -767,6 +801,13 @@ void yos_link_imports(IM3Module module, struct yos_exec_ctx *ctx)
                          "i()", m3_yos_envc, ctx);
     m3_LinkRawFunctionEx(module, "env", "__yos_envp_setup",
                          "v(i)", m3_yos_envp_setup, ctx);
+    /* __yos_env_reload — test-only hook: drops the per-process env
+     * table and re-pulls from host environ. The freebsd-libc test
+     * harness calls this between ATF test cases to mimic atf-run's
+     * fork-per-test isolation, so a previous test's clearenv() can't
+     * starve a later test of e.g. PWD. */
+    m3_LinkRawFunctionEx(module, "env", "__yos_env_reload",
+                         "v()", m3_yos_env_reload, ctx);
     m3_LinkRawFunction(module, "env", "__error", "i()", m3_yos_error);
     m3_LinkRawFunction(module, "env", "__assert", "v(iiii)", m3_yos_assert);
     m3_LinkRawFunction(module, "env", "abort", "v()", m3_yos_abort);

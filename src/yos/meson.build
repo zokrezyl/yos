@@ -60,6 +60,7 @@ yos_runtime_sources = files(
   'impl/file.c',
   'impl/kqueue.c',
   'impl/posix.c',
+  'impl/fmtcheck_freebsd.c',
   'impl/random.c',
   'impl/signal.c',
   'impl/strto.c',

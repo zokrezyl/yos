@@ -177,8 +177,17 @@ LIBC_INIT_O="$BLD/yos_libc_init.o"
 # load. `--export-all` exposes the function table (pthread_create
 # needs it) and `--stack-first` puts the wasm shadow stack at the
 # bottom of linear memory.
+# Stack size: libuv's uv__io_poll allocates `struct kevent events[1024]`
+# on the stack — 1024 × 64 B = 64 KiB by itself, so a 64 KiB stack is
+# fully consumed before any other local fits. Empirically nvim also
+# wants room for vimscript parsing, ex_getln, regex ops, etc., so
+# bump to 1 MiB. (Real i386 + the FreeBSD 11 kevent shape would fit
+# in 32 KiB, but our wasm32 ABI 8-aligns int64_t and gives kevent a
+# 64-byte footprint — see src/yos/impl/kqueue.c for the layout
+# table.) The `--stack-first` flag still places the stack at the
+# low end of linear memory growing downward.
 LDFLAGS_W="-Wl,--no-entry -Wl,--export=_start -Wl,--export-all \
-    -Wl,--allow-undefined -Wl,--stack-first -Wl,-z,stack-size=65536 \
+    -Wl,--allow-undefined -Wl,--stack-first -Wl,-z,stack-size=1048576 \
     $WASM_SYSROOT/usr/lib/crt1.o $LIBC_INIT_O"
 
 cmake "$SRC" \

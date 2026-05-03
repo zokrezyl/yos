@@ -79,11 +79,15 @@ int32_t yos_brk(struct yos_exec_ctx *ctx, uint32_t addr)
     return (int32_t)addr;
 }
 
-int32_t yos_mmap(struct yos_exec_ctx *ctx)
+/* mmap(addr, length, prot, flags, fd, offset) — POSIX. We support
+ * anonymous mappings (fd == -1) by routing into yos_mmap2; non-
+ * anonymous file mappings still return ENOSYS. The wasm-side
+ * `pgoffset` stays in bytes; mmap2 ignores it for anonymous maps. */
+int32_t yos_mmap(struct yos_exec_ctx *ctx, uint32_t addr, uint32_t length,
+                 int32_t prot, int32_t flags, int32_t fd, uint64_t offset)
 {
-    (void)ctx;
-    ydebug("mmap called -> ENOSYS\n");
-    return -ENOSYS;
+    (void)offset;
+    return yos_mmap2(ctx, addr, length, prot, flags, fd, 0);
 }
 
 int32_t yos_munmap(struct yos_exec_ctx *ctx, uint32_t addr, uint32_t len)

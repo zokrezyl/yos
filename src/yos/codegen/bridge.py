@@ -477,20 +477,37 @@ def _arg_translation_full(name, idx, gt, ht, g_types, h_types):
             guest_t = _guest_type(g_pointee, g_types) or 'int'
             host_t  = _host_type(h_pointee, h_types) or 'int'
             is_const = bool(gt.get('pointee_is_const')) or bool(g_pointee.get('is_const'))
+            # NULL passthrough: when the wasm guest passes 0, the
+            # libc convention is "no out-param wanted" (time(NULL),
+            # wait(NULL), waitpid(..., NULL, 0), …). Without a NULL
+            # short-circuit we'd READ from wasm offset 0 (a string
+            # literal in .data) AND on the post-call WRITE back 4
+            # bytes there — silently corrupting whatever the linker
+            # placed at offset 0. nvim hit this on `time(NULL)`
+            # called from os_localtime; the canary smash showed up
+            # later in os_localtime_r's epilogue once the corrupted
+            # data segment was used. Pass NULL straight through to
+            # the host, skip both the read and the writeback.
             setup_lines = [
                 f'    /* narrow-ptr thunk: guest {guest_t} ({g_pointee.get("size")}B)'
                 f' vs host {host_t} ({h_pointee.get("size")}B) — route through'
                 f' a host-width temp and narrow-copy back. */',
-                f'    {host_t} {var}_v = ({host_t})*({guest_t} *)(ctx->memory + {var});',
-                f'    {host_t} *{var}_h = &{var}_v;',
+                f'    {host_t}  {var}_v = ({var}) ? ({host_t})*({guest_t} *)(ctx->memory + {var}) : 0;',
+                f'    {host_t} *{var}_h = ({var}) ? &{var}_v : ({host_t} *)0;',
             ]
             setup = '\n'.join(setup_lines)
             post  = ('' if is_const
-                     else f'    *({guest_t} *)(ctx->memory + {var}) = ({guest_t}){var}_v;')
+                     else f'    if ({var}) *({guest_t} *)(ctx->memory + {var}) = ({guest_t}){var}_v;')
             return (setup, f'{var}_h', post)
         host_ptr_type = _host_type(ht, h_types) or 'void *'
         # See _arg_translation comment: don't NULL-translate; custom
         # impls handle the few fns where NULL passthrough matters.
+        # The narrow-ptr thunk above DOES NULL-translate (and must,
+        # since we'd otherwise read+write wasm offset 0 to satisfy
+        # the host's wider scalar). For wide-ptr passthrough, leaving
+        # 0 → ctx->memory keeps realpath(_, NULL), getcwd(NULL, _),
+        # and friends working — those rely on host libc seeing a
+        # non-NULL output that points somewhere it can write to.
         setup = f'    {host_ptr_type} {var}_h = ({host_ptr_type})(ctx->memory + {var});'
         return (setup, f'{var}_h', '')
     if gk == 'builtin' and hk == 'builtin':
@@ -797,8 +814,22 @@ def _emit_struct_convert_body(name: str, gf: dict, hf: dict,
             continue
         if ht and ht.get('kind') == 'pointer':
             # Translate wasm offset to host pointer for non-struct
-            # pointer args (e.g. `const char *path` for stat).
-            call_args.append(f'({host_t or "void *"})(ctx->memory + {wname})')
+            # pointer args (e.g. `const char *path` for stat). NULL
+            # passthrough is mandatory here: `gettimeofday(_, NULL)`
+            # is a normal POSIX call and glibc writes 8 bytes through
+            # a non-NULL `tz` (the obsolete `struct timezone` slot).
+            # Translating wasm 0 to `ctx->memory + 0` makes glibc
+            # smash the start of linear memory — surfaced as a stack
+            # canary trip in nvim's logger function. struct_convert
+            # is a curated table (see hooks.yaml), so adding NULL
+            # passthrough here is safe: every fn in that table
+            # accepts NULL for its non-struct pointer args (path
+            # args are required-non-NULL by the libc spec, but we
+            # don't second-guess buggy callers).
+            ht_str = host_t or 'void *'
+            call_args.append(
+                f'({wname}) ? ({ht_str})(ctx->memory + {wname}) : ({ht_str})0'
+            )
         elif host_t:
             call_args.append(f'({host_t}){wname}')
         else:

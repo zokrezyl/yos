@@ -234,24 +234,20 @@ int yos_vsnprintf_core(struct yos_exec_ctx *ctx,
     return (int)pos;
 }
 
-/* The 7 variadic libc fns nvim hits — each one routes to the core
- * formatter and either writes to a guest buffer or to a host FILE*.
- *
- * For `printf`/`fprintf` we resolve the host FILE* from a small handle
- * table built at startup: 1 → stdout, 2 → stderr. Nvim only writes to
- * stderr (panic / version output) and stdout (most other text), so
- * those two cover what we need today. fopen-derived handles will get
- * wired when impl/file.c lands. */
+/* Resolve a guest FILE* handle to the host FILE* through impl/file.c's
+ * handle table. Pre-bound: 1=stdin, 2=stdout, 3=stderr; 4..MAX are
+ * fopen-allocated. Anything unknown falls back to stdout — partial
+ * output is less bad than a NULL deref in fwrite. nvim's logger
+ * writes to a real fopen()'d file (handle ≥ 4), and a previous shim
+ * here was hard-coding 1→stdout / 2→stderr / else→stdout, sending
+ * every log line to stdout instead. */
+extern FILE *yos_handle_to_file(uint32_t h);
 static FILE *guest_fp_to_host(struct yos_exec_ctx *ctx, uint32_t fp_off)
 {
     (void)ctx;
-    /* musl/wasi-libc-style: stdin = 1, stdout = 2, stderr = 3 in some
-     * conventions. clang -nostdlib has no built-in convention. nvim
-     * uses the FreeBSD convention: stdin/stdout/stderr are extern
-     * FILE * resolved at link. For now, treat fp_off as 1 → stdout,
-     * 2 → stderr, anything else → stdout. Refine when fopen lands. */
     if (fp_off == 0) return stdout;
-    return fp_off == 2 ? stderr : stdout;
+    FILE *f = yos_handle_to_file(fp_off);
+    return f ? f : stdout;
 }
 
 int32_t yos_vfprintf(struct yos_exec_ctx *ctx,

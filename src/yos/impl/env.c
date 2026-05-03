@@ -82,11 +82,14 @@ static int find_entry(const struct yos_env_store *st,
     return -1;
 }
 
-/* Lazy-init: walk host environ once, copy each entry into wasm. */
-static void env_init_once(struct yos_exec_ctx *ctx)
+/* Walk host environ and copy entries into wasm. Used both for
+ * lazy-init on first getenv/setenv AND from yos_env_reload() to
+ * reset state between FreeBSD ATF test cases (their atf-runner
+ * forks per-test; we run them serially in one process, so without
+ * an explicit reload hook the previous test's clearenv() would
+ * leave the env empty for the next test). */
+static void env_load_from_host(struct yos_exec_ctx *ctx)
 {
-    if (g_env.initialised) return;
-    g_env.initialised = 1;
     if (!environ) return;
     for (char **p = environ; *p && g_env.count < YOS_ENV_MAX; p++) {
         const char *eq = strchr(*p, '=');
@@ -104,6 +107,28 @@ static void env_init_once(struct yos_exec_ctx *ctx)
         g_env.e[g_env.count].name_len  = (uint32_t)nlen;
         g_env.count++;
     }
+}
+
+static void env_init_once(struct yos_exec_ctx *ctx)
+{
+    if (g_env.initialised) return;
+    g_env.initialised = 1;
+    env_load_from_host(ctx);
+}
+
+/* Test-only: drop all known entries and re-pull from host environ.
+ * Bound as `env.__yos_env_reload` — atf-runner-style forks would
+ * give each test case a fresh env; we approximate by reloading. */
+void yos_env_reload(struct yos_exec_ctx *ctx)
+{
+    /* Free the wasm-side string buffers we allocated. */
+    for (int i = 0; i < g_env.count; i++) {
+        if (g_env.e[i].name_off)  yos_free(ctx, g_env.e[i].name_off);
+        if (g_env.e[i].value_off) yos_free(ctx, g_env.e[i].value_off);
+    }
+    memset(&g_env, 0, sizeof g_env);
+    g_env.initialised = 1;
+    env_load_from_host(ctx);
 }
 
 uint32_t yos_getenv(struct yos_exec_ctx *ctx, uint32_t name_off)

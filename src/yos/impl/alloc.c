@@ -1,16 +1,23 @@
 /* alloc.c — yos guest-allocator backed by host mimalloc.
  *
- * Architecture (CLAUDE.md "What needs to be done #5"):
+ * Architecture:
  *   - mimalloc runs on the HOST, but its arena is a region of the
  *     GUEST's wasm linear memory. mi_malloc returns a host pointer
  *     INTO ctx->memory[]; we convert to wasm offset for the guest.
- *   - One arena + one heap per yos_exec_ctx (per fork). pthread
- *     workers share the parent ctx's heap (mimalloc has internal
- *     locking for cross-thread free).
- *   - Lazy init: claim the arena on first allocation. Region:
- *       lo = ctx->heap_end (16-aligned)
- *       hi = ctx->memory_size / 2  (upper half reserved for mmap2)
- *     ctx->heap_end is then bumped past hi so brk cannot cross.
+ *   - ONE shared arena per yos_exec_ctx (per fork) — that's the wasm
+ *     linear-memory region we own. Within that arena, EACH host
+ *     thread that allocates gets its own mi_heap_t. mimalloc's
+ *     invariant is that a heap is single-threaded; nvim's libuv
+ *     pthread workers call malloc from threads other than the one
+ *     that first allocated, which used to trip a debug assertion
+ *     (and, in release builds, silently corrupt mimalloc's
+ *     free-lists). Per-thread heaps in the same arena fix that
+ *     properly: cross-thread `free` already works (mimalloc uses an
+ *     atomic enqueue to the owning thread's free list), so we only
+ *     need to route allocations through THIS thread's heap.
+ *   - Lazy init: claim the arena on first allocation; first thread
+ *     in also creates the first heap. Subsequent threads create
+ *     their own heap in the same arena via mi_heap_new_in_arena().
  *   - Bridges in yos_bridge.c (custom_alloc routing) call us with
  *     wasm-ABI args (uint32 offsets, uint32 sizes); we return uint32
  *     offsets. Errors -> 0 (NULL in wasm) for malloc-family,
@@ -33,6 +40,29 @@
 /* Initialisation guard. mimalloc itself is thread-safe; this lock
  * only serialises the one-shot arena/heap setup. */
 static pthread_mutex_t alloc_init_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/* Per-host-thread heap. Each thread that allocates for `ctx` gets
+ * its own mi_heap_t into ctx's shared arena, satisfying mimalloc's
+ * single-threaded-per-heap invariant. The pointer is keyed by the
+ * arena id so a fork-spawned ctx's threads don't reuse a parent
+ * ctx's heap. */
+struct alloc_tls {
+    int          arena_id;
+    mi_heap_t   *heap;
+};
+static __thread struct alloc_tls alloc_tls;
+
+/* Get (or create) THIS thread's heap into ctx's arena. */
+static mi_heap_t *thread_heap(struct yos_exec_ctx *ctx)
+{
+    if (alloc_tls.heap && alloc_tls.arena_id == ctx->mi_arena_id)
+        return alloc_tls.heap;
+    mi_heap_t *h = mi_heap_new_in_arena((mi_arena_id_t)ctx->mi_arena_id);
+    if (!h) return NULL;
+    alloc_tls.heap     = h;
+    alloc_tls.arena_id = ctx->mi_arena_id;
+    return h;
+}
 
 /* Round x up to a multiple of 16 (mimalloc requires 16-aligned arena
  * starts on most platforms; matches our heap_end alignment too). */
@@ -126,30 +156,40 @@ static inline void *wasm_to_host(struct yos_exec_ctx *ctx, uint32_t off)
 uint32_t yos_malloc(struct yos_exec_ctx *ctx, uint32_t size)
 {
     if (alloc_init(ctx) != 0) return 0;
-    void *p = mi_heap_malloc((mi_heap_t *)ctx->mi_heap, size);
+    mi_heap_t *h = thread_heap(ctx);
+    if (!h) return 0;
+    void *p = mi_heap_malloc(h, size);
     return host_to_wasm(ctx, p);
 }
 
 void yos_free(struct yos_exec_ctx *ctx, uint32_t off)
 {
+    (void)ctx;
     void *p = wasm_to_host(ctx, off);
+    /* mi_free is cross-thread safe — mimalloc enqueues onto the
+     * owning heap's deferred-free list with an atomic op. So we
+     * intentionally DON'T look up thread_heap here. */
     if (p) mi_free(p);
 }
 
 uint32_t yos_calloc(struct yos_exec_ctx *ctx, uint32_t nmemb, uint32_t size)
 {
     if (alloc_init(ctx) != 0) return 0;
-    void *p = mi_heap_calloc((mi_heap_t *)ctx->mi_heap, nmemb, size);
+    mi_heap_t *h = thread_heap(ctx);
+    if (!h) return 0;
+    void *p = mi_heap_calloc(h, nmemb, size);
     return host_to_wasm(ctx, p);
 }
 
 uint32_t yos_realloc(struct yos_exec_ctx *ctx, uint32_t off, uint32_t newsize)
 {
     if (alloc_init(ctx) != 0) return 0;
+    mi_heap_t *h = thread_heap(ctx);
+    if (!h) return 0;
     void *p = wasm_to_host(ctx, off);
     /* mi_heap_realloc(NULL) == mi_heap_malloc; mi_heap_realloc(p, 0)
      * frees p and returns NULL. Both match POSIX realloc. */
-    void *q = mi_heap_realloc((mi_heap_t *)ctx->mi_heap, p, newsize);
+    void *q = mi_heap_realloc(h, p, newsize);
     return host_to_wasm(ctx, q);
 }
 
@@ -157,11 +197,12 @@ uint32_t yos_reallocarray(struct yos_exec_ctx *ctx, uint32_t off,
                           uint32_t nmemb, uint32_t size)
 {
     if (alloc_init(ctx) != 0) return 0;
+    mi_heap_t *h = thread_heap(ctx);
+    if (!h) return 0;
     /* Overflow check matches glibc/musl reallocarray semantics. */
     if (nmemb && size > UINT32_MAX / nmemb) return 0;
     void *p = wasm_to_host(ctx, off);
-    void *q = mi_heap_realloc((mi_heap_t *)ctx->mi_heap, p,
-                              (size_t)nmemb * size);
+    void *q = mi_heap_realloc(h, p, (size_t)nmemb * size);
     return host_to_wasm(ctx, q);
 }
 
@@ -173,8 +214,9 @@ int32_t yos_posix_memalign(struct yos_exec_ctx *ctx, uint32_t memptr_off,
     /* POSIX: alignment must be power-of-two AND multiple of sizeof(void*).
      * On wasm32 sizeof(void*) == 4. */
     if (alignment < 4 || (alignment & (alignment - 1)) != 0) return EINVAL;
-    void *p = mi_heap_malloc_aligned((mi_heap_t *)ctx->mi_heap,
-                                     size, alignment);
+    mi_heap_t *h = thread_heap(ctx);
+    if (!h) return ENOMEM;
+    void *p = mi_heap_malloc_aligned(h, size, alignment);
     if (!p) return ENOMEM;
     uint32_t off = host_to_wasm(ctx, p);
     *(uint32_t *)(ctx->memory + memptr_off) = off;
@@ -186,8 +228,9 @@ uint32_t yos_aligned_alloc(struct yos_exec_ctx *ctx, uint32_t alignment,
 {
     if (alloc_init(ctx) != 0) return 0;
     if (alignment == 0 || (alignment & (alignment - 1)) != 0) return 0;
-    void *p = mi_heap_malloc_aligned((mi_heap_t *)ctx->mi_heap,
-                                     size, alignment);
+    mi_heap_t *h = thread_heap(ctx);
+    if (!h) return 0;
+    void *p = mi_heap_malloc_aligned(h, size, alignment);
     return host_to_wasm(ctx, p);
 }
 

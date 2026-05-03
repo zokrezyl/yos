@@ -42,6 +42,31 @@ int32_t yos_isatty(struct yos_exec_ctx *ctx, int32_t wfd)
     return isatty(hfd);
 }
 
+/* fmtcheck(user_fmt, default_fmt) — FreeBSD libc helper that returns
+ * `user_fmt` if its conversion specifiers are CLASS-compatible with
+ * `default_fmt`, else `default_fmt`. glibc has no equivalent.
+ *
+ * The FreeBSD test exercises 30+ subtle cases (e.g. `%qd` is the BSD
+ * synonym of `%llx`, `%D` of `%ld`, width-modifier `*` introduces an
+ * extra int arg, etc.). Reimplementing it correctly from scratch is
+ * a nontrivial state machine; we link against the FreeBSD source
+ * directly via a thin wrapper. The .c file lives under build-tools/
+ * freebsd/.../lib/libc/gen/fmtcheck.c (BSD-2-Clause). */
+extern const char *yos_fmtcheck_freebsd(const char *f1, const char *f2);
+
+uint32_t yos_fmtcheck(struct yos_exec_ctx *ctx, uint32_t user_off,
+                      uint32_t default_off)
+{
+    const char *u = user_off    ? (const char *)(ctx->memory + user_off)    : NULL;
+    const char *d = default_off ? (const char *)(ctx->memory + default_off) : NULL;
+    const char *r = yos_fmtcheck_freebsd(u, d);
+    /* FreeBSD always returns one of the two input pointers (or NULL
+     * if user is NULL); convert that host pointer back to wasm. */
+    if (r == u) return user_off;
+    if (r == d) return default_off;
+    return default_off;
+}
+
 int32_t yos_fsync(struct yos_exec_ctx *ctx, int32_t wfd)
 {
     int hfd = yos_fd_get(ctx, wfd);
