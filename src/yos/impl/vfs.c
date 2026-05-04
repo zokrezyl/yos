@@ -434,11 +434,32 @@ static uint32_t ioctl_cmd_fb_to_lx(uint32_t cmd)
 int32_t yos_ioctl(struct yos_exec_ctx *ctx, int32_t fd, uint32_t cmd, uint32_t arg)
 {
     uint32_t lcmd = ioctl_cmd_fb_to_lx(cmd);
-    ydebug("ioctl(tid=%d fd=%d, cmd=0x%x->0x%x, arg=0x%x)\n",
-           (int)syscall(SYS_gettid), fd, cmd, lcmd, arg);
+
+    /* ioctl is variadic in C; clang's wasm32 ABI passes the third
+     * argument via a va_list pointer on the shadow stack — `arg` is
+     * the offset of that pack, NOT the offset of the user buffer. The
+     * first slot of the pack is the user's actual wasm pointer (or
+     * the integer value, for value-arg ioctls). Without this
+     * dereference, the host kernel writes/reads the pack location
+     * instead of the user's struct, and TIOCGWINSZ silently leaves
+     * the caller's `struct winsize` zero — nvim's tui_guess_size
+     * then falls through to terminfo defaults (80×24).
+     *
+     * For value-arg ioctls (TIOCSCTTY, FIONBIO with int*, ...) the
+     * dereferenced word is either the int value (passed directly)
+     * or another wasm pointer; treating it as a pointer and passing
+     * the host translation works for both cases — the host kernel
+     * interprets the third arg per the request encoding. */
+    uint32_t user_arg = arg;
+    if (arg && (uint32_t)arg + 4 <= ctx->memory_size) {
+        user_arg = *(uint32_t *)(ctx->memory + arg);
+    }
+
+    ydebug("ioctl(tid=%d fd=%d, cmd=0x%x->0x%x, va_pack=0x%x user_arg=0x%x)\n",
+           (int)syscall(SYS_gettid), fd, cmd, lcmd, arg, user_arg);
 
     int hfd = host_fd(ctx, fd);
-    void *argp = arg ? wptr(ctx, arg) : NULL;
+    void *argp = user_arg ? wptr(ctx, user_arg) : NULL;
 
     /* Virtualize controlling-tty foreground pgrp queries/sets so the
      * pgid the wasm caller stores/reads belongs to the *guest* pid
