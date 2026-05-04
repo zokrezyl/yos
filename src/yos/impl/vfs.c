@@ -434,7 +434,8 @@ static uint32_t ioctl_cmd_fb_to_lx(uint32_t cmd)
 int32_t yos_ioctl(struct yos_exec_ctx *ctx, int32_t fd, uint32_t cmd, uint32_t arg)
 {
     uint32_t lcmd = ioctl_cmd_fb_to_lx(cmd);
-    ydebug("ioctl(fd=%d, cmd=0x%x->0x%x, arg=0x%x)\n", fd, cmd, lcmd, arg);
+    ydebug("ioctl(tid=%d fd=%d, cmd=0x%x->0x%x, arg=0x%x)\n",
+           (int)syscall(SYS_gettid), fd, cmd, lcmd, arg);
 
     int hfd = host_fd(ctx, fd);
     void *argp = arg ? wptr(ctx, arg) : NULL;
@@ -472,6 +473,11 @@ int32_t yos_ioctl(struct yos_exec_ctx *ctx, int32_t fd, uint32_t cmd, uint32_t a
 
     int r = ioctl(hfd, lcmd, argp);
     ydebug("ioctl = %d (errno=%d)\n", r, r < 0 ? errno : 0);
+    if (lcmd == LX_TIOCGWINSZ && r == 0 && argp) {
+        unsigned short *ws = (unsigned short *)argp;
+        ydebug("  winsize: row=%u col=%u xpix=%u ypix=%u\n",
+               ws[0], ws[1], ws[2], ws[3]);
+    }
     return r < 0 ? -errno : r;
 }
 

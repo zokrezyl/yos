@@ -47,8 +47,10 @@ int32_t yos_dup(struct yos_exec_ctx *ctx, int32_t wfd)
 int32_t yos_isatty(struct yos_exec_ctx *ctx, int32_t wfd)
 {
     int hfd = yos_fd_get(ctx, wfd);
-    if (hfd < 0) { errno = EBADF; return 0; }
-    return isatty(hfd);
+    if (hfd < 0) { errno = EBADF; ydebug("isatty(wfd=%d) -> 0 (EBADF)\n", wfd); return 0; }
+    int r = isatty(hfd);
+    ydebug("isatty(wfd=%d hfd=%d) -> %d\n", wfd, hfd, r);
+    return r;
 }
 
 /* yos_getsockname — translate host fd, then convert host's Linux

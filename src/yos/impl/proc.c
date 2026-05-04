@@ -256,6 +256,7 @@ typedef struct {
 
 static void *fork_thread_func(void *arg)
 {
+    ydebug("fork_thread_func: child thread tid=%d\n", (int)syscall(SYS_gettid));
     fork_thread_arg_t *fork_thread_arg = (fork_thread_arg_t *)arg;
 
     /* Create new wasm3 environment and runtime for child */
@@ -714,7 +715,7 @@ void yos_fork_pump(struct yos_exec_ctx *ctx)
         }
         pthread_detach(t);
 
-        ydebug("forked child pid=%d, resuming parent\n", child_proc->pid);
+        ydebug("forked child pid=%d (parent thread tid=%d), resuming parent\n", child_proc->pid, (int)syscall(SYS_gettid));
 
         /* Resume parent - start rewind */
         call_asyncify(wrt, "asyncify_start_rewind", ctx->asyncify_ptr);
