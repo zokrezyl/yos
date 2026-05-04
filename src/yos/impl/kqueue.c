@@ -82,17 +82,14 @@ static pthread_mutex_t   g_proc_watches_lock = PTHREAD_MUTEX_INITIALIZER;
 void yos_kqueue_notify_exit(uint32_t pid)
 {
     pthread_mutex_lock(&g_proc_watches_lock);
-    int n = 0;
     for (int i = 0; i < MAX_PROC_WATCH; i++) {
         if (g_proc_watches[i].pid == pid && g_proc_watches[i].eventfd > 0) {
             uint64_t one = 1;
             ssize_t w = write(g_proc_watches[i].eventfd, &one, 8);
             (void)w;
-            n++;
         }
     }
     pthread_mutex_unlock(&g_proc_watches_lock);
-    ydebug("notify_exit(pid=%u) -> %d watcher(s) poked\n", pid, n);
 }
 
 static int proc_watch_add(int kq, uint32_t pid, uint32_t udata)
@@ -121,8 +118,6 @@ static int proc_watch_add(int kq, uint32_t pid, uint32_t udata)
             g_proc_watches[i].pid = pid;
             g_proc_watches[i].udata = udata;
             pthread_mutex_unlock(&g_proc_watches_lock);
-            ydebug("proc_watch_add(kq=%d pid=%u udata=0x%x) -> efd=%d slot=%d\n",
-                   kq, pid, udata, efd, i);
             return 0;
         }
     }
@@ -260,7 +255,7 @@ static m3ApiRawFunction(m3_yos_kevent)
     ctx->memory_size = mem_size;
     static int kevent_call_n = 0;
     int my_call = ++kevent_call_n;
-    if (ydebug_enabled()) {
+    if (ydebug_enabled() && my_call < 30) {
         pid_t tid = (pid_t)syscall(SYS_gettid);
         ydebug("kevent#%d(tid=%d kq=%d nchanges=%d nevents=%d timeout=%s)\n",
                my_call, (int)tid, kq_wfd, nchanges, nevents,
@@ -376,7 +371,7 @@ static m3ApiRawFunction(m3_yos_kevent)
     struct epoll_event eevs[256];
     int n = epoll_wait(kq, eevs, nevents, timeout_ms);
     if (n < 0) { write_errno(ctx, errno); m3ApiReturn(-1); }
-    if (ydebug_enabled()) {
+    if (ydebug_enabled() && my_call < 30) {
         for (int i = 0; i < n && i < 4; i++) {
             ydebug("  epoll_event[%d]: events=0x%x udata=%016lx\n",
                    i, eevs[i].events, (unsigned long)eevs[i].data.u64);

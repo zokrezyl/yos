@@ -675,14 +675,24 @@ static m3ApiRawFunction (host_pthread_cond_timedwait)
 #define RW_FREE     0u
 #define RW_WRITER   0xFFFFFFFFu
 
+/* FreeBSD's pthread_rwlock_t is a 4-byte pointer (`struct pthread_rwlock *`)
+ * — the wasm guest's storage for one rwlock is exactly 4 bytes. Earlier
+ * impl wrote 4×u32 = 16 bytes inline, stomping the two adjacent fields.
+ * For a uv_loop_t.cloexec_lock that's `closing_handles` + the first 4 bytes
+ * of `process_handles` getting zeroed at every uv_loop_init → uv_rwlock_init,
+ * which deinitialised libuv's process queue and crashed uv__io_poll's
+ * EVFILT_PROC handler with a stale pointer. Now we pack everything into
+ * the single 4-byte cell:
+ *   value == 0xFFFFFFFF   : writer holds
+ *   value > 0 (< 0xFFFFFFFF): reader count
+ *   value == 0            : free
+ * Wait/notify uses the same cell — every state-changing op increments
+ * the cell as part of its CAS, and notify wakes everyone. */
 static int
 rw_init (uint32_t * rw)
 {
     if (!rw) return -1;
-    __atomic_store_n (&rw[0], 0u, __ATOMIC_SEQ_CST);
-    __atomic_store_n (&rw[1], 0u, __ATOMIC_SEQ_CST);
-    __atomic_store_n (&rw[2], 0u, __ATOMIC_SEQ_CST);
-    __atomic_store_n (&rw[3], 0u, __ATOMIC_SEQ_CST);
+    __atomic_store_n (rw, 0u, __ATOMIC_SEQ_CST);
     return 0;
 }
 
@@ -691,21 +701,16 @@ rw_rdlock_impl (uint32_t * rw, int try_only)
 {
     if (!rw) return -1;
     while (1) {
-        mu_lock_cell (&rw[0]);
-        uint32_t st       = __atomic_load_n (&rw[1], __ATOMIC_ACQUIRE);
-        uint32_t writers  = __atomic_load_n (&rw[3], __ATOMIC_ACQUIRE);
-        if (st != RW_WRITER && writers == 0u) {
-            __atomic_store_n (&rw[1], st + 1u, __ATOMIC_RELEASE);
-            mu_unlock_cell (&rw[0]);
-            return 0;
+        uint32_t st = __atomic_load_n (rw, __ATOMIC_ACQUIRE);
+        if (st != RW_WRITER && st < (RW_WRITER - 1u)) {
+            uint32_t want = st + 1u;
+            if (__atomic_compare_exchange_n (rw, &st, want, 0,
+                    __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+                return 0;
+            continue;  /* CAS lost — retry */
         }
-        if (try_only) {
-            mu_unlock_cell (&rw[0]);
-            return 16; // EBUSY
-        }
-        uint32_t seq = __atomic_load_n (&rw[2], __ATOMIC_SEQ_CST);
-        mu_unlock_cell (&rw[0]);
-        m3Atomic_Wait32 ((volatile uint32_t *) &rw[2], seq, -1);
+        if (try_only) return 16; /* EBUSY */
+        m3Atomic_Wait32 ((volatile uint32_t *) rw, st, -1);
     }
 }
 
@@ -713,31 +718,16 @@ static int
 rw_wrlock_impl (uint32_t * rw, int try_only)
 {
     if (!rw) return -1;
-    int registered_wait = 0;
-
     while (1) {
-        mu_lock_cell (&rw[0]);
-        uint32_t st = __atomic_load_n (&rw[1], __ATOMIC_ACQUIRE);
+        uint32_t st = __atomic_load_n (rw, __ATOMIC_ACQUIRE);
         if (st == RW_FREE) {
-            __atomic_store_n (&rw[1], RW_WRITER, __ATOMIC_RELEASE);
-            if (registered_wait)
-                __atomic_fetch_sub (&rw[3], 1u, __ATOMIC_RELEASE);
-            mu_unlock_cell (&rw[0]);
-            return 0;
+            if (__atomic_compare_exchange_n (rw, &st, RW_WRITER, 0,
+                    __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+                return 0;
+            continue;  /* CAS lost — retry */
         }
-        if (try_only) {
-            mu_unlock_cell (&rw[0]);
-            return 16;
-        }
-        if (!registered_wait) {
-            __atomic_fetch_add (&rw[3], 1u, __ATOMIC_ACQUIRE);
-            registered_wait = 1;
-            // Re-check: we just announced our presence; existing readers
-            // unlocking now will notify us.
-        }
-        uint32_t seq = __atomic_load_n (&rw[2], __ATOMIC_SEQ_CST);
-        mu_unlock_cell (&rw[0]);
-        m3Atomic_Wait32 ((volatile uint32_t *) &rw[2], seq, -1);
+        if (try_only) return 16; /* EBUSY */
+        m3Atomic_Wait32 ((volatile uint32_t *) rw, st, -1);
     }
 }
 
@@ -745,21 +735,18 @@ static int
 rw_unlock_impl (uint32_t * rw)
 {
     if (!rw) return -1;
-    mu_lock_cell (&rw[0]);
-    uint32_t st = __atomic_load_n (&rw[1], __ATOMIC_ACQUIRE);
-    uint32_t new_st;
-    if (st == RW_WRITER)        new_st = RW_FREE;
-    else if (st > 0u)           new_st = st - 1u;
-    else                        { mu_unlock_cell (&rw[0]); return 22; /* EINVAL */ }
-    __atomic_store_n (&rw[1], new_st, __ATOMIC_RELEASE);
-
-    // Always wake. Writers polling for state==FREE will see it, and
-    // would-be readers blocked behind a writer will re-check writers_waiting.
-    __atomic_fetch_add (&rw[2], 1u, __ATOMIC_SEQ_CST);
-    m3Atomic_Notify ((void *) &rw[2], UINT32_MAX);
-
-    mu_unlock_cell (&rw[0]);
-    return 0;
+    while (1) {
+        uint32_t st = __atomic_load_n (rw, __ATOMIC_ACQUIRE);
+        uint32_t new_st;
+        if (st == RW_WRITER)    new_st = RW_FREE;
+        else if (st > 0u)       new_st = st - 1u;
+        else                    return 22; /* EINVAL — unlock of free lock */
+        if (__atomic_compare_exchange_n (rw, &st, new_st, 0,
+                __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+            m3Atomic_Notify ((void *) rw, UINT32_MAX);
+            return 0;
+        }
+    }
 }
 
 static m3ApiRawFunction (host_pthread_rwlock_init)

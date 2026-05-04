@@ -100,9 +100,9 @@ d_m3BeginExternC
                       _mem->runtime, "memory size: %zu; access offset: %zu; size: %u",     \
                       _mem->length, OFFSET, SIZE))
 #else
-  #define d_outOfBounds { fprintf(stderr, "yos: OOB mem_len=%zu operand=%llu\n", (size_t)_mem->length, (unsigned long long)operand); newTrap (m3Err_trapOutOfBoundsMemoryAccess); }
+  #define d_outOfBounds newTrap (m3Err_trapOutOfBoundsMemoryAccess)
 
-#   define d_outOfBoundsMemOp(OFFSET, SIZE) { fprintf(stderr, "yos: OOBmemop mem_len=%zu offset=%llu size=%u\n", (size_t)_mem->length, (unsigned long long)(OFFSET), (unsigned)(SIZE)); newTrap (m3Err_trapOutOfBoundsMemoryAccess); }
+#   define d_outOfBoundsMemOp(OFFSET, SIZE) newTrap (m3Err_trapOutOfBoundsMemoryAccess)
 
 #endif
 
