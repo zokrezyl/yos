@@ -36,6 +36,7 @@
 #include <sys/syscall.h>
 #include <signal.h>
 #include <unistd.h>
+#include <pthread.h>
 
 #include "wasm3.h"
 #include "m3_env.h"
@@ -49,6 +50,7 @@ extern int yos_fd_get  (struct yos_exec_ctx *ctx, int wasm_fd);
 /* FreeBSD kevent constants (from sys/event.h, i386 wasm32 view). */
 #define EVFILT_READ        (-1)
 #define EVFILT_WRITE       (-2)
+#define EVFILT_PROC        (-5)
 #define EVFILT_SIGNAL      (-6)
 #define EV_ADD             0x0001
 #define EV_DELETE          0x0002
@@ -60,6 +62,89 @@ extern int yos_fd_get  (struct yos_exec_ctx *ctx, int wasm_fd);
 #define EV_DISPATCH        0x0080
 #define EV_ERROR           0x4000
 #define EV_EOF             0x8000
+
+/* EVFILT_PROC fflags */
+#define NOTE_EXIT          0x80000000
+
+/* Per-kqueue map: guest pid → eventfd we registered with epoll for that
+ * pid's exit. When yos_exit's child branch fires (proc.c), it walks
+ * yos_proc_table and writes 1 to the matching eventfd, which makes
+ * the parent's epoll_wait return with the watcher event so libuv's
+ * uv__wait_children path picks it up via waitpid (yos_waitpid). */
+#include <sys/eventfd.h>
+struct proc_watch { int kq; int eventfd; uint32_t pid; uint32_t udata; };
+#define MAX_PROC_WATCH 64
+static struct proc_watch g_proc_watches[MAX_PROC_WATCH];
+static pthread_mutex_t   g_proc_watches_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/* Called by impl/proc.c when a guest child exits. Wakes the parent's
+ * libuv kqueue so its EVFILT_PROC | NOTE_EXIT watcher fires. */
+void yos_kqueue_notify_exit(uint32_t pid)
+{
+    pthread_mutex_lock(&g_proc_watches_lock);
+    int n = 0;
+    for (int i = 0; i < MAX_PROC_WATCH; i++) {
+        if (g_proc_watches[i].pid == pid && g_proc_watches[i].eventfd > 0) {
+            uint64_t one = 1;
+            ssize_t w = write(g_proc_watches[i].eventfd, &one, 8);
+            (void)w;
+            n++;
+        }
+    }
+    pthread_mutex_unlock(&g_proc_watches_lock);
+    ydebug("notify_exit(pid=%u) -> %d watcher(s) poked\n", pid, n);
+}
+
+static int proc_watch_add(int kq, uint32_t pid, uint32_t udata)
+{
+    pthread_mutex_lock(&g_proc_watches_lock);
+    for (int i = 0; i < MAX_PROC_WATCH; i++) {
+        if (g_proc_watches[i].eventfd < 0 ||
+            g_proc_watches[i].eventfd == 0) {
+            int efd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+            if (efd < 0) { pthread_mutex_unlock(&g_proc_watches_lock); return -1; }
+            struct epoll_event eev = {0};
+            eev.events = EPOLLIN;
+            /* Pack tag identical to read/write events but with EVFILT_PROC
+             * filter so kevent unpack reports the right filter. ident =
+             * the guest pid (libuv reads ident to identify which child). */
+            eev.data.u64 = ((uint64_t)(udata & 0xffff) << 48) |
+                           ((uint64_t)(uint16_t)EVFILT_PROC << 32) |
+                           (uint64_t)pid;
+            if (epoll_ctl(kq, EPOLL_CTL_ADD, efd, &eev) < 0) {
+                close(efd);
+                pthread_mutex_unlock(&g_proc_watches_lock);
+                return -1;
+            }
+            g_proc_watches[i].kq = kq;
+            g_proc_watches[i].eventfd = efd;
+            g_proc_watches[i].pid = pid;
+            g_proc_watches[i].udata = udata;
+            pthread_mutex_unlock(&g_proc_watches_lock);
+            ydebug("proc_watch_add(kq=%d pid=%u udata=0x%x) -> efd=%d slot=%d\n",
+                   kq, pid, udata, efd, i);
+            return 0;
+        }
+    }
+    pthread_mutex_unlock(&g_proc_watches_lock);
+    return -1;
+}
+
+static void proc_watch_remove(int kq, uint32_t pid)
+{
+    pthread_mutex_lock(&g_proc_watches_lock);
+    for (int i = 0; i < MAX_PROC_WATCH; i++) {
+        if (g_proc_watches[i].kq == kq && g_proc_watches[i].pid == pid &&
+            g_proc_watches[i].eventfd > 0) {
+            epoll_ctl(kq, EPOLL_CTL_DEL, g_proc_watches[i].eventfd, NULL);
+            close(g_proc_watches[i].eventfd);
+            g_proc_watches[i].eventfd = -1;
+            g_proc_watches[i].kq = -1;
+            g_proc_watches[i].pid = 0;
+        }
+    }
+    pthread_mutex_unlock(&g_proc_watches_lock);
+}
 
 /* FreeBSD struct kevent layout in wasm32 view. Even though we tell
  * clang `-D__i386__=1` for the FreeBSD headers, clang's wasm32 ABI
@@ -175,7 +260,7 @@ static m3ApiRawFunction(m3_yos_kevent)
     ctx->memory_size = mem_size;
     static int kevent_call_n = 0;
     int my_call = ++kevent_call_n;
-    if (ydebug_enabled() && my_call < 30) {
+    if (ydebug_enabled()) {
         pid_t tid = (pid_t)syscall(SYS_gettid);
         ydebug("kevent#%d(tid=%d kq=%d nchanges=%d nevents=%d timeout=%s)\n",
                my_call, (int)tid, kq_wfd, nchanges, nevents,
@@ -237,6 +322,22 @@ static m3ApiRawFunction(m3_yos_kevent)
                     epoll_ctl(kq, EPOLL_CTL_MOD, target_hfd, &eev);
                 }
             }
+        } else if (filter == EVFILT_PROC) {
+            /* libuv on __FreeBSD__ uses EVFILT_PROC|NOTE_EXIT instead of
+             * SIGCHLD to detect child exit. ident is the guest pid. We
+             * keep an eventfd per (kq, pid) registered with epoll;
+             * impl/proc.c yos_exit pokes the eventfd when the child
+             * pthread terminates. */
+            (void)fflags;  /* assume NOTE_EXIT; that's all libuv asks for */
+            if (flags & EV_ADD) {
+                if (proc_watch_add(kq, ident, udata) < 0) {
+                    ydebug("kevent: proc_watch_add(pid=%u) failed errno=%d\n",
+                           ident, errno);
+                }
+            } else if (flags & (EV_DELETE | EV_DISABLE)) {
+                proc_watch_remove(kq, ident);
+            }
+            continue;
         } else if (filter == EVFILT_SIGNAL) {
             /* Signals via kqueue → not supported here; libuv's signal
              * loop has its own pipe-based path that doesn't actually
@@ -275,7 +376,7 @@ static m3ApiRawFunction(m3_yos_kevent)
     struct epoll_event eevs[256];
     int n = epoll_wait(kq, eevs, nevents, timeout_ms);
     if (n < 0) { write_errno(ctx, errno); m3ApiReturn(-1); }
-    if (ydebug_enabled() && my_call < 30) {
+    if (ydebug_enabled()) {
         for (int i = 0; i < n && i < 4; i++) {
             ydebug("  epoll_event[%d]: events=0x%x udata=%016lx\n",
                    i, eevs[i].events, (unsigned long)eevs[i].data.u64);
@@ -294,13 +395,42 @@ static m3ApiRawFunction(m3_yos_kevent)
         uint32_t ident_w = (uint32_t)(tag & 0xffffffff);
         int16_t  filter  = (int16_t)((tag >> 32) & 0xffff);
         uint32_t udata   = (uint32_t)(tag >> 48);
+        uint32_t fflags_out = 0;
+        if (filter == EVFILT_PROC) {
+            /* libuv on __FreeBSD__ keys process watchers by udata (a
+             * pointer to its uv_process_t), not by ident. Our 16-bit
+             * udata-in-tag packing truncates the pointer, so we must
+             * recover the full 32-bit udata from the proc_watch table
+             * here. Also EV_ONESHOT semantics: kqueue auto-removes the
+             * registration after the first fire — our impl must do the
+             * same so libuv's loop->nfds bookkeeping stays in sync
+             * (uv__wait_children does loop->nfds--, expecting EV_ONESHOT
+             * to have already removed the kqueue entry). */
+            pthread_mutex_lock(&g_proc_watches_lock);
+            for (int j = 0; j < MAX_PROC_WATCH; j++) {
+                if (g_proc_watches[j].kq == kq &&
+                    g_proc_watches[j].pid == ident_w &&
+                    g_proc_watches[j].eventfd > 0) {
+                    udata = g_proc_watches[j].udata;
+                    epoll_ctl(kq, EPOLL_CTL_DEL,
+                              g_proc_watches[j].eventfd, NULL);
+                    close(g_proc_watches[j].eventfd);
+                    g_proc_watches[j].eventfd = -1;
+                    g_proc_watches[j].kq = -1;
+                    g_proc_watches[j].pid = 0;
+                    break;
+                }
+            }
+            pthread_mutex_unlock(&g_proc_watches_lock);
+            fflags_out = NOTE_EXIT;
+        }
         /* libuv (uv__io_poll) reads ev->ident to identify which fd
          * fired, then walks its `loop->watchers[fd]` to find the
          * watcher. Returning ident=0 makes it spin on every poll. */
         ke_set_ident(ke, ident_w);
         ke_set_filter(ke, filter);
         ke_set_flags(ke, (eevs[i].events & EPOLLERR) ? EV_ERROR : 0);
-        ke_set_fflags(ke, 0);
+        ke_set_fflags(ke, fflags_out);
         ke_set_data(ke, 0);
         ke_set_udata(ke, udata);
     }

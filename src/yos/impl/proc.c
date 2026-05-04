@@ -131,6 +131,12 @@ int32_t yos_exit(struct yos_exec_ctx *ctx, int32_t code)
 
     /* Forked children run in separate threads - only terminate the thread */
     if (ctx->is_child) {
+        /* Notify any libuv-style EVFILT_PROC|NOTE_EXIT watcher in the
+         * parent runtime. libuv on __FreeBSD__ uses kqueue PROC events
+         * (not SIGCHLD) to detect child exit; without this notify the
+         * parent's event loop never wakes and :q!/exit hangs. */
+        extern void yos_kqueue_notify_exit(uint32_t);
+        if (ctx->proc) yos_kqueue_notify_exit((uint32_t)ctx->proc->pid);
         pthread_exit((void *)(intptr_t)code);
     }
 
