@@ -11,6 +11,9 @@
 #include <stddef.h>
 #include <unistd.h>
 #include <errno.h>
+#if defined(__APPLE__)
+#  include <sys/random.h>  /* getentropy lives here, not <unistd.h>, on darwin */
+#endif
 
 #include "yos/types.h"
 #include "impl/errno_helpers.h"

@@ -25,6 +25,14 @@ wasm3_sources = files(
 wasm3_lib = static_library(
   'wasm3',
   wasm3_sources,
+  # wasm3 is an interpreter that uses indirect-call dispatch from one
+  # opcode handler to the next. At -O2/-O3 the compiler turns those
+  # into sibling calls (no host-stack growth), but at -O0 every
+  # dispatched opcode adds a frame — a guest function with thousands
+  # of opcodes blows the host pthread stack and SIGSEGV's at the
+  # call instruction (rsp on guard page). Pin -O3 here so the project
+  # buildtype (debug, release, …) doesn't break the dispatch loop.
+  override_options : ['optimization=3'],
   c_args : [
     '-D_GNU_SOURCE',
     # Enable wasm backtraces — main.c's abort/assert handlers use them

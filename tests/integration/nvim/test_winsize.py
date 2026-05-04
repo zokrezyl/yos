@@ -21,7 +21,8 @@ ROWS, COLS = 60, 200
 
 def main():
     repo = os.environ.get("YOS_REPO_ROOT") or os.getcwd()
-    yos = os.path.join(repo, "build-linux", "src", "yos", "yos")
+    build_dir = os.environ.get("YOS_BUILD_DIR") or "build-linux"
+    yos = os.path.join(repo, build_dir, "src", "yos", "yos")
     nvim = os.path.join(repo, "build-linux", "wasm-pkgs", "nvim-0.10.4",
                         "out", "bin", "nvim.wasm")
     if not os.path.exists(yos) or not os.path.exists(nvim):

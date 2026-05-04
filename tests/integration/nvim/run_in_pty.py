@@ -29,7 +29,15 @@ import time
 import signal
 
 
-def run_in_pty(argv, rows=24, cols=80, driver=None, kill_after=2.0, env=None):
+def run_in_pty(argv, rows=24, cols=80, driver=None, kill_after=2.0,
+               env=None, setup=None):
+    """Run argv in a pty.
+
+    setup: optional callable(fd) invoked AFTER the child is forked and
+    AFTER the window size is set, BEFORE any driver entries fire. Use
+    it to put the pty into raw mode (cfmakeraw) for tests that send
+    single bytes and don't want the kernel's cooked-mode line buffering.
+    """
     if driver is None:
         driver = [(3.0, b"")]
     pid, fd = pty.fork()
@@ -43,6 +51,8 @@ def run_in_pty(argv, rows=24, cols=80, driver=None, kill_after=2.0, env=None):
             os.write(2, f"exec failed: {e}\n".encode())
             os._exit(127)
     fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
+    if setup is not None:
+        setup(fd)
     buf = bytearray()
     for wait, payload in driver:
         end = time.time() + wait

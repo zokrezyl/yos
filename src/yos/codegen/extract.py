@@ -359,11 +359,46 @@ def extract(inputs: ExtractInputs) -> dict:
         constants: dict[str, dict] = {}
         enums:     list[dict]      = []
 
+        # darwin SDK ships headers we never want to bridge — kernel
+        # internals (`sys/dtrace*`, `sys/kern_*`, `kern/*`), Mach IPC,
+        # IOKit, dyld internals. They satisfy `--restrict-to sys/`
+        # but their decls aren't libc and including them in the
+        # bridge fails (they need `kern/kalloc.h` etc.). Drop here.
+        darwin_skip_prefixes = (
+            'sys/dtrace', 'sys/kern_', 'sys/_sigtramp_',
+            'kern/', 'mach/', 'IOKit/', 'dyld/', 'xpc/',
+            'objc/',
+            # darwin's <netinet6/in6.h> errors out on direct inclusion
+            # (#error "do not include netinet6/in6.h directly"); decls
+            # we'd want come transitively through netinet/in.h anyway.
+            'netinet6/',
+        )
+        # Functions that exist as decls in darwin SDK headers but
+        # whose symbols aren't actually exported by libSystem (or
+        # exist only as deprecation tombstones with absurdly long
+        # names like `getdirentries_is_not_available_when_…`). The
+        # bridge would compile but the host yos binary fails to link.
+        darwin_skip_function_names = {
+            'acl_valid_link_np',
+            # Apple aliases getdirentries to a long deprecation tombstone
+            # symbol via `__asm("_getdirentries_is_not_available…")` when
+            # 64-bit inodes is in effect (the modern default). Calling
+            # `getdirentries(...)` looks fine at compile time but fails
+            # to link. The replacement on darwin is `getdirentries$INODE64`
+            # (which doesn't exist) or `readdir`. Just drop the bridge
+            # — guests that need it should fall through to libc-pure.wasm.
+            'getdirentries',
+            'profil',
+            'unwhiteout',
+        }
+
         for cur in tu.cursor.walk_preorder():
             if cur.location is None or cur.location.file is None:
                 continue
             src_tag = _short_header(str(cur.location.file), inputs.root_markers)
             if not src_tag:
+                continue
+            if any(src_tag.startswith(p) for p in darwin_skip_prefixes):
                 continue
 
             k = cur.kind
@@ -373,6 +408,8 @@ def extract(inputs: ExtractInputs) -> dict:
                     # storage_class: 0=NONE, 2=EXTERN.
                     continue
                 if cur.spelling in functions:
+                    continue
+                if cur.spelling in darwin_skip_function_names:
                     continue
                 args_out = []
                 for a in cur.get_arguments():
@@ -455,6 +492,11 @@ def main() -> int:
                    help='label for this extraction, e.g. "guest-i386-freebsd" or "host"')
     p.add_argument('--include-dir', action='append', default=[],
                    help='one or more sysroot include dirs (passed as -isystem to clang)')
+    p.add_argument('--include-root', action='append', default=[],
+                   help='auto-discover NN-* subdirs (host-libc/snapshot.py output) '
+                        'inside this dir and add each as an include path. Repeatable. '
+                        'Lets the meson rule stay portable across hosts where the '
+                        'snapshot dir basenames differ.')
     p.add_argument('--no-stdinc', action='store_true',
                    help='pass -nostdinc (use ONLY the --include-dirs given). '
                         'For freestanding-sysroot extraction.')
@@ -480,6 +522,25 @@ def main() -> int:
     args = p.parse_args()
 
     include_dirs = [Path(d) for d in args.include_dir]
+    # Walk each --include-root and pick up NN-* subdirs in numeric order.
+    # Ignores Frameworks/ entries (darwin) — those are -F not -I.
+    # Also seeds --root-marker with each subdir's basename so the
+    # source-header labels emitted by extract are stable cross-host
+    # (e.g. `string.h`, not `09-include/string.h`).
+    import re
+    for root in args.include_root:
+        root_p = Path(root)
+        if not root_p.is_dir():
+            continue
+        subs = sorted(p for p in root_p.iterdir()
+                      if p.is_dir() and re.match(r'^\d+-', p.name)
+                      and 'Frameworks' not in p.name)
+        include_dirs.extend(subs)
+        # Prepend (more specific) so they match before the generic
+        # `include/` marker the meson rule already passes — otherwise
+        # `find('include/')` wins and the suffix is `NN-include/x.h`.
+        for sub in subs:
+            args.root_marker.insert(0, sub.name + '/')
     cflags = ['-fsyntax-only']
     if args.no_stdinc:
         cflags.append('-nostdinc')

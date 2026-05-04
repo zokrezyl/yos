@@ -1,6 +1,8 @@
 #define _GNU_SOURCE
+#define _DARWIN_C_SOURCE  /* darwin libc gates mknodat/etc. behind this */
 #include "yos/types.h"
 #include "yos/ydebug.h"
+#include "platform.h"
 #include "impl/errno_helpers.h"
 #include "vfs/mount.h"
 #include "vfs/file.h"
@@ -16,8 +18,10 @@
 #include <sys/stat.h>
 #include <sys/uio.h>
 #include <sys/syscall.h>
-#include <linux/stat.h>  /* for struct statx */
-#include <linux/time_types.h> /* struct __kernel_timespec */
+#ifdef __linux__
+#  include <linux/stat.h>  /* for struct statx */
+#  include <linux/time_types.h> /* struct __kernel_timespec */
+#endif
 #include <sys/ioctl.h>
 #include <dirent.h>
 #include <stdio.h>
@@ -149,7 +153,7 @@ int32_t yos_read(struct yos_exec_ctx *ctx, int32_t fd, uint32_t buf, uint32_t co
     if (hfd < 0) return hfd;
     ssize_t r = read(hfd, p, count);
     if (ydebug_enabled()) {
-        pid_t tid = (pid_t)syscall(SYS_gettid);
+        pid_t tid = yos_plat_gettid();
         ydebug("read(tid=%d wfd=%d hfd=%d count=%u) = %zd%s%.*s%s\n",
                (int)tid, fd, hfd, count, r,
                r > 0 ? " head=\"" : "",
@@ -174,7 +178,7 @@ int32_t yos_write(struct yos_exec_ctx *ctx, int32_t fd, uint32_t buf, uint32_t c
     }
     ssize_t r = write(hfd, p, count);
     if (ydebug_enabled() && fd != 4 && fd != 5) {
-        pid_t tid = (pid_t)syscall(SYS_gettid);
+        pid_t tid = yos_plat_gettid();
         ydebug("write(tid=%d wfd=%d hfd=%d count=%u) = %zd%s%.*s%s\n",
                (int)tid, fd, hfd, count, r,
                r > 0 ? " head=\"" : "",
@@ -415,6 +419,16 @@ int32_t yos_pipe(struct yos_exec_ctx *ctx, uint32_t fildes)
 
 static uint32_t ioctl_cmd_fb_to_lx(uint32_t cmd)
 {
+#if defined(__APPLE__) || defined(__FreeBSD__)
+    /* darwin and FreeBSD share the BSD-style ioctl encoding (e.g.
+     * `_IOR/_IOW` macros) — the FB_* values above match the host
+     * symbols verbatim, so NO translation is needed. Returning the
+     * Linux value here would feed the kernel an unrecognised request
+     * (e.g. ioctl(0, FIONBIO, ...) → 0x5421 → ENOTTY), which is what
+     * broke uv_pipe_open(stdin) and prevented the TUI from ever
+     * registering its read watcher. */
+    return cmd;
+#else
     switch (cmd) {
     case FB_TIOCGWINSZ: return LX_TIOCGWINSZ;
     case FB_TIOCSWINSZ: return LX_TIOCSWINSZ;
@@ -429,6 +443,7 @@ static uint32_t ioctl_cmd_fb_to_lx(uint32_t cmd)
     case FB_FIOASYNC:   return LX_FIOASYNC;
     default:            return cmd;  /* pass through, may still fail */
     }
+#endif
 }
 
 int32_t yos_ioctl(struct yos_exec_ctx *ctx, int32_t fd, uint32_t cmd, uint32_t arg)
@@ -581,24 +596,42 @@ static int fcntl_cmd_fb_to_lx(int cmd)
 #define LX_O_CLOEXEC    0x00080000
 
 int oflags_fb_to_lx_fwd(int);  /* exported for impl/posix.c */
+/* Host-native O_* values via the system header. On darwin most flags
+ * collide with the FreeBSD bit pattern (both are BSD lineage), but
+ * a few don't: darwin O_CLOEXEC=0x01000000 vs FreeBSD's 0x00100000,
+ * and darwin doesn't define O_DIRECT or O_PATH at all. Use the
+ * system macro where available, else 0 (drop the flag). */
+#ifndef O_DIRECT
+#define O_DIRECT 0
+#endif
+#ifndef O_PATH
+#define O_PATH 0
+#endif
+#ifndef O_NOFOLLOW
+#define O_NOFOLLOW 0
+#endif
+#ifndef O_DIRECTORY
+#define O_DIRECTORY 0
+#endif
+
 static int oflags_fb_to_lx(int f)
 {
     int r = (f & 3);
-    if (f & FB_O_NONBLOCK)   r |= LX_O_NONBLOCK;
-    if (f & FB_O_APPEND)     r |= LX_O_APPEND;
-    if (f & FB_O_ASYNC)      r |= LX_O_ASYNC;
-    if (f & FB_O_SYNC)       r |= LX_O_SYNC;
-    if (f & FB_O_NOFOLLOW)   r |= LX_O_NOFOLLOW;
-    if (f & FB_O_CREAT)      r |= LX_O_CREAT;
-    if (f & FB_O_TRUNC)      r |= LX_O_TRUNC;
-    if (f & FB_O_EXCL)       r |= LX_O_EXCL;
-    if (f & FB_O_NOCTTY)     r |= LX_O_NOCTTY;
-    if (f & FB_O_DIRECT)     r |= LX_O_DIRECT;
-    if (f & FB_O_DIRECTORY)  r |= LX_O_DIRECTORY;
-    if (f & FB_O_EXEC)       r |= LX_O_PATH;     /* closest match */
-    if (f & FB_O_CLOEXEC)    r |= LX_O_CLOEXEC;
-    if (f & FB_O_PATH)       r |= LX_O_PATH;
-    /* SHLOCK/EXLOCK/TTY_INIT have no Linux equivalent — drop. */
+    if (f & FB_O_NONBLOCK)   r |= O_NONBLOCK;
+    if (f & FB_O_APPEND)     r |= O_APPEND;
+    if (f & FB_O_ASYNC)      r |= O_ASYNC;
+    if (f & FB_O_SYNC)       r |= O_SYNC;
+    if (f & FB_O_NOFOLLOW)   r |= O_NOFOLLOW;
+    if (f & FB_O_CREAT)      r |= O_CREAT;
+    if (f & FB_O_TRUNC)      r |= O_TRUNC;
+    if (f & FB_O_EXCL)       r |= O_EXCL;
+    if (f & FB_O_NOCTTY)     r |= O_NOCTTY;
+    if (f & FB_O_DIRECT)     r |= O_DIRECT;
+    if (f & FB_O_DIRECTORY)  r |= O_DIRECTORY;
+    if (f & FB_O_EXEC)       r |= O_PATH;     /* closest match */
+    if (f & FB_O_CLOEXEC)    r |= O_CLOEXEC;
+    if (f & FB_O_PATH)       r |= O_PATH;
+    /* SHLOCK/EXLOCK/TTY_INIT have no portable equivalent — drop. */
     return r;
 }
 
@@ -607,19 +640,19 @@ int oflags_fb_to_lx_fwd(int f) { return oflags_fb_to_lx(f); }
 static int oflags_lx_to_fb(int f)
 {
     int r = (f & 3);
-    if (f & LX_O_NONBLOCK)   r |= FB_O_NONBLOCK;
-    if (f & LX_O_APPEND)     r |= FB_O_APPEND;
-    if (f & LX_O_ASYNC)      r |= FB_O_ASYNC;
-    if (f & LX_O_SYNC)       r |= FB_O_SYNC;
-    if (f & LX_O_NOFOLLOW)   r |= FB_O_NOFOLLOW;
-    if (f & LX_O_CREAT)      r |= FB_O_CREAT;
-    if (f & LX_O_TRUNC)      r |= FB_O_TRUNC;
-    if (f & LX_O_EXCL)       r |= FB_O_EXCL;
-    if (f & LX_O_NOCTTY)     r |= FB_O_NOCTTY;
-    if (f & LX_O_DIRECT)     r |= FB_O_DIRECT;
-    if (f & LX_O_DIRECTORY)  r |= FB_O_DIRECTORY;
-    if (f & LX_O_CLOEXEC)    r |= FB_O_CLOEXEC;
-    if (f & LX_O_PATH)       r |= FB_O_PATH;
+    if (f & O_NONBLOCK)             r |= FB_O_NONBLOCK;
+    if (f & O_APPEND)               r |= FB_O_APPEND;
+    if (f & O_ASYNC)                r |= FB_O_ASYNC;
+    if (f & O_SYNC)                 r |= FB_O_SYNC;
+    if (O_NOFOLLOW  && (f & O_NOFOLLOW))   r |= FB_O_NOFOLLOW;
+    if (f & O_CREAT)                r |= FB_O_CREAT;
+    if (f & O_TRUNC)                r |= FB_O_TRUNC;
+    if (f & O_EXCL)                 r |= FB_O_EXCL;
+    if (f & O_NOCTTY)               r |= FB_O_NOCTTY;
+    if (O_DIRECT    && (f & O_DIRECT))     r |= FB_O_DIRECT;
+    if (O_DIRECTORY && (f & O_DIRECTORY))  r |= FB_O_DIRECTORY;
+    if (f & O_CLOEXEC)              r |= FB_O_CLOEXEC;
+    if (O_PATH      && (f & O_PATH))       r |= FB_O_PATH;
     return r;
 }
 
@@ -774,7 +807,7 @@ int32_t yos_writev(struct yos_exec_ctx *ctx, int32_t fd, uint32_t vec, int32_t v
     if (ydebug_enabled()) {
         size_t total = 0;
         for (int i = 0; i < vlen; i++) total += host_iov[i].iov_len;
-        pid_t tid = (pid_t)syscall(SYS_gettid);
+        pid_t tid = yos_plat_gettid();
         ydebug("writev(tid=%d wfd=%d hfd=%d vlen=%d total=%zu) = %zd%s\n",
                (int)tid, fd, hfd, vlen, total, n,
                n < 0 ? strerror(errno) : "");
@@ -1030,6 +1063,7 @@ int32_t yos_pipe2(struct yos_exec_ctx *ctx, uint32_t fildes, int32_t flags)
     int *p = wptr(ctx, fildes);
     if (!p) return -EFAULT;
     int hfds[2];
+#ifdef __linux__
     /* FreeBSD vs Linux flag remap. FreeBSD: O_CLOEXEC=0x00100000,
      * O_NONBLOCK=0x00000004. Linux: O_CLOEXEC=0x00080000,
      * O_NONBLOCK=0x00000800. Translate before calling host pipe2. */
@@ -1047,14 +1081,32 @@ int32_t yos_pipe2(struct yos_exec_ctx *ctx, uint32_t fildes, int32_t flags)
                flags, hflags, strerror(errno));
         return -errno;
     }
+#else
+    /* darwin / freebsd-host: no pipe2; fall back to pipe() + fcntl
+     * for the CLOEXEC and NONBLOCK bits we care about. The remaining
+     * flag bits the guest passes that aren't C/N — silently ignored
+     * (libuv only exercises these two). */
+    if (pipe(hfds) < 0) return -errno;
+    int want_cloexec  = !!(flags & 0x00100000);
+    int want_nonblock = !!(flags & 0x00000004);
+    for (int i = 0; i < 2; i++) {
+        if (want_cloexec) {
+            int fl = fcntl(hfds[i], F_GETFD);
+            if (fl >= 0) fcntl(hfds[i], F_SETFD, fl | FD_CLOEXEC);
+        }
+        if (want_nonblock) {
+            int fl = fcntl(hfds[i], F_GETFL);
+            if (fl >= 0) fcntl(hfds[i], F_SETFL, fl | O_NONBLOCK);
+        }
+    }
+#endif
     int32_t r = yos_fd_alloc(ctx, hfds[0]);
     if (r < 0) { close(hfds[1]); return r; }
     int32_t w = yos_fd_alloc(ctx, hfds[1]);
     if (w < 0) { yos_fd_close(ctx, r); return w; }
     p[0] = r;
     p[1] = w;
-    ydebug("yos_pipe2(flags=0x%x->0x%x) -> wfd[%d, %d]\n",
-           flags, hflags, r, w);
+    ydebug("yos_pipe2(flags=0x%x) -> wfd[%d, %d]\n", flags, r, w);
     return 0;
 }
 
@@ -1066,7 +1118,27 @@ int32_t yos_vfs_socketpair(struct yos_exec_ctx *ctx, int32_t domain,
     int *p = wptr(ctx, sv);
     if (!p) return -EFAULT;
     int hfds[2];
-    if (socketpair(domain, type, protocol, hfds) < 0) return -errno;
+
+    /* FreeBSD encodes SOCK_NONBLOCK / SOCK_CLOEXEC in the high bits of
+     * `type` (0x20000000 / 0x10000000); Linux uses different values
+     * (0x800 / 0x80000); darwin doesn't accept them at all and the
+     * call EINVALs / silently masks them. Strip those bits before
+     * the host call and apply via fcntl afterwards on every host
+     * that doesn't natively handle them. */
+    int want_nonblock = !!(type & 0x20000000);  /* FreeBSD SOCK_NONBLOCK */
+    int want_cloexec  = !!(type & 0x10000000);  /* FreeBSD SOCK_CLOEXEC */
+    int htype = type & ~0x30000000;
+    if (socketpair(domain, htype, protocol, hfds) < 0) return -errno;
+    for (int i = 0; i < 2; i++) {
+        if (want_nonblock) {
+            int fl = fcntl(hfds[i], F_GETFL);
+            if (fl >= 0) fcntl(hfds[i], F_SETFL, fl | O_NONBLOCK);
+        }
+        if (want_cloexec) {
+            int fl = fcntl(hfds[i], F_GETFD);
+            if (fl >= 0) fcntl(hfds[i], F_SETFD, fl | FD_CLOEXEC);
+        }
+    }
     int32_t a = yos_fd_alloc(ctx, hfds[0]);
     if (a < 0) { close(hfds[1]); return a; }
     int32_t b = yos_fd_alloc(ctx, hfds[1]);
@@ -1100,6 +1172,7 @@ int32_t yos_pwritev(struct yos_exec_ctx *ctx, int32_t fd, uint32_t vec, int32_t 
     return n < 0 ? -errno : (int32_t)n;
 }
 
+#ifdef __linux__
 /* preadv2/pwritev2 add a `flags` arg (RWF_HIPRI / RWF_DSYNC / RWF_SYNC etc.)
  * — passed straight through to the kernel. */
 int32_t yos_vfs_preadv2(struct yos_exec_ctx *ctx, int32_t fd, uint32_t vec,
@@ -1248,7 +1321,26 @@ int32_t yos_vfs_getdents64(struct yos_exec_ctx *ctx, int32_t fd, uint32_t dirent
     long r = syscall(SYS_getdents64, hfd, p, count);
     return r < 0 ? -errno : (int32_t)r;
 }
+#else /* !__linux__ */
+int32_t yos_vfs_preadv2(struct yos_exec_ctx *ctx, int32_t fd, uint32_t vec, int32_t vlen, uint32_t pos_l, uint32_t pos_h, int32_t flags)
+{ (void)ctx;(void)fd;(void)vec;(void)vlen;(void)pos_l;(void)pos_h;(void)flags; return -ENOSYS; }
+int32_t yos_vfs_pwritev2(struct yos_exec_ctx *ctx, int32_t fd, uint32_t vec, int32_t vlen, uint32_t pos_l, uint32_t pos_h, int32_t flags)
+{ (void)ctx;(void)fd;(void)vec;(void)vlen;(void)pos_l;(void)pos_h;(void)flags; return -ENOSYS; }
+int32_t yos_vfs_vmsplice(struct yos_exec_ctx *ctx, int32_t fd, uint32_t vec, uint32_t vlen, uint32_t flags)
+{ (void)ctx;(void)fd;(void)vec;(void)vlen;(void)flags; return -ENOSYS; }
+int32_t yos_vfs_process_madvise(struct yos_exec_ctx *ctx, int32_t pidfd, uint32_t vec, uint32_t vlen, int32_t behavior, uint32_t flags)
+{ (void)ctx;(void)pidfd;(void)vec;(void)vlen;(void)behavior;(void)flags; return -ENOSYS; }
+int32_t yos_vfs_process_vm_readv(struct yos_exec_ctx *ctx, int32_t pid, uint32_t lvec, uint32_t liovcnt, uint32_t rvec, uint32_t riovcnt, uint32_t flags)
+{ (void)ctx;(void)pid;(void)lvec;(void)liovcnt;(void)rvec;(void)riovcnt;(void)flags; return -ENOSYS; }
+int32_t yos_vfs_process_vm_writev(struct yos_exec_ctx *ctx, int32_t pid, uint32_t lvec, uint32_t liovcnt, uint32_t rvec, uint32_t riovcnt, uint32_t flags)
+{ (void)ctx;(void)pid;(void)lvec;(void)liovcnt;(void)rvec;(void)riovcnt;(void)flags; return -ENOSYS; }
+int32_t yos_vfs_getdents(struct yos_exec_ctx *ctx, int32_t fd, uint32_t dirent, uint32_t count)
+{ (void)ctx;(void)fd;(void)dirent;(void)count; return -ENOSYS; }
+int32_t yos_vfs_getdents64(struct yos_exec_ctx *ctx, int32_t fd, uint32_t dirent, uint32_t count)
+{ (void)ctx;(void)fd;(void)dirent;(void)count; return -ENOSYS; }
+#endif /* __linux__ */
 
+#ifdef __linux__
 /*
  * statx - extended stat with mount table support
  * Kernel ABI constants for mode bits
@@ -1329,7 +1421,9 @@ int32_t yos_vfs_statx(struct yos_exec_ctx *ctx, int32_t dfd, uint32_t pathname,
  * scratch off_t, and write back with overflow detection.
  * ========================================================================= */
 
-#include <sys/sendfile.h>
+#ifdef __linux__
+#  include <sys/sendfile.h>
+#endif
 
 int32_t yos_vfs_sendfile(struct yos_exec_ctx *ctx, int32_t out_fd, int32_t in_fd, uint32_t offset_ptr, uint32_t count)
 {
@@ -1796,3 +1890,49 @@ int32_t yos_vfs_futex(struct yos_exec_ctx *ctx, uint32_t uaddr, int32_t op, int3
                      uaddr2_p, (long)val3);
     return r < 0 ? -errno : (int32_t)r;
 }
+#else /* !__linux__ — darwin/windows stubs for the Linux-only chunk above */
+#define _STUB_RET(args) do { args; return -ENOSYS; } while (0)
+int32_t yos_vfs_statx(struct yos_exec_ctx *ctx, int32_t dfd, uint32_t pathname, int32_t flags, uint32_t mask, uint32_t buffer)
+{ (void)ctx;(void)dfd;(void)pathname;(void)flags;(void)mask;(void)buffer; return -ENOSYS; }
+int32_t yos_vfs_sendfile(struct yos_exec_ctx *ctx, int32_t out_fd, int32_t in_fd, uint32_t offset_ptr, uint32_t count)
+{ (void)ctx;(void)out_fd;(void)in_fd;(void)offset_ptr;(void)count; return -ENOSYS; }
+int32_t yos_vfs_sendfile64(struct yos_exec_ctx *ctx, int32_t out_fd, int32_t in_fd, uint32_t offset_ptr, uint32_t count)
+{ (void)ctx;(void)out_fd;(void)in_fd;(void)offset_ptr;(void)count; return -ENOSYS; }
+int32_t yos_vfs_timer_create(struct yos_exec_ctx *ctx, int32_t clockid, uint32_t sevp, uint32_t timerid_out)
+{ (void)ctx;(void)clockid;(void)sevp;(void)timerid_out; return -ENOSYS; }
+int32_t yos_vfs_timer_settime(struct yos_exec_ctx *ctx, int32_t timerid, int32_t flags, uint32_t new_value, uint32_t old_value)
+{ (void)ctx;(void)timerid;(void)flags;(void)new_value;(void)old_value; return -ENOSYS; }
+int32_t yos_vfs_timer_settime64(struct yos_exec_ctx *ctx, int32_t timerid, int32_t flags, uint32_t new_value, uint32_t old_value)
+{ (void)ctx;(void)timerid;(void)flags;(void)new_value;(void)old_value; return -ENOSYS; }
+int32_t yos_vfs_timer_gettime(struct yos_exec_ctx *ctx, int32_t timerid, uint32_t cur_value)
+{ (void)ctx;(void)timerid;(void)cur_value; return -ENOSYS; }
+int32_t yos_vfs_timer_gettime64(struct yos_exec_ctx *ctx, int32_t timerid, uint32_t cur_value)
+{ (void)ctx;(void)timerid;(void)cur_value; return -ENOSYS; }
+int32_t yos_vfs_timer_delete(struct yos_exec_ctx *ctx, int32_t timerid)
+{ (void)ctx;(void)timerid; return -ENOSYS; }
+int32_t yos_vfs_timer_getoverrun(struct yos_exec_ctx *ctx, int32_t timerid)
+{ (void)ctx;(void)timerid; return -ENOSYS; }
+int32_t yos_vfs_set_mempolicy(struct yos_exec_ctx *ctx, int32_t mode, uint32_t nmask, uint32_t maxnode)
+{ (void)ctx;(void)mode;(void)nmask;(void)maxnode; return -ENOSYS; }
+int32_t yos_vfs_get_mempolicy(struct yos_exec_ctx *ctx, uint32_t mode, uint32_t nmask, uint32_t maxnode, uint32_t addr, uint32_t flags)
+{ (void)ctx;(void)mode;(void)nmask;(void)maxnode;(void)addr;(void)flags; return -ENOSYS; }
+int32_t yos_vfs_mbind(struct yos_exec_ctx *ctx, uint32_t start, uint32_t len, int32_t mode, uint32_t nmask, uint32_t maxnode, uint32_t flags)
+{ (void)ctx;(void)start;(void)len;(void)mode;(void)nmask;(void)maxnode;(void)flags; return -ENOSYS; }
+int32_t yos_vfs_migrate_pages(struct yos_exec_ctx *ctx, int32_t pid, uint32_t maxnode, uint32_t old_nodes, uint32_t new_nodes)
+{ (void)ctx;(void)pid;(void)maxnode;(void)old_nodes;(void)new_nodes; return -ENOSYS; }
+int32_t yos_vfs_execveat(struct yos_exec_ctx *ctx, int32_t dirfd, uint32_t pathname, uint32_t argv, uint32_t envp, int32_t flags)
+{ (void)ctx;(void)dirfd;(void)pathname;(void)argv;(void)envp;(void)flags; return -ENOSYS; }
+int32_t yos_vfs_get_robust_list(struct yos_exec_ctx *ctx, int32_t pid, uint32_t head_ptr, uint32_t len_ptr)
+{ (void)ctx;(void)pid;(void)head_ptr;(void)len_ptr; return -ENOSYS; }
+int32_t yos_vfs_io_setup(struct yos_exec_ctx *ctx, uint32_t nr_events, uint32_t ctx_idp)
+{ (void)ctx;(void)nr_events;(void)ctx_idp; return -ENOSYS; }
+int32_t yos_vfs_io_destroy(struct yos_exec_ctx *ctx, uint32_t ctx_id)
+{ (void)ctx;(void)ctx_id; return -ENOSYS; }
+int32_t yos_vfs_io_submit(struct yos_exec_ctx *ctx, uint32_t ctx_id, int32_t nr, uint32_t iocbpp)
+{ (void)ctx;(void)ctx_id;(void)nr;(void)iocbpp; return -ENOSYS; }
+int32_t yos_vfs_io_cancel(struct yos_exec_ctx *ctx, uint32_t ctx_id, uint32_t iocb_addr, uint32_t result)
+{ (void)ctx;(void)ctx_id;(void)iocb_addr;(void)result; return -ENOSYS; }
+int32_t yos_vfs_futex(struct yos_exec_ctx *ctx, uint32_t uaddr, int32_t op, int32_t val, uint32_t utime, uint32_t uaddr2, int32_t val3)
+{ (void)ctx;(void)uaddr;(void)op;(void)val;(void)utime;(void)uaddr2;(void)val3; return -ENOSYS; }
+#undef _STUB_RET
+#endif /* __linux__ */

@@ -7,6 +7,25 @@
 
 #include <stdint.h>
 
+/* See host64_structs.h for why we hide these darwin libc field-name
+ * macros while declaring our Linux-shape mirror structs. */
+#ifdef __APPLE__
+#  pragma push_macro("st_atime")
+#  pragma push_macro("st_mtime")
+#  pragma push_macro("st_ctime")
+#  pragma push_macro("st_birthtime")
+#  pragma push_macro("sa_handler")
+#  pragma push_macro("sa_sigaction")
+#  pragma push_macro("__unused")
+#  undef st_atime
+#  undef st_mtime
+#  undef st_ctime
+#  undef st_birthtime
+#  undef sa_handler
+#  undef sa_sigaction
+#  undef __unused
+#endif
+
 /* COFF_AOUTHDR: 28 bytes, align 1 */
 struct wasm32_COFF_AOUTHDR {
     uint8_t magic[2];
@@ -23366,5 +23385,15 @@ struct wasm32_sockaddr_pppol2tpv3 {
     uint32_t sa_protocol;
     struct wasm32_pppol2tpv3_addr pppol2tp;
 };
+
+#ifdef __APPLE__
+#  pragma pop_macro("__unused")
+#  pragma pop_macro("sa_sigaction")
+#  pragma pop_macro("sa_handler")
+#  pragma pop_macro("st_birthtime")
+#  pragma pop_macro("st_ctime")
+#  pragma pop_macro("st_mtime")
+#  pragma pop_macro("st_atime")
+#endif
 
 #endif // YOS_WASM32_STRUCTS_H

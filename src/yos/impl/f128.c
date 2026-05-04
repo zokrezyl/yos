@@ -22,6 +22,15 @@
 #include "m3_api_defs.h"
 #include "impl/pthread.h"  /* not actually needed but keeps the link surface tidy */
 
+#if !defined(__SIZEOF_FLOAT128__)
+/* Hosts that lack __float128 (darwin x86_64 clang, windows MSVC):
+ * stub yos_f128_link so the build links. Any guest that actually uses
+ * long-double arithmetic will trap at runtime on the missing import,
+ * which is preferable to silent precision loss. */
+void yos_f128_link (IM3Module mod);
+void yos_f128_link (IM3Module mod) { (void)mod; }
+#else
+
 typedef __float128 f128;
 typedef double     f64;
 typedef float      f32;
@@ -296,3 +305,5 @@ void yos_f128_link (IM3Module mod)
 }
 
 #undef LINK
+
+#endif /* __SIZEOF_FLOAT128__ */

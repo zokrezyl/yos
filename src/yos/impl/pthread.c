@@ -391,11 +391,15 @@ yos_clone_thread (yos_pthread_host *h,
     if (tls) ht->tls_arena = tls;
 
     /* Cap host pthread stack — default 8 MB × 128 threads would burn a
-     * gigabyte of VM with most unused (the wasm interpreter loop is
-     * small). 256 KB is plenty. */
+     * gigabyte of VM with most unused. 1 MB is comfortable for wasm3's
+     * opcode-dispatch chain plus libc bridge frames; the original
+     * 256 KB was too tight on darwin once macOS' default 16 KB pages
+     * and debug-build wasm3 (no sibling-call elim) were in play, and
+     * an nvim run blew the guard page in op_SetSlot_i32's `call *%rax`
+     * to the next opcode handler. */
     pthread_attr_t attr;
     pthread_attr_init        (&attr);
-    pthread_attr_setstacksize (&attr, 256 * 1024);
+    pthread_attr_setstacksize (&attr, 1024 * 1024);
 
     int rc = pthread_create (&ht->os_tid, &attr, worker_main, ht);
     pthread_attr_destroy    (&attr);

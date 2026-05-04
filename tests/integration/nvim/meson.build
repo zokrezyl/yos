@@ -20,11 +20,21 @@ nvim_wasm = meson.project_build_root() / 'wasm-pkgs' / 'nvim-0.10.4' \
 
 nvim_int_env = environment()
 nvim_int_env.set('YOS_REPO_ROOT', meson.project_source_root())
+# Tell tests where the host yos binary lives (build dir basename, e.g.
+# build-linux on linux, build-darwin on darwin). Tests join repo +
+# build_dir + "src/yos/yos" — defaults to build-linux for back-compat.
+yos_build_basename = run_command('basename', meson.project_build_root(),
+                                 check : true).stdout().strip()
+nvim_int_env.set('YOS_BUILD_DIR', yos_build_basename)
 
 nvim_int_tests = {
   'quit'         : files('test_quit.py'),
   'winsize'      : files('test_winsize.py'),
   'edit-session' : files('test_edit_session.py'),
+  # Pins the user-reported "no text input" symptom on darwin. Drives
+  # nvim with 'iHELLO<Esc>:q!<CR>' and verifies HELLO appears in the
+  # pty output (proof that input arrived). Currently fails on darwin.
+  'input'        : files('test_input.py'),
 }
 
 foreach name, src : nvim_int_tests

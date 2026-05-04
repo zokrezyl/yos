@@ -85,6 +85,16 @@ if [[ ! -f "$SRC/.extracted" ]]; then
     sed -i 's|fpconv_update_locale();|/* yos wasm32: skip self-test */ (void)0;|' \
         "$SRC/src/cjson/fpconv.c"
 
+    # 4z. Inject the libuv include path directly into the codegen
+    #     (`gen_cflags`) inside src/nvim/CMakeLists.txt. The codegen
+    #     `walks` BUILDSYSTEM_TARGETS in its own directory; libuv is
+    #     IMPORTED in the top-level CMakeLists, so its include never
+    #     reaches the codegen step on a fresh cross build. Append a
+    #     hard `-I${LIBUV_INCLUDE_DIR}` after the BUILDSYSTEM_TARGETS
+    #     loop so every gen_declarations.lua run sees uv.h.
+    sed -i 's|^list(REMOVE_DUPLICATES gen_cflags)|list(APPEND gen_cflags "-I${LIBUV_INCLUDE_DIR}")\nlist(REMOVE_DUPLICATES gen_cflags)|' \
+        "$SRC/src/nvim/CMakeLists.txt"
+
     # 4. Replace FindLibuv.cmake — upstream version runs `check_library_exists`
     #    against the HOST toolchain (glibc), so it appends -ldl -lrt -lkstat
     #    -lkvm -lnsl -lperfstat -lsendfile to LIBUV_LIBRARIES. None of those
@@ -98,10 +108,15 @@ set(LIBUV_LIBRARIES ${LIBUV_LIBRARY})
 include(FindPackageHandleStandardArgs)
 find_package_handle_standard_args(Libuv DEFAULT_MSG LIBUV_LIBRARY LIBUV_INCLUDE_DIR)
 mark_as_advanced(LIBUV_INCLUDE_DIR LIBUV_LIBRARY)
-add_library(libuv UNKNOWN IMPORTED)
+add_library(libuv UNKNOWN IMPORTED GLOBAL)
 set_target_properties(libuv PROPERTIES
     IMPORTED_LOCATION "${LIBUV_LIBRARY}"
     INTERFACE_INCLUDE_DIRECTORIES "${LIBUV_INCLUDE_DIR}")
+# nvim's src/nvim/CMakeLists.txt builds gen_cflags (used to preprocess
+# .c files for header generation) by walking BUILDSYSTEM_TARGETS in
+# its own directory and pulling INTERFACE_INCLUDE_DIRECTORIES. Without
+# the cmake-side stub being GLOBAL the codegen step doesn't see uv.h.
+include_directories("${LIBUV_INCLUDE_DIR}")
 CMAKE
 
     touch "$SRC/.extracted"
