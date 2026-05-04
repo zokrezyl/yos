@@ -1360,7 +1360,7 @@ int main(int argc, char **argv)
     proc->thread = pthread_self();
 
     /* Initialize process info */
-    if (syscall(__NR_getcwd, proc->cwd, sizeof(proc->cwd)) < 0)
+    if (!getcwd(proc->cwd, sizeof(proc->cwd)))
         strcpy(proc->cwd, "/");
     strncpy(proc->exe, argv[1], PATH_MAX - 1);
     const char *slash = strrchr(argv[1], '/');
