@@ -93,7 +93,18 @@ int32_t yos_getsockname(struct yos_exec_ctx *ctx, int32_t wfd,
         ydebug("getsockname host failed: %s\n", strerror(errno));
         return -errno;
     }
+    /* Decode the host family. Linux: sa_family is uint16_t at offset
+     * 0. BSD-lineage hosts (darwin/FreeBSD) put sa_len uint8 at 0,
+     * sa_family uint8 at 1. The wrong decoding gave nvim's
+     * uv_guess_handle ss_family = sa_len (e.g. 16) on darwin instead
+     * of AF_UNIX, classifying the IPC socketpair end as
+     * UV_UNKNOWN_HANDLE — root cause of "ch 1 was closed by the
+     * client" in tmp/nvim-runtime-issues.md. */
+#if defined(__APPLE__) || defined(__FreeBSD__)
+    uint16_t host_fam = (uint16_t)host_buf[1];
+#else
     uint16_t host_fam = (uint16_t)(host_buf[0] | (host_buf[1] << 8));
+#endif
     /* Re-emit FreeBSD shape: sa_len, sa_family[, sa_data...]. */
     uint8_t *w = ctx->memory + addr_off;
     socklen_t out = host_len < cap ? host_len : cap;
@@ -241,32 +252,39 @@ int32_t yos_mkostemps(struct yos_exec_ctx *ctx, uint32_t template_off,
 }
 
 #if defined(__APPLE__)
-/* Hand-rolled cv_stat_h2w for darwin: the auto-generated converter
- * pipeline only emits pairs the codegen could match guest-vs-host
- * field-by-field, and stat differs (FreeBSD vs macOS layout). Copy
- * the fields we expose to the wasm guest into its 72-byte stat. */
+/* Hand-rolled cv_stat_h2w for darwin: matches the FreeBSD i386
+ * sysroot's struct stat layout that nvim/libuv was compiled against
+ * (see build-darwin/sysroot/usr/include/sys/stat.h). The previous
+ * version mirrored a stale 72-byte wasm32_stat (st_mode at offset 8),
+ * which silently broke uv_guess_handle on every SOCK fd in the
+ * embedded nvim server: libuv read st_mode=0 (the byte at the WRONG
+ * offset), S_ISSOCK was false, and the IPC stdin was misclassified
+ * as UV_FILE → never registered on kqueue → the embedded server hit
+ * the "ch 1 was closed by the client" path within ~200 ms. The
+ * auto-generated cv_stat_h2w on Linux already uses the layout below;
+ * keeping the two in sync. */
 #include <sys/stat.h>
 static inline void cv_stat_h2w(uint8_t *w, const struct stat *h)
 {
-    /* wasm32_stat layout (see wasm32_structs.h): 18*u32 = 72 bytes. */
-    *(uint32_t *)(w +  0) = (uint32_t)h->st_dev;
-    *(uint32_t *)(w +  4) = (uint32_t)h->st_ino;
-    *(uint16_t *)(w +  8) = (uint16_t)h->st_mode;
-    *(uint16_t *)(w + 10) = (uint16_t)h->st_nlink;
-    *(uint16_t *)(w + 12) = (uint16_t)h->st_uid;
-    *(uint16_t *)(w + 14) = (uint16_t)h->st_gid;
-    *(uint32_t *)(w + 16) = (uint32_t)h->st_rdev;
-    *(uint32_t *)(w + 20) = (uint32_t)h->st_size;
-    *(uint32_t *)(w + 24) = (uint32_t)h->st_blksize;
-    *(uint32_t *)(w + 28) = (uint32_t)h->st_blocks;
-    *(uint32_t *)(w + 32) = (uint32_t)h->st_atimespec.tv_sec;
-    *(uint32_t *)(w + 36) = (uint32_t)h->st_atimespec.tv_nsec;
-    *(uint32_t *)(w + 40) = (uint32_t)h->st_mtimespec.tv_sec;
-    *(uint32_t *)(w + 44) = (uint32_t)h->st_mtimespec.tv_nsec;
-    *(uint32_t *)(w + 48) = (uint32_t)h->st_ctimespec.tv_sec;
-    *(uint32_t *)(w + 52) = (uint32_t)h->st_ctimespec.tv_nsec;
-    *(uint32_t *)(w + 56) = 0;
-    *(uint32_t *)(w + 60) = 0;
+    /* FreeBSD i386 struct stat (192 bytes used; size with __spare is
+     * 224, but the auto-gen layout stops at 192). */
+    memset(w, 0, 192);
+    *(int64_t *)(w +  0) = (int64_t)h->st_dev;
+    *(int64_t *)(w +  8) = (int64_t)h->st_ino;
+    *(int64_t *)(w + 16) = (int64_t)h->st_nlink;
+    *(int16_t *)(w + 24) = (int16_t)h->st_mode;
+    /* st_bsdflags @26: no host counterpart; left 0 */
+    *(int32_t *)(w + 28) = (int32_t)h->st_uid;
+    *(int32_t *)(w + 32) = (int32_t)h->st_gid;
+    /* st_padding1 @36: 0 */
+    *(int64_t *)(w + 40) = (int64_t)h->st_rdev;
+    /* st_atim/mtim/ctim/birthtim @48..111: leave 0 (nvim's hot path
+     * doesn't read them; the auto-gen converter on Linux also skips). */
+    *(int64_t *)(w + 80) = (int64_t)h->st_size;
+    *(int64_t *)(w + 88) = (int64_t)h->st_blocks;
+    *(int32_t *)(w + 96) = (int32_t)h->st_blksize;
+    *(int32_t *)(w + 100) = (int32_t)h->st_flags;
+    *(int64_t *)(w + 104) = (int64_t)h->st_gen;
 }
 #else
 extern void cv_stat_h2w(uint8_t *w, const struct stat *h);
@@ -443,8 +461,25 @@ int32_t yos_socketpair(struct yos_exec_ctx *ctx, int32_t domain,
 {
     if (sv_off + 8 > ctx->memory_size) return -EFAULT;
     int hfds[2];
+    /* Detect the FreeBSD high-bit flags before they get masked away
+     * by sock_type_fb_to_lx (which on darwin maps both to 0 because
+     * the platform has no SOCK_NONBLOCK/SOCK_CLOEXEC). Apply the
+     * equivalent semantics via fcntl below. tmp/nvim-runtime-issues.md
+     * covers why this matters for libuv's IPC channel. */
+    int want_nonblock = !!(type & 0x20000000);
+    int want_cloexec  = !!(type & 0x10000000);
     if (socketpair(domain, sock_type_fb_to_lx(type), protocol, hfds) < 0)
         return -errno;
+    for (int i = 0; i < 2; i++) {
+        if (want_nonblock) {
+            int fl = fcntl(hfds[i], F_GETFL);
+            if (fl >= 0) fcntl(hfds[i], F_SETFL, fl | O_NONBLOCK);
+        }
+        if (want_cloexec) {
+            int fl = fcntl(hfds[i], F_GETFD);
+            if (fl >= 0) fcntl(hfds[i], F_SETFD, fl | FD_CLOEXEC);
+        }
+    }
     int32_t wa = yos_fd_alloc(ctx, hfds[0]);
     if (wa < 0) { close(hfds[0]); close(hfds[1]); return -EMFILE; }
     int32_t wb = yos_fd_alloc(ctx, hfds[1]);
@@ -616,6 +651,22 @@ static void termios_fb_to_lx(struct termios *h, const uint8_t *w)
     uint32_t ospeed = *(uint32_t *)(w + 40);
 
     memset(h, 0, sizeof *h);
+#if defined(__APPLE__) || defined(__FreeBSD__)
+    /* darwin/FreeBSD host: termios flag bit positions match the
+     * FreeBSD wasm guest verbatim (both BSD lineage). The map_flags
+     * tables convert to LINUX positions, which on darwin would set
+     * the wrong host bits — e.g. nvim's cfmakeraw clears ISIG (0x80
+     * in FreeBSD) but the bridge would write Linux ISIG (0x1) to
+     * the host, leaving darwin's ISIG (0x80) untouched and the pty
+     * stuck in cooked mode. nvim's keystrokes then never reach the
+     * read pipeline. Pass the flag words straight through; only the
+     * c_cc[] index translation still applies because darwin's index
+     * macros (VEOF/VINTR/VMIN/...) name the same numeric positions. */
+    h->c_iflag = iflag;
+    h->c_oflag = oflag;
+    h->c_cflag = cflag;
+    h->c_lflag = lflag;
+#else
     h->c_iflag = map_flags(iflag, iflag_map,
                            sizeof iflag_map/sizeof iflag_map[0], 1);
     h->c_oflag = map_flags(oflag, oflag_map,
@@ -625,6 +676,7 @@ static void termios_fb_to_lx(struct termios *h, const uint8_t *w)
                            sizeof cflag_map/sizeof cflag_map[0], 1);
     h->c_lflag = map_flags(lflag, lflag_map,
                            sizeof lflag_map/sizeof lflag_map[0], 1);
+#endif
     for (int i = 0; i < YOS_FBSD_NCCS; i++) {
         int li = cc_fb_to_lx(i);
         if (li >= 0 && li < NCCS) h->c_cc[li] = cc[i];
@@ -636,6 +688,16 @@ static void termios_fb_to_lx(struct termios *h, const uint8_t *w)
 static void termios_lx_to_fb(uint8_t *w, const struct termios *h)
 {
     memset(w, 0, YOS_FBSD_TERMIOS_SIZE);
+#if defined(__APPLE__) || defined(__FreeBSD__)
+    /* See termios_fb_to_lx: identity passthrough on BSD-lineage
+     * hosts; the bit positions already match the FreeBSD wasm guest's
+     * expectations. Otherwise tcgetattr returns flags that, when
+     * passed back through tcsetattr, get scrambled by the round-trip. */
+    *(uint32_t *)(w +  0) = (uint32_t)h->c_iflag;
+    *(uint32_t *)(w +  4) = (uint32_t)h->c_oflag;
+    *(uint32_t *)(w +  8) = (uint32_t)h->c_cflag;
+    *(uint32_t *)(w + 12) = (uint32_t)h->c_lflag;
+#else
     *(uint32_t *)(w +  0) = map_flags(h->c_iflag, iflag_map,
                                       sizeof iflag_map/sizeof iflag_map[0], 0);
     *(uint32_t *)(w +  4) = map_flags(h->c_oflag, oflag_map,
@@ -644,6 +706,7 @@ static void termios_lx_to_fb(uint8_t *w, const struct termios *h)
                                       sizeof cflag_map/sizeof cflag_map[0], 0);
     *(uint32_t *)(w + 12) = map_flags(h->c_lflag, lflag_map,
                                       sizeof lflag_map/sizeof lflag_map[0], 0);
+#endif
     uint8_t *cc = w + 16;
     for (int i = 0; i < YOS_FBSD_NCCS; i++) {
         int li = cc_fb_to_lx(i);

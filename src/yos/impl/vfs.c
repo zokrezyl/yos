@@ -419,6 +419,16 @@ int32_t yos_pipe(struct yos_exec_ctx *ctx, uint32_t fildes)
 
 static uint32_t ioctl_cmd_fb_to_lx(uint32_t cmd)
 {
+#if defined(__APPLE__) || defined(__FreeBSD__)
+    /* darwin and FreeBSD share the BSD-style ioctl encoding (e.g.
+     * `_IOR/_IOW` macros) — the FB_* values above match the host
+     * symbols verbatim, so NO translation is needed. Returning the
+     * Linux value here would feed the kernel an unrecognised request
+     * (e.g. ioctl(0, FIONBIO, ...) → 0x5421 → ENOTTY), which is what
+     * broke uv_pipe_open(stdin) and prevented the TUI from ever
+     * registering its read watcher. */
+    return cmd;
+#else
     switch (cmd) {
     case FB_TIOCGWINSZ: return LX_TIOCGWINSZ;
     case FB_TIOCSWINSZ: return LX_TIOCSWINSZ;
@@ -433,6 +443,7 @@ static uint32_t ioctl_cmd_fb_to_lx(uint32_t cmd)
     case FB_FIOASYNC:   return LX_FIOASYNC;
     default:            return cmd;  /* pass through, may still fail */
     }
+#endif
 }
 
 int32_t yos_ioctl(struct yos_exec_ctx *ctx, int32_t fd, uint32_t cmd, uint32_t arg)
@@ -585,24 +596,42 @@ static int fcntl_cmd_fb_to_lx(int cmd)
 #define LX_O_CLOEXEC    0x00080000
 
 int oflags_fb_to_lx_fwd(int);  /* exported for impl/posix.c */
+/* Host-native O_* values via the system header. On darwin most flags
+ * collide with the FreeBSD bit pattern (both are BSD lineage), but
+ * a few don't: darwin O_CLOEXEC=0x01000000 vs FreeBSD's 0x00100000,
+ * and darwin doesn't define O_DIRECT or O_PATH at all. Use the
+ * system macro where available, else 0 (drop the flag). */
+#ifndef O_DIRECT
+#define O_DIRECT 0
+#endif
+#ifndef O_PATH
+#define O_PATH 0
+#endif
+#ifndef O_NOFOLLOW
+#define O_NOFOLLOW 0
+#endif
+#ifndef O_DIRECTORY
+#define O_DIRECTORY 0
+#endif
+
 static int oflags_fb_to_lx(int f)
 {
     int r = (f & 3);
-    if (f & FB_O_NONBLOCK)   r |= LX_O_NONBLOCK;
-    if (f & FB_O_APPEND)     r |= LX_O_APPEND;
-    if (f & FB_O_ASYNC)      r |= LX_O_ASYNC;
-    if (f & FB_O_SYNC)       r |= LX_O_SYNC;
-    if (f & FB_O_NOFOLLOW)   r |= LX_O_NOFOLLOW;
-    if (f & FB_O_CREAT)      r |= LX_O_CREAT;
-    if (f & FB_O_TRUNC)      r |= LX_O_TRUNC;
-    if (f & FB_O_EXCL)       r |= LX_O_EXCL;
-    if (f & FB_O_NOCTTY)     r |= LX_O_NOCTTY;
-    if (f & FB_O_DIRECT)     r |= LX_O_DIRECT;
-    if (f & FB_O_DIRECTORY)  r |= LX_O_DIRECTORY;
-    if (f & FB_O_EXEC)       r |= LX_O_PATH;     /* closest match */
-    if (f & FB_O_CLOEXEC)    r |= LX_O_CLOEXEC;
-    if (f & FB_O_PATH)       r |= LX_O_PATH;
-    /* SHLOCK/EXLOCK/TTY_INIT have no Linux equivalent — drop. */
+    if (f & FB_O_NONBLOCK)   r |= O_NONBLOCK;
+    if (f & FB_O_APPEND)     r |= O_APPEND;
+    if (f & FB_O_ASYNC)      r |= O_ASYNC;
+    if (f & FB_O_SYNC)       r |= O_SYNC;
+    if (f & FB_O_NOFOLLOW)   r |= O_NOFOLLOW;
+    if (f & FB_O_CREAT)      r |= O_CREAT;
+    if (f & FB_O_TRUNC)      r |= O_TRUNC;
+    if (f & FB_O_EXCL)       r |= O_EXCL;
+    if (f & FB_O_NOCTTY)     r |= O_NOCTTY;
+    if (f & FB_O_DIRECT)     r |= O_DIRECT;
+    if (f & FB_O_DIRECTORY)  r |= O_DIRECTORY;
+    if (f & FB_O_EXEC)       r |= O_PATH;     /* closest match */
+    if (f & FB_O_CLOEXEC)    r |= O_CLOEXEC;
+    if (f & FB_O_PATH)       r |= O_PATH;
+    /* SHLOCK/EXLOCK/TTY_INIT have no portable equivalent — drop. */
     return r;
 }
 
@@ -611,19 +640,19 @@ int oflags_fb_to_lx_fwd(int f) { return oflags_fb_to_lx(f); }
 static int oflags_lx_to_fb(int f)
 {
     int r = (f & 3);
-    if (f & LX_O_NONBLOCK)   r |= FB_O_NONBLOCK;
-    if (f & LX_O_APPEND)     r |= FB_O_APPEND;
-    if (f & LX_O_ASYNC)      r |= FB_O_ASYNC;
-    if (f & LX_O_SYNC)       r |= FB_O_SYNC;
-    if (f & LX_O_NOFOLLOW)   r |= FB_O_NOFOLLOW;
-    if (f & LX_O_CREAT)      r |= FB_O_CREAT;
-    if (f & LX_O_TRUNC)      r |= FB_O_TRUNC;
-    if (f & LX_O_EXCL)       r |= FB_O_EXCL;
-    if (f & LX_O_NOCTTY)     r |= FB_O_NOCTTY;
-    if (f & LX_O_DIRECT)     r |= FB_O_DIRECT;
-    if (f & LX_O_DIRECTORY)  r |= FB_O_DIRECTORY;
-    if (f & LX_O_CLOEXEC)    r |= FB_O_CLOEXEC;
-    if (f & LX_O_PATH)       r |= FB_O_PATH;
+    if (f & O_NONBLOCK)             r |= FB_O_NONBLOCK;
+    if (f & O_APPEND)               r |= FB_O_APPEND;
+    if (f & O_ASYNC)                r |= FB_O_ASYNC;
+    if (f & O_SYNC)                 r |= FB_O_SYNC;
+    if (O_NOFOLLOW  && (f & O_NOFOLLOW))   r |= FB_O_NOFOLLOW;
+    if (f & O_CREAT)                r |= FB_O_CREAT;
+    if (f & O_TRUNC)                r |= FB_O_TRUNC;
+    if (f & O_EXCL)                 r |= FB_O_EXCL;
+    if (f & O_NOCTTY)               r |= FB_O_NOCTTY;
+    if (O_DIRECT    && (f & O_DIRECT))     r |= FB_O_DIRECT;
+    if (O_DIRECTORY && (f & O_DIRECTORY))  r |= FB_O_DIRECTORY;
+    if (f & O_CLOEXEC)              r |= FB_O_CLOEXEC;
+    if (O_PATH      && (f & O_PATH))       r |= FB_O_PATH;
     return r;
 }
 
@@ -1031,10 +1060,10 @@ int32_t yos_dup3(struct yos_exec_ctx *ctx, int32_t oldfd, int32_t newfd, int32_t
 
 int32_t yos_pipe2(struct yos_exec_ctx *ctx, uint32_t fildes, int32_t flags)
 {
-#ifdef __linux__
     int *p = wptr(ctx, fildes);
     if (!p) return -EFAULT;
     int hfds[2];
+#ifdef __linux__
     /* FreeBSD vs Linux flag remap. FreeBSD: O_CLOEXEC=0x00100000,
      * O_NONBLOCK=0x00000004. Linux: O_CLOEXEC=0x00080000,
      * O_NONBLOCK=0x00000800. Translate before calling host pipe2. */
@@ -1052,19 +1081,33 @@ int32_t yos_pipe2(struct yos_exec_ctx *ctx, uint32_t fildes, int32_t flags)
                flags, hflags, strerror(errno));
         return -errno;
     }
+#else
+    /* darwin / freebsd-host: no pipe2; fall back to pipe() + fcntl
+     * for the CLOEXEC and NONBLOCK bits we care about. The remaining
+     * flag bits the guest passes that aren't C/N — silently ignored
+     * (libuv only exercises these two). */
+    if (pipe(hfds) < 0) return -errno;
+    int want_cloexec  = !!(flags & 0x00100000);
+    int want_nonblock = !!(flags & 0x00000004);
+    for (int i = 0; i < 2; i++) {
+        if (want_cloexec) {
+            int fl = fcntl(hfds[i], F_GETFD);
+            if (fl >= 0) fcntl(hfds[i], F_SETFD, fl | FD_CLOEXEC);
+        }
+        if (want_nonblock) {
+            int fl = fcntl(hfds[i], F_GETFL);
+            if (fl >= 0) fcntl(hfds[i], F_SETFL, fl | O_NONBLOCK);
+        }
+    }
+#endif
     int32_t r = yos_fd_alloc(ctx, hfds[0]);
     if (r < 0) { close(hfds[1]); return r; }
     int32_t w = yos_fd_alloc(ctx, hfds[1]);
     if (w < 0) { yos_fd_close(ctx, r); return w; }
     p[0] = r;
     p[1] = w;
-    ydebug("yos_pipe2(flags=0x%x->0x%x) -> wfd[%d, %d]\n",
-           flags, hflags, r, w);
+    ydebug("yos_pipe2(flags=0x%x) -> wfd[%d, %d]\n", flags, r, w);
     return 0;
-#else
-    (void)ctx; (void)fildes; (void)flags;
-    return -ENOSYS;
-#endif
 }
 
 #include <sys/socket.h>
@@ -1075,7 +1118,27 @@ int32_t yos_vfs_socketpair(struct yos_exec_ctx *ctx, int32_t domain,
     int *p = wptr(ctx, sv);
     if (!p) return -EFAULT;
     int hfds[2];
-    if (socketpair(domain, type, protocol, hfds) < 0) return -errno;
+
+    /* FreeBSD encodes SOCK_NONBLOCK / SOCK_CLOEXEC in the high bits of
+     * `type` (0x20000000 / 0x10000000); Linux uses different values
+     * (0x800 / 0x80000); darwin doesn't accept them at all and the
+     * call EINVALs / silently masks them. Strip those bits before
+     * the host call and apply via fcntl afterwards on every host
+     * that doesn't natively handle them. */
+    int want_nonblock = !!(type & 0x20000000);  /* FreeBSD SOCK_NONBLOCK */
+    int want_cloexec  = !!(type & 0x10000000);  /* FreeBSD SOCK_CLOEXEC */
+    int htype = type & ~0x30000000;
+    if (socketpair(domain, htype, protocol, hfds) < 0) return -errno;
+    for (int i = 0; i < 2; i++) {
+        if (want_nonblock) {
+            int fl = fcntl(hfds[i], F_GETFL);
+            if (fl >= 0) fcntl(hfds[i], F_SETFL, fl | O_NONBLOCK);
+        }
+        if (want_cloexec) {
+            int fl = fcntl(hfds[i], F_GETFD);
+            if (fl >= 0) fcntl(hfds[i], F_SETFD, fl | FD_CLOEXEC);
+        }
+    }
     int32_t a = yos_fd_alloc(ctx, hfds[0]);
     if (a < 0) { close(hfds[1]); return a; }
     int32_t b = yos_fd_alloc(ctx, hfds[1]);

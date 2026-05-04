@@ -18,7 +18,12 @@ from run_in_pty import run_in_pty
 
 def main():
     repo = os.environ.get("YOS_REPO_ROOT") or os.getcwd()
-    yos = os.path.join(repo, "build-linux", "src", "yos", "yos")
+    # YOS_BUILD_DIR overrides where the host yos binary lives; defaults
+    # to build-linux for back-compat with the original linux invocation.
+    # The wasm-pkgs path stays under build-linux/ regardless of host —
+    # see tools/wasm-pkg.sh for the rationale.
+    build_dir = os.environ.get("YOS_BUILD_DIR") or "build-linux"
+    yos = os.path.join(repo, build_dir, "src", "yos", "yos")
     nvim = os.path.join(repo, "build-linux", "wasm-pkgs", "nvim-0.10.4",
                         "out", "bin", "nvim.wasm")
     if not os.path.exists(yos):
