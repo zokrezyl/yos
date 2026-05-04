@@ -277,6 +277,14 @@ def _emit_bridge(name: str, gf: dict, hf: dict, gtypes: dict, htypes: dict,
 
     g_args = gf.get('args', [])
     h_args = hf.get('args', [])
+    # Arity skew (darwin vs FreeBSD): when guest declares more args
+    # than host (pthread_setname_np: FreeBSD takes 2, darwin 1; shm_open:
+    # FreeBSD's 3rd arg is fixed, darwin's is variadic) — accept all
+    # guest args at the bridge boundary so the m3w wrapper signature
+    # still matches, then fall back to the TODO stub for the body.
+    arity_skew = len(g_args) != len(h_args)
+    if arity_skew:
+        can_emit = False
     for i, (ga, ha) in enumerate(zip(g_args, h_args)):
         gt = gtypes.get(ga['type_uid']);  ht = htypes.get(ha['type_uid'])
         decl = _bridge_arg_decl(ga.get('name'), i, gt, gtypes)
@@ -298,6 +306,12 @@ def _emit_bridge(name: str, gf: dict, hf: dict, gtypes: dict, htypes: dict,
         call_args.append(tr[1])
         if len(tr) >= 3 and tr[2]:
             post_writebacks.append(tr[2])
+
+    # If guest has more args than host, pad arg_decls with dummies
+    # so the bridge body's signature matches the m3w wrapper that
+    # uses _wasm_sig (computed from gf alone).
+    for i in range(len(arg_decls) - 1, len(g_args)):
+        arg_decls.append(f'uint32_t a{i}')
 
     # Variadic: clang's wasm32 ABI adds an implicit `i32 va_list_ptr`
     # at the end of the call. We accept it as an extra unused parameter
@@ -384,6 +398,24 @@ def _emit_bridge(name: str, gf: dict, hf: dict, gtypes: dict, htypes: dict,
     # narrowing and errno remap.
     call = f'{name}({", ".join(call_args)})'
     if hret == 'void':
+        # Guest may declare a non-void return (e.g. darwin's link_addr
+        # is `void` but FreeBSD's is `int`). The m3w wrapper that calls
+        # us is built from the GUEST signature and assigns *raw_return
+        # = yos_<name>(...), so we must follow the guest's wret here
+        # and emit an `int yos_...{ host_call; return 0; }` shim when
+        # they disagree. Otherwise gcc errors with "operand of type
+        # void where arithmetic or pointer type is required".
+        if wret and wret != 'void':
+            body = (
+                f'{wret} yos_{name}({", ".join(arg_decls)}) {{\n'
+                + ('    (void)ctx;\n')
+                + ('\n'.join(setups) + '\n' if setups else '')
+                + f'    {call};\n'
+                + ('\n'.join(post_writebacks) + '\n' if post_writebacks else '')
+                + f'    return ({wret})0;\n'
+                + f'}}'
+            )
+            return f'{wret} yos_{name}({", ".join(arg_decls)});', body
         body = (
             f'void yos_{name}({", ".join(arg_decls)}) {{\n'
             + ('\n'.join(setups) + '\n' if setups else '')

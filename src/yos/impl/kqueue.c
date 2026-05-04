@@ -37,10 +37,32 @@
 /* This file currently implements the GUEST kqueue surface on top of
  * Linux epoll + signalfd + eventfd. Darwin/Windows ports need a
  * native rewrite (darwin: host kqueue passthrough; windows: IOCP).
- * For now, stub the two public entry points so the host links. */
+ *
+ * Interim stubs — register env.kqueue / env.kevent / env.kqueue1 /
+ * env.kqueuex with bodies that return -ENOSYS so guest libc gets a
+ * clean error instead of "unresolved import" at module load. nvim
+ * happens to call kqueue() from libuv during loop init; without these
+ * stubs the wasm runtime traps before main even gets started. Real
+ * darwin kqueue port (host kqueue passthrough) is the followup. */
 #include "wasm3.h"
+#include "m3_env.h"
+#include <errno.h>
+
+static const void *_yos_kqueue_enosys(IM3Runtime rt, IM3ImportContext _ctx,
+                                      uint64_t *_sp, void *_mem)
+{
+    (void)rt; (void)_ctx; (void)_mem;
+    *(int32_t *)(_sp++) = -ENOSYS;
+    return 0;
+}
 void yos_kqueue_notify_exit(uint32_t pid) { (void)pid; }
-void yos_kqueue_link(IM3Module mod) { (void)mod; }
+void yos_kqueue_link(IM3Module mod) {
+    /* Each kqueue/kevent variant: takes 0..6 i32 args, returns i32. */
+    m3_LinkRawFunction(mod, "env", "kqueue",  "i()",       _yos_kqueue_enosys);
+    m3_LinkRawFunction(mod, "env", "kqueue1", "i(i)",      _yos_kqueue_enosys);
+    m3_LinkRawFunction(mod, "env", "kqueuex", "i(i)",      _yos_kqueue_enosys);
+    m3_LinkRawFunction(mod, "env", "kevent",  "i(iiiiii)", _yos_kqueue_enosys);
+}
 #else
 
 #include <sys/epoll.h>

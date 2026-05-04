@@ -4,7 +4,8 @@
 # The runner script reads the test's `Expected: exit N, stdout contains
 # "..."` header to know what counts as a pass.
 
-wasm_cc  = find_program('clang',    required: true)
+wasm_cc  = find_program(meson.project_source_root() / 'build-tools' / 'wasm-clang',
+                        required: true)
 wasm_opt = find_program('wasm-opt', required: true)  # Binaryen — for asyncify
 
 # Tests run after `yos` is built; meson.test() handles the dep.

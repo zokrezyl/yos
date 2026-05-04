@@ -17,7 +17,12 @@
 # Output: <build>/build-tools/freebsd-libc/libc-pure.wasm
 # yos host runtime locates it via a meson-injected absolute path.
 
-wasm_cc = find_program('clang', required: true)
+# Use repo's `wasm-clang` shim for wasm32 cross-compilation. On Linux
+# it's a thin passthrough; on darwin it strips nix's injected `-arch`/
+# `-mmacos-version-min=...` so wasm-ld doesn't choke. See the script
+# header for the gory details.
+wasm_cc = find_program(meson.project_source_root() / 'build-tools' / 'wasm-clang',
+                       required: true)
 
 # Per-file wasm32 compile flags. -nostdlib because libc-pure.wasm
 # IS our libc — anything it can't resolve locally must be an env

@@ -99,10 +99,11 @@ host_api_yaml = custom_target(
   command          : [
     py, files('extract.py'),
     '--name',         'host',
-    '--include-dir',  '@INPUT@/include/01-include',
-    '--include-dir',  '@INPUT@/include/02-include',
-    '--include-dir',  '@INPUT@/include/03-x86_64-linux-gnu',
-    '--include-dir',  '@INPUT@/include/04-include',
+    # Walk every NN-* subdir the snapshot emitted; basenames differ
+    # by host (linux: 01-include / 02-include / 03-x86_64-linux-gnu / …,
+    # darwin: 01-include … 09-include + 10-Frameworks). The auto-walk
+    # picks up apple-sdk's usr/include where string.h / etc. live.
+    '--include-root', '@INPUT@/include',
     '--root-marker',  '/usr/include/',
     '--root-marker',  '/usr/local/include/',
     '--root-marker',  'include/',
