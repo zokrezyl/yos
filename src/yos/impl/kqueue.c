@@ -33,6 +33,7 @@
 #include <string.h>
 #include <errno.h>
 #include <sys/epoll.h>
+#include <sys/syscall.h>
 #include <signal.h>
 #include <unistd.h>
 
@@ -172,6 +173,14 @@ static m3ApiRawFunction(m3_yos_kevent)
     uint32_t mem_size = 0;
     ctx->memory = m3_GetMemory(runtime, &mem_size, 0);
     ctx->memory_size = mem_size;
+    static int kevent_call_n = 0;
+    int my_call = ++kevent_call_n;
+    if (ydebug_enabled() && my_call < 30) {
+        pid_t tid = (pid_t)syscall(SYS_gettid);
+        ydebug("kevent#%d(tid=%d kq=%d nchanges=%d nevents=%d timeout=%s)\n",
+               my_call, (int)tid, kq_wfd, nchanges, nevents,
+               timeout_off ? "ts" : "BLOCK");
+    }
 
     int kq = yos_fd_get(ctx, kq_wfd);
     if (kq < 0) { write_errno(ctx, EBADF); m3ApiReturn(-1); }
@@ -205,8 +214,14 @@ static m3ApiRawFunction(m3_yos_kevent)
             }
 
             struct epoll_event eev;
-            eev.data.u64 = ((uint64_t)udata << 16) |
-                           (uint16_t)(filter & 0xffff);
+            /* Pack: low 32 bits = guest wfd (so we can put it back in
+             * ident on the way out — libuv keys events on ident, not
+             * udata, so returning ident=0 makes libuv think no
+             * watcher matches and busy-loop on the same event). Next
+             * 16 bits = filter. Top 16 bits = (truncated) udata. */
+            eev.data.u64 = ((uint64_t)(udata & 0xffff) << 48) |
+                           ((uint64_t)(uint16_t)(filter & 0xffff) << 32) |
+                           (uint64_t)(uint32_t)ident;
             eev.events = ev_mask;
 
             int op = -1;
@@ -260,6 +275,13 @@ static m3ApiRawFunction(m3_yos_kevent)
     struct epoll_event eevs[256];
     int n = epoll_wait(kq, eevs, nevents, timeout_ms);
     if (n < 0) { write_errno(ctx, errno); m3ApiReturn(-1); }
+    if (ydebug_enabled() && my_call < 30) {
+        for (int i = 0; i < n && i < 4; i++) {
+            ydebug("  epoll_event[%d]: events=0x%x udata=%016lx\n",
+                   i, eevs[i].events, (unsigned long)eevs[i].data.u64);
+        }
+        ydebug("kevent#%d returned %d events\n", my_call, n);
+    }
 
     /* Marshal back into FreeBSD kevent structs in eventlist. */
     for (int i = 0; i < n; i++) {
@@ -269,14 +291,13 @@ static m3ApiRawFunction(m3_yos_kevent)
         uint8_t *ke = ctx->memory + eventlist + (uint32_t)i * KE_SZ;
         memset(ke, 0, KE_SZ);
         uint64_t tag = eevs[i].data.u64;
-        int16_t filter = (int16_t)(tag & 0xffff);
-        uint32_t udata = (uint32_t)(tag >> 16);
-        /* NOTE: ident is the host fd's *guest* wfd. We can't recover the
-         * wfd from the host fd cheaply without a reverse map. For libuv
-         * the ident isn't typically read from the returned event (the
-         * udata pointer points at libuv's per-watcher struct). Leave
-         * ident=0; libuv keys on udata. */
-        ke_set_ident(ke, 0);
+        uint32_t ident_w = (uint32_t)(tag & 0xffffffff);
+        int16_t  filter  = (int16_t)((tag >> 32) & 0xffff);
+        uint32_t udata   = (uint32_t)(tag >> 48);
+        /* libuv (uv__io_poll) reads ev->ident to identify which fd
+         * fired, then walks its `loop->watchers[fd]` to find the
+         * watcher. Returning ident=0 makes it spin on every poll. */
+        ke_set_ident(ke, ident_w);
         ke_set_filter(ke, filter);
         ke_set_flags(ke, (eevs[i].events & EPOLLERR) ? EV_ERROR : 0);
         ke_set_fflags(ke, 0);

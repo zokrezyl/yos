@@ -148,6 +148,14 @@ int32_t yos_read(struct yos_exec_ctx *ctx, int32_t fd, uint32_t buf, uint32_t co
     int32_t hfd = yos_fd_get(ctx, fd);
     if (hfd < 0) return hfd;
     ssize_t r = read(hfd, p, count);
+    if (ydebug_enabled()) {
+        pid_t tid = (pid_t)syscall(SYS_gettid);
+        ydebug("read(tid=%d wfd=%d hfd=%d count=%u) = %zd%s%.*s%s\n",
+               (int)tid, fd, hfd, count, r,
+               r > 0 ? " head=\"" : "",
+               (int)(r > 0 ? (r > 16 ? 16 : r) : 0), (const char *)p,
+               r > 0 ? "\"" : "");
+    }
     return r < 0 ? -errno : (int32_t)r;
 }
 
@@ -165,8 +173,21 @@ int32_t yos_write(struct yos_exec_ctx *ctx, int32_t fd, uint32_t buf, uint32_t c
                 m[0], m[1], m[2], m[3], m[4], m[5], (const char *)m);
     }
     ssize_t r = write(hfd, p, count);
+    if (ydebug_enabled() && fd != 4 && fd != 5) {
+        pid_t tid = (pid_t)syscall(SYS_gettid);
+        ydebug("write(tid=%d wfd=%d hfd=%d count=%u) = %zd%s%.*s%s\n",
+               (int)tid, fd, hfd, count, r,
+               r > 0 ? " head=\"" : "",
+               (int)(r > 0 ? (r > 32 ? 32 : r) : 0), (const char *)p,
+               r > 0 ? "\"" : "");
+    }
     return r < 0 ? -errno : (int32_t)r;
 }
+
+/* Forward decls — definitions are further down with the fcntl
+ * cmd/oflags translation tables. */
+static int oflags_fb_to_lx(int f);
+static int oflags_lx_to_fb(int f);
 
 int32_t yos_open(struct yos_exec_ctx *ctx, uint32_t path, int32_t flags, int32_t mode)
 {
@@ -183,7 +204,30 @@ int32_t yos_open(struct yos_exec_ctx *ctx, uint32_t path, int32_t flags, int32_t
         }
     }
 
-    int r = open(s, flags, mode);
+    int hflags = oflags_fb_to_lx(flags);
+    /* open() is `int open(const char *path, int flags, ...)` in
+     * FreeBSD headers — variadic. clang's wasm32 ABI passes the
+     * variadic mode arg via a va_list pointer in the shadow stack,
+     * NOT as a direct i32. The `mode` parameter we receive is a wasm
+     * offset to a small struct containing the mode int. Pulling
+     * the literal `mode` value used to set garbage permission bits
+     * (the wasm stack address looked like mode_t≈0x100000), which
+     * surfaced as e.g. shada files created `--w-rw---T` and then
+     * unreadable on the next nvim run ("permission denied"). */
+    int real_mode = mode;
+    if (hflags & O_CREAT) {
+        if (mode && (uint32_t)mode + 4 <= ctx->memory_size)
+            real_mode = *(int32_t *)(ctx->memory + (uint32_t)mode);
+    } else {
+        /* Without O_CREAT mode is ignored; don't deref a stack address
+         * that may be 0 / past memory. */
+        real_mode = 0;
+    }
+    int r = open(s, hflags, real_mode);
+    if (ydebug_enabled())
+        ydebug("open(\"%s\" flags=0x%x->0x%x mode_off=%d real_mode=0%o) = %d%s\n",
+               s, flags, hflags, mode, real_mode, r,
+               r < 0 ? strerror(errno) : "");
     if (r < 0) return -errno;
     return yos_fd_alloc(ctx, r);
 }
@@ -337,15 +381,60 @@ int32_t yos_pipe(struct yos_exec_ctx *ctx, uint32_t fildes)
     return 0;
 }
 
+/* FreeBSD ioctl request numbers (from sys/ttycom.h, sys/filio.h) that
+ * nvim/libuv reach for. Linux's request numbers for the equivalent
+ * operations are completely different — same operation, different
+ * encoding scheme — so the wasm guest's `ioctl(tty_fd, FB_TIOCGWINSZ)`
+ * passed straight to host glibc returns ENOTTY because Linux doesn't
+ * recognise the request. Translate request → request, then call host
+ * ioctl. The arg buffer (struct winsize / int) is layout-compatible
+ * for the ones we need so no struct conversion is required. */
+#define FB_TIOCGWINSZ   0x40087468u   /* _IOR('t', 0x68, struct winsize) */
+#define FB_TIOCSWINSZ   0x80087467u
+#define FB_TIOCGPGRP    0x40047477u   /* _IOR('t', 0x77, int) */
+#define FB_TIOCSPGRP    0x80047476u
+#define FB_TIOCSCTTY    0x20007461u
+#define FB_TIOCNOTTY    0x20007471u
+#define FB_FIONREAD     0x4004667fu
+#define FB_FIONBIO      0x8004667eu
+#define FB_FIOCLEX      0x20006601u
+#define FB_FIONCLEX     0x20006602u
+#define FB_FIOASYNC     0x8004667du
+
+#define LX_TIOCGWINSZ   0x5413u
+#define LX_TIOCSWINSZ   0x5414u
+#define LX_TIOCGPGRP    0x540Fu
+#define LX_TIOCSPGRP    0x5410u
+#define LX_TIOCSCTTY    0x540Eu
+#define LX_TIOCNOTTY    0x5422u
+#define LX_FIONREAD     0x541Bu
+#define LX_FIONBIO      0x5421u
+#define LX_FIOCLEX      0x5451u
+#define LX_FIONCLEX     0x5450u
+#define LX_FIOASYNC     0x5452u
+
+static uint32_t ioctl_cmd_fb_to_lx(uint32_t cmd)
+{
+    switch (cmd) {
+    case FB_TIOCGWINSZ: return LX_TIOCGWINSZ;
+    case FB_TIOCSWINSZ: return LX_TIOCSWINSZ;
+    case FB_TIOCGPGRP:  return LX_TIOCGPGRP;
+    case FB_TIOCSPGRP:  return LX_TIOCSPGRP;
+    case FB_TIOCSCTTY:  return LX_TIOCSCTTY;
+    case FB_TIOCNOTTY:  return LX_TIOCNOTTY;
+    case FB_FIONREAD:   return LX_FIONREAD;
+    case FB_FIONBIO:    return LX_FIONBIO;
+    case FB_FIOCLEX:    return LX_FIOCLEX;
+    case FB_FIONCLEX:   return LX_FIONCLEX;
+    case FB_FIOASYNC:   return LX_FIOASYNC;
+    default:            return cmd;  /* pass through, may still fail */
+    }
+}
+
 int32_t yos_ioctl(struct yos_exec_ctx *ctx, int32_t fd, uint32_t cmd, uint32_t arg)
 {
-    /* Common ioctl commands that need handling */
-    /* TIOCGWINSZ = 0x5413 - get window size */
-    /* TIOCSWINSZ = 0x5414 - set window size */
-    /* TCGETS = 0x5401 - get terminal attributes */
-    /* TCSETS = 0x5402 - set terminal attributes */
-
-    ydebug("ioctl(fd=%d, cmd=0x%x, arg=0x%x)\n", fd, cmd, arg);
+    uint32_t lcmd = ioctl_cmd_fb_to_lx(cmd);
+    ydebug("ioctl(fd=%d, cmd=0x%x->0x%x, arg=0x%x)\n", fd, cmd, lcmd, arg);
 
     int hfd = host_fd(ctx, fd);
     void *argp = arg ? wptr(ctx, arg) : NULL;
@@ -356,10 +445,10 @@ int32_t yos_ioctl(struct yos_exec_ctx *ctx, int32_t fd, uint32_t cmd, uint32_t a
      * shell's pgrp the kernel would report. Only intercept on tty fds
      * — non-tty TIOCGPGRP/TIOCSPGRP would just fail with ENOTTY which
      * is the correct kernel behavior. */
-    if ((cmd == 0x540F /*TIOCGPGRP*/ || cmd == 0x5410 /*TIOCSPGRP*/)
+    if ((lcmd == LX_TIOCGPGRP || lcmd == LX_TIOCSPGRP)
         && hfd >= 0 && isatty(hfd)) {
         if (!argp) return -EFAULT;
-        if (cmd == 0x540F) {
+        if (lcmd == LX_TIOCGPGRP) {
             *(int32_t *)argp = ctx->rt->fg_pgid;
             ydebug("ioctl TIOCGPGRP(virt) = %d\n", ctx->rt->fg_pgid);
             return 0;
@@ -375,30 +464,182 @@ int32_t yos_ioctl(struct yos_exec_ctx *ctx, int32_t fd, uint32_t cmd, uint32_t a
      * The kernel's bookkeeping is per-host-process and doesn't fit
      * one-pthread-per-guest-proc; just accept and update the
      * virtualized fg pgrp to the caller's pgrp. */
-    if (cmd == 0x540E /*TIOCSCTTY*/ && hfd >= 0 && isatty(hfd)) {
+    if (lcmd == LX_TIOCSCTTY && hfd >= 0 && isatty(hfd)) {
         if (ctx->proc) ctx->rt->fg_pgid = ctx->proc->pgid;
         ydebug("ioctl TIOCSCTTY(virt) fg_pgid <- %d\n", ctx->rt->fg_pgid);
         return 0;
     }
 
-    int r = ioctl(hfd, cmd, argp);
+    int r = ioctl(hfd, lcmd, argp);
     ydebug("ioctl = %d (errno=%d)\n", r, r < 0 ? errno : 0);
     return r < 0 ? -errno : r;
+}
+
+/* fcntl command numbers diverge between FreeBSD and Linux past the
+ * common 0..4 range. Most importantly nvim's `fcntl(fd, F_DUPFD_CLOEXEC,
+ * 3)` (in channel_from_stdio for the embedded server) passes the
+ * FreeBSD value (17); host Linux glibc expects 1030. Without this
+ * translation the call returns -1, nvim asserts in stream_init, and
+ * the embedded server crashes — leaving the TUI parent's RPC writes
+ * to EPIPE. Add the translation table and the matching arg/flag
+ * remap for F_GETFL/F_SETFL (O_* values also differ). */
+#define FB_F_DUPFD              0
+#define FB_F_GETFD              1
+#define FB_F_SETFD              2
+#define FB_F_GETFL              3
+#define FB_F_SETFL              4
+#define FB_F_GETOWN             5
+#define FB_F_SETOWN             6
+#define FB_F_GETLK              11
+#define FB_F_SETLK              12
+#define FB_F_SETLKW             13
+#define FB_F_DUPFD_CLOEXEC      17
+#define FB_F_DUP2FD_CLOEXEC     18
+
+static int fcntl_cmd_fb_to_lx(int cmd)
+{
+    switch (cmd) {
+    case FB_F_DUPFD:           return F_DUPFD;
+    case FB_F_GETFD:           return F_GETFD;
+    case FB_F_SETFD:           return F_SETFD;
+    case FB_F_GETFL:           return F_GETFL;
+    case FB_F_SETFL:           return F_SETFL;
+    case FB_F_GETOWN:          return F_GETOWN;
+    case FB_F_SETOWN:          return F_SETOWN;
+    case FB_F_GETLK:           return F_GETLK;
+    case FB_F_SETLK:           return F_SETLK;
+    case FB_F_SETLKW:          return F_SETLKW;
+    case FB_F_DUPFD_CLOEXEC:   return F_DUPFD_CLOEXEC;
+    default:                   return cmd;  /* pass through, may EINVAL */
+    }
+}
+
+/* O_* flag bits — FreeBSD vs Linux. Used by open/openat/fcntl(F_*FL).
+ * Bottom 2 bits (RDONLY/WRONLY/RDWR) match. The rest is per-flag
+ * remap: most differ in BIT POSITION. Without translation, opens with
+ * `O_CREAT | O_EXCL` (FreeBSD: 0x200|0x800) get sent to host glibc as
+ * O_NOCTTY|O_NDELAY which neither creates nor enforces exclusivity —
+ * nvim's swap-file mkstemp loop fails through every variant name
+ * and surfaces as E326/E303. */
+#define FB_O_NONBLOCK   0x00000004
+#define FB_O_APPEND     0x00000008
+#define FB_O_SHLOCK     0x00000010
+#define FB_O_EXLOCK     0x00000020
+#define FB_O_ASYNC      0x00000040
+#define FB_O_SYNC       0x00000080
+#define FB_O_NOFOLLOW   0x00000100
+#define FB_O_CREAT      0x00000200
+#define FB_O_TRUNC      0x00000400
+#define FB_O_EXCL       0x00000800
+#define FB_O_NOCTTY     0x00008000
+#define FB_O_DIRECT     0x00010000
+#define FB_O_DIRECTORY  0x00020000
+#define FB_O_EXEC       0x00040000
+#define FB_O_TTY_INIT   0x00080000
+#define FB_O_CLOEXEC    0x00100000
+#define FB_O_PATH       0x00400000
+
+#define LX_O_NONBLOCK   0x00000800
+#define LX_O_APPEND     0x00000400
+#define LX_O_ASYNC      0x00002000
+#define LX_O_SYNC       0x00101000
+#define LX_O_NOFOLLOW   0x00020000
+#define LX_O_CREAT      0x00000040
+#define LX_O_TRUNC      0x00000200
+#define LX_O_EXCL       0x00000080
+#define LX_O_NOCTTY     0x00000100
+#define LX_O_DIRECT     0x00004000
+#define LX_O_DIRECTORY  0x00010000
+#define LX_O_PATH       0x00200000
+#define LX_O_CLOEXEC    0x00080000
+
+int oflags_fb_to_lx_fwd(int);  /* exported for impl/posix.c */
+static int oflags_fb_to_lx(int f)
+{
+    int r = (f & 3);
+    if (f & FB_O_NONBLOCK)   r |= LX_O_NONBLOCK;
+    if (f & FB_O_APPEND)     r |= LX_O_APPEND;
+    if (f & FB_O_ASYNC)      r |= LX_O_ASYNC;
+    if (f & FB_O_SYNC)       r |= LX_O_SYNC;
+    if (f & FB_O_NOFOLLOW)   r |= LX_O_NOFOLLOW;
+    if (f & FB_O_CREAT)      r |= LX_O_CREAT;
+    if (f & FB_O_TRUNC)      r |= LX_O_TRUNC;
+    if (f & FB_O_EXCL)       r |= LX_O_EXCL;
+    if (f & FB_O_NOCTTY)     r |= LX_O_NOCTTY;
+    if (f & FB_O_DIRECT)     r |= LX_O_DIRECT;
+    if (f & FB_O_DIRECTORY)  r |= LX_O_DIRECTORY;
+    if (f & FB_O_EXEC)       r |= LX_O_PATH;     /* closest match */
+    if (f & FB_O_CLOEXEC)    r |= LX_O_CLOEXEC;
+    if (f & FB_O_PATH)       r |= LX_O_PATH;
+    /* SHLOCK/EXLOCK/TTY_INIT have no Linux equivalent — drop. */
+    return r;
+}
+
+int oflags_fb_to_lx_fwd(int f) { return oflags_fb_to_lx(f); }
+
+static int oflags_lx_to_fb(int f)
+{
+    int r = (f & 3);
+    if (f & LX_O_NONBLOCK)   r |= FB_O_NONBLOCK;
+    if (f & LX_O_APPEND)     r |= FB_O_APPEND;
+    if (f & LX_O_ASYNC)      r |= FB_O_ASYNC;
+    if (f & LX_O_SYNC)       r |= FB_O_SYNC;
+    if (f & LX_O_NOFOLLOW)   r |= FB_O_NOFOLLOW;
+    if (f & LX_O_CREAT)      r |= FB_O_CREAT;
+    if (f & LX_O_TRUNC)      r |= FB_O_TRUNC;
+    if (f & LX_O_EXCL)       r |= FB_O_EXCL;
+    if (f & LX_O_NOCTTY)     r |= FB_O_NOCTTY;
+    if (f & LX_O_DIRECT)     r |= FB_O_DIRECT;
+    if (f & LX_O_DIRECTORY)  r |= FB_O_DIRECTORY;
+    if (f & LX_O_CLOEXEC)    r |= FB_O_CLOEXEC;
+    if (f & LX_O_PATH)       r |= FB_O_PATH;
+    return r;
 }
 
 int32_t yos_fcntl(struct yos_exec_ctx *ctx, int32_t fd, int32_t cmd, int32_t arg)
 {
     int32_t hfd = yos_fd_get(ctx, fd);
-    if (hfd < 0) return hfd;
+    if (hfd < 0) {
+        ydebug("fcntl(wfd=%d) -> EBADF (no fd_map entry)\n", fd);
+        return -EBADF;
+    }
+    int hcmd = fcntl_cmd_fb_to_lx(cmd);
+    /* fcntl is declared `int fcntl(int fd, int cmd, ...)` in the
+     * FreeBSD headers nvim was built against. clang's wasm32 ABI
+     * passes the variadic arg via a va_list pointer in the shadow
+     * stack, NOT as a direct i32 — so the `arg` parameter we
+     * receive is a wasm offset into a small struct of varargs.
+     * Read the actual int from the first slot. (Variadic ints are
+     * 4-byte-aligned in clang's wasm32 va layout — see
+     * impl/printf.c's va_align for the same convention.) */
+    int real_arg = arg;
+    if (hcmd == F_DUPFD || hcmd == F_DUPFD_CLOEXEC ||
+        hcmd == F_SETFD || hcmd == F_SETFL ||
+        hcmd == F_SETOWN) {
+        if (arg && (uint32_t)arg + 4 <= ctx->memory_size)
+            real_arg = *(int32_t *)(ctx->memory + (uint32_t)arg);
+    }
+    if (ydebug_enabled())
+        ydebug("fcntl(wfd=%d hfd=%d cmd=%d->%d va_off=%d arg=%d)\n",
+               fd, hfd, cmd, hcmd, arg, real_arg);
     /* F_DUPFD / F_DUPFD_CLOEXEC return a fresh host fd that needs a
      * wasm-fd slot like dup() does. Other fcntl commands return flags
      * or 0 — pass through unchanged. */
-    if (cmd == F_DUPFD || cmd == F_DUPFD_CLOEXEC) {
-        int r = fcntl(hfd, cmd, arg);
+    if (hcmd == F_DUPFD || hcmd == F_DUPFD_CLOEXEC) {
+        int r = fcntl(hfd, hcmd, real_arg);
         if (r < 0) return -errno;
         return yos_fd_alloc(ctx, r);
     }
-    int r = fcntl(hfd, cmd, arg);
+    if (hcmd == F_SETFL) {
+        int r = fcntl(hfd, hcmd, oflags_fb_to_lx(real_arg));
+        return r < 0 ? -errno : r;
+    }
+    if (hcmd == F_GETFL) {
+        int r = fcntl(hfd, hcmd, 0);
+        if (r < 0) return -errno;
+        return oflags_lx_to_fb(r);
+    }
+    int r = fcntl(hfd, hcmd, real_arg);
     return r < 0 ? -errno : r;
 }
 
@@ -501,7 +742,16 @@ int32_t yos_writev(struct yos_exec_ctx *ctx, int32_t fd, uint32_t vec, int32_t v
     struct iovec host_iov[vlen];
     int r = yos_iovec_w32_to_host(ctx, vec, vlen, host_iov);
     if (r) return r;
-    ssize_t n = writev(host_fd(ctx, fd), host_iov, vlen);
+    int hfd = host_fd(ctx, fd);
+    ssize_t n = writev(hfd, host_iov, vlen);
+    if (ydebug_enabled()) {
+        size_t total = 0;
+        for (int i = 0; i < vlen; i++) total += host_iov[i].iov_len;
+        pid_t tid = (pid_t)syscall(SYS_gettid);
+        ydebug("writev(tid=%d wfd=%d hfd=%d vlen=%d total=%zu) = %zd%s\n",
+               (int)tid, fd, hfd, vlen, total, n,
+               n < 0 ? strerror(errno) : "");
+    }
     return n < 0 ? -errno : (int32_t)n;
 }
 
@@ -566,7 +816,21 @@ int32_t yos_openat(struct yos_exec_ctx *ctx, int32_t dfd, uint32_t filename, int
     int host_dfd = (dfd == AT_FDCWD) ? AT_FDCWD : yos_fd_get(ctx, dfd);
     if (host_dfd < 0) return host_dfd;
 
-    int r = openat(host_dfd, path, flags, mode);
+    int hflags = oflags_fb_to_lx(flags);
+    /* See yos_open: openat is also variadic; mode comes via a wasm
+     * va_list pointer when O_CREAT is set. */
+    int real_mode = mode;
+    if (hflags & O_CREAT) {
+        if (mode && (uint32_t)mode + 4 <= ctx->memory_size)
+            real_mode = *(int32_t *)(ctx->memory + (uint32_t)mode);
+    } else {
+        real_mode = 0;
+    }
+    int r = openat(host_dfd, path, hflags, real_mode);
+    if (ydebug_enabled())
+        ydebug("openat(dfd=%d \"%s\" flags=0x%x->0x%x mode_off=%d real_mode=0%o) = %d%s\n",
+               host_dfd, path, flags, hflags, mode, real_mode, r,
+               r < 0 ? strerror(errno) : "");
     if (r < 0) return -errno;
     /* Allocate a wasm-side fd that maps to the host fd. The previous
      * version returned the raw host fd, which broke the per-runtime fd

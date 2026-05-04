@@ -136,6 +136,49 @@ runtime_owned_pthread: &runtime_owned_pthread
 # ─── VFS (fd virtualisation, cwd-relative paths) ──────────────────────
 custom_vfs:
   - socketpair  # impl/posix.c
+  # termios family — FreeBSD struct termios is 44 B with c_cc[20] and a
+  # different control-char index assignment (VINTR=8 vs Linux 0).
+  # Linux glibc termios is 60 B with c_line + c_cc[32]. The auto-bridge
+  # passes the wasm pointer straight to host glibc which reads/writes
+  # the wrong fields and returns ENOTTY — leaving the pty in cooked
+  # mode so Ctrl-C is not delivered to nvim. impl/posix.c does the
+  # bit-by-bit translation. See yos_tcsetattr/yos_tcgetattr.
+  - tcsetattr
+  - tcgetattr
+  - cfmakeraw
+  - cfsetispeed
+  - cfsetospeed
+  - cfgetispeed
+  - cfgetospeed
+  - fstat   # see struct_convert comment
+  # getsockname: needs fd_map translation AND the wasm guest's
+  # FreeBSD sockaddr layout (sa_len + sa_family bytes at offsets 0,1)
+  # vs the host's Linux layout (sa_family uint16 at offset 0).
+  # libuv's uv_guess_handle reads ss_family at offset 1 (FreeBSD)
+  # and gets the high byte of Linux's ss_family — 0 instead of
+  # AF_UNIX, so it can't recognise the spawn pipe and asserts.
+  - getsockname
+  # getsockopt: same fd-not-translated bug + SOL_SOCKET / SO_TYPE etc.
+  # have completely different numeric values on FreeBSD (0xffff/0x1008)
+  # vs Linux (1/3). Pass-through breaks uv_guess_handle's SO_TYPE
+  # query, so libuv can't recognise socketpair-backed UV_NAMED_PIPEs.
+  - getsockopt
+  - setsockopt
+  # socket: needs to allocate a wasm fd slot for the returned host fd
+  # (auto-bridge returns the host fd straight to wasm, breaking later
+  # close/read/write fd-map lookups) and translate the FreeBSD SOCK_*
+  # type flags (SOCK_CLOEXEC=0x10000000) to Linux equivalents.
+  - socket
+  # mkdtemp: auto-bridge stubs to NULL ("complex arg/return types").
+  # nvim's swap-file machinery uses it to create a unique per-session
+  # subdir under /tmp/nvim.<uid>/; without it, nvim can't allocate
+  # any swap-file name and falls into "E326: Too many swap files
+  # found" + E303 on every run. impl/posix.c calls host mkdtemp
+  # in-place on the wasm template, returns the original wasm offset.
+  - mkdtemp
+  - mkstemp
+  - mkostemp
+  - mkostemps
   # FILE* family — impl/file.c. Guest sees small-int handles into a
   # host FILE* table; passing those to host libc as FILE* would
   # segfault since our handles aren't real FILE struct addresses.
@@ -278,7 +321,10 @@ custom_sig:
 struct_convert:
   # struct stat
   stat:           {out: statbuf, type: stat}
-  fstat:          {out: statbuf, type: stat}
+  # fstat: hand-written in impl/posix.c so the wasm fd is translated
+  # through ctx->fd_map (the auto-bridge passes the wasm fd straight
+  # to host glibc, which stats yos's own stdio rather than the child's
+  # actual host fd — fatal for nvim --embed's channel_from_stdio).
   lstat:          {out: statbuf, type: stat}
   fstatat:        {out: statbuf, type: stat}
   # struct timespec

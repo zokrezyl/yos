@@ -286,6 +286,17 @@ static void *fork_thread_func(void *arg)
     /* TODO(setjmp-refactor): copy parent's sj_slots[] into child. */
     child_ctx->fork_return = 0;  /* child gets 0 from fork */
     child_ctx->is_child = 1;
+    /* errno_off MUST match the parent's (set in main.c::load_wasm_module).
+     * Without this child_ctx->errno_off stays at calloc'd 0, env.__error
+     * returns 0, and the wasm guest reads/writes errno through
+     * memory[0..3] — which is also where nvim's wasm-libc keeps the
+     * thread-pointer / stack-protector canary. Result: errno-reads
+     * after a failed lstat see the canary value (nonzero, constant)
+     * instead of ENOENT, libuv's `UV__ERR(errno)` produces a bogus
+     * negative number, nvim's `os_fileinfo_link` thinks every swap-name
+     * variant exists, and findswapname surfaces "E326: Too many swap
+     * files found" + E303. */
+    child_ctx->errno_off = 0x108;
     /* Give the child its own host fds for each of the parent's open
      * wasm fds, so close/dup2 in one runtime doesn't trample the
      * other's. POSIX fork preserves FD_CLOEXEC; F_DUPFD strips it,

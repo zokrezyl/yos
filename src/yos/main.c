@@ -250,22 +250,26 @@ static m3ApiRawFunction(m3_main_argc_argv)
     if (r) {
         /* Intentional traps (exec) are part of normal control flow, not
          * errors — the host loop catches them via exec_pending and loads
-         * the new module. Silently propagate; no scary backtrace. */
+         * the new module. PROPAGATE the trap up through m3_CallV so the
+         * outer fork_thread_func / main exec loop sees res != NULL,
+         * checks exec_pending, and proceeds to reload. If we absorbed
+         * the trap here (m3ApiReturn), wasm's _start would resume,
+         * call exit(-1), pthread_exit on the child thread, and the
+         * exec-pending check in the host loop would never fire. */
         struct yos_exec_ctx *ctx2 =
             (struct yos_exec_ctx *)m3_GetUserData(runtime);
-        int silent = (r && strcmp(r, "exec") == 0)
-                  || (ctx2 && ctx2->exec_pending);
-        if (!silent) {
-            fprintf(stderr, "yos: main trapped: %s\n", r);
-            IM3BacktraceInfo bt = m3_GetBacktrace(runtime);
-            if (bt && bt->frames) {
-                IM3BacktraceFrame f = bt->frames;
-                int i = 0;
-                while (f && i < 32) {
-                    const char *fn = f->function ? m3_GetFunctionName(f->function) : "?";
-                    fprintf(stderr, "yos: bt #%d %s\n", i++, fn);
-                    f = f->next;
-                }
+        if (ctx2 && ctx2->exec_pending) {
+            return r;  /* trap propagates up; host loop handles exec */
+        }
+        fprintf(stderr, "yos: main trapped: %s\n", r);
+        IM3BacktraceInfo bt = m3_GetBacktrace(runtime);
+        if (bt && bt->frames) {
+            IM3BacktraceFrame f = bt->frames;
+            int i = 0;
+            while (f && i < 32) {
+                const char *fn = f->function ? m3_GetFunctionName(f->function) : "?";
+                fprintf(stderr, "yos: bt #%d %s\n", i++, fn);
+                f = f->next;
             }
         }
         m3ApiReturn(-1);
