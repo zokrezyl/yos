@@ -75,7 +75,6 @@ HOST_INCLUDES = (
     '<sys/types.h>',
     '<sys/stat.h>',
     '<sys/statvfs.h>',
-    '<sys/vfs.h>',
     '<sys/time.h>',
     '<sys/resource.h>',
     '<sys/socket.h>',
@@ -288,7 +287,13 @@ def emit(guest_api: dict, host_api: dict) -> tuple[str, str, list[str]]:
         '#define YOS_STRUCT_CONVERT_H\n\n'
         '#include <stdint.h>\n\n'
         + '\n'.join(f'#include {h}' for h in HOST_INCLUDES)
-        + '\n\n'
+        + '\n'
+        '/* struct statfs lives in different headers per OS. */\n'
+        '#ifdef __linux__\n'
+        '#  include <sys/vfs.h>\n'
+        '#else\n'
+        '#  include <sys/mount.h>\n'
+        '#endif\n\n'
         '#ifdef __cplusplus\nextern "C" {\n#endif\n\n'
         '/* Convert-trace hooks — defined in struct_convert_trace.c.\n'
         ' * Enabled at runtime by YOS_CONVERT_TRACE=1; off by default.\n'

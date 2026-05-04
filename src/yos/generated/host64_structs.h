@@ -7,6 +7,30 @@
 
 #include <stdint.h>
 
+/* Darwin libc rewrites several POSIX struct field names to internal
+ * forms via macros: e.g. <sys/stat.h>'s `st_atime` -> `st_atimespec.tv_sec`,
+ * <signal.h>'s `sa_handler` -> `__sigaction_u.__sa_handler`. Those macros
+ * collide with the literal field names in our Linux-shape mirror structs.
+ * Push them out of the way for the duration of this header and pop at
+ * the bottom so callers that hold a real `struct stat` / `struct sigaction`
+ * keep working. */
+#ifdef __APPLE__
+#  pragma push_macro("st_atime")
+#  pragma push_macro("st_mtime")
+#  pragma push_macro("st_ctime")
+#  pragma push_macro("st_birthtime")
+#  pragma push_macro("sa_handler")
+#  pragma push_macro("sa_sigaction")
+#  pragma push_macro("__unused")
+#  undef st_atime
+#  undef st_mtime
+#  undef st_ctime
+#  undef st_birthtime
+#  undef sa_handler
+#  undef sa_sigaction
+#  undef __unused
+#endif
+
 /* COFF_AOUTHDR: 28 bytes, align 1 */
 struct host64_COFF_AOUTHDR {
     uint8_t magic[2];
@@ -23139,5 +23163,15 @@ struct host64_sockaddr_pppol2tpv3 {
     uint32_t sa_protocol;
     struct host64_pppol2tpv3_addr pppol2tp;
 };
+
+#ifdef __APPLE__
+#  pragma pop_macro("__unused")
+#  pragma pop_macro("sa_sigaction")
+#  pragma pop_macro("sa_handler")
+#  pragma pop_macro("st_birthtime")
+#  pragma pop_macro("st_ctime")
+#  pragma pop_macro("st_mtime")
+#  pragma pop_macro("st_atime")
+#endif
 
 #endif // YOS_HOST64_STRUCTS_H

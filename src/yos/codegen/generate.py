@@ -85,8 +85,17 @@ def _group_for(name: str) -> str:
 
 
 def _split_groups(remap: dict) -> dict[str, list[tuple[str, int, int]]]:
-    """Bucket remap entries by name-prefix group. Each entry: (name, guest_value, host_value)."""
+    """Bucket remap entries by name-prefix group. Each entry: (name, guest_value, host_value).
+
+    Always seeds every PREFIX_GROUPS bucket so the emitter produces a
+    passthrough function even when the group ended up with zero entries
+    on this host (e.g. on darwin all FreeBSD errno values already match
+    so the errno bucket is empty — but yos source code still calls
+    yos_remap_errno_h2g unconditionally and needs the symbol to link).
+    """
     groups: dict[str, list] = defaultdict(list)
+    for g, _ in PREFIX_GROUPS:
+        groups.setdefault(g, [])
     for name, info in sorted(remap.items()):
         groups[_group_for(name)].append(
             (name, info.get('guest_value'), info.get('host_value'))

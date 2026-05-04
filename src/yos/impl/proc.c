@@ -2,6 +2,7 @@
 #define _GNU_SOURCE   /* for the syscall() prototype in <unistd.h> */
 #include "yos/types.h"
 #include "yos/ydebug.h"
+#include "impl/clone-abi.h"
 #include <stdint.h>
 #include <unistd.h>
 #include <fcntl.h>

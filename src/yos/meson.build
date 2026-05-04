@@ -33,6 +33,11 @@
 threads_dep = dependency('threads')
 cc = meson.get_compiler('c')
 m_dep = cc.find_library('m', required: true)
+# iconv: glibc folds it into libc; darwin/BSD ship a separate libiconv
+# whose symbols start with `iconv_*` (and `__iconv_*` for the GNU
+# extras). yos's bridge calls those names, so we need explicit linkage
+# wherever it isn't already in libc.
+iconv_dep = cc.find_library('iconv', required: false)
 
 subdir('codegen')        # api_bridge_dep, yos_imports.h
 
@@ -42,7 +47,20 @@ yos_inc = include_directories(
   '.',                   # `impl/<area>.h`, `vfs/<x>.h`, `generated/<x>.h`
   'generated',           # `host64_structs.h`, `struct_convert.h`
   'vfs',                 # vfs/*.c sees sibling `file.h` etc.
+  'platform/posix',      # `platform.h` (Linux+darwin shared abstraction)
 )
+
+# Platform-specific host sources. Anything that diverges between Linux
+# and darwin (gettid, …) lands in platform/posix/<x>-{linux,darwin}.c;
+# Windows port will grow platform/windows/ later.
+host_os = host_machine.system()
+if host_os == 'linux'
+  platform_sources = files('platform/posix/platform-linux.c')
+elif host_os == 'darwin'
+  platform_sources = files('platform/posix/platform-darwin.c')
+else
+  error('yos: unsupported host OS: ' + host_os)
+endif
 
 yos_runtime_sources = files(
   'main.c',
@@ -80,6 +98,7 @@ yos_runtime_sources = files(
 yos_exe = executable(
   'yos',
   yos_runtime_sources,
+  platform_sources,
   include_directories : yos_inc,
   dependencies : [
     wasm3_dep,
@@ -87,6 +106,7 @@ yos_exe = executable(
     mimalloc_dep,        # impl/alloc.c — guest malloc backed by mimalloc
     threads_dep,
     m_dep,
+    iconv_dep,           # darwin/BSD: separate libiconv
   ],
   c_args : [
     '-D_GNU_SOURCE',

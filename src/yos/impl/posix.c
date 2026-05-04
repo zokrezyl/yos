@@ -8,6 +8,24 @@
 #include <stdint.h>
 #include <string.h>
 #include <unistd.h>
+
+#if defined(__APPLE__)
+/* darwin has no fdatasync; fsync is the closest equivalent (it does
+ * the same data-and-metadata flush, and F_FULLFSYNC is a stronger
+ * variant). Map fdatasync -> fsync for the host. */
+#  define fdatasync(fd) fsync(fd)
+/* SOCK_CLOEXEC / SOCK_NONBLOCK are Linux extensions to socket(2); darwin
+ * has no equivalent flags-on-socket-create. Define as 0 so the bit-or
+ * compiles; the atomic semantics are lost — call sites that need them
+ * must follow up with fcntl(F_SETFD, FD_CLOEXEC) / fcntl(F_SETFL, O_NONBLOCK).
+ * TODO: do that fcntl postwork in yos_socketpair on darwin. */
+#  ifndef SOCK_CLOEXEC
+#    define SOCK_CLOEXEC 0
+#  endif
+#  ifndef SOCK_NONBLOCK
+#    define SOCK_NONBLOCK 0
+#  endif
+#endif
 #include <sys/socket.h>
 #include <sys/stat.h>     /* umask */
 #include <sys/uio.h>
@@ -222,7 +240,37 @@ int32_t yos_mkostemps(struct yos_exec_ctx *ctx, uint32_t template_off,
     return wfd;
 }
 
+#if defined(__APPLE__)
+/* Hand-rolled cv_stat_h2w for darwin: the auto-generated converter
+ * pipeline only emits pairs the codegen could match guest-vs-host
+ * field-by-field, and stat differs (FreeBSD vs macOS layout). Copy
+ * the fields we expose to the wasm guest into its 72-byte stat. */
+#include <sys/stat.h>
+static inline void cv_stat_h2w(uint8_t *w, const struct stat *h)
+{
+    /* wasm32_stat layout (see wasm32_structs.h): 18*u32 = 72 bytes. */
+    *(uint32_t *)(w +  0) = (uint32_t)h->st_dev;
+    *(uint32_t *)(w +  4) = (uint32_t)h->st_ino;
+    *(uint16_t *)(w +  8) = (uint16_t)h->st_mode;
+    *(uint16_t *)(w + 10) = (uint16_t)h->st_nlink;
+    *(uint16_t *)(w + 12) = (uint16_t)h->st_uid;
+    *(uint16_t *)(w + 14) = (uint16_t)h->st_gid;
+    *(uint32_t *)(w + 16) = (uint32_t)h->st_rdev;
+    *(uint32_t *)(w + 20) = (uint32_t)h->st_size;
+    *(uint32_t *)(w + 24) = (uint32_t)h->st_blksize;
+    *(uint32_t *)(w + 28) = (uint32_t)h->st_blocks;
+    *(uint32_t *)(w + 32) = (uint32_t)h->st_atimespec.tv_sec;
+    *(uint32_t *)(w + 36) = (uint32_t)h->st_atimespec.tv_nsec;
+    *(uint32_t *)(w + 40) = (uint32_t)h->st_mtimespec.tv_sec;
+    *(uint32_t *)(w + 44) = (uint32_t)h->st_mtimespec.tv_nsec;
+    *(uint32_t *)(w + 48) = (uint32_t)h->st_ctimespec.tv_sec;
+    *(uint32_t *)(w + 52) = (uint32_t)h->st_ctimespec.tv_nsec;
+    *(uint32_t *)(w + 56) = 0;
+    *(uint32_t *)(w + 60) = 0;
+}
+#else
 extern void cv_stat_h2w(uint8_t *w, const struct stat *h);
+#endif
 
 int32_t yos_fstat(struct yos_exec_ctx *ctx, int32_t wfd, uint32_t statbuf_off)
 {

@@ -32,6 +32,17 @@
 #include <stddef.h>
 #include <string.h>
 #include <errno.h>
+
+#if !defined(__linux__)
+/* This file currently implements the GUEST kqueue surface on top of
+ * Linux epoll + signalfd + eventfd. Darwin/Windows ports need a
+ * native rewrite (darwin: host kqueue passthrough; windows: IOCP).
+ * For now, stub the two public entry points so the host links. */
+#include "wasm3.h"
+void yos_kqueue_notify_exit(uint32_t pid) { (void)pid; }
+void yos_kqueue_link(IM3Module mod) { (void)mod; }
+#else
+
 #include <sys/epoll.h>
 #include <sys/syscall.h>
 #include <signal.h>
@@ -40,6 +51,7 @@
 
 #include "wasm3.h"
 #include "m3_env.h"
+#include "platform.h"
 #include "yos/types.h"
 #include "yos/ydebug.h"
 
@@ -256,7 +268,7 @@ static m3ApiRawFunction(m3_yos_kevent)
     static int kevent_call_n = 0;
     int my_call = ++kevent_call_n;
     if (ydebug_enabled() && my_call < 30) {
-        pid_t tid = (pid_t)syscall(SYS_gettid);
+        pid_t tid = yos_plat_gettid();
         ydebug("kevent#%d(tid=%d kq=%d nchanges=%d nevents=%d timeout=%s)\n",
                my_call, (int)tid, kq_wfd, nchanges, nevents,
                timeout_off ? "ts" : "BLOCK");
@@ -439,3 +451,5 @@ void yos_kqueue_link(IM3Module mod)
     m3_LinkRawFunction(mod, "env", "kqueuex", "i(i)",      m3_yos_kqueuex);
     m3_LinkRawFunction(mod, "env", "kevent",  "i(iiiiii)", m3_yos_kevent);
 }
+
+#endif /* __linux__ */

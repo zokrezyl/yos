@@ -1,6 +1,8 @@
 #define _GNU_SOURCE
+#define _DARWIN_C_SOURCE  /* darwin libc gates mknodat/etc. behind this */
 #include "yos/types.h"
 #include "yos/ydebug.h"
+#include "platform.h"
 #include "impl/errno_helpers.h"
 #include "vfs/mount.h"
 #include "vfs/file.h"
@@ -16,8 +18,10 @@
 #include <sys/stat.h>
 #include <sys/uio.h>
 #include <sys/syscall.h>
-#include <linux/stat.h>  /* for struct statx */
-#include <linux/time_types.h> /* struct __kernel_timespec */
+#ifdef __linux__
+#  include <linux/stat.h>  /* for struct statx */
+#  include <linux/time_types.h> /* struct __kernel_timespec */
+#endif
 #include <sys/ioctl.h>
 #include <dirent.h>
 #include <stdio.h>
@@ -149,7 +153,7 @@ int32_t yos_read(struct yos_exec_ctx *ctx, int32_t fd, uint32_t buf, uint32_t co
     if (hfd < 0) return hfd;
     ssize_t r = read(hfd, p, count);
     if (ydebug_enabled()) {
-        pid_t tid = (pid_t)syscall(SYS_gettid);
+        pid_t tid = yos_plat_gettid();
         ydebug("read(tid=%d wfd=%d hfd=%d count=%u) = %zd%s%.*s%s\n",
                (int)tid, fd, hfd, count, r,
                r > 0 ? " head=\"" : "",
@@ -174,7 +178,7 @@ int32_t yos_write(struct yos_exec_ctx *ctx, int32_t fd, uint32_t buf, uint32_t c
     }
     ssize_t r = write(hfd, p, count);
     if (ydebug_enabled() && fd != 4 && fd != 5) {
-        pid_t tid = (pid_t)syscall(SYS_gettid);
+        pid_t tid = yos_plat_gettid();
         ydebug("write(tid=%d wfd=%d hfd=%d count=%u) = %zd%s%.*s%s\n",
                (int)tid, fd, hfd, count, r,
                r > 0 ? " head=\"" : "",
@@ -774,7 +778,7 @@ int32_t yos_writev(struct yos_exec_ctx *ctx, int32_t fd, uint32_t vec, int32_t v
     if (ydebug_enabled()) {
         size_t total = 0;
         for (int i = 0; i < vlen; i++) total += host_iov[i].iov_len;
-        pid_t tid = (pid_t)syscall(SYS_gettid);
+        pid_t tid = yos_plat_gettid();
         ydebug("writev(tid=%d wfd=%d hfd=%d vlen=%d total=%zu) = %zd%s\n",
                (int)tid, fd, hfd, vlen, total, n,
                n < 0 ? strerror(errno) : "");
@@ -1027,6 +1031,7 @@ int32_t yos_dup3(struct yos_exec_ctx *ctx, int32_t oldfd, int32_t newfd, int32_t
 
 int32_t yos_pipe2(struct yos_exec_ctx *ctx, uint32_t fildes, int32_t flags)
 {
+#ifdef __linux__
     int *p = wptr(ctx, fildes);
     if (!p) return -EFAULT;
     int hfds[2];
@@ -1056,6 +1061,10 @@ int32_t yos_pipe2(struct yos_exec_ctx *ctx, uint32_t fildes, int32_t flags)
     ydebug("yos_pipe2(flags=0x%x->0x%x) -> wfd[%d, %d]\n",
            flags, hflags, r, w);
     return 0;
+#else
+    (void)ctx; (void)fildes; (void)flags;
+    return -ENOSYS;
+#endif
 }
 
 #include <sys/socket.h>
@@ -1100,6 +1109,7 @@ int32_t yos_pwritev(struct yos_exec_ctx *ctx, int32_t fd, uint32_t vec, int32_t 
     return n < 0 ? -errno : (int32_t)n;
 }
 
+#ifdef __linux__
 /* preadv2/pwritev2 add a `flags` arg (RWF_HIPRI / RWF_DSYNC / RWF_SYNC etc.)
  * — passed straight through to the kernel. */
 int32_t yos_vfs_preadv2(struct yos_exec_ctx *ctx, int32_t fd, uint32_t vec,
@@ -1248,7 +1258,26 @@ int32_t yos_vfs_getdents64(struct yos_exec_ctx *ctx, int32_t fd, uint32_t dirent
     long r = syscall(SYS_getdents64, hfd, p, count);
     return r < 0 ? -errno : (int32_t)r;
 }
+#else /* !__linux__ */
+int32_t yos_vfs_preadv2(struct yos_exec_ctx *ctx, int32_t fd, uint32_t vec, int32_t vlen, uint32_t pos_l, uint32_t pos_h, int32_t flags)
+{ (void)ctx;(void)fd;(void)vec;(void)vlen;(void)pos_l;(void)pos_h;(void)flags; return -ENOSYS; }
+int32_t yos_vfs_pwritev2(struct yos_exec_ctx *ctx, int32_t fd, uint32_t vec, int32_t vlen, uint32_t pos_l, uint32_t pos_h, int32_t flags)
+{ (void)ctx;(void)fd;(void)vec;(void)vlen;(void)pos_l;(void)pos_h;(void)flags; return -ENOSYS; }
+int32_t yos_vfs_vmsplice(struct yos_exec_ctx *ctx, int32_t fd, uint32_t vec, uint32_t vlen, uint32_t flags)
+{ (void)ctx;(void)fd;(void)vec;(void)vlen;(void)flags; return -ENOSYS; }
+int32_t yos_vfs_process_madvise(struct yos_exec_ctx *ctx, int32_t pidfd, uint32_t vec, uint32_t vlen, int32_t behavior, uint32_t flags)
+{ (void)ctx;(void)pidfd;(void)vec;(void)vlen;(void)behavior;(void)flags; return -ENOSYS; }
+int32_t yos_vfs_process_vm_readv(struct yos_exec_ctx *ctx, int32_t pid, uint32_t lvec, uint32_t liovcnt, uint32_t rvec, uint32_t riovcnt, uint32_t flags)
+{ (void)ctx;(void)pid;(void)lvec;(void)liovcnt;(void)rvec;(void)riovcnt;(void)flags; return -ENOSYS; }
+int32_t yos_vfs_process_vm_writev(struct yos_exec_ctx *ctx, int32_t pid, uint32_t lvec, uint32_t liovcnt, uint32_t rvec, uint32_t riovcnt, uint32_t flags)
+{ (void)ctx;(void)pid;(void)lvec;(void)liovcnt;(void)rvec;(void)riovcnt;(void)flags; return -ENOSYS; }
+int32_t yos_vfs_getdents(struct yos_exec_ctx *ctx, int32_t fd, uint32_t dirent, uint32_t count)
+{ (void)ctx;(void)fd;(void)dirent;(void)count; return -ENOSYS; }
+int32_t yos_vfs_getdents64(struct yos_exec_ctx *ctx, int32_t fd, uint32_t dirent, uint32_t count)
+{ (void)ctx;(void)fd;(void)dirent;(void)count; return -ENOSYS; }
+#endif /* __linux__ */
 
+#ifdef __linux__
 /*
  * statx - extended stat with mount table support
  * Kernel ABI constants for mode bits
@@ -1329,7 +1358,9 @@ int32_t yos_vfs_statx(struct yos_exec_ctx *ctx, int32_t dfd, uint32_t pathname,
  * scratch off_t, and write back with overflow detection.
  * ========================================================================= */
 
-#include <sys/sendfile.h>
+#ifdef __linux__
+#  include <sys/sendfile.h>
+#endif
 
 int32_t yos_vfs_sendfile(struct yos_exec_ctx *ctx, int32_t out_fd, int32_t in_fd, uint32_t offset_ptr, uint32_t count)
 {
@@ -1796,3 +1827,49 @@ int32_t yos_vfs_futex(struct yos_exec_ctx *ctx, uint32_t uaddr, int32_t op, int3
                      uaddr2_p, (long)val3);
     return r < 0 ? -errno : (int32_t)r;
 }
+#else /* !__linux__ — darwin/windows stubs for the Linux-only chunk above */
+#define _STUB_RET(args) do { args; return -ENOSYS; } while (0)
+int32_t yos_vfs_statx(struct yos_exec_ctx *ctx, int32_t dfd, uint32_t pathname, int32_t flags, uint32_t mask, uint32_t buffer)
+{ (void)ctx;(void)dfd;(void)pathname;(void)flags;(void)mask;(void)buffer; return -ENOSYS; }
+int32_t yos_vfs_sendfile(struct yos_exec_ctx *ctx, int32_t out_fd, int32_t in_fd, uint32_t offset_ptr, uint32_t count)
+{ (void)ctx;(void)out_fd;(void)in_fd;(void)offset_ptr;(void)count; return -ENOSYS; }
+int32_t yos_vfs_sendfile64(struct yos_exec_ctx *ctx, int32_t out_fd, int32_t in_fd, uint32_t offset_ptr, uint32_t count)
+{ (void)ctx;(void)out_fd;(void)in_fd;(void)offset_ptr;(void)count; return -ENOSYS; }
+int32_t yos_vfs_timer_create(struct yos_exec_ctx *ctx, int32_t clockid, uint32_t sevp, uint32_t timerid_out)
+{ (void)ctx;(void)clockid;(void)sevp;(void)timerid_out; return -ENOSYS; }
+int32_t yos_vfs_timer_settime(struct yos_exec_ctx *ctx, int32_t timerid, int32_t flags, uint32_t new_value, uint32_t old_value)
+{ (void)ctx;(void)timerid;(void)flags;(void)new_value;(void)old_value; return -ENOSYS; }
+int32_t yos_vfs_timer_settime64(struct yos_exec_ctx *ctx, int32_t timerid, int32_t flags, uint32_t new_value, uint32_t old_value)
+{ (void)ctx;(void)timerid;(void)flags;(void)new_value;(void)old_value; return -ENOSYS; }
+int32_t yos_vfs_timer_gettime(struct yos_exec_ctx *ctx, int32_t timerid, uint32_t cur_value)
+{ (void)ctx;(void)timerid;(void)cur_value; return -ENOSYS; }
+int32_t yos_vfs_timer_gettime64(struct yos_exec_ctx *ctx, int32_t timerid, uint32_t cur_value)
+{ (void)ctx;(void)timerid;(void)cur_value; return -ENOSYS; }
+int32_t yos_vfs_timer_delete(struct yos_exec_ctx *ctx, int32_t timerid)
+{ (void)ctx;(void)timerid; return -ENOSYS; }
+int32_t yos_vfs_timer_getoverrun(struct yos_exec_ctx *ctx, int32_t timerid)
+{ (void)ctx;(void)timerid; return -ENOSYS; }
+int32_t yos_vfs_set_mempolicy(struct yos_exec_ctx *ctx, int32_t mode, uint32_t nmask, uint32_t maxnode)
+{ (void)ctx;(void)mode;(void)nmask;(void)maxnode; return -ENOSYS; }
+int32_t yos_vfs_get_mempolicy(struct yos_exec_ctx *ctx, uint32_t mode, uint32_t nmask, uint32_t maxnode, uint32_t addr, uint32_t flags)
+{ (void)ctx;(void)mode;(void)nmask;(void)maxnode;(void)addr;(void)flags; return -ENOSYS; }
+int32_t yos_vfs_mbind(struct yos_exec_ctx *ctx, uint32_t start, uint32_t len, int32_t mode, uint32_t nmask, uint32_t maxnode, uint32_t flags)
+{ (void)ctx;(void)start;(void)len;(void)mode;(void)nmask;(void)maxnode;(void)flags; return -ENOSYS; }
+int32_t yos_vfs_migrate_pages(struct yos_exec_ctx *ctx, int32_t pid, uint32_t maxnode, uint32_t old_nodes, uint32_t new_nodes)
+{ (void)ctx;(void)pid;(void)maxnode;(void)old_nodes;(void)new_nodes; return -ENOSYS; }
+int32_t yos_vfs_execveat(struct yos_exec_ctx *ctx, int32_t dirfd, uint32_t pathname, uint32_t argv, uint32_t envp, int32_t flags)
+{ (void)ctx;(void)dirfd;(void)pathname;(void)argv;(void)envp;(void)flags; return -ENOSYS; }
+int32_t yos_vfs_get_robust_list(struct yos_exec_ctx *ctx, int32_t pid, uint32_t head_ptr, uint32_t len_ptr)
+{ (void)ctx;(void)pid;(void)head_ptr;(void)len_ptr; return -ENOSYS; }
+int32_t yos_vfs_io_setup(struct yos_exec_ctx *ctx, uint32_t nr_events, uint32_t ctx_idp)
+{ (void)ctx;(void)nr_events;(void)ctx_idp; return -ENOSYS; }
+int32_t yos_vfs_io_destroy(struct yos_exec_ctx *ctx, uint32_t ctx_id)
+{ (void)ctx;(void)ctx_id; return -ENOSYS; }
+int32_t yos_vfs_io_submit(struct yos_exec_ctx *ctx, uint32_t ctx_id, int32_t nr, uint32_t iocbpp)
+{ (void)ctx;(void)ctx_id;(void)nr;(void)iocbpp; return -ENOSYS; }
+int32_t yos_vfs_io_cancel(struct yos_exec_ctx *ctx, uint32_t ctx_id, uint32_t iocb_addr, uint32_t result)
+{ (void)ctx;(void)ctx_id;(void)iocb_addr;(void)result; return -ENOSYS; }
+int32_t yos_vfs_futex(struct yos_exec_ctx *ctx, uint32_t uaddr, int32_t op, int32_t val, uint32_t utime, uint32_t uaddr2, int32_t val3)
+{ (void)ctx;(void)uaddr;(void)op;(void)val;(void)utime;(void)uaddr2;(void)val3; return -ENOSYS; }
+#undef _STUB_RET
+#endif /* __linux__ */

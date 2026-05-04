@@ -9,6 +9,7 @@
 
 #include "wasm3.h"
 #include "m3_env.h"
+#include "platform.h"
 #include "yos/types.h"
 #include "yos/ydebug.h"
 #include "yos/vfs/mount.h"
@@ -350,7 +351,7 @@ static _Atomic uint64_t   yos_brg_ring_seq = 0;
 static __thread uint32_t  yos_brg_my_slot = 0;
 
 static inline pid_t yos_brg_gettid(void) {
-    return (pid_t)syscall(SYS_gettid);
+    return yos_plat_gettid();
 }
 
 void yos_brg_record(const char *name)
