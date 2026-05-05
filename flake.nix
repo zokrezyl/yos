@@ -13,10 +13,49 @@
     flake-utils.lib.eachDefaultSystem (system:
       let
         pkgs = import nixpkgs { inherit system; };
+        yos = import ./nixpkgs { inherit pkgs; src = self; };
       in {
+        # `nix build .#<name>` — derivations.
+        # Foundation:
+        #   .#yos          host runtime binary (wasm3-based loader, meson)
+        #   .#sysroot      wasm32 sysroot built from FreeBSD-i386 headers
+        #   .#toolchain    wasm-clang shim + clang-unwrapped + lld + wasm-opt
+        # Wasm ports:
+        #   .#nvim         neovim 0.10.4 wasm (with all 9 deps)
+        #   .#zsh          zsh 5.9 wasm
+        #   .#freebsd-tools FreeBSD-base userland (cat/echo/ls/…)
+        # nvim's libraries (each is its own derivation, also exposed):
+        #   .#lua .#libuv .#msgpack-c .#unibilium .#libvterm
+        #   .#tree-sitter .#lpeg .#lua-mpack .#luv
+        # Convenience umbrella + sandbox entry point:
+        #   .#all          yos + every wasm port merged into one tree.
+        #                  `nix shell .#all` puts every runner on PATH
+        #                  (host shell, host PATH alongside).
+        #   nix run .#     enters `$out/bin/yos-shell` — a wasm zsh
+        #                  under yos with PATH scoped to $out/libexec
+        #                  only. Nothing reaches host /usr/bin from
+        #                  inside; that's the sandbox boundary.
+        packages = {
+          default = yos.yos;
+        } // builtins.removeAttrs yos [ "buildRecipe" "buildFreebsdTool" ];
+
+        # `nix run .#` enters the wasm-zsh sandbox under yos: pristine
+        # PATH (only $out/libexec wasm modules), no host /usr/bin reach.
+        # See nixpkgs/default.nix `all.postBuild` for the wrapper details.
+        apps.default = {
+          type    = "app";
+          program = "${yos.all}/bin/yos-shell";
+        };
+
+        # Re-export the recipe builder so downstream flakes can `yos.lib.<sys>.buildRecipe { … }`.
+        lib = {
+          inherit (yos) buildRecipe;
+        };
+
         # `nix develop` — interactive shell with the wasm toolchain wired up.
-        # NOTE: ./nixpkgs/ tree (yos.devShell, package builders) is gone for
-        # now; this is a minimal shell with just what meson needs to build.
+        # The package builders above use Nix's sandboxed paths; the dev shell
+        # is for running `meson compile` and `tools/wasm-pkg.sh` against the
+        # in-tree build directly.
         devShells.default = pkgs.mkShell {
           packages = with pkgs; [
             meson

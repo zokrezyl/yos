@@ -1675,7 +1675,10 @@ int main(int argc, char **argv)
      * SA_ONSTACK + SA_SIGINFO to also receive the faulting address. */
     {
         extern void yos_host_crash_handler_si(int, siginfo_t *, void *);
-        static char altstack_buf[SIGSTKSZ * 4];
+        /* glibc 2.34+ made SIGSTKSZ a sysconf() call (not a constant),
+         * so it can't size a static array. 64 KiB is well above
+         * MINSIGSTKSZ on every platform we target. */
+        static char altstack_buf[64 * 1024];
         stack_t ss = {0};
         ss.ss_sp = altstack_buf;
         ss.ss_size = sizeof altstack_buf;
@@ -1755,9 +1758,11 @@ int main(int argc, char **argv)
      * -ENOSYS at call time. */
 #ifdef YOS_LIBC_PURE_PATH
     if (yos_tier2_init(YOS_LIBC_PURE_PATH) != 0) {
-        fprintf(stderr,
-                "yos: tier2: libc-pure.wasm unavailable, "
-                "Tier-2 imports will trap\n");
+        /* Informational only — the guest still runs, Tier-2 fns just
+         * trap on first call. Gate via ydebug so default runs stay
+         * quiet (per CLAUDE.md). */
+        ydebug("tier2: libc-pure.wasm unavailable, "
+               "Tier-2 imports will trap\n");
     }
 #endif
 

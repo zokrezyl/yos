@@ -169,6 +169,14 @@ custom_vfs:
   # close/read/write fd-map lookups) and translate the FreeBSD SOCK_*
   # type flags (SOCK_CLOEXEC=0x10000000) to Linux equivalents.
   - socket
+  # realpath: auto-bridge stubs to NULL because it returns char* and the
+  # generator's RET_IS_DST table doesn't know it aliases the SECOND arg.
+  # FreeBSD-base realpath(1) calls realpath(path, buf) with non-NULL buf;
+  # the stubbed bridge returns NULL with errno=0, making realpath(1)
+  # warn `yos-tool: <path>: errno=0` for every interactive shell-prompt
+  # invocation. Hand-written body in impl/posix.c calls host realpath on
+  # buf and returns the buf's wasm offset.
+  - realpath
   # mkdtemp: auto-bridge stubs to NULL ("complex arg/return types").
   # nvim's swap-file machinery uses it to create a unique per-session
   # subdir under /tmp/nvim.<uid>/; without it, nvim can't allocate

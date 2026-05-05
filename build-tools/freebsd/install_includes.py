@@ -56,7 +56,15 @@ EXTRA_SYS_SUBDIRS = (
 
 
 def copy_tree(src: Path, dst: Path, *, symlinks: bool = False) -> int:
-    """Copy `src` into `dst`. Returns count of .h files copied."""
+    """Copy `src` into `dst`. Returns count of .h files copied.
+
+    The post-copy step patches a few specific headers in place
+    (cdefs.h shim etc.); when the source tree lives in a read-only
+    location (e.g. /nix/store under the freebsd-src derivation),
+    `shutil.copy2` preserves the source mode bits and the patching
+    step trips on PermissionError. Chmod every copy to user-writable
+    so subsequent edits work regardless of source perms.
+    """
     if not src.is_dir():
         return 0
     dst.mkdir(parents=True, exist_ok=True)
@@ -72,6 +80,7 @@ def copy_tree(src: Path, dst: Path, *, symlinks: bool = False) -> int:
         out = dst / rel
         out.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(entry, out, follow_symlinks=not symlinks)
+        out.chmod(0o644)
         n += 1
     return n
 
@@ -93,7 +102,9 @@ def install_arch_headers(src_root: Path, out_root: Path, arch: str) -> None:
     # 1. Flat POSIX headers from src/include/<*.h>
     n = 0
     for hdr in src_include.glob('*.h'):
-        shutil.copy2(hdr, usr_include / hdr.name, follow_symlinks=True)
+        out = usr_include / hdr.name
+        shutil.copy2(hdr, out, follow_symlinks=True)
+        out.chmod(0o644)
         n += 1
     counts['include/*.h'] = n
 
@@ -144,7 +155,9 @@ def install_arch_headers(src_root: Path, out_root: Path, arch: str) -> None:
     if syscalls_master.is_file():
         share = out_root / 'usr' / 'share' / 'syscalls'
         share.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(syscalls_master, share / 'syscalls.master')
+        out = share / 'syscalls.master'
+        shutil.copy2(syscalls_master, out)
+        out.chmod(0o644)
         counts['kern/syscalls.master'] = 1
 
     # 7a. Library-shipped headers FreeBSD installs to /usr/include
@@ -157,7 +170,9 @@ def install_arch_headers(src_root: Path, out_root: Path, arch: str) -> None:
     for lib_dir, hdr in LIB_HEADERS:
         src_hdr = src_root / lib_dir / hdr
         if src_hdr.is_file():
-            shutil.copy2(src_hdr, usr_include / hdr, follow_symlinks=True)
+            out = usr_include / hdr
+            shutil.copy2(src_hdr, out, follow_symlinks=True)
+            out.chmod(0o644)
             counts[f'{lib_dir}/{hdr}'] = 1
 
     # 7a-2. <pty.h> is a Linux convention. FreeBSD puts openpty /

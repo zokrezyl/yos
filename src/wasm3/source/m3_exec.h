@@ -585,7 +585,37 @@ d_m3Op  (CallIndirect)
                     }
                 }
             }
-            else r = m3Err_trapIndirectCallTypeMismatch;
+            else {
+                /* yos: enrich the trap with which function was being called
+                 * and the signature mismatch. Helps when chasing wasm-side
+                 * bugs (e.g. zsh's runhookdef). Cost paid only on the
+                 * mismatch path. SPrintFuncTypeSignature is DEBUG-only so we
+                 * inline a compact dumper here. */
+                if (getenv("YOS_TRAP_VERBOSE")) {
+                    IM3FuncType ct = function->funcType;
+                    fprintf(stderr,
+                        "yos: indirect call type mismatch: tableIndex=%u "
+                        "callee='%s' callee_sig=(",
+                        tableIndex, m3_GetFunctionName(function));
+                    for (u32 i = 0; i < ct->numArgs; ++i)
+                        fprintf(stderr, "%s%u", i ? "," : "",
+                                (unsigned) d_FuncArgType(ct, i));
+                    fprintf(stderr, ")->(");
+                    for (u32 i = 0; i < ct->numRets; ++i)
+                        fprintf(stderr, "%s%u", i ? "," : "",
+                                (unsigned) d_FuncRetType(ct, i));
+                    fprintf(stderr, ") call_site_sig=(");
+                    for (u32 i = 0; i < type->numArgs; ++i)
+                        fprintf(stderr, "%s%u", i ? "," : "",
+                                (unsigned) d_FuncArgType(type, i));
+                    fprintf(stderr, ")->(");
+                    for (u32 i = 0; i < type->numRets; ++i)
+                        fprintf(stderr, "%s%u", i ? "," : "",
+                                (unsigned) d_FuncRetType(type, i));
+                    fprintf(stderr, ")\n");
+                }
+                r = m3Err_trapIndirectCallTypeMismatch;
+            }
         }
         else r = m3Err_trapTableElementIsNull;
     }

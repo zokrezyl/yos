@@ -22,10 +22,21 @@ def main() -> int:
     dest.mkdir(parents=True, exist_ok=True)
     repo = dest / 'mimalloc'
 
+    # Pre-staged path (Nix sandbox): if the stamp already records our
+    # exact commit AND a checkout exists, we trust whoever populated the
+    # tree (typically the yos Nix derivation, which extracts a
+    # fetchFromGitHub source and writes the stamp before invoking meson).
+    # Without this short-circuit we'd shell out to `git` which isn't on
+    # PATH in the Nix sandbox, the dir-exists check below would call
+    # `git rev-parse` and fail with FileNotFoundError.
+    stamp = dest / 'mimalloc.stamp'
+    if stamp.exists() and stamp.read_text().strip() == args.commit and repo.exists():
+        return 0
+
     if repo.exists():
         try:
             current = run('git', 'rev-parse', 'HEAD', cwd=repo)
-        except subprocess.CalledProcessError:
+        except (subprocess.CalledProcessError, FileNotFoundError):
             shutil.rmtree(repo); current = None
         if current == args.commit:
             (dest / 'mimalloc.stamp').write_text(args.commit + '\n')

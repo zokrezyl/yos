@@ -197,6 +197,48 @@ int32_t yos_socket(struct yos_exec_ctx *ctx, int32_t domain, int32_t type, int32
 
 #include <stdlib.h>  /* mkdtemp/mkstemp */
 
+/* realpath: resolve absolute pathname. Two calling conventions:
+ *   resolved_off != 0: write into the guest-supplied buffer (FreeBSD
+ *                       PATH_MAX = 1024). Return resolved_off on
+ *                       success, 0 on error.
+ *   resolved_off == 0: caller wants malloc'd buffer. We don't have a
+ *                       guest-side allocator hooked up here, so today
+ *                       we return 0 + errno=ENOMEM. The FreeBSD-base
+ *                       realpath(1) tool always passes a non-NULL buf,
+ *                       which is the case we care about.
+ * The auto-bridge stubs this to NULL because the result is "alias of
+ * second arg" — a pattern the generator doesn't yet recognise. */
+uint32_t yos_realpath(struct yos_exec_ctx *ctx, uint32_t path_off,
+                      uint32_t resolved_off)
+{
+    if (!path_off || path_off >= ctx->memory_size) {
+        if (ctx && ctx->memory && ctx->errno_off)
+            *(int *)(ctx->memory + ctx->errno_off) = EFAULT;
+        return 0;
+    }
+    const char *p = (const char *)(ctx->memory + path_off);
+    if (!resolved_off) {
+        /* malloc-style call — not yet supported here. */
+        if (ctx && ctx->memory && ctx->errno_off)
+            *(int *)(ctx->memory + ctx->errno_off) = ENOMEM;
+        return 0;
+    }
+    if (resolved_off >= ctx->memory_size) {
+        if (ctx && ctx->memory && ctx->errno_off)
+            *(int *)(ctx->memory + ctx->errno_off) = EFAULT;
+        return 0;
+    }
+    char *buf = (char *)(ctx->memory + resolved_off);
+    char *r = realpath(p, buf);
+    if (!r) {
+        extern int yos_remap_errno_h2g(int);
+        if (ctx && ctx->memory && ctx->errno_off)
+            *(int *)(ctx->memory + ctx->errno_off) = yos_remap_errno_h2g(errno);
+        return 0;
+    }
+    return resolved_off;
+}
+
 /* mkdtemp: replaces the trailing "XXXXXX" in template with random
  * chars, creates the directory, returns the (modified) template
  * pointer on success or NULL on failure. The auto-bridge stubbed

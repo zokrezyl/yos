@@ -12,6 +12,7 @@
 #include <unistd.h>
 
 #include "wasm3.h"
+#include "yos/ydebug.h"
 
 /* Singletons. The sidecar is shared across all guest forks — Tier 2
  * fns are required to be pure (no per-ctx state). The init function
@@ -59,8 +60,10 @@ int yos_tier2_init(const char *libc_pure_path)
     size_t  bytes_size = 0;
     uint8_t *bytes = slurp(libc_pure_path, &bytes_size);
     if (!bytes) {
-        fprintf(stderr, "yos: tier2: cannot read %s: %s\n",
-                libc_pure_path, strerror(errno));
+        /* Informational — guest still runs, Tier-2 fns trap on use.
+         * Gate via ydebug so default runs stay quiet (CLAUDE.md). */
+        ydebug("tier2: cannot read %s: %s\n",
+               libc_pure_path, strerror(errno));
         m3_FreeRuntime(g_t2_rt);
         m3_FreeEnvironment(g_t2_env);
         g_t2_rt = NULL; g_t2_env = NULL;
