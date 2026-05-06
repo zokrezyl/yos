@@ -21,29 +21,29 @@ import sys
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 from run_in_pty import run_in_pty
+from _nvim_path import find_nvim
 
 
 def main():
     repo = os.environ.get("YOS_REPO_ROOT") or os.getcwd()
-    build_dir = os.environ.get("YOS_BUILD_DIR") or "build-linux"
-    yos = os.path.join(repo, build_dir, "src", "yos", "yos")
-    nvim = os.path.join(repo, "build-linux", "wasm-pkgs", "nvim-0.10.4",
-                        "out", "bin", "nvim.wasm")
-    if not os.path.exists(yos):
-        print(f"FAIL: yos binary not found: {yos}")
-        return 1
-    if not os.path.exists(nvim):
-        print(f"FAIL: nvim.wasm not found: {nvim}")
-        return 1
+    paths = find_nvim(repo)
+    if not paths:
+        print("SKIP: nvim wasm not found (run `nix build .#all`)")
+        return 0
+    if not paths["has_runtime"]:
+        print("SKIP: nvim runtime tree missing — need `.#all` umbrella")
+        return 0
 
     env = dict(os.environ)
     env["TERM"] = "xterm-256color"
+    env["HOME"] = "/tmp/yos-nvim-test-no-such-home"
 
     # Drive: wait for startup, type 'iHELLO<Esc>:q!<CR>'. With a
     # working input pipeline nvim enters insert, types HELLO, exits
     # insert, runs :q!, and the embedded server exits 0.
     out, status = run_in_pty(
-        [yos, nvim, "-u", "NONE", "-i", "NONE", "--noplugin"],
+        [paths["yos"], paths["nvim"], "-u", "NONE", "-i", "NONE",
+         "--noplugin"],
         rows=24, cols=80,
         driver=[
             (3.0, b""),

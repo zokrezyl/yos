@@ -59,6 +59,10 @@ __attribute__((import_module("env"), import_name("__yos_argc")))
 int   __yos_argc(void);
 __attribute__((import_module("env"), import_name("__yos_argv_setup")))
 void  __yos_argv_setup(char **argv);
+__attribute__((import_module("env"), import_name("__yos_envc")))
+int   __yos_envc(void);
+__attribute__((import_module("env"), import_name("__yos_envp_setup")))
+void  __yos_envp_setup(char **envp);
 __attribute__((import_module("env"), import_name("exit")))
 __attribute__((noreturn))
 void  exit(int);
@@ -73,12 +77,35 @@ extern int main(int argc, char **argv);
  * symbol. Weak so binaries that don't have any ctors still link. */
 extern void __wasm_call_ctors(void) __attribute__((weak));
 
+/* Process-wide environment vector. zsh, FreeBSD coreutils, and most
+ * libc-using programs reference `extern char **environ` and walk it
+ * directly during init to import inherited env vars (PATH, HOME, …).
+ * Without a definition the link uses --allow-undefined and zsh sees
+ * environ=NULL → walks 0 entries → falls back to a hard-coded default
+ * PATH (`/bin:/usr/bin:/usr/ucb:/usr/local/bin`) instead of the
+ * caller's. The storage is sized for typical shells; __yos_envp_setup
+ * fills it. zsh has been observed with up to ~40 inherited env vars,
+ * 256 covers everything we've seen. */
+#define YOS_ENVP_MAX 256
+static char *yos_envp_storage[YOS_ENVP_MAX + 1];
+char **environ = yos_envp_storage;
+
 void _start(void) {
     if (__wasm_call_ctors) __wasm_call_ctors();
     int argc = __yos_argc();
     char *argv[65] = {0};
     if (argc > 64) argc = 64;
     __yos_argv_setup(argv);
+
+    /* Pull host env into the wasm guest BEFORE main runs — zsh's
+     * createparamtable() walks `environ` directly during early init.
+     * envp_setup writes wasm-offset pointers into yos_envp_storage and
+     * NULL-terminates at index envc. */
+    int envc = __yos_envc();
+    if (envc > YOS_ENVP_MAX) envc = YOS_ENVP_MAX;
+    if (envc > 0) __yos_envp_setup(yos_envp_storage);
+    yos_envp_storage[envc] = 0;
+
     int rc = main(argc, argv);
     exit(rc);
 }

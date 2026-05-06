@@ -382,6 +382,8 @@ int32_t yos_pipe(struct yos_exec_ctx *ctx, uint32_t fildes)
     if (w < 0) { yos_fd_close(ctx, r); return w; }
     p[0] = r;
     p[1] = w;
+    ydebug("pipe -> wfd_r=%d hfd_r=%d wfd_w=%d hfd_w=%d\n",
+           r, hfds[0], w, hfds[1]);
     return 0;
 }
 
@@ -1039,11 +1041,17 @@ int32_t yos_faccessat(struct yos_exec_ctx *ctx, int32_t dfd, uint32_t filename, 
  * file out from under the other. */
 int32_t yos_dup2(struct yos_exec_ctx *ctx, int32_t oldfd, int32_t newfd)
 {
+    ydebug("dup2(oldfd=%d, newfd=%d) ENTRY\n", oldfd, newfd);
     int32_t host_old = yos_fd_get(ctx, oldfd);
-    if (host_old < 0) return host_old;
+    if (host_old < 0) {
+        ydebug("dup2: bad oldfd, host_old=%d\n", host_old);
+        return host_old;
+    }
     if (oldfd == newfd) return newfd;  /* POSIX: no-op */
     int host_new = fcntl(host_old, F_DUPFD, 0);
     if (host_new < 0) return -errno;
+    ydebug("dup2(oldwfd=%d hfd=%d, newwfd=%d) -> new_hfd=%d\n",
+           oldfd, host_old, newfd, host_new);
     return yos_fd_assign(ctx, newfd, host_new);
 }
 

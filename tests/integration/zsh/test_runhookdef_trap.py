@@ -61,6 +61,13 @@ def main():
 
     env = dict(os.environ)
     env["TERM"] = "xterm-256color"
+    # Force HOME at a non-existent path so zsh skips `.zshrc`/`.zlogout`
+    # sourcing and history-save on exit — those paths take seconds under
+    # yos (file I/O through bridges) and would push this test past its
+    # kill_after timeout. The trap we're pinning fires during zle init,
+    # not during rc-file processing, so skipping rcs is safe here.
+    env["HOME"] = "/tmp/yos-zsh-test-no-such-home"
+    env["ZDOTDIR"] = "/tmp/yos-zsh-test-no-such-home"
 
     out, status = run_in_pty(
         # `-i` forces interactive even with stdin not a tty (belt and

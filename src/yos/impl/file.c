@@ -22,6 +22,7 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <string.h>
+#include <unistd.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <errno.h>
@@ -46,6 +47,27 @@ FILE *yos_handle_to_file(uint32_t h)
     return yos_files[h];
 }
 #define handle_to_file yos_handle_to_file
+
+/* For the pre-bound stream handles (1/2/3), look up the host fd the
+ * wasm guest's per-ctx fd_map currently maps to wasm fd 0/1/2.
+ * Returns -1 if the handle isn't a stream handle.
+ *
+ * Why this matters: zsh redirects stdin/stdout/stderr via dup2 (e.g.
+ * `dup2(pipe_w, 1)`) so that its `echo` builtin (which writes via
+ * stdio's __stdoutp = (FILE *)2) lands on the pipe. yos's stdio
+ * bridge naively maps __stdoutp to the host's *global* stdout, which
+ * bypasses the dup2: the child writes "inner" to host stdout instead
+ * of into the pipe, so `$(echo inner)` captures nothing. By routing
+ * fp=1/2/3 through fd_map to a raw write/read on the current host
+ * fd, the redirect actually takes effect. */
+static int std_handle_hfd(struct yos_exec_ctx *ctx, uint32_t h)
+{
+    extern int yos_fd_get(struct yos_exec_ctx *, int);
+    if (h == 1) return yos_fd_get(ctx, 0);
+    if (h == 2) return yos_fd_get(ctx, 1);
+    if (h == 3) return yos_fd_get(ctx, 2);
+    return -1;
+}
 
 static uint32_t alloc_handle(FILE *f)
 {
@@ -135,9 +157,19 @@ uint32_t yos_fread(struct yos_exec_ctx *ctx, uint32_t buf, uint32_t size,
 uint32_t yos_fwrite(struct yos_exec_ctx *ctx, uint32_t buf, uint32_t size,
                     uint32_t nmemb, uint32_t fp)
 {
-    FILE *f = handle_to_file(fp);
-    if (!f || !size) return 0;
+    if (!size) return 0;
     if (buf + (uint64_t)size * nmemb > ctx->memory_size) return 0;
+    /* Route stream handles through the per-ctx host fd so dup2'd
+     * stdin/stdout/stderr actually take effect. See std_handle_hfd. */
+    int hfd = std_handle_hfd(ctx, fp);
+    if (hfd >= 0) {
+        size_t total = (size_t)size * nmemb;
+        ssize_t w = write(hfd, ctx->memory + buf, total);
+        if (w <= 0) return 0;
+        return (uint32_t)((size_t)w / size);
+    }
+    FILE *f = handle_to_file(fp);
+    if (!f) return 0;
     return (uint32_t)fwrite(ctx->memory + buf, size, nmemb, f);
 }
 
@@ -173,8 +205,15 @@ uint32_t yos_fgets(struct yos_exec_ctx *ctx, uint32_t buf, int32_t n, uint32_t f
 
 int32_t yos_fputs(struct yos_exec_ctx *ctx, uint32_t s, uint32_t fp)
 {
+    if (!s || s >= ctx->memory_size) return -1;
+    int hfd = std_handle_hfd(ctx, fp);
+    if (hfd >= 0) {
+        size_t len = strlen((const char *)(ctx->memory + s));
+        ssize_t w = write(hfd, ctx->memory + s, len);
+        return w < 0 ? -1 : (int32_t)w;
+    }
     FILE *f = handle_to_file(fp);
-    if (!f || !s || s >= ctx->memory_size) return -1;
+    if (!f) return -1;
     return fputs((const char *)(ctx->memory + s), f);
 }
 

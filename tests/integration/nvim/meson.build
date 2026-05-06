@@ -28,21 +28,21 @@ yos_build_basename = run_command('basename', meson.project_build_root(),
 nvim_int_env.set('YOS_BUILD_DIR', yos_build_basename)
 
 nvim_int_tests = {
-  'quit'         : files('test_quit.py'),
-  'winsize'      : files('test_winsize.py'),
-  'edit-session' : files('test_edit_session.py'),
-  # Pins the user-reported "no text input" symptom on darwin. Drives
-  # nvim with 'iHELLO<Esc>:q!<CR>' and verifies HELLO appears in the
-  # pty output (proof that input arrived). Currently fails on darwin.
-  'input'        : files('test_input.py'),
+  'quit'         : {'src' : files('test_quit.py'),         'xfail' : false},
+  'winsize'      : {'src' : files('test_winsize.py'),      'xfail' : false},
+  'edit-session' : {'src' : files('test_edit_session.py'), 'xfail' : false},
+  # Pins the user-reported "no text input" symptom. Drives nvim with
+  # 'iHELLO<Esc>:q!<CR>' and verifies HELLO appears in the pty output.
+  'input'        : {'src' : files('test_input.py'),        'xfail' : false},
 }
 
-foreach name, src : nvim_int_tests
+foreach name, cfg : nvim_int_tests
   test('nvim-' + name,
        py3,
-       args : src,
+       args : cfg['src'],
        suite : 'integration-nvim',
        env : nvim_int_env,
        depends : [yos_exe],
+       should_fail : cfg['xfail'],
        timeout : 30)
 endforeach

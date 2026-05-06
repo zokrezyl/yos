@@ -257,6 +257,31 @@ in stdenv.mkDerivation {
         if (str && putcfn) for (; *str; ++str) putcfn((unsigned char)*str);
         return 0;
     }
+
+    /* ── stdio FILE* singletons ─────────────────────────────────────
+     * FreeBSD's stdio.h declares
+     *     extern FILE *__stdinp, *__stdoutp, *__stderrp;
+     *     #define stdin  __stdinp
+     *     #define stdout __stdoutp
+     *     #define stderr __stderrp
+     * The wasm guest's libc (zsh, FreeBSD coreutils, …) needs concrete
+     * values for these symbols. Without them the link uses
+     * --allow-undefined and the symbols resolve to 0 at runtime; every
+     * fputs/fwrite/fprintf call to "stdout" passes 0 to the bridge,
+     * which yos's FILE-handle table treats as "unknown handle" — output
+     * silently dropped.
+     *
+     * yos's bridge (src/yos/impl/file.c::yos_handle_to_file) reserves
+     * the small ints 1/2/3 as the canonical handles for stdin/stdout/
+     * stderr — it returns the host's stdin/stdout/stderr unconditionally
+     * for those values. Cast each integer to FILE* so consumers can
+     * dereference-equality against the symbol but the bridge sees
+     * exactly 1/2/3 as the wasm-side argument. The struct __sFILE is
+     * never accessed by the host (we never read members from the wasm
+     * guest's FILE), so the "pointer" is purely an opaque handle. */
+    FILE *__stdinp  = (FILE *)1;
+    FILE *__stdoutp = (FILE *)2;
+    FILE *__stderrp = (FILE *)3;
     STUBS_EOF
     YOS_STUBS_O="$TMPDIR/yos_capsicum_stubs.o"
     # clang-unwrapped doesn't ship its resource dir on the include

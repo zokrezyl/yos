@@ -22,17 +22,18 @@ import tempfile
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 from run_in_pty import run_in_pty
+from _nvim_path import find_nvim
 
 
 def main():
     repo = os.environ.get("YOS_REPO_ROOT") or os.getcwd()
-    build_dir = os.environ.get("YOS_BUILD_DIR") or "build-linux"
-    yos = os.path.join(repo, build_dir, "src", "yos", "yos")
-    nvim = os.path.join(repo, "build-linux", "wasm-pkgs", "nvim-0.10.4",
-                        "out", "bin", "nvim.wasm")
-    if not os.path.exists(yos) or not os.path.exists(nvim):
-        print("FAIL: yos or nvim.wasm not built")
-        sys.exit(1)
+    paths = find_nvim(repo)
+    if not paths:
+        print("SKIP: nvim wasm not found (run `nix build .#all`)")
+        sys.exit(0)
+    if not paths["has_runtime"]:
+        print("SKIP: nvim runtime tree missing — need `.#all` umbrella")
+        sys.exit(0)
 
     fd, tmp_path = tempfile.mkstemp(prefix="nvim_edit_", suffix=".txt")
     os.close(fd)
@@ -43,10 +44,11 @@ def main():
 
     env = dict(os.environ)
     env["TERM"] = "xterm-256color"
+    env["HOME"] = "/tmp/yos-nvim-test-no-such-home"
 
     write_cmd = f":w {tmp_path}\r".encode()
     out, status = run_in_pty(
-        [yos, nvim],
+        [paths["yos"], paths["nvim"], "--clean"],
         rows=40, cols=120,
         driver=[
             (3.0, b""),

@@ -14,28 +14,27 @@ import sys
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 from run_in_pty import run_in_pty
+from _nvim_path import find_nvim
 
 
 def main():
     repo = os.environ.get("YOS_REPO_ROOT") or os.getcwd()
-    # YOS_BUILD_DIR overrides where the host yos binary lives; defaults
-    # to build-linux for back-compat with the original linux invocation.
-    # The wasm-pkgs path stays under build-linux/ regardless of host —
-    # see tools/wasm-pkg.sh for the rationale.
-    build_dir = os.environ.get("YOS_BUILD_DIR") or "build-linux"
-    yos = os.path.join(repo, build_dir, "src", "yos", "yos")
-    nvim = os.path.join(repo, "build-linux", "wasm-pkgs", "nvim-0.10.4",
-                        "out", "bin", "nvim.wasm")
-    if not os.path.exists(yos):
-        print(f"FAIL: yos binary not found: {yos}")
-        sys.exit(1)
-    if not os.path.exists(nvim):
-        print(f"FAIL: nvim.wasm not found: {nvim}")
-        sys.exit(1)
+    paths = find_nvim(repo)
+    if not paths:
+        print("SKIP: nvim wasm not found (run `nix build .#all`)")
+        sys.exit(0)
+    if not paths["has_runtime"]:
+        print("SKIP: nvim runtime tree missing — need `.#all` umbrella "
+              "(legacy build-linux/wasm-pkgs/nvim only ships the bin)")
+        sys.exit(0)
     env = dict(os.environ)
     env["TERM"] = "xterm-256color"
+    # Force a clean HOME so the user's ~/.config/nvim/init.lua doesn't
+    # taint the test (it'd source plugins missing from the wasm guest
+    # and crash before :q! ever fires).
+    env["HOME"] = "/tmp/yos-nvim-test-no-such-home"
     out, status = run_in_pty(
-        [yos, nvim],
+        [paths["yos"], paths["nvim"], "--clean"],
         rows=24, cols=80,
         driver=[(2.5, b""), (0.5, b":q!\r"), (3.0, b"")],
         kill_after=2.0,

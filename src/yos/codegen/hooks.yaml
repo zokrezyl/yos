@@ -566,7 +566,12 @@ stub:
   # struct utsname differs between FreeBSD/Linux.
   - uname
   - sigaltstack
-  - sigsuspend
+  # Note: sigsuspend used to be listed here as a stub. zsh's "fork+wait
+  # for child" pattern is `block(SIGCHLD); sigsuspend(empty); waitpid()`
+  # — with a stub, sigsuspend returns ENOSYS without blocking and zsh
+  # busy-loops forever, hanging on every external command. The custom
+  # body in impl/sig.c polls the proc table for child state changes,
+  # then returns -1/EINTR so zsh's loop falls through to waitpid.
   - sigwait
   - sigwaitinfo
   - sigtimedwait
@@ -584,7 +589,11 @@ stub:
   - ualarm
   - revoke
   - wait        # yos-private has wait4 only; map at next iteration
-  - wait3
+  # Note: wait3 was previously stubbed here. zsh's `wait_for_processes`
+  # calls wait3 (configure detected HAVE_WAIT3) and treats anything
+  # that isn't 0 / -1+ECHILD as a hard error → "wait failed:" warnings
+  # on every fork+wait. Now routed through custom_proc to a thin
+  # wrapper around yos_waitpid in impl/proc.c.
 
 # ─── Runtime-owned: the host yos binary binds these directly ──────────
 # (setjmp/longjmp via asyncify, the obsolete __yos_argc helpers, plus

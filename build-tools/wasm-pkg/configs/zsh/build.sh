@@ -355,8 +355,16 @@ make -j"$(nproc 2>/dev/null || echo 4)" || {
 # ── install ────────────────────────────────────────────────────────
 # zsh's install target wants directories owned + execute perms; we
 # install just the resulting Src/zsh wasm binary.
+#
+# Apply binaryen's --asyncify pass: yos's fork() is implemented as a
+# memory snapshot + asyncify rewind on the parent and a fresh
+# pthread/runtime on the child. Without an asyncify-instrumented
+# binary, yos_fork returns -ENOSYS, zsh's `cmd1 | cmd2` and
+# `x=$(cmd)` paths can't actually fork their right-hand side, and
+# the shell wedges on every pipe / command-substitution. Same pass
+# nvim and the freebsd-tools use.
 mkdir -p "$PREFIX/bin"
-cp "$BLD/Src/zsh" "$PREFIX/bin/zsh.wasm"
+wasm-opt --asyncify -O2 "$BLD/Src/zsh" -o "$PREFIX/bin/zsh.wasm"
 
 cat > "$PREFIX/manifest.txt" <<EOF
 name=zsh

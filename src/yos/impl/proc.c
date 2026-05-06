@@ -132,6 +132,22 @@ int32_t yos_exit(struct yos_exec_ctx *ctx, int32_t code)
 
     /* Forked children run in separate threads - only terminate the thread */
     if (ctx->is_child) {
+        /* Close all host fds the child holds. yos's fork F_DUPFD's the
+         * parent's fd_map into the child so each side has independent
+         * host fds (so close/dup2 in one runtime doesn't trample the
+         * other). On a real OS, process exit closes every fd
+         * implicitly; pthread_exit does NOT. Without this loop the
+         * child's dup'd pipe write-end leaks, the pipe never reaches
+         * EOF, and the parent's read (e.g. `echo a | read v`) hangs
+         * forever waiting for data. */
+        for (int i = 0; i < YOS_FD_MAX; i++) {
+            int hfd = ctx->fd_map[i];
+            if (hfd >= 3) {  /* don't close 0/1/2 — those are shared host stdio */
+                close(hfd);
+                ctx->fd_map[i] = -1;
+            }
+        }
+
         /* Notify any libuv-style EVFILT_PROC|NOTE_EXIT watcher in the
          * parent runtime. libuv on __FreeBSD__ uses kqueue PROC events
          * (not SIGCHLD) to detect child exit; without this notify the
@@ -770,7 +786,15 @@ int32_t yos_waitpid(struct yos_exec_ctx *ctx, int32_t pid, uint32_t stat_addr, i
     /* Check if child exists */
     if (!has_children(rt, my_pid, pid)) {
         pthread_mutex_unlock(&rt->proc_lock);
-        return -ECHILD;
+        /* POSIX waitpid returns -1 + errno=ECHILD, NOT -ECHILD as the
+         * return value. zsh's `wait_for_processes` polls with WNOHANG
+         * and only stops the reap loop on rc==0 or rc==-1+ECHILD;
+         * returning -10 directly looks like "reaped pid 4294967286" to
+         * the guest and trips the `wait failed: %e` warning. */
+        extern int yos_remap_errno_h2g(int);
+        if (ctx->memory && ctx->errno_off)
+            *(int *)(ctx->memory + ctx->errno_off) = yos_remap_errno_h2g(ECHILD);
+        return -1;
     }
 
     /* Find zombie child */
@@ -1088,6 +1112,25 @@ static int deliver_to_proc(struct yos_proc *p, int sig)
         return -ESRCH;
     if (sig == 0) return 0;
     if (!p->thread) return -ESRCH;
+    /* Some signals are *process-wide* on Linux/FreeBSD — pthread_kill
+     * for SIGSTOP/SIGCONT/SIGTSTP/SIGTTIN/SIGTTOU stops or resumes the
+     * entire host process (including yos and the parent guest), not
+     * just the targeted child thread. zsh sends these for job control
+     * (SIGSTOP/SIGCONT around `$(...)` evaluation, etc.) and the
+     * intent is purely guest-internal — drop them. The guest's exec
+     * model already provides start/stop semantics via pthread
+     * lifetime; we don't want host-process suspension. SIGTERM/SIGKILL
+     * pass through (real teardown). */
+    switch (sig) {
+        case 17: /* SIGSTOP   on FreeBSD — same as Linux */
+        case 18: /* SIGTSTP   */
+        case 19: /* SIGCONT (FreeBSD) — Linux's SIGSTOP is 19, ambiguous;
+                  *           filtering both numbers is safest. */
+        case 20: /* SIGCHLD on FreeBSD — handled separately */
+        case 21: /* SIGTTIN  */
+        case 22: /* SIGTTOU  */
+            return 0;
+    }
     int rc = pthread_kill(p->thread, sig);
     return rc == 0 ? 0 : -rc;
 }
@@ -1097,12 +1140,30 @@ int32_t yos_kill(struct yos_exec_ctx *ctx, int32_t pid, int32_t sig)
     ydebug("kill(%d, %d)\n", pid, sig);
     struct yos_runtime *rt = ctx->rt;
     int32_t my_pgid = ctx->proc ? ctx->proc->pgid : 0;
+    extern int yos_remap_errno_h2g(int);
+
+    /* POSIX kill returns -1 + errno on failure, NOT -<errno> as the
+     * return value. zsh's wait loop is
+     *   while (kill(pid, 0) >= 0 || errno != ESRCH) sigsuspend(...);
+     * — returning -ESRCH (=-3) directly looks like rc<0, but errno
+     * stays whatever it was before, so the loop never breaks. */
+    int rc;
 
     /* pid > 0: deliver to that guest proc. */
     if (pid > 0) {
         struct yos_proc *t = yos_proc_find(rt, pid);
-        if (!t) return -ESRCH;
-        return deliver_to_proc(t, sig);
+        if (!t) {
+            if (ctx->memory && ctx->errno_off)
+                *(int *)(ctx->memory + ctx->errno_off) = yos_remap_errno_h2g(ESRCH);
+            return -1;
+        }
+        rc = deliver_to_proc(t, sig);
+        if (rc < 0) {
+            if (ctx->memory && ctx->errno_off)
+                *(int *)(ctx->memory + ctx->errno_off) = yos_remap_errno_h2g(-rc);
+            return -1;
+        }
+        return rc;
     }
 
     /* pid == 0: deliver to every proc in caller's pgrp. */
@@ -1124,8 +1185,33 @@ int32_t yos_kill(struct yos_exec_ctx *ctx, int32_t pid, int32_t sig)
         if (rc != 0) last_err = -rc;
     }
     pthread_mutex_unlock(&rt->proc_lock);
-    if (!found) return -ESRCH;
-    return last_err;
+    if (!found) {
+        if (ctx->memory && ctx->errno_off)
+            *(int *)(ctx->memory + ctx->errno_off) = yos_remap_errno_h2g(ESRCH);
+        return -1;
+    }
+    if (last_err) {
+        if (ctx->memory && ctx->errno_off)
+            *(int *)(ctx->memory + ctx->errno_off) = yos_remap_errno_h2g(-last_err);
+        return -1;
+    }
+    return 0;
+}
+
+/* wait3(status, options, rusage) — equivalent to waitpid(-1, status,
+ * options) with rusage data. zsh's `wait_for_processes` uses wait3
+ * with WNOHANG to drain zombies after a SIGCHLD. The bridge previously
+ * stubbed this to ENOSYS; that made zsh report `wait failed: <errno>`
+ * after every fork+wait. We pass through to yos_waitpid and zero the
+ * rusage struct (yos doesn't track per-proc CPU yet — bridge.py's
+ * struct_convert pipeline could fill this in later). */
+int32_t yos_wait3(struct yos_exec_ctx *ctx, uint32_t stat_addr, int32_t options, uint32_t ru)
+{
+    if (ru && ctx->memory && ru + 72 <= ctx->memory_size) {
+        /* struct rusage is 72 bytes on FreeBSD i386 — zero it. */
+        memset(ctx->memory + ru, 0, 72);
+    }
+    return yos_waitpid(ctx, -1, stat_addr, options);
 }
 
 int32_t yos_wait4(struct yos_exec_ctx *ctx, int32_t pid, uint32_t stat_addr, int32_t options, uint32_t ru)
@@ -1141,8 +1227,12 @@ int32_t yos_wait4(struct yos_exec_ctx *ctx, int32_t pid, uint32_t stat_addr, int
     /* Check if child exists */
     if (!has_children(rt, my_pid, pid)) {
         pthread_mutex_unlock(&rt->proc_lock);
-        ydebug("wait4 = -ECHILD\n");
-        return -ECHILD;
+        ydebug("wait4 = -1 errno=ECHILD\n");
+        /* See yos_waitpid for the rationale on -1+errno vs -ECHILD. */
+        extern int yos_remap_errno_h2g(int);
+        if (ctx->memory && ctx->errno_off)
+            *(int *)(ctx->memory + ctx->errno_off) = yos_remap_errno_h2g(ECHILD);
+        return -1;
     }
 
     /* Find zombie child */

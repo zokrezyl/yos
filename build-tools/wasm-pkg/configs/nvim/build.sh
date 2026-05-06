@@ -292,6 +292,34 @@ cmake --build . --parallel --target nvim_bin
 mkdir -p "$PREFIX/bin"
 wasm-opt --asyncify -O2 "$BLD/bin/nvim" -o "$PREFIX/bin/nvim.wasm"
 
+# nvim's binary references its runtime tree at $PREFIX/share/nvim/runtime/
+# (set at compile time via CMAKE_INSTALL_PREFIX). Without this tree
+# nvim crashes loading vim/_init_packages.lua and friends — every
+# init.lua errors out with "attempt to index a nil value", and any
+# user script that references syntax/colors/etc. fails too.
+#
+# The canonical runtime layout is in the source tree ($SRC/runtime).
+# The cmake-build dir has additional generated files (help tags etc.)
+# we want to merge in. Use `cmake --install` to perform nvim's own
+# install rules, then prune the empty/aux files cmake leaves behind.
+echo "[$NAME] copying runtime tree → $PREFIX/share/nvim/runtime/"
+# Direct copy of the source runtime/ — that's the canonical layout
+# (syntax/, lua/, autoload/, plugin/, colors/, ftplugin/, doc/, …).
+# `cmake --install runtime` only triggers a small subset of install
+# rules (pack/dist/* mostly) so we can't rely on it. Merge any
+# generated files from cmake-build/runtime/ on top (help tags etc.)
+# but skip cmake's own bookkeeping (CMakeFiles/, Makefile, …).
+mkdir -p "$PREFIX/share/nvim/runtime"
+cp -r "$SRC/runtime/." "$PREFIX/share/nvim/runtime/"
+if [ -d "$BLD/runtime" ]; then
+    # Pick up cmake-generated runtime artefacts (help tags, package
+    # tags etc.) without dragging in cmake's own metadata files.
+    for sub in doc syntax pack; do
+        [ -d "$BLD/runtime/$sub" ] && cp -r "$BLD/runtime/$sub/." \
+            "$PREFIX/share/nvim/runtime/$sub/" 2>/dev/null || true
+    done
+fi
+
 cat > "$PREFIX/manifest.txt" <<EOF
 name=nvim
 version=${VERSION}
