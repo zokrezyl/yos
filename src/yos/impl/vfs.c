@@ -176,6 +176,60 @@ int32_t yos_write(struct yos_exec_ctx *ctx, int32_t fd, uint32_t buf, uint32_t c
         fprintf(stderr, "yos: dump@0x6aa70: %02x %02x %02x %02x %02x %02x \"%.20s\"\n",
                 m[0], m[1], m[2], m[3], m[4], m[5], (const char *)m);
     }
+    /* DIAG: catch 0xff garbage — log the FULL hex of any write that
+     * starts with 0xff or is short and contains 0xff. Helps locate
+     * which guest call path is dribbling poisoned bytes onto the tty
+     * (zsh ZLE refresh emits these before `\b \b` and they look like
+     * "backspace inserts a space" on the user's screen). */
+    if (getenv("YOS_TRACE_0XFF") && count <= 64) {
+        const uint8_t *bp = (const uint8_t *)p;
+        int has_ff = 0;
+        for (uint32_t i = 0; i < count; i++) if (bp[i] == 0xff) { has_ff = 1; break; }
+        if (has_ff) {
+            fprintf(stderr, "yos_write fd=%d count=%u hex=", fd, count);
+            for (uint32_t i = 0; i < count; i++) fprintf(stderr, "%02x ", bp[i]);
+            fprintf(stderr, "  buf_off=0x%x\n", buf);
+        }
+    }
+
+    /* WORKAROUND for the post-fork tty garbage bug: zsh's ZLE under
+     * yos's asyncify-based fork has a child whose first writes
+     * include short runs of all-0xff bytes (typically count=8)
+     * directed at the dup'd tty fd. Those bytes are invalid UTF-8
+     * and on modern UTF-8 terminals render as replacement chars or
+     * box-glyphs, breaking the column accounting that the
+     * destructive-backspace `\b \b` echo depends on — the visible
+     * symptom is "backspace inserts a space".
+     *
+     * Real fix is in src/yos/impl/proc.c (the fork-asyncify
+     * memory-snapshot + child-fd-table path corrupts an 8-byte
+     * scratch area at wasm linear-memory offset 0x29098). Until
+     * that lands, drop writes that are pure all-0xff with count ≤
+     * 16 going to host fds 0/1/2 (terminal). Pure-0xff isn't a
+     * legitimate text payload anywhere — no protocol, no escape
+     * sequence, no UTF-8 — so this can't suppress real output.
+     * Anyone who needs the raw byte stream sets YOS_NO_FF_DROP=1.
+     *
+     * Diagnostic for anyone hitting this: re-enable the bytes with
+     * `YOS_NO_FF_DROP=1 yos …` and grep with `YOS_TRACE_0XFF=1` to
+     * see exactly when they fire. */
+    /* The earlier "hfd in 0..2" check was wrong — zsh's SHTTY is
+     * dup'd to a higher host fd (often 5–10) at startup, so the
+     * post-fork garbage write goes to an hfd outside the std range.
+     * Use isatty() instead so the filter catches any tty regardless
+     * of which slot it landed in. Pure-0xff is never a legitimate
+     * tty payload (no UTF-8, no escape sequence, no protocol). */
+    if (count > 0 && count <= 16 && hfd >= 0 &&
+        getenv("YOS_NO_FF_DROP") == NULL && isatty(hfd) == 1) {
+        const uint8_t *bp = (const uint8_t *)p;
+        int all_ff = 1;
+        for (uint32_t i = 0; i < count; i++) {
+            if (bp[i] != 0xff) { all_ff = 0; break; }
+        }
+        if (all_ff) {
+            return (int32_t)count;
+        }
+    }
     ssize_t r = write(hfd, p, count);
     if (ydebug_enabled() && fd != 4 && fd != 5) {
         pid_t tid = yos_plat_gettid();

@@ -1478,6 +1478,16 @@ void yos_link_imports(IM3Module module, struct yos_exec_ctx *ctx)
     m3_LinkRawFunction(module, "env", "execve",  "i(iii)", m3_execve);
     m3_LinkRawFunction(module, "env", "execvpe", "i(iii)", m3_execvpe);
 
+    /* FreeBSD userland fns the bridge auto-stubs to NULL because their
+     * signatures (returning host-allocated char *, writing through
+     * char **) don't fit the mechanical pointer-translation pattern.
+     * Without these, the second-batch tool ports (cut, sort, grep,
+     * sed, awk, du, df, …) trap on first strdup / asprintf / strerror.
+     * Bound BEFORE yos_brg_link_imports so we win the race against
+     * its NULL-returning auto-stub. */
+    extern void yos_freebsd_userland_link(IM3Module mod);
+    yos_freebsd_userland_link(module);
+
     /* Auto-generated bridges for the FreeBSD-libc-name import surface.
      * For guests that import each libc fn by name (env.write, env.read,
      * env.exit, …) instead of going through __yos_syscall. Bridges

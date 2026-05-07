@@ -154,6 +154,22 @@ uint32_t yos_fread(struct yos_exec_ctx *ctx, uint32_t buf, uint32_t size,
     return (uint32_t)fread(ctx->memory + buf, size, nmemb, f);
 }
 
+/* See vfs.c::yos_write for the rationale; same workaround needed
+ * here because the wasm guest (zsh ZLE refresh, in particular) uses
+ * fwrite() against stderr, which routes through yos_fwrite and
+ * bypasses the write() path. Pure-0xff payloads ≤16 B going to a
+ * terminal fd are dropped silently — they're a known fork-asyncify
+ * leak from impl/proc.c. Set YOS_NO_FF_DROP=1 to disable. */
+static inline int yos__drop_0xff_garbage(int hfd, const void *p, size_t n)
+{
+    if (n == 0 || n > 16 || hfd < 0) return 0;
+    if (getenv("YOS_NO_FF_DROP")) return 0;
+    if (isatty(hfd) != 1) return 0;
+    const uint8_t *bp = (const uint8_t *)p;
+    for (size_t i = 0; i < n; i++) if (bp[i] != 0xff) return 0;
+    return 1;
+}
+
 uint32_t yos_fwrite(struct yos_exec_ctx *ctx, uint32_t buf, uint32_t size,
                     uint32_t nmemb, uint32_t fp)
 {
@@ -164,12 +180,19 @@ uint32_t yos_fwrite(struct yos_exec_ctx *ctx, uint32_t buf, uint32_t size,
     int hfd = std_handle_hfd(ctx, fp);
     if (hfd >= 0) {
         size_t total = (size_t)size * nmemb;
+        if (yos__drop_0xff_garbage(hfd, ctx->memory + buf, total))
+            return nmemb;
         ssize_t w = write(hfd, ctx->memory + buf, total);
         if (w <= 0) return 0;
         return (uint32_t)((size_t)w / size);
     }
     FILE *f = handle_to_file(fp);
     if (!f) return 0;
+    if (f == stdout || f == stderr) {
+        size_t total = (size_t)size * nmemb;
+        if (yos__drop_0xff_garbage(fileno(f), ctx->memory + buf, total))
+            return nmemb;
+    }
     return (uint32_t)fwrite(ctx->memory + buf, size, nmemb, f);
 }
 

@@ -32,9 +32,54 @@ a working wasm userspace built against FreeBSD libc:
 - **zsh 5.9** — interactive shell, scripting, pipes, command
   substitution, env passthrough, fork+exec.
 - **neovim 0.10.4** — full TUI, runtime tree, plugin loader.
-- **FreeBSD coreutils** — cat, echo, pwd, mkdir, ln, head, hostname,
-  id, kill, mktemp, realpath, sleep, sync, test, touch, true, false,
-  uniq, yes, basename, dirname, rmdir.
+- **FreeBSD coreutils — first batch (run cleanly today):** cat, echo,
+  pwd, mkdir, ln, head, hostname, id, kill, mktemp, realpath, sleep,
+  sync, test, touch, true, false, uniq, yes, basename, dirname, rmdir.
+
+- **FreeBSD coreutils — second batch (build cleanly; runtime
+  partial):** awk, cut, df, du, find, grep, sed, sort, tr, wc, xargs.
+
+  These compile and link, but most trap or misbehave at runtime
+  against the current yos host bridge. Status pinned by
+  `tests/integration/freebsd-tools/`:
+
+  | Tool   | Runtime | Failure mode (xfail in test suite)                 |
+  |--------|---------|----------------------------------------------------|
+  | wc     | partial | line + byte counts correct; words always 1         |
+  | df     | partial | runs clean but prints nothing (0 mounts in stub)   |
+  | awk    | broken  | lexer reads only first byte (rune-locale gap)      |
+  | cut    | broken  | empty / `\n\n`-only output (rune-locale gap)       |
+  | tr     | broken  | unresolved import `env.mergesort`                  |
+  | grep   | broken  | no matches (regex char-class lookup hits same gap) |
+  | sed    | broken  | mimalloc free-list corruption                      |
+  | sort   | broken  | exits ENOENT in setlocale path                     |
+  | xargs  | broken  | "no free pid slot" — proc-table slot not recycled  |
+  | find   | broken  | unresolved import `env.fts_open`                   |
+  | du     | broken  | same `env.fts_open` gap as find                    |
+
+  The shared root cause for many of these is the wasm guest's
+  `<_ctype.h>` macros deref'ing `_CurrentRuneLocale->__runetype[c]` —
+  yos doesn't initialise the FreeBSD rune-locale at startup, so every
+  `isspace`/`isalpha`/`isdigit` returns 0 and the tools' lexers /
+  parsers / delimiter walkers all silently mis-classify every byte.
+  Test suite tracks each gap with a docstring + xfail entry; flipping
+  any test to UNEXPECTEDPASS marks a real regression-net win.
+
+  Build-time machinery the second batch added that's unconditionally
+  green: bison generates `getdate.c` for find and `awkgram.c` for
+  awk; awk's `proctab.c` is emitted by a host-side `maketab` build;
+  sort vendors `md5c.c` from `lib/libmd`; df + wc link a 200-line
+  text-only libxo shim. Plus `src/yos/impl/freebsd_userland.c` adds
+  host-side bridges for `strdup`/`strerror`/`asprintf`/`getmntinfo`/
+  `getbsize`/`strtonum`/`fgetln`/`getprogname` etc., which the
+  bridge.py auto-stubs would otherwise return NULL for.
+
+- **Not yet ported (dependency cost too high for one tool change):**
+  - **ps, top** — need `libkvm` + a kernel-style proc table; yos's
+    proc table is host-side, would need a custom `machine.c` reading
+    yos's procfs.
+  - **tar** — needs libarchive (~500+ files) — own derivation.
+  - **gzip** — needs zlib + lzma + zstd, three separate ports.
 
 Each lives in `result/libexec/<name>` as a bare wasm module that
 yos's exec bridge can load directly. Shell-script wrappers in

@@ -82,6 +82,7 @@ yos_runtime_sources = files(
   'impl/random.c',
   'impl/signal.c',
   'impl/strto.c',
+  'impl/freebsd_userland.c',
   'impl/sysctl.c',
   'impl/tier2.c',
   'impl/printf.c',

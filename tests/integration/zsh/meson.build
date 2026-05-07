@@ -49,6 +49,17 @@ zsh_int_tests = {
   'silent-builtins'     : {'src' : files('test_silent_builtins.py'),     'xfail' : false},
   'external-diagnostic' : {'src' : files('test_external_diagnostic.py'), 'xfail' : false},
   'env-passthrough'     : {'src' : files('test_env_passthrough.py'),     'xfail' : false},
+  # User-reported "backspace = space" bug. ZLE emits the right
+  # `\b \b` sequence; the visible corruption was caused by a yos
+  # fork-asyncify leak — a forked child wrote 8 bytes of 0xff to
+  # the dup'd tty fd, modern UTF-8 terminals rendered those as
+  # replacement glyphs, and the destructive-backspace's column
+  # accounting fell apart. Workaround in vfs.c::yos_write +
+  # file.c::yos_fwrite drops short pure-0xff writes going to a
+  # tty (isatty(hfd)==1). The test asserts NO 0xff garbage in the
+  # post-backspace byte stream. The deeper proc.c fork-snapshot
+  # bug is still open; YOS_NO_FF_DROP=1 disables the workaround.
+  'backspace'           : {'src' : files('test_backspace.py'),           'xfail' : false},
   # Bug pins still standing (xfail). Each flips to UNEXPECTEDPASS when
   # fixed — remove the xfail entry as part of the fix commit.
   #
