@@ -65,6 +65,29 @@ let
     err          = { sub = "lib/libc/gen";    file = "err.c"; };
     basename     = { sub = "lib/libc/gen";    file = "basename.c"; };
     strsignal    = { sub = "lib/libc/string"; file = "strsignal.c"; };
+    # fts(3) — directory-tree walker used by ls, cp, find, du, rm -r,
+    # chmod -R, etc. Pure userspace traversal sitting on top of
+    # opendir/readdir/closedir/fstatfs/fchdir/lstat — all already
+    # bridged in yos. Pulled verbatim from FreeBSD libc; the FreeBSD-
+    # internal headers it needs (namespace.h, un-namespace.h,
+    # gen-private.h, libc_private.h) come from -I lib/libc/include
+    # and lib/libc/gen (added in libcCflags below).
+    #
+    # fts.c references the underscored symbols _open/_close/_fstat/
+    # _fstatfs and __opendir2 — these are FreeBSD libc-internal aliases
+    # for the public POSIX calls. The sysroot's libyos_stubs.a provides
+    # thin wrappers so they resolve at link time.
+    fts          = { sub = "lib/libc/gen";    file = "fts.c"; };
+    # qsort(3) — fts(3) uses it to sort directory entries when the
+    # user passes a comparator to fts_open(). Compiling FreeBSD's
+    # qsort.c into the tool means the comparator callback stays a
+    # wasm function pointer (no cross-runtime call) and we get
+    # FreeBSD-faithful ordering semantics.
+    qsort        = { sub = "lib/libc/stdlib"; file = "qsort.c"; };
+    # reallocf(3) — realloc that frees the old pointer on failure.
+    # FreeBSD-specific; pulled in for tools that link fts (fts.c uses
+    # it during path-buffer growth).
+    reallocf     = { sub = "lib/libc/stdlib"; file = "reallocf.c"; };
   };
 
   # Default libc helpers every tool gets unless it opts out by setting
@@ -92,18 +115,40 @@ let
   # }
   tools = {
     # ── FreeBSD bin/ ─────────────────────────────────────────────────
+    # sh     = { srcDir = "bin/sh";     };
+    #ps     = { srcDir = "bin/ps";     };
     cat      = { srcDir = "bin/cat";      libcExtras = [ "getopt" ]; extraCflags = [ "-DBOOTSTRAP_CAT" ]; };
+    cp       = { srcDir = "bin/cp";       srcs = [ "cp.c" "utils.c" ];
+                 libcExtras  = defaultLibcExtras ++ [ "fts" "qsort" "reallocf" ];
+                 extraCflags = [ "-D_ACL_PRIVATE" ]; };
+    chmod    = { srcDir = "bin/chmod";    };
+    date     = { srcDir = "bin/date";     srcs = [ "date.c" "vary.c" ]; };
+    dd       = { srcDir = "bin/dd";       srcs = [ "args.c" "conv.c" "conv_tab.c" "dd.c" "misc.c" "position.c" ]; };
     echo     = { srcDir = "bin/echo";     libcExtras = []; };
-    pwd      = { srcDir = "bin/pwd";      libcExtras = [ "getopt" ]; };
-    sleep    = { srcDir = "bin/sleep";    };
-    sync     = { srcDir = "bin/sync";     libcExtras = []; };
-    realpath = { srcDir = "bin/realpath"; };
-    ln       = { srcDir = "bin/ln";       };
-    rmdir    = { srcDir = "bin/rmdir";    };
-    mkdir    = { srcDir = "bin/mkdir";    };
+    domainname = { srcDir = "bin/domainname"; };
     hostname = { srcDir = "bin/hostname"; };
-    test     = { srcDir = "bin/test";     };
     kill     = { srcDir = "bin/kill";     };
+    ln       = { srcDir = "bin/ln";       };
+    ls       = { srcDir = "bin/ls";       srcs = [ "cmp.c" "ls.c" "print.c" "util.c" "yos_locale_stub.c" ];
+                 libcExtras = defaultLibcExtras ++ [ "fts" "qsort" "reallocf" ];
+                 # print.c filters every output byte through isprint().
+                 # Without the locale stub, _CurrentRuneLocale is NULL
+                 # so isprint() returns 0 for every byte and ls (in
+                 # default `-q` mode under a TTY) substitutes '?' for
+                 # every character of every filename.
+                 stageDirs = [ "locale-stub" ]; };
+    mkdir    = { srcDir = "bin/mkdir";    };
+    mv       = { srcDir = "bin/mv";       };
+    pwd      = { srcDir = "bin/pwd";      libcExtras = [ "getopt" ]; };
+    realpath = { srcDir = "bin/realpath"; };
+    rm       = { srcDir = "bin/rm";       };
+    rmdir    = { srcDir = "bin/rmdir";    };
+    sleep    = { srcDir = "bin/sleep";    };
+    stty     = { srcDir = "bin/stty";     srcs = [ "cchar.c" "gfmt.c" "key.c" "modes.c" "print.c" "stty.c" "util.c" ]; };
+    sync     = { srcDir = "bin/sync";     libcExtras = []; };
+    test     = { srcDir = "bin/test";     };
+    timeout  = { srcDir = "bin/timeout";  };
+    uuidgen  = { srcDir = "bin/uuidgen";  extraCflags = [ "-include" "errno.h" ]; };
 
     # ── FreeBSD usr.bin/ ─────────────────────────────────────────────
     "true"   = { srcDir = "usr.bin/true";  libcExtras = []; };
@@ -133,6 +178,7 @@ let
                  srcs = [ "compile.c" "main.c" "misc.c" "process.c" "yos_locale_stub.c" ];
                  stageDirs = [ "locale-stub" ]; };
     du       = { srcDir = "usr.bin/du"; srcs = [ "du.c" "yos_locale_stub.c" ];
+                 libcExtras = ctypeLibcExtras ++ [ "fts" "qsort" "reallocf" ];
                  stageDirs = [ "locale-stub" ]; };
     grep     = { srcDir = "usr.bin/grep";
                  srcs = [ "file.c" "grep.c" "queue.c" "util.c" "yos_locale_stub.c" ];
@@ -146,6 +192,7 @@ let
                  srcs = [ "find.c" "function.c" "ls.c" "main.c" "misc.c"
                           "operator.c" "option.c" "getdate.c"
                           "yos_locale_stub.c" ];
+                 libcExtras = defaultLibcExtras ++ [ "fts" "qsort" "reallocf" ];
                  stageDirs   = [ "find-gen" "locale-stub" ];
                  extraCflags = [ "-Wno-incompatible-pointer-types" ]; };
     # sort: pulls md5c.c straight in from lib/libmd, then -Is the same
@@ -181,6 +228,18 @@ let
                  srcs = [ "df.c" "yos_libxo_shim.c" "yos_locale_stub.c" ];
                  stageDirs   = [ "libxo" "locale-stub" ];
                  extraCflags = [ "-I$STAGE/libxo" ]; };
+
+    # ── yos-native ps ────────────────────────────────────────────────
+    # FreeBSD's bin/ps is ~3000 lines and pulls in libkvm; libkvm
+    # itself reads /dev/kmem and a kernel proc table that yos doesn't
+    # have. yos exposes its process state through /proc (synthesised
+    # by src/yos/vfs/procfs.c, mounted at startup in src/yos/main.c),
+    # so the user-facing fix is a small ps that reads /proc directly.
+    # Source is staged in $STAGE/yos-ps from buildPhase below.
+    ps       = { srcDir = "bin"; /* unused — all srcs come from stageDirs */
+                 srcs = [ "yos_ps.c" ];
+                 stageDirs = [ "yos-ps" ];
+                 libcExtras = [ ]; };
   };
 
   # ── helpers (Nix side) ───────────────────────────────────────────────
@@ -192,7 +251,15 @@ let
 
   libcCflags = lib.optionals
     (lib.any (t: (toolExtras t) != []) (lib.attrValues tools))
-    [ "-I${freebsd-src}/usr/src/lib/libc/include" ];
+    [ "-I${freebsd-src}/usr/src/lib/libc/include"
+      # lib/libc/gen carries gen-private.h, which fts.c includes via
+      # double-quote ("gen-private.h"). The compiler finds it in the
+      # source file's own directory when fts.c is compiled, but the
+      # consumer translation units (ls.c, cp.c, …) don't compile
+      # anything from lib/libc/gen, so adding the dir to the search
+      # path keeps the include resolvable from any TU that ends up
+      # parsing it (none today, but cheap insurance).
+      "-I${freebsd-src}/usr/src/lib/libc/gen" ];
 
   # Render the bash buildPhase loop. Each tool becomes a build_tool call
   # with its arguments folded into a heredoc-friendly form.
@@ -401,7 +468,125 @@ stdenv.mkDerivation {
         echo " * the upstream none.c value (every byte is single-byte)."
         echo " */"
         echo "int __mb_sb_limit = 256;"
+        echo ""
+        echo "/* yos addition: <runetype.h> declares _ThreadRuneLocale as"
+        echo " * _Thread_local and the inline __getCurrentRuneLocale reads"
+        echo " * it on every is*()/iswXXX() call. Without a definition the"
+        echo " * wasm-ld link only resolves it through --allow-undefined,"
+        echo " * which leaves the TLS slot uninitialised; reads return"
+        echo " * garbage pointers and __maskrune dereferences them. Define"
+        echo " * it explicitly as the zero TLS so __getCurrentRuneLocale"
+        echo " * falls through to the global _CurrentRuneLocale set above."
+        echo " */"
+        echo "_Thread_local const _RuneLocale *_ThreadRuneLocale = 0;"
     } > "$STAGE/locale-stub/yos_locale_stub.c"
+
+    # ── yos-native ps ────────────────────────────────────────────────
+    # Reads yos's synthetic /proc (mounted at startup by src/yos/main.c
+    # via src/yos/vfs/procfs.c). Output mirrors `ps -e` from BSD ps
+    # closely enough to be useful in the yos shell without dragging in
+    # libkvm + 3 kloc of FreeBSD's actual bin/ps. Pure libc — opendir/
+    # readdir/closedir + open/read on /proc/<pid>/stat.
+    mkdir -p "$STAGE/yos-ps"
+    cat > "$STAGE/yos-ps/yos_ps.c" <<'YOSPS_EOF'
+    /* yos-native ps(1) — reads yos's synthetic /proc.
+     *
+     * Output columns: PID  PPID  STAT  COMMAND
+     *
+     * The /proc/<pid>/stat format is Linux-flavoured (see
+     * src/yos/vfs/procfs.c generate_stat): "<pid> (<comm>) <state>
+     * <ppid> <pgrp> <session> 0 -1 0 ...". We parse just the first
+     * four fields and ignore the rest.
+     */
+    #include <ctype.h>
+    #include <dirent.h>
+    #include <errno.h>
+    #include <fcntl.h>
+    #include <stdint.h>
+    #include <stdio.h>
+    #include <stdlib.h>
+    #include <string.h>
+    #include <unistd.h>
+
+    static int is_all_digits(const char *s)
+    {
+        if (!*s) return 0;
+        for (; *s; s++) if (*s < '0' || *s > '9') return 0;
+        return 1;
+    }
+
+    /* Parse /proc/<pid>/stat. comm comes back in `comm_out`
+     * (NUL-terminated, up to `comm_max` bytes including the NUL).
+     * Returns 0 on success, -1 on parse failure. */
+    static int parse_stat(const char *path, int *pid, int *ppid,
+                          char *state, char *comm_out, size_t comm_max)
+    {
+        int fd = open(path, O_RDONLY);
+        if (fd < 0) return -1;
+        char buf[1024];
+        ssize_t n = read(fd, buf, sizeof(buf) - 1);
+        close(fd);
+        if (n <= 0) return -1;
+        buf[n] = '\0';
+
+        /* pid */
+        char *p = buf;
+        *pid = (int)strtol(p, &p, 10);
+        while (*p == ' ') p++;
+        /* (comm) — comm may contain spaces and parentheses, so find
+         * the LAST ')' before reading further. */
+        if (*p != '(') return -1;
+        p++;
+        const char *comm_start = p;
+        const char *comm_end = strrchr(p, ')');
+        if (!comm_end) return -1;
+        size_t clen = (size_t)(comm_end - comm_start);
+        if (clen >= comm_max) clen = comm_max - 1;
+        memcpy(comm_out, comm_start, clen);
+        comm_out[clen] = '\0';
+        p = (char *)comm_end + 1;
+        while (*p == ' ') p++;
+        /* state */
+        *state = *p ? *p : '?';
+        if (*p) p++;
+        while (*p == ' ') p++;
+        /* ppid */
+        *ppid = (int)strtol(p, &p, 10);
+        return 0;
+    }
+
+    int main(int argc, char **argv)
+    {
+        (void)argc; (void)argv;
+        DIR *dir = opendir("/proc");
+        if (!dir) {
+            fprintf(stderr, "ps: opendir(/proc): %s\n", strerror(errno));
+            return 1;
+        }
+        printf("  PID  PPID S COMMAND\n");
+
+        struct dirent *de;
+        int rows = 0;
+        while ((de = readdir(dir)) != NULL) {
+            if (!is_all_digits(de->d_name)) continue;
+            char path[64];
+            snprintf(path, sizeof(path), "/proc/%s/stat", de->d_name);
+            int pid = 0, ppid = 0;
+            char state = '?';
+            char comm[64] = {0};
+            if (parse_stat(path, &pid, &ppid, &state,
+                           comm, sizeof(comm)) != 0)
+                continue;
+            printf("%5d %5d %c %s\n", pid, ppid, state, comm);
+            rows++;
+        }
+        closedir(dir);
+        if (rows == 0)
+            fprintf(stderr, "ps: no processes found in /proc — is yos's "
+                            "procfs mounted?\n");
+        return 0;
+    }
+    YOSPS_EOF
 
     # ── minimal text-only libxo shim ──────────────────────────────────
     # df, wc (and other FreeBSD utilities) drive output through

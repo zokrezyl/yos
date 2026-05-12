@@ -132,6 +132,20 @@ int32_t yos_exit(struct yos_exec_ctx *ctx, int32_t code)
 
     /* Forked children run in separate threads - only terminate the thread */
     if (ctx->is_child) {
+        /* Flush host stdio. impl/file.c keeps a single global FILE*
+         * table where handles 1/2/3 alias the host's stdin/stdout/
+         * stderr, so a guest's printf("...") lands in the host's
+         * glibc stdout buffer. yos_exit doesn't go through libc's
+         * exit(3) on the guest side — pthread_exit is the only
+         * thing left — so the atexit handler that would normally
+         * fflush these never runs. Without the explicit flush, an
+         * external command's output stays buffered and only reaches
+         * the user when SOMETHING ELSE writes to stdout next: in an
+         * interactive zsh that's the next command, so the user sees
+         * `command1: <silence>` followed by the previous command's
+         * output glued onto the next command's. fflush(NULL) flushes
+         * every open output stream including stdout / stderr. */
+        fflush(NULL);
         /* Close all host fds the child holds. yos's fork F_DUPFD's the
          * parent's fd_map into the child so each side has independent
          * host fds (so close/dup2 in one runtime doesn't trample the

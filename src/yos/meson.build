@@ -86,6 +86,7 @@ yos_runtime_sources = files(
   'impl/sysctl.c',
   'impl/tier2.c',
   'impl/printf.c',
+  'impl/dir.c',
   'vfs/file.c',
   'vfs/mount.c',
   'vfs/procfs.c',

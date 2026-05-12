@@ -122,7 +122,37 @@ in stdenv.mkDerivation {
     #include <stdlib.h>
     #include <string.h>
     #include <errno.h>
+    #include <fcntl.h>
+    #include <unistd.h>
+    #include <dirent.h>
+    #include <sys/stat.h>
+    #include <sys/mount.h>
     #include <sys/capsicum.h>
+
+    /* ── FreeBSD libc-internal aliases ────────────────────────────────
+     * FreeBSD libc has two flavours of every syscall wrapper: a public
+     * one (open/close/fstat/…) plus a hidden alias prefixed with `_`
+     * (e.g. `_open`). Internal libc code (fts.c, opendir2.c, …) calls
+     * the underscored variant directly to bypass user interposers.
+     *
+     * When we compile pieces of FreeBSD libc straight into a tool
+     * (libcExtras = [ "fts", "qsort", … ]), those underscored
+     * references show up as undefined symbols at link time. yos's
+     * bridge surface only knows the public POSIX names — wire the
+     * aliases here as thin pass-throughs. The wasm linker drops the
+     * .o when the tool doesn't reference these symbols, so tools that
+     * don't pull in fts.c pay nothing.
+     *
+     * __opendir2 is FreeBSD's "real" opendir that takes a DTF_* flag
+     * (whiteout / dup filtering). yos has no union-fs concept; ignore
+     * the flag and route to opendir(). */
+    int _open(const char *path, int flags, mode_t mode)
+    { return open(path, flags, mode); }
+    int _close(int fd)              { return close(fd); }
+    int _fstat(int fd, struct stat *sb)            { return fstat(fd, sb); }
+    int _fstatfs(int fd, struct statfs *sb)        { return fstatfs(fd, sb); }
+    DIR *__opendir2(const char *name, int flag)
+    { (void)flag; return opendir(name); }
 
     /* ── capsicum stubs ───────────────────────────────────────────── */
     cap_rights_t *

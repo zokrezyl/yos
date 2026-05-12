@@ -36,6 +36,28 @@ ftools_int_tests = {
   'xargs' : {'src' : files('test_xargs.py'), 'xfail' : true},
   'find'  : {'src' : files('test_find.py'),  'xfail' : true},
   'du'    : {'src' : files('test_du.py'),    'xfail' : true},
+  # New batch: fts(3) is wired in, host opendir/readdir/closedir
+  # bridges live in src/yos/impl/dir.c. ls/cp/find/du now actually
+  # walk filesystems. The xfail entries below mark ports that
+  # compile but trip on a separate libc gap (setmode, sscanf,
+  # sys_signame, host uuidgen).
+  'ls'         : {'src' : files('test_ls.py'),         'xfail' : false},
+  'ls-tty'     : {'src' : files('test_ls_tty.py'),     'xfail' : false},
+  'echo'       : {'src' : files('test_echo.py'),       'xfail' : false},
+  'hostname'   : {'src' : files('test_hostname.py'),   'xfail' : false},
+  'mkdir_rmdir': {'src' : files('test_mkdir_rmdir.py'),'xfail' : false},
+  'cp'         : {'src' : files('test_cp.py'),         'xfail' : false},
+  'rm'         : {'src' : files('test_rm.py'),         'xfail' : false},
+  'mv'         : {'src' : files('test_mv.py'),         'xfail' : false},
+  'ln'         : {'src' : files('test_ln.py'),         'xfail' : false},
+  'realpath'   : {'src' : files('test_realpath.py'),   'xfail' : false},
+  'test'       : {'src' : files('test_test.py'),       'xfail' : false},
+  'chmod'      : {'src' : files('test_chmod.py'),      'xfail' : true},
+  'sleep'      : {'src' : files('test_sleep.py'),      'xfail' : true},
+  'uuidgen'    : {'src' : files('test_uuidgen.py'),    'xfail' : true},
+  'kill'       : {'src' : files('test_kill.py'),       'xfail' : true},
+  'ps'         : {'src' : files('test_ps.py'),         'xfail' : false},
+  'ps-tty'     : {'src' : files('test_ps_interactive.py'), 'xfail' : false},
 }
 
 foreach name, cfg : ftools_int_tests

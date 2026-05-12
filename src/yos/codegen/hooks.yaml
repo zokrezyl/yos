@@ -275,6 +275,18 @@ custom_vfs:
   - fdatasync
   - sync
   - isatty
+  # opendir(3) family — auto-bridge can't handle the opaque DIR* pointer.
+  # impl/dir.c keeps a host-side DIR* slot table indexed by a small int
+  # the wasm guest treats as `DIR *`, and lays out FreeBSD-i386
+  # struct dirent into a per-DIR scratch in linear memory.
+  - opendir
+  - fdopendir
+  - readdir
+  - closedir
+  - dirfd
+  - rewinddir
+  # copy_file_range: keep cp(1) on the portable read/write fallback.
+  - copy_file_range
 
 # ─── Memory ───────────────────────────────────────────────────────────
 custom_mem:
@@ -438,7 +450,12 @@ stub:
   - __xuname
   # Linux-only that nvim/libuv reaches for; safe to stub.
   - sched_getcpu
-  - copy_file_range
+  # copy_file_range moved to custom_vfs — cp(1) probes it first and
+  # falls back to read/write only on EINVAL, so the generic
+  # -ENOSYS stub leaves cp emitting "Remote address changed" and
+  # producing a zero-byte destination. impl/vfs.c returns -EINVAL
+  # to keep cp on the portable fallback path until a real bridge
+  # to host copy_file_range / sendfile lands.
   - recvmmsg
   - sendmmsg
   - accept4

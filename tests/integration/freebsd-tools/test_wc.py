@@ -18,7 +18,10 @@ from run_tool import get_paths, run
 
 def main():
     yos, libexec = get_paths()
-    # 5 lines, 8 words, 34 bytes (incl. newlines).
+    # 5 lines, 7 words ("one"+"two three"+"four"+"five six"+"seven" =
+    # 1+2+1+2+1 = 7), 34 bytes (incl. newlines). The previous test
+    # text claimed 8 words, but counting them gives 7 — the rune-
+    # locale fix surfaced the off-by-one in the comment, not in wc.
     text = b"one\ntwo three\nfour\nfive six\nseven\n"
     r = run(yos, libexec, "wc", stdin=text)
     out = r.stdout.decode().split()
@@ -32,16 +35,10 @@ def main():
     if bytes_ != len(text):
         print(f"FAIL: wc -c counted {bytes_}, want {len(text)}")
         sys.exit(1)
-    # Word count is currently always 1 (rune-locale bug).
-    if words == 8:
-        print(f"PASS: wc ({lines} lines, {words} words, {bytes_} bytes) — "
-              f"word count fixed!")
-    elif words == 1:
-        print(f"PASS-PARTIAL: wc lines={lines}, bytes={bytes_} correct; "
-              f"words={words} is the known rune-locale gap")
-    else:
-        print(f"FAIL: wc words={words}, expected 8 or known-gap 1")
+    if words != 7:
+        print(f"FAIL: wc words={words}, expected 7")
         sys.exit(1)
+    print(f"PASS: wc ({lines} lines, {words} words, {bytes_} bytes)")
 
 
 if __name__ == "__main__":
