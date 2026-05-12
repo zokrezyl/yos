@@ -242,6 +242,15 @@ int32_t yos_fork(struct yos_exec_ctx *ctx)
     }
     child_proc->pgid = ctx->proc->pgid;
     child_proc->sid = ctx->proc->sid;
+    /* fork(2) inherits comm/exe/cwd from the parent. Without this
+     * copy the child appears in /proc/<pid>/stat with an empty
+     * COMMAND column until something execve's into it — surprising
+     * for short-lived helpers and breaks `ps` output for any forked-
+     * but-not-yet-exec'd process. execve replaces these on the
+     * exec path. */
+    memcpy(child_proc->comm, ctx->proc->comm, sizeof(child_proc->comm));
+    memcpy(child_proc->exe,  ctx->proc->exe,  sizeof(child_proc->exe));
+    memcpy(child_proc->cwd,  ctx->proc->cwd,  sizeof(child_proc->cwd));
 
     /* Store child pid as return value for parent (child gets 0) */
     ctx->fork_return = child_proc->pid;
@@ -610,6 +619,23 @@ static void *fork_thread_func(void *arg)
         uint32_t *thread_ptr = (uint32_t *)(child_ctx->memory + 0);
         *thread_ptr = 0x100;
         memset(child_ctx->memory + 0x100, 0, 256);
+
+        /* execve(2) replaces the process image — update comm and exe
+         * on the yos_proc so /proc/<pid>/{stat,comm,exe} reflect the
+         * new program. Same reasoning as the matching update in
+         * main.c's top-level exec_pending loop; without this, a
+         * forked-and-exec'd child keeps the parent's COMMAND in ps
+         * output. */
+        if (child_ctx->proc) {
+            const char *slash = strrchr(child_ctx->exec_path, '/');
+            const char *base  = slash ? slash + 1 : child_ctx->exec_path;
+            strncpy(child_ctx->proc->comm, base,
+                    sizeof(child_ctx->proc->comm) - 1);
+            child_ctx->proc->comm[sizeof(child_ctx->proc->comm) - 1] = '\0';
+            strncpy(child_ctx->proc->exe, child_ctx->exec_path,
+                    sizeof(child_ctx->proc->exe) - 1);
+            child_ctx->proc->exe[sizeof(child_ctx->proc->exe) - 1] = '\0';
+        }
 
         child_ctx->exec_pending = 0;
         child_ctx->exec_argv = NULL;
@@ -1467,6 +1493,15 @@ int32_t yos_vfork(struct yos_exec_ctx *ctx)
     }
     child_proc->pgid = ctx->proc->pgid;
     child_proc->sid = ctx->proc->sid;
+    /* fork(2) inherits comm/exe/cwd from the parent. Without this
+     * copy the child appears in /proc/<pid>/stat with an empty
+     * COMMAND column until something execve's into it — surprising
+     * for short-lived helpers and breaks `ps` output for any forked-
+     * but-not-yet-exec'd process. execve replaces these on the
+     * exec path. */
+    memcpy(child_proc->comm, ctx->proc->comm, sizeof(child_proc->comm));
+    memcpy(child_proc->exe,  ctx->proc->exe,  sizeof(child_proc->exe));
+    memcpy(child_proc->cwd,  ctx->proc->cwd,  sizeof(child_proc->cwd));
 
     /* vfork specific: child stores parent pid, parent will block */
     child_proc->vfork_parent_pid = ctx->proc->pid;

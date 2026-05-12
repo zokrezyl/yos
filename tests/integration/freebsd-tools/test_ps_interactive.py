@@ -84,7 +84,22 @@ def main():
     if " 1 " not in clean and " 1\t" not in clean:
         print(f"FAIL: ps did not report PID 1 (zsh) — output: {clean!r}")
         sys.exit(1)
-    print(f"PASS: interactive ps flushed its output before next prompt")
+    # The forked-and-exec'd ps process must appear with COMMAND='ps',
+    # not the parent's name. yos_execve updates yos_proc->comm so
+    # /proc/<pid>/stat picks up the new program's basename — guard
+    # the regression where this wasn't wired.
+    lines = clean.splitlines()
+    ps_row = None
+    for ln in lines:
+        cols = ln.split(None, 3)
+        if len(cols) >= 4 and cols[0].isdigit() and cols[3].strip() == "ps":
+            ps_row = ln
+            break
+    if not ps_row:
+        print(f"FAIL: no ps row with COMMAND='ps' — execve did not update "
+              f"comm. output: {clean!r}")
+        sys.exit(1)
+    print(f"PASS: interactive ps shows itself as 'ps' ({ps_row.strip()!r})")
     sys.exit(0)
 
 

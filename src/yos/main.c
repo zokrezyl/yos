@@ -1893,6 +1893,20 @@ int main(int argc, char **argv)
         ctx.wasm_bytes_size = wasm_size;
         ctx.free_count = 0;
 
+        /* execve(2) replaces the process image — update comm and exe
+         * on the yos_proc so /proc/<pid>/{stat,comm,exe} reflect the
+         * new program. Without this, `ps` keeps showing the parent's
+         * name for every forked-and-exec'd child (e.g. a ps invoked
+         * from zsh would show up as "zsh" or empty). */
+        if (ctx.proc) {
+            const char *slash = strrchr(ctx.exec_path, '/');
+            const char *base = slash ? slash + 1 : ctx.exec_path;
+            strncpy(ctx.proc->comm, base, sizeof(ctx.proc->comm) - 1);
+            ctx.proc->comm[sizeof(ctx.proc->comm) - 1] = '\0';
+            strncpy(ctx.proc->exe, ctx.exec_path, sizeof(ctx.proc->exe) - 1);
+            ctx.proc->exe[sizeof(ctx.proc->exe) - 1] = '\0';
+        }
+
         ctx.exec_pending = 0;
         ctx.exec_argv = NULL;
         ctx.exec_argc = 0;
