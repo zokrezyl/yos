@@ -16,6 +16,9 @@ subdir('freebsd')
 subdir('host-libc')
 # wasm3 lives under src/wasm3/ (vendored source); its meson.build is
 # included from src/meson.build BEFORE subdir('yos').
-subdir('mimalloc')      # host-side allocator; backs guest malloc/free
+# mimalloc removed — the guest-facing allocator (impl/alloc.c) now
+# keeps all its state IN the wasm linear memory, so there's no host-
+# side bookkeeping to clean up on execve and we don't need mimalloc's
+# host runtime at all. See the comment at the top of impl/alloc.c.
 subdir('freebsd-libc')  # Tier 2 sidecar wasm (libc-pure.wasm)
 subdir('sysroot')       # wasm sysroot for guest .c compilation

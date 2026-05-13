@@ -207,15 +207,24 @@ struct yos_exec_ctx {
      * correct); pthread workers need their own slot — TODO. */
     uint32_t errno_off;
 
-    /* Guest-facing allocator state (impl/alloc.c, mimalloc-backed).
-     * mi_heap is `mi_heap_t *`; mi_arena_id is `mi_arena_id_t` (int).
-     * Kept opaque to avoid pulling mimalloc.h into types.h.
-     * mi_arena_lo/hi bracket the wasm offsets reserved as mimalloc's
-     * arena — bridges in impl/alloc.c lazy-init on first malloc. */
-    void    *mi_heap;
-    int      mi_arena_id;
-    uint32_t mi_arena_lo;
-    uint32_t mi_arena_hi;
+    /* Guest-facing allocator state (impl/alloc.c).
+     *
+     * Pure free-list allocator inside [alloc_lo, alloc_hi) of the
+     * guest's wasm linear memory. State (free-list head + block
+     * headers) lives IN ctx->memory itself, so on execve the new
+     * runtime's fresh linear memory starts with a clean allocator
+     * automatically — no host-side global registry to dangle, no
+     * mimalloc, no per-ctx cleanup needed. Lazy-inited on first
+     * malloc by impl/alloc.c.
+     *
+     *   alloc_lo, alloc_hi        — wasm-offset bounds of the heap
+     *                               region. Zero = not initialised.
+     *   alloc_free_head           — wasm offset of the first free
+     *                               block, or 0 if the list is empty.
+     */
+    uint32_t alloc_lo;
+    uint32_t alloc_hi;
+    uint32_t alloc_free_head;
 };
 
 /* Global runtime state */

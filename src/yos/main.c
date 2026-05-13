@@ -1872,11 +1872,7 @@ int main(int argc, char **argv)
         /* Handle exec - load new module */
         ydebug("exec: loading %s\n", ctx.exec_path);
 
-        /* Don't free the old runtime — its linear memory backs an
-         * mi_manage_os_memory_ex arena that we have no API to
-         * unregister. See the matching leak comment in
-         * impl/proc.c's child exec block. */
-        (void)ctx.runtime;
+        m3_FreeRuntime(ctx.runtime);
         free(wasm_bytes);
 
         ctx.argc = ctx.exec_argc;
@@ -1920,16 +1916,12 @@ int main(int argc, char **argv)
         ctx.exec_argc = 0;
         ctx.exec_envp = NULL;
         ctx.exec_envc = 0;
-        /* mimalloc arena state — see matching reset in proc.c child
-         * exec block. The pre-execve image's heap pointed into the
-         * OLD wasm linear memory which was just freed above (via
-         * m3_FreeRuntime). Leaving it set makes alloc_init's
-         * lazy-init skip the new arena setup and the next allocation
-         * walks freed page metadata → "heap!=NULL" mimalloc assert. */
-        ctx.mi_heap = NULL;
-        ctx.mi_arena_id = 0;
-        ctx.mi_arena_lo = 0;
-        ctx.mi_arena_hi = 0;
+        /* Allocator state lives IN the (just-replaced) linear memory.
+         * Reset the wasm-offset bookmarks so the new image's first
+         * malloc lazy-inits a fresh heap. */
+        ctx.alloc_lo = 0;
+        ctx.alloc_hi = 0;
+        ctx.alloc_free_head = 0;
 
         ydebug("exec: loaded %s, argc=%d\n", ctx.exec_path, ctx.argc);
     }

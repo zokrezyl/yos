@@ -507,27 +507,11 @@ static void *fork_thread_func(void *arg)
         /* Handle exec - load new module */
         ydebug("child exec: loading %s\n", child_ctx->exec_path);
 
-        /* DELIBERATE LEAK: don't m3_FreeRuntime(rt) here.
-         *
-         * yos's host allocator (impl/alloc.c → mimalloc) lives
-         * INSIDE the wasm guest's linear memory via
-         * mi_manage_os_memory_ex. mimalloc has no API to
-         * unregister an arena once registered (only mi_subproc
-         * which has its own constraints) — releasing the linear
-         * memory while mimalloc still holds page metadata
-         * pointing into it crashes the very next allocation with
-         * "page->prev == NULL" or "heap != NULL" in
-         * mi_page_init / mi_heap_page_queue_of.
-         *
-         * Trade-off: every execve leaks ~256 MiB of wasm linear
-         * memory until the host process exits. Bad for long
-         * interactive sessions; acceptable to make nvim launch
-         * at all. Proper fix is mi_subproc-per-ctx in alloc.c —
-         * see TODO at the top of impl/alloc.c.
-         *
-         * Free only the environment (which doesn't hold
-         * mimalloc-managed memory). */
-        (void)rt;
+        /* The guest-facing allocator (impl/alloc.c) keeps all its
+         * state INSIDE ctx->memory now — no host-side registry to
+         * dangle when m3_FreeRuntime frees the linear memory. Safe
+         * to release the old runtime here. */
+        m3_FreeRuntime(rt);
         m3_FreeEnvironment(env);
 
         child_ctx->argc = child_ctx->exec_argc;
@@ -642,18 +626,12 @@ static void *fork_thread_func(void *arg)
          * itself at memory_size/2 by clearing the watermark. */
         child_ctx->mmap_top = 0;
         child_ctx->free_count = 0;
-        /* mimalloc arena state — the pre-execve image's heap/arena
-         * pointed into the OLD wasm linear memory which is now
-         * freed (m3_FreeRuntime above released it). Leaving these
-         * non-NULL makes alloc_init's lazy-init skip the new arena
-         * setup; the next mi_heap_new_in_arena then walks page
-         * metadata pointing into freed memory and trips
-         * "heap!=NULL" in mi_heap_page_queue_of. Reset so the new
-         * image starts with a clean arena. */
-        child_ctx->mi_heap = NULL;
-        child_ctx->mi_arena_id = 0;
-        child_ctx->mi_arena_lo = 0;
-        child_ctx->mi_arena_hi = 0;
+        /* Allocator state lives IN the (just-replaced) linear memory.
+         * Reset the wasm-offset bookmarks so the new image's first
+         * malloc lazy-inits a fresh heap in the new memory. */
+        child_ctx->alloc_lo = 0;
+        child_ctx->alloc_hi = 0;
+        child_ctx->alloc_free_head = 0;
         /* Stale setjmp slots from the pre-execve image refer to
          * jmp_buf addresses in the OLD module's stack. After execve
          * they are dead but sj_alloc_slot still treats them as

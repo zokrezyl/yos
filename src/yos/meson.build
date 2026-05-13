@@ -115,7 +115,6 @@ yos_exe = executable(
   dependencies : [
     wasm3_dep,
     api_bridge_dep,      # m3w_<fn> wrappers + yos_brg_link_imports()
-    mimalloc_dep,        # impl/alloc.c — guest malloc backed by mimalloc
     threads_dep,
     m_dep,
     iconv_dep,           # darwin/BSD: separate libiconv
