@@ -17,6 +17,7 @@
 #include <errno.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>   /* mmap/munmap for fork's memory snapshot */
 
 #include "wasm3.h"
 #include "m3_env.h"
@@ -129,6 +130,14 @@ int32_t yos_exit(struct yos_exec_ctx *ctx, int32_t code)
         ctx->proc->exited = 1;
         pthread_cond_broadcast(&ctx->proc->wait_cond);
         pthread_mutex_unlock(&ctx->proc->lock);
+
+        /* Runtime-wide "something exited" event. main.c's shutdown
+         * wait blocks on this so yos doesn't tear down while a
+         * forked child is still alive. Per-proc wait_cond above
+         * is for waitpid() consumers; this is the rt-wide one. */
+        pthread_mutex_lock(&ctx->rt->proc_lock);
+        pthread_cond_broadcast(&ctx->rt->any_exit_cond);
+        pthread_mutex_unlock(&ctx->rt->proc_lock);
     }
 
     /* Forked children run in separate threads - only terminate the thread */
@@ -263,6 +272,22 @@ int32_t yos_fork(struct yos_exec_ctx *ctx)
     return child_proc->pid;
 }
 
+/* Live-region descriptor used by snapshot_wasm_memory / restore.
+ * Offsets are within the wasm linear memory; len is bytes.
+ *
+ * The cap is 16 K entries (256 KiB of struct space). With page
+ * coalescing, a typical guest produces a handful of runs (data
+ * segment + heap + asyncify buffer + a few mmap allocations). The
+ * cap exists only so a pathologically fragmented heap doesn't
+ * unboundedly grow the snapshot metadata — on overflow we keep
+ * copying to dst and signal the child to do a single full-size
+ * memcpy at restore instead of replaying the (incomplete) list. */
+#define YOS_FORK_MAX_REGIONS 16384
+struct yos_fork_region {
+    uint32_t off;
+    uint32_t len;
+};
+
 /* Thread argument for child process */
 typedef struct {
     struct yos_runtime *rt;
@@ -284,6 +309,15 @@ typedef struct {
     char **envp;
     uint8_t *wasm_bytes;
     size_t wasm_bytes_size;
+    /* Live-region map produced by snapshot_wasm_memory. Each entry is
+     * a (offset, length) pair INTO memory_snapshot that the child
+     * should memcpy onto its fresh linear memory. Everything outside
+     * these regions is implicitly zero (child's freshly resized
+     * memory comes pre-zeroed by mmap). Replaces a brute-force 256-
+     * MiB memcpy with O(live-bytes) memcpys — typically <1 MiB for
+     * a small guest. */
+    struct yos_fork_region live_regions[YOS_FORK_MAX_REGIONS];
+    uint32_t live_region_count;
     /* Snapshot of parent's fd_map; child duplicates each entry to a
      * fresh host fd at startup so the runtimes have independent
      * close/dup2 semantics. */
@@ -311,7 +345,7 @@ static void *fork_thread_func(void *arg)
     IM3Environment env = m3_NewEnvironment();
     IM3Runtime rt = m3_NewRuntime(env, 64 * 1024, NULL);
     if (!rt) {
-        free(fork_thread_arg->memory_snapshot);
+        munmap(fork_thread_arg->memory_snapshot, fork_thread_arg->memory_size);
         free(fork_thread_arg->wasm_globals);
         free(fork_thread_arg);
         return NULL;
@@ -322,7 +356,7 @@ static void *fork_thread_func(void *arg)
     if (!child_ctx) {
         m3_FreeRuntime(rt);
         m3_FreeEnvironment(env);
-        free(fork_thread_arg->memory_snapshot);
+        munmap(fork_thread_arg->memory_snapshot, fork_thread_arg->memory_size);
         free(fork_thread_arg->wasm_globals);
         free(fork_thread_arg);
         return NULL;
@@ -390,7 +424,7 @@ static void *fork_thread_func(void *arg)
         free(child_ctx);
         m3_FreeRuntime(rt);
         m3_FreeEnvironment(env);
-        free(fork_thread_arg->memory_snapshot);
+        munmap(fork_thread_arg->memory_snapshot, fork_thread_arg->memory_size);
         free(fork_thread_arg->wasm_globals);
         free(fork_thread_arg);
         return NULL;
@@ -401,7 +435,7 @@ static void *fork_thread_func(void *arg)
         free(child_ctx);
         m3_FreeRuntime(rt);
         m3_FreeEnvironment(env);
-        free(fork_thread_arg->memory_snapshot);
+        munmap(fork_thread_arg->memory_snapshot, fork_thread_arg->memory_size);
         free(fork_thread_arg->wasm_globals);
         free(fork_thread_arg);
         return NULL;
@@ -413,22 +447,47 @@ static void *fork_thread_func(void *arg)
     extern void yos_link_imports(IM3Module module, struct yos_exec_ctx *ctx);
     yos_link_imports(mod, child_ctx);
 
-    /* Grow memory to match parent BEFORE restoring snapshot */
+    /* Grow memory to match parent BEFORE restoring snapshot. Pages
+     * = parent's memory_size / 64 KiB. Matching exactly avoids both
+     * over-commit (child paying for memory the parent never sized
+     * to) and under-commit (snapshot bytes that don't fit). */
     extern M3Result ResizeMemory(IM3Runtime, uint32_t);
-    /* Must match the parent's memory size (set in main.c). 4096 pages
-     * × 64 KiB = 256 MiB. If this is smaller than the parent, the
-     * memcpy(snapshot) below fails and the child traps on its first
-     * memory access. */
-    ResizeMemory(rt, 4096);
+    ResizeMemory(rt, fork_thread_arg->memory_size / 65536);
 
-    /* Restore memory from snapshot */
+    /* Restore memory from snapshot. Child's freshly resized linear
+     * memory is zero from mmap, so we only need to memcpy the LIVE
+     * regions the parent recorded. live_region_count==0 means the
+     * parent had to fall back (region overflow / no /proc/self/maps),
+     * in which case copy the whole thing — correctness over speed. */
     uint32_t mem_size;
     uint8_t *mem = m3_GetMemory(rt, &mem_size, 0);
     if (mem && fork_thread_arg->memory_size <= mem_size) {
-        memcpy(mem, fork_thread_arg->memory_snapshot, fork_thread_arg->memory_size);
-        ydebug("child: restored %u bytes of memory\n", fork_thread_arg->memory_size);
+        if (fork_thread_arg->live_region_count > 0) {
+            uint64_t bytes_copied = 0;
+            for (uint32_t i = 0; i < fork_thread_arg->live_region_count; i++) {
+                uint32_t off = fork_thread_arg->live_regions[i].off;
+                uint32_t len = fork_thread_arg->live_regions[i].len;
+                if (off + len > fork_thread_arg->memory_size) continue;
+                memcpy(mem + off,
+                       fork_thread_arg->memory_snapshot + off,
+                       len);
+                bytes_copied += len;
+            }
+            ydebug("child: restored %u regions, %llu bytes (skipped "
+                   "%llu zero bytes of %u total)\n",
+                   fork_thread_arg->live_region_count,
+                   (unsigned long long)bytes_copied,
+                   (unsigned long long)(fork_thread_arg->memory_size - bytes_copied),
+                   fork_thread_arg->memory_size);
+        } else {
+            memcpy(mem, fork_thread_arg->memory_snapshot,
+                   fork_thread_arg->memory_size);
+            ydebug("child: restored %u bytes of memory (full fallback)\n",
+                   fork_thread_arg->memory_size);
+        }
     } else {
-        ydebug("child: FAILED to restore memory! have %u, need %u\n", mem_size, fork_thread_arg->memory_size);
+        ydebug("child: FAILED to restore memory! have %u, need %u\n",
+               mem_size, fork_thread_arg->memory_size);
     }
     child_ctx->memory = mem;
     child_ctx->memory_size = mem_size;
@@ -439,7 +498,7 @@ static void *fork_thread_func(void *arg)
     }
     ydebug("child: restored %u globals\n", fork_thread_arg->wasm_globals_count);
 
-    free(fork_thread_arg->memory_snapshot);
+    munmap(fork_thread_arg->memory_snapshot, fork_thread_arg->memory_size);
     free(fork_thread_arg->wasm_globals);
     free(fork_thread_arg);
 
@@ -600,9 +659,19 @@ static void *fork_thread_func(void *arg)
         yos_link_imports(mod, child_ctx);
 
         extern M3Result ResizeMemory(IM3Runtime, uint32_t);
-        /* Match the parent's 4096 pages × 64 KiB = 256 MiB. nvim --embed
-         * blows past 16 MiB just on Lua + module dictionaries. */
-        ResizeMemory(rt, 4096);
+        /* Use the just-loaded module's declared max (capped at 4096 pages
+         * = 256 MiB for nvim's sake). Avoids over-committing memory the
+         * execed binary doesn't need — fork after exec then snapshots a
+         * smaller arena. */
+        {
+            uint32_t pages = 4096;
+            if (mod->memoryInfo.maxPages > 0 &&
+                mod->memoryInfo.maxPages < pages)
+                pages = mod->memoryInfo.maxPages;
+            if (mod->memoryInfo.initPages > pages)
+                pages = mod->memoryInfo.initPages;
+            ResizeMemory(rt, pages);
+        }
 
         uint32_t mem_size;
         child_ctx->memory = m3_GetMemory(rt, &mem_size, 0);
@@ -687,6 +756,13 @@ static void *fork_thread_func(void *arg)
     }
     pthread_cond_broadcast(&child_ctx->proc->wait_cond);
 
+    /* Runtime-wide "something exited" event for main.c's shutdown
+     * wait. Covers every break-out-of-loop path above (trap, exec
+     * load failure, etc.) since they all fall through to here. */
+    pthread_mutex_lock(&child_ctx->rt->proc_lock);
+    pthread_cond_broadcast(&child_ctx->rt->any_exit_cond);
+    pthread_mutex_unlock(&child_ctx->rt->proc_lock);
+
     ydebug("child pid=%d exited\n", child_ctx->proc->pid);
 
     m3_FreeRuntime(rt);
@@ -696,41 +772,120 @@ static void *fork_thread_func(void *arg)
     return NULL;
 }
 
-/* Snapshot wasm linear memory page-by-page, honouring host
- * /proc/self/maps. mimalloc (yos's host allocator for the wasm
- * arena) decommits unused pages with mprotect(PROT_NONE) — a
- * naive memcpy(dst, mem, mem_size) hits one of those after the
- * guest has touched-then-released a few pages and the SIGSEGV
- * freezes the fork pump (the resulting fault is absorbed
- * silently upstream). Pre-zero the destination, then copy only
- * the regions /proc/self/maps marks readable: PROT_NONE pages
- * are by definition not in use by the guest so leaving the
- * snapshot's matching range zero is byte-accurate. Returns 0 on
- * success, -1 on /proc/self/maps unavailability. */
+/* Snapshot wasm linear memory using mincore() to skip the untouched
+ * (lazy zero) bulk.
+ *
+ * The wasm linear arena is one big anonymous mmap (via wasm3's
+ * realloc → glibc's large-alloc path). Only the pages the guest has
+ * actually touched are backed by real RAM; the rest are mapped to
+ * the kernel's shared zero page. A naive `memcpy(dst, src, 256MiB)`
+ * READS every single page — forcing a fault per untouched 4 KiB
+ * slot (~2 µs each, ~130 ms for 256 MiB) AND a corresponding write
+ * fault on dst. Doubled by the child's restore = ~520 ms / fork.
+ *
+ * mincore() tells us, for each page in [src, src+size), whether it
+ * is currently resident (bit 0 of vec[i]). We memcpy only the runs
+ * of resident pages and record them so the child can replay just
+ * those memcpys. Untouched pages stay lazy-zero on both sides.
+ *
+ * Portable across Linux / FreeBSD / macOS / iOS / tvOS — bit 0 has
+ * the "in core" meaning on all of them. Linux 5.2+ requires the
+ * memory to be ours (anonymous private), which it always is here.
+ *
+ * Returns 0 on success, -1 on region-table overflow OR mincore
+ * failure. On overflow the snapshot is still byte-correct (every
+ * resident page was copied) but the live-region list is incomplete,
+ * so the caller MUST fall back to a full-size memcpy at restore. */
+#define YOS_PAGE_SIZE 4096u
 static int snapshot_wasm_memory(uint8_t *dst, const uint8_t *src,
-                                size_t size)
+                                size_t size,
+                                struct yos_fork_region *out_regions,
+                                uint32_t out_regions_max,
+                                uint32_t *out_count)
 {
-    memset(dst, 0, size);
-    FILE *mf = fopen("/proc/self/maps", "r");
-    if (!mf) return -1;
-    unsigned long src_lo = (unsigned long)src;
-    unsigned long src_hi = src_lo + size;
-    char line[512];
-    while (fgets(line, sizeof line, mf)) {
-        unsigned long lo, hi;
-        char perms[8] = {0};
-        if (sscanf(line, "%lx-%lx %7s", &lo, &hi, perms) < 3) continue;
-        if (hi <= src_lo || lo >= src_hi) continue;
-        if (perms[0] != 'r') continue;  /* skip PROT_NONE (---p) and write-only */
-        unsigned long copy_lo = (lo > src_lo) ? lo : src_lo;
-        unsigned long copy_hi = (hi < src_hi) ? hi : src_hi;
-        if (copy_hi <= copy_lo) continue;
-        memcpy(dst + (copy_lo - src_lo),
-               (const void *)copy_lo,
-               (size_t)(copy_hi - copy_lo));
+    *out_count = 0;
+    int overflow = 0;
+    uint64_t total_live = 0;
+
+    /* mincore() requires a page-aligned start address. wasm3 places
+     * an M3MemoryHeader right before the linear-memory pointer it
+     * returns from m3_GetMemory, so `src` is base + sizeof(header) —
+     * not page-aligned. Handle the unaligned head as one always-
+     * copied partial page; mincore the aligned middle; handle any
+     * unaligned tail the same way. The partial pages are tiny
+     * (≤ 4 KiB) so unconditional copy is fine and keeps them
+     * always-recorded (mincore can't tell us anything useful about
+     * a page that straddles the header). */
+    uintptr_t s = (uintptr_t)src;
+    uintptr_t aligned_start = (s + YOS_PAGE_SIZE - 1) & ~(uintptr_t)(YOS_PAGE_SIZE - 1);
+    size_t head_len = (aligned_start > s) ? (aligned_start - s) : 0;
+    if (head_len > size) head_len = size;
+    if (head_len > 0) {
+        memcpy(dst, src, head_len);
+        total_live += head_len;
+        if (*out_count < out_regions_max) {
+            out_regions[*out_count].off = 0;
+            out_regions[*out_count].len = (uint32_t)head_len;
+            (*out_count)++;
+        } else {
+            overflow = 1;
+        }
     }
-    fclose(mf);
-    return 0;
+
+    size_t remaining = size - head_len;
+    size_t middle_size = remaining & ~(size_t)(YOS_PAGE_SIZE - 1);
+    size_t tail_len = remaining - middle_size;
+
+    if (middle_size > 0) {
+        const uint8_t *src_mid = src + head_len;
+        size_t npages = middle_size / YOS_PAGE_SIZE;
+        unsigned char *vec = malloc(npages);
+        if (!vec) return -1;
+        if (mincore((void *)src_mid, middle_size, vec) < 0) {
+            ydebug("snapshot: mincore(addr=%p size=%zu) failed: %s\n",
+                   (void *)src_mid, middle_size, strerror(errno));
+            free(vec);
+            return -1;
+        }
+        size_t i = 0;
+        while (i < npages) {
+            if (!(vec[i] & 1u)) { i++; continue; }
+            size_t start = i;
+            while (i < npages && (vec[i] & 1u)) i++;
+            size_t end = i;
+            size_t off_in_mid = start * YOS_PAGE_SIZE;
+            size_t len        = (end - start) * YOS_PAGE_SIZE;
+            size_t off        = head_len + off_in_mid;
+            memcpy(dst + off, src + off, len);
+            total_live += len;
+            if (*out_count < out_regions_max) {
+                out_regions[*out_count].off = (uint32_t)off;
+                out_regions[*out_count].len = (uint32_t)len;
+                (*out_count)++;
+            } else {
+                overflow = 1;
+            }
+        }
+        free(vec);
+    }
+
+    if (tail_len > 0) {
+        size_t off = head_len + middle_size;
+        memcpy(dst + off, src + off, tail_len);
+        total_live += tail_len;
+        if (*out_count < out_regions_max) {
+            out_regions[*out_count].off = (uint32_t)off;
+            out_regions[*out_count].len = (uint32_t)tail_len;
+            (*out_count)++;
+        } else {
+            overflow = 1;
+        }
+    }
+
+    ydebug("snapshot: %u live runs, %llu live bytes of %zu (%.1f%%)\n",
+           *out_count, (unsigned long long)total_live, size,
+           size ? 100.0 * (double)total_live / (double)size : 0.0);
+    return overflow ? -1 : 0;
 }
 
 /* yos_fork_pump - called after WASM execution returns */
@@ -769,25 +924,47 @@ void yos_fork_pump(struct yos_exec_ctx *ctx)
                 ydebug("fork asyncify save used=%u/%u bytes\n", used, cap);
             }
         }
-        uint8_t *mem_copy = malloc(mem_size);
-        if (!mem_copy) {
+        /* Anonymous mmap gives lazily-faulted zero pages — only
+         * touched pages cost physical RAM. Replaces malloc+memset
+         * which would commit 256 MiB up front on every fork. */
+        uint8_t *mem_copy = mmap(NULL, mem_size, PROT_READ | PROT_WRITE,
+                                 MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (mem_copy == MAP_FAILED) {
             struct yos_proc *child = yos_proc_find(ctx->rt, ctx->fork_return);
             if (child) child->state = YOS_PROC_FREE;
             return;
         }
-        if (snapshot_wasm_memory(mem_copy, mem, mem_size) < 0) {
-            fprintf(stderr, "yos: fork pump: snapshot failed\n");
-            free(mem_copy);
+
+        /* Prepare thread argument up front so snapshot_wasm_memory
+         * can fill its live-region map directly into the struct. */
+        fork_thread_arg_t *fork_thread_arg = malloc(sizeof(fork_thread_arg_t));
+        if (!fork_thread_arg) {
+            munmap(mem_copy, mem_size);
             struct yos_proc *child = yos_proc_find(ctx->rt, ctx->fork_return);
             if (child) child->state = YOS_PROC_FREE;
             return;
+        }
+        if (snapshot_wasm_memory(mem_copy, mem, mem_size,
+                                  fork_thread_arg->live_regions,
+                                  YOS_FORK_MAX_REGIONS,
+                                  &fork_thread_arg->live_region_count) < 0) {
+            /* /proc/self/maps unavailable OR region table overflowed —
+             * either way the child can't trust the region list, so
+             * mark it empty and fall back to a full-size memcpy in
+             * fork_thread_func. The snapshot itself is still valid:
+             * snapshot_wasm_memory wrote the live bytes via memcpy
+             * before signalling the overflow. */
+            ydebug("fork pump: region overflow OR /proc/self/maps "
+                   "unavailable — child will full-memcpy\n");
+            fork_thread_arg->live_region_count = 0;
         }
 
         /* Save WASM globals */
         uint32_t num_globals = mod->numGlobals;
         int64_t *wasm_globals_copy = malloc(num_globals * sizeof(int64_t));
         if (!wasm_globals_copy) {
-            free(mem_copy);
+            munmap(mem_copy, mem_size);
+            free(fork_thread_arg);
             struct yos_proc *child = yos_proc_find(ctx->rt, ctx->fork_return);
             if (child) child->state = YOS_PROC_FREE;
             return;
@@ -799,19 +976,12 @@ void yos_fork_pump(struct yos_exec_ctx *ctx)
         /* Find child process */
         struct yos_proc *child_proc = yos_proc_find(ctx->rt, ctx->fork_return);
         if (!child_proc) {
-            free(mem_copy);
+            munmap(mem_copy, mem_size);
+            free(fork_thread_arg);
             free(wasm_globals_copy);
             return;
         }
 
-        /* Prepare thread argument */
-        fork_thread_arg_t *fork_thread_arg = malloc(sizeof(fork_thread_arg_t));
-        if (!fork_thread_arg) {
-            free(mem_copy);
-            free(wasm_globals_copy);
-            child_proc->state = YOS_PROC_FREE;
-            return;
-        }
         fork_thread_arg->rt = ctx->rt;
         fork_thread_arg->proc = child_proc;
         fork_thread_arg->memory_snapshot = mem_copy;
@@ -1607,26 +1777,38 @@ void yos_vfork_pump(struct yos_exec_ctx *ctx)
         /* Copy memory */
         uint32_t mem_size;
         uint8_t *mem = m3_GetMemory(wrt, &mem_size, 0);
-        uint8_t *mem_copy = malloc(mem_size);
-        if (!mem_copy) {
+        /* Anonymous mmap: zero-filled lazy pages, no upfront commit. */
+        uint8_t *mem_copy = mmap(NULL, mem_size, PROT_READ | PROT_WRITE,
+                                 MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (mem_copy == MAP_FAILED) {
             struct yos_proc *child = yos_proc_find(ctx->rt, ctx->fork_return);
             if (child) child->state = YOS_PROC_FREE;
             return;
         }
-        /* Same PROT_NONE-page hazard as yos_fork_pump — use the
-         * /proc/self/maps-aware snapshot helper. */
-        if (snapshot_wasm_memory(mem_copy, mem, mem_size) < 0) {
-            free(mem_copy);
+
+        /* Allocate thread arg up front so snapshot can fill regions. */
+        fork_thread_arg_t *fork_thread_arg = malloc(sizeof(fork_thread_arg_t));
+        if (!fork_thread_arg) {
+            munmap(mem_copy, mem_size);
             struct yos_proc *child = yos_proc_find(ctx->rt, ctx->fork_return);
             if (child) child->state = YOS_PROC_FREE;
             return;
+        }
+        if (snapshot_wasm_memory(mem_copy, mem, mem_size,
+                                  fork_thread_arg->live_regions,
+                                  YOS_FORK_MAX_REGIONS,
+                                  &fork_thread_arg->live_region_count) < 0) {
+            ydebug("vfork snapshot: region overflow / no /proc maps —"
+                   " fall back to full memcpy\n");
+            fork_thread_arg->live_region_count = 0;
         }
 
         /* Save globals */
         uint32_t num_globals = mod->numGlobals;
         int64_t *wasm_globals_copy = malloc(num_globals * sizeof(int64_t));
         if (!wasm_globals_copy) {
-            free(mem_copy);
+            munmap(mem_copy, mem_size);
+            free(fork_thread_arg);
             struct yos_proc *child = yos_proc_find(ctx->rt, ctx->fork_return);
             if (child) child->state = YOS_PROC_FREE;
             return;
@@ -1637,19 +1819,12 @@ void yos_vfork_pump(struct yos_exec_ctx *ctx)
 
         struct yos_proc *child_proc = yos_proc_find(ctx->rt, ctx->fork_return);
         if (!child_proc) {
-            free(mem_copy);
+            munmap(mem_copy, mem_size);
+            free(fork_thread_arg);
             free(wasm_globals_copy);
             return;
         }
 
-        /* Prepare thread argument */
-        fork_thread_arg_t *fork_thread_arg = malloc(sizeof(fork_thread_arg_t));
-        if (!fork_thread_arg) {
-            free(mem_copy);
-            free(wasm_globals_copy);
-            child_proc->state = YOS_PROC_FREE;
-            return;
-        }
         fork_thread_arg->rt = ctx->rt;
         fork_thread_arg->proc = child_proc;
         fork_thread_arg->memory_snapshot = mem_copy;

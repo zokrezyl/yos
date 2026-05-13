@@ -151,7 +151,23 @@ int32_t yos_read(struct yos_exec_ctx *ctx, int32_t fd, uint32_t buf, uint32_t co
 
     int32_t hfd = yos_fd_get(ctx, fd);
     if (hfd < 0) return hfd;
-    ssize_t r = read(hfd, p, count);
+    /* Pump host-side pending signals (Ctrl-C → SIGINT, terminal
+     * resize → SIGWINCH, …) before we sleep in read(). For zsh at
+     * the prompt, that calls its recorded wasm SIGINT handler
+     * which line-discards. For nvim, SIGWINCH triggers a redraw. */
+    extern void yos_signal_pump(struct yos_exec_ctx *);
+    yos_signal_pump(ctx);
+    ssize_t r;
+    for (;;) {
+        r = read(hfd, p, count);
+        if (r >= 0 || errno != EINTR) break;
+        /* Signal arrived while we were blocked. Drain the pending
+         * bitmask (delivers to the wasm handler) and retry the
+         * read — zsh has had its chance to react. If the guest
+         * actually wants EINTR to propagate it'll see it via the
+         * second-stage return from its wasm handler. */
+        yos_signal_pump(ctx);
+    }
     if (ydebug_enabled()) {
         pid_t tid = yos_plat_gettid();
         ydebug("read(tid=%d wfd=%d hfd=%d count=%u) = %zd%s%.*s%s\n",

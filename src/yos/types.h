@@ -231,6 +231,12 @@ struct yos_exec_ctx {
 struct yos_runtime {
     struct yos_proc procs[YOS_MAX_PROCS];
     pthread_mutex_t proc_lock;
+    /* Broadcast every time ANY proc transitions to ZOMBIE — main.c
+     * waits on it during shutdown so yos doesn't exit while a
+     * forked child is still running. Per-proc wait_cond is for
+     * waitpid() consumers (one cond var per child); this one is
+     * a runtime-wide "something exited" event. */
+    pthread_cond_t  any_exit_cond;
     int32_t next_pid;
 
     /* Foreground process-group of the controlling tty, virtualized in

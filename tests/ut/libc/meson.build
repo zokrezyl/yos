@@ -80,6 +80,58 @@ libc_tests = [
 # api_bridge_outputs[2] is yos_imports.h — used to derive the include path.
 yos_imports_dir = meson.project_build_root() / 'src' / 'yos' / 'codegen'
 
+# Combined performance + stress test. Different from the others: links
+# against crt1.o so main() gets argv (needed because the test execve's
+# itself, passing argv[0] as the wasm path). Built standalone, not
+# inside the libc_tests foreach.
+perf_stress_raw = custom_target(
+  'test_perf_stress-raw.wasm',
+  input            : files('test_perf_stress.c'),
+  output           : 'test_perf_stress-raw.wasm',
+  depends          : sysroot_skel,
+  command          : [wasm_cc,
+                      '-target', 'wasm32-unknown-unknown',
+                      '-nostdlib',
+                      '--sysroot=' + sysroot_dir,
+                      '-isystem', sysroot_dir / 'usr' / 'include',
+                      '-L', sysroot_dir / 'usr' / 'lib',
+                      '-Wl,--no-entry',
+                      '-Wl,--allow-undefined',
+                      '-Wl,--export=_start',
+                      '-Wl,--export=main',
+                      # pthread_create looks up start_routine by index
+                      # into the wasm function table; without
+                      # --export-all the table is empty and every
+                      # thread traps with "fn_idx N out of table".
+                      '-Wl,--export-all',
+                      '-O2',
+                      sysroot_dir / 'usr' / 'lib' / 'crt1.o',
+                      '-o', '@OUTPUT@', '@INPUT0@'],
+  build_by_default : true,
+)
+perf_stress_wasm = custom_target(
+  'test_perf_stress.wasm',
+  input            : perf_stress_raw,
+  output           : 'test_perf_stress.wasm',
+  command          : [wasm_opt, '--asyncify', '-o', '@OUTPUT@', '@INPUT@'],
+  build_by_default : true,
+)
+test('test_perf_stress',
+  py,
+  args : [
+    files('run_libc_test.py'),
+    '--yos',     yos_bin,
+    '--src',     files('test_perf_stress.c'),
+    '--wasm',    perf_stress_wasm,
+    '--timeout', '90',
+  ],
+  suite   : 'libc',
+  # Stress test spawns many forks + threads + execve'd processes; the
+  # default 30 s per-test timeout is tight when the host is under
+  # load. 120 s is plenty even on a slow VM.
+  timeout : 120,
+)
+
 foreach t : libc_tests
   src = files(t + '.c')
 

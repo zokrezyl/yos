@@ -37,13 +37,15 @@ def main() -> int:
                    help='The test\'s .c source (read for `Expected:` header)')
     p.add_argument('--wasm', required=True, type=Path,
                    help='Compiled .wasm to run')
+    p.add_argument('--timeout', type=int, default=30,
+                   help='Per-test timeout in seconds')
     args = p.parse_args()
 
     expected_code, expected_subs = parse_expectations(args.src)
 
     proc = subprocess.run(
         [str(args.yos), str(args.wasm)],
-        capture_output=True, text=True, timeout=30,
+        capture_output=True, text=True, timeout=args.timeout,
     )
 
     name = args.wasm.stem

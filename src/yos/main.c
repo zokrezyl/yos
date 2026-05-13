@@ -5,6 +5,7 @@
 #include <errno.h>
 #include <stdatomic.h>
 #include <sys/syscall.h>
+#include <sys/mman.h>
 #include <unistd.h>
 #include <signal.h>
 #include <fcntl.h>
@@ -1537,6 +1538,52 @@ static struct yos_runtime g_runtime;
 extern struct yos_proc *yos_proc_alloc(struct yos_runtime *rt, int32_t ppid);
 extern void yos_fork_pump(struct yos_exec_ctx *ctx);
 extern void yos_vfork_pump(struct yos_exec_ctx *ctx);
+extern void yos_signal_set_pending(int fbsd_signum);
+
+/* Translate host (Linux) signal numbers to FreeBSD wasm-guest signums.
+ * Most match (POSIX-defined values are the same on Linux & FreeBSD)
+ * but a handful diverge — track only the ones we forward. */
+static int host_signum_to_fbsd(int host_sig)
+{
+    switch (host_sig) {
+        case SIGHUP:   return 1;
+        case SIGINT:   return 2;
+        case SIGQUIT:  return 3;
+        case SIGABRT:  return 6;
+        case SIGPIPE:  return 13;
+        case SIGTERM:  return 15;
+        case SIGCONT:  return 19;  /* FreeBSD SIGCONT */
+        case SIGTSTP:  return 18;
+        case SIGTTIN:  return 21;
+        case SIGTTOU:  return 22;
+        case SIGWINCH: return 28;
+        default:       return -1;
+    }
+}
+
+static void host_signal_dispatcher(int host_sig)
+{
+    int fbsd = host_signum_to_fbsd(host_sig);
+    if (fbsd > 0) yos_signal_set_pending(fbsd);
+}
+
+static void yos_install_host_signal_handlers(void)
+{
+    /* No SA_RESTART. We DO want blocking reads/writes to return
+     * EINTR when a forwardable signal hits the host, so the guest's
+     * recorded wasm handler can fire on the way out and (for zsh)
+     * the line-editor sees Ctrl-C immediately rather than waiting
+     * for the next keystroke. yos_read pumps the pending bitmask
+     * before and after the system call. */
+    struct sigaction sa = { .sa_handler = host_signal_dispatcher,
+                            .sa_flags   = 0 };
+    sigemptyset(&sa.sa_mask);
+    int sigs[] = { SIGINT, SIGQUIT, SIGTERM, SIGTSTP, SIGTTIN,
+                   SIGTTOU, SIGWINCH, SIGHUP, SIGPIPE, SIGCONT };
+    for (size_t i = 0; i < sizeof sigs / sizeof sigs[0]; i++) {
+        sigaction(sigs[i], &sa, NULL);
+    }
+}
 
 /* Load and prepare a wasm module. Returns 0 on success. */
 static int load_wasm_module(struct yos_exec_ctx *ctx, IM3Environment env,
@@ -1591,17 +1638,37 @@ static int load_wasm_module(struct yos_exec_ctx *ctx, IM3Environment env,
     /* Link imports */
     yos_link_imports(module, ctx);
 
-    /* Grow memory */
+    /* Grow memory. Default cap is 4096 pages * 64 KiB = 256 MiB —
+     * nvim's Lua + module dictionaries easily blow past 16 MiB during
+     * startup. BUT every fork's snapshot/restore copies the full
+     * committed size, so blindly committing 256 MiB makes fork() cost
+     * ~300 ms even for guests that barely use 1 MiB.
+     *
+     * Pick the smallest size that satisfies the module's contract:
+     *   - if the wasm declares --max-memory, cap by that (and never
+     *     grow past the module's own declared limit anyway).
+     *   - else use 4096 pages as before for nvim's sake.
+     * A guest that needs more than its declared initial can still
+     * memory.grow() up to maxPages at runtime — wasm3 handles that. */
     extern M3Result ResizeMemory(IM3Runtime, uint32_t);
-    /* 4096 pages * 64 KiB = 256 MiB. nvim's Lua + module dictionaries
-     * easily blow past the old 16 MiB cap during startup. */
-    res = ResizeMemory(rt, 4096);
+    uint32_t resize_pages = 4096;
+    if (module->memoryInfo.maxPages > 0 &&
+        module->memoryInfo.maxPages < resize_pages) {
+        resize_pages = module->memoryInfo.maxPages;
+    }
+    if (module->memoryInfo.initPages > resize_pages) {
+        resize_pages = module->memoryInfo.initPages;
+    }
+    res = ResizeMemory(rt, resize_pages);
     if (res) {
         fprintf(stderr, "yos: memory resize: %s\n", res);
         m3_FreeRuntime(rt);
         free(wasm_bytes);
         return -1;
     }
+    ydebug("memory: resized to %u pages (%u MiB) — init=%u max=%u\n",
+           resize_pages, resize_pages / 16,
+           module->memoryInfo.initPages, module->memoryInfo.maxPages);
 
     /* Get memory info */
     uint32_t mem_size = 0;
@@ -1737,9 +1804,24 @@ int main(int argc, char **argv)
         sigaction(SIGUSR1, &sa, NULL);
     }
 
+    /* Install host-side signal forwarders BEFORE any wasm runs.
+     *
+     * The user's terminal driver sends SIGINT/SIGQUIT/SIGTSTP/SIGWINCH
+     * etc. to yos's host process. Default kernel disposition is
+     * "terminate" for the first three, which kills yos and every
+     * guest along with it. We intercept and forward to the foreground
+     * guest's wasm-side handler via impl/sig.c::yos_signal_pump.
+     *
+     * `yos_install_host_signal_handlers` is defined below in this
+     * file. Translate host→FreeBSD signum (Linux SIGINT=2 == FreeBSD;
+     * Linux SIGSTOP=19 vs FreeBSD SIGSTOP=17; SIGCHLD: Linux=17
+     * FreeBSD=20) when pushing to the pending bitmask. */
+    yos_install_host_signal_handlers();
+
     /* Initialize global runtime */
     memset(&g_runtime, 0, sizeof(g_runtime));
     pthread_mutex_init(&g_runtime.proc_lock, NULL);
+    pthread_cond_init(&g_runtime.any_exit_cond, NULL);
     g_runtime.next_pid = 1;
     g_runtime.fg_pgid  = 1; /* init proc owns the tty at startup */
     g_runtime.argc = argc - 1;
@@ -1924,6 +2006,29 @@ int main(int argc, char **argv)
         ctx.alloc_free_head = 0;
 
         ydebug("exec: loaded %s, argc=%d\n", ctx.exec_path, ctx.argc);
+    }
+
+    /* The initial proc (pid 1) has finished. There may still be
+     * forked children running in their own pthreads — block here
+     * until every non-init proc has reached ZOMBIE before tearing
+     * down the host. Event-driven: each proc-exit path broadcasts
+     * rt->any_exit_cond, we wake, recount, and either sleep again
+     * or fall through to teardown. No polling. */
+    {
+        pthread_mutex_lock(&g_runtime.proc_lock);
+        for (;;) {
+            int alive = 0;
+            for (int i = 0; i < YOS_MAX_PROCS; i++) {
+                struct yos_proc *p = &g_runtime.procs[i];
+                if (p->state == YOS_PROC_RUNNING && p->pid != 1) {
+                    alive++;
+                }
+            }
+            if (!alive) break;
+            pthread_cond_wait(&g_runtime.any_exit_cond,
+                              &g_runtime.proc_lock);
+        }
+        pthread_mutex_unlock(&g_runtime.proc_lock);
     }
 
     m3_FreeRuntime(ctx.runtime);
