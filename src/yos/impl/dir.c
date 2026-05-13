@@ -366,3 +366,53 @@ int32_t yos_copy_file_range(struct yos_exec_ctx *ctx,
     (void)off_out_ptr; (void)len; (void)flags;
     return yos_errno_neg(ctx, EINVAL);
 }
+
+/* poll(2): walk a wasm array of pollfd, translate each fd through
+ * fd_map to a host fd, call host poll, copy revents back. The
+ * pollfd layout is identical on FreeBSD-i386 and host Linux/glibc
+ * (int + short + short = 8 bytes, both ends), so we can call host
+ * poll directly with the translated array. POLL* event-bit values
+ * also match between FreeBSD and Linux for the bits zsh/ZLE cares
+ * about (POLLIN/OUT/ERR/HUP/NVAL/PRI), so no flag remap.
+ *
+ * Without this bridge, zsh ZLE's getbyte() traps with
+ *   yos: unresolved import env.poll
+ * the first time it peeks for an escape-sequence continuation —
+ * which is also the path that turns plain backspace into the
+ * "advances like space" symptom because zsh falls out of ZLE mid-
+ * edit and the line driver echoes through canonical mode oddly.
+ */
+#include <poll.h>
+int32_t yos_poll(struct yos_exec_ctx *ctx,
+                 uint32_t pfds_off, uint32_t nfds, int32_t timeout)
+{
+    extern int yos_fd_get(struct yos_exec_ctx *, int);
+
+    if (nfds == 0) return (int32_t)poll(NULL, 0, timeout);
+    if (nfds > 1024) return yos_errno_neg(ctx, EINVAL);
+    if (pfds_off == 0 || pfds_off + nfds * 8 > ctx->memory_size)
+        return yos_errno_neg(ctx, EFAULT);
+
+    struct pollfd host_pfds[1024];
+    uint8_t *w = ctx->memory + pfds_off;
+    for (uint32_t i = 0; i < nfds; i++) {
+        int32_t wfd;     memcpy(&wfd,    w + i*8 + 0, 4);
+        int16_t events;  memcpy(&events, w + i*8 + 4, 2);
+        int hfd = (wfd >= 0) ? yos_fd_get(ctx, wfd) : wfd;
+        /* A negative wfd is a deliberate "ignore this slot" sentinel
+         * per POSIX. Pass it through so host poll skips the entry. */
+        host_pfds[i].fd      = (wfd < 0) ? wfd : (hfd < 0 ? -1 : hfd);
+        host_pfds[i].events  = events;
+        host_pfds[i].revents = 0;
+    }
+
+    int r = poll(host_pfds, (nfds_t)nfds, timeout);
+    int saved = errno;
+
+    for (uint32_t i = 0; i < nfds; i++) {
+        int16_t revents = (int16_t)host_pfds[i].revents;
+        memcpy(w + i*8 + 6, &revents, 2);
+    }
+    if (r < 0) return yos_errno_neg(ctx, saved);
+    return (int32_t)r;
+}

@@ -58,6 +58,8 @@ ftools_int_tests = {
   'kill'       : {'src' : files('test_kill.py'),       'xfail' : true},
   'ps'         : {'src' : files('test_ps.py'),         'xfail' : false},
   'ps-tty'     : {'src' : files('test_ps_interactive.py'), 'xfail' : false},
+  'backspace'  : {'src' : files('test_backspace.py'),  'xfail' : false},
+  'nvim-zsh'   : {'src' : files('test_nvim_from_zsh.py'),'xfail' : false},
 }
 
 foreach name, cfg : ftools_int_tests

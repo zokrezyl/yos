@@ -1799,6 +1799,8 @@ int main(int argc, char **argv)
     strncpy(proc->comm, slash ? slash + 1 : argv[1], sizeof(proc->comm) - 1);
     proc->cmdline = argv + 1;
     proc->cmdline_argc = argc - 1;
+    /* Label the trace file for the initial process. */
+    yos_ytrace_set_comm(proc->comm);
 
     /* Set up exec context */
     struct yos_exec_ctx ctx = {0};
@@ -1870,7 +1872,11 @@ int main(int argc, char **argv)
         /* Handle exec - load new module */
         ydebug("exec: loading %s\n", ctx.exec_path);
 
-        m3_FreeRuntime(ctx.runtime);
+        /* Don't free the old runtime — its linear memory backs an
+         * mi_manage_os_memory_ex arena that we have no API to
+         * unregister. See the matching leak comment in
+         * impl/proc.c's child exec block. */
+        (void)ctx.runtime;
         free(wasm_bytes);
 
         ctx.argc = ctx.exec_argc;
@@ -1905,6 +1911,8 @@ int main(int argc, char **argv)
             ctx.proc->comm[sizeof(ctx.proc->comm) - 1] = '\0';
             strncpy(ctx.proc->exe, ctx.exec_path, sizeof(ctx.proc->exe) - 1);
             ctx.proc->exe[sizeof(ctx.proc->exe) - 1] = '\0';
+            /* Re-label the per-thread ytrace file. */
+            yos_ytrace_set_comm(ctx.proc->comm);
         }
 
         ctx.exec_pending = 0;
@@ -1912,6 +1920,16 @@ int main(int argc, char **argv)
         ctx.exec_argc = 0;
         ctx.exec_envp = NULL;
         ctx.exec_envc = 0;
+        /* mimalloc arena state — see matching reset in proc.c child
+         * exec block. The pre-execve image's heap pointed into the
+         * OLD wasm linear memory which was just freed above (via
+         * m3_FreeRuntime). Leaving it set makes alloc_init's
+         * lazy-init skip the new arena setup and the next allocation
+         * walks freed page metadata → "heap!=NULL" mimalloc assert. */
+        ctx.mi_heap = NULL;
+        ctx.mi_arena_id = 0;
+        ctx.mi_arena_lo = 0;
+        ctx.mi_arena_hi = 0;
 
         ydebug("exec: loaded %s, argc=%d\n", ctx.exec_path, ctx.argc);
     }

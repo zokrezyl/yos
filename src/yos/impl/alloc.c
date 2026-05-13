@@ -27,8 +27,11 @@
 #define _GNU_SOURCE
 #include <stdint.h>
 #include <stddef.h>
+#include <stdio.h>
 #include <string.h>
 #include <pthread.h>
+#include <unistd.h>
+#include <sys/syscall.h>
 #include <errno.h>
 
 #include "mimalloc.h"
@@ -164,12 +167,24 @@ uint32_t yos_malloc(struct yos_exec_ctx *ctx, uint32_t size)
 
 void yos_free(struct yos_exec_ctx *ctx, uint32_t off)
 {
-    (void)ctx;
+    if (off == 0) return;
+    /* mi_free assumes the pointer comes from a mimalloc allocation.
+     * The wasm guest can hand us anything — including pointers from
+     * its own internal allocators (libc startup sentinels, dlmalloc
+     * fallbacks, …) or stale offsets after execve. Passing those to
+     * mi_free walks page metadata that mimalloc never wrote and
+     * trips the debug-build assert "heap!=NULL" in
+     * mi_heap_page_queue_of. mi_check_owned() returns false for
+     * non-mimalloc pointers; skip those silently — same behaviour
+     * as free()ing a non-malloc pointer on a real system (UB, but
+     * no crash). Init the arena first so the check can answer at
+     * all. */
+    if (alloc_init(ctx) != 0) return;
+    if (off < ctx->mi_arena_lo || off >= ctx->mi_arena_hi) return;
     void *p = wasm_to_host(ctx, off);
-    /* mi_free is cross-thread safe — mimalloc enqueues onto the
-     * owning heap's deferred-free list with an atomic op. So we
-     * intentionally DON'T look up thread_heap here. */
-    if (p) mi_free(p);
+    if (!p) return;
+    if (!mi_check_owned(p)) return;
+    mi_free(p);
 }
 
 uint32_t yos_calloc(struct yos_exec_ctx *ctx, uint32_t nmemb, uint32_t size)
@@ -186,7 +201,13 @@ uint32_t yos_realloc(struct yos_exec_ctx *ctx, uint32_t off, uint32_t newsize)
     if (alloc_init(ctx) != 0) return 0;
     mi_heap_t *h = thread_heap(ctx);
     if (!h) return 0;
-    void *p = wasm_to_host(ctx, off);
+    void *p = NULL;
+    if (off != 0) {
+        if (off < ctx->mi_arena_lo || off >= ctx->mi_arena_hi)
+            return 0;  /* Same as realloc-of-foreign-ptr: ignore. */
+        p = wasm_to_host(ctx, off);
+        if (p && !mi_check_owned(p)) return 0;
+    }
     /* mi_heap_realloc(NULL) == mi_heap_malloc; mi_heap_realloc(p, 0)
      * frees p and returns NULL. Both match POSIX realloc. */
     void *q = mi_heap_realloc(h, p, newsize);
@@ -201,7 +222,12 @@ uint32_t yos_reallocarray(struct yos_exec_ctx *ctx, uint32_t off,
     if (!h) return 0;
     /* Overflow check matches glibc/musl reallocarray semantics. */
     if (nmemb && size > UINT32_MAX / nmemb) return 0;
-    void *p = wasm_to_host(ctx, off);
+    void *p = NULL;
+    if (off != 0) {
+        if (off < ctx->mi_arena_lo || off >= ctx->mi_arena_hi) return 0;
+        p = wasm_to_host(ctx, off);
+        if (p && !mi_check_owned(p)) return 0;
+    }
     void *q = mi_heap_realloc(h, p, (size_t)nmemb * size);
     return host_to_wasm(ctx, q);
 }

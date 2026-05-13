@@ -269,16 +269,70 @@ in stdenv.mkDerivation {
      * libtermcap.a stub from this sysroot) gets clean compile + link
      * + runtime "no terminal" behaviour. Callers fall back to plain
      * text output. */
+    /* PC: "padding character" (NUL bytes inserted when terminal needs
+     * timing-based delays). Modern terminals don't need it, leave 0.
+     * UP: "cursor up" termcap string. We don't synthesise one — zsh
+     * uses single-line redraw anyway.
+     * BC: "backspace cursor motion" string. CRITICAL — when zsh's
+     * ZLE deletes a char from the buffer it needs BC to move the
+     * cursor back over the just-erased column. With BC=0, ZLE falls
+     * out of its destructive-backspace path and only writes a space
+     * to overwrite the previous char, never the \b to step the
+     * cursor back. The user's visible symptom: hitting backspace
+     * makes the cursor advance forward like a space instead of
+     * erasing. Setting BC = "\b" (0x08) is the universal value —
+     * every ANSI-ish terminal moves cursor left one column on \b. */
     char  PC = 0;
     char *UP = 0;
-    char *BC = 0;
+    static char _yos_bc_storage[] = "\b";
+    char *BC = _yos_bc_storage;
     short ospeed = 0;
+    /* tgetent: returns 1 = "entry found" so zsh proceeds to query
+     * caps rather than falling into its dumb-terminal redraw path.
+     * We don't ship a real termcap database — caps come back from
+     * tgetstr/tgetflag/tgetnum by name from the small table below. */
     int   tgetent(char *bp, const char *name)
-    { (void)bp; (void)name; return -1; }   /* "no entry" */
-    int   tgetnum(const char *id)          { (void)id; return -1; }
-    int   tgetflag(const char *id)         { (void)id; return 0; }
+    { (void)bp; (void)name; return 1; }
+    int   tgetnum(const char *id)
+    {
+        /* Width and height come from TIOCGWINSZ at runtime; nothing
+         * to advertise here. Negative = "no entry". */
+        (void)id; return -1;
+    }
+    int   tgetflag(const char *id)
+    {
+        if (id && id[0] && id[1] && id[2] == 0) {
+            if (id[0] == 'a' && id[1] == 'm') return 1;   /* auto-margin */
+            if (id[0] == 'b' && id[1] == 'w') return 1;   /* backspace wraps */
+            if (id[0] == 'x' && id[1] == 'n') return 0;   /* no eat-newline glitch */
+        }
+        return 0;
+    }
+    /* Minimum termcap caps zsh's ZLE consults on every line edit.
+     * Without `le` (cursor left), ZLE writes a literal space for
+     * backspace and the cursor advances forward instead of erasing
+     * — the user's "backspace acts like space" symptom. Everything
+     * else here is the bare ANSI-ish set that lets ZLE redraw with
+     * \r + escape sequences instead of pad-with-spaces. */
     char *tgetstr(const char *id, char **area)
-    { (void)id; (void)area; return 0; }
+    {
+        (void)area;
+        if (!id || !id[0] || !id[1]) return 0;
+        /* 2-char termcap caps. */
+        if (id[2] == 0) {
+            if (id[0] == 'l' && id[1] == 'e') return (char *)"\b";        /* cursor left */
+            if (id[0] == 'b' && id[1] == 'c') return (char *)"\b";        /* backspace cursor (alias) */
+            if (id[0] == 'n' && id[1] == 'd') return (char *)"\x1b[C";    /* cursor right */
+            if (id[0] == 'u' && id[1] == 'p') return (char *)"\x1b[A";    /* cursor up */
+            if (id[0] == 'd' && id[1] == 'o') return (char *)"\n";        /* cursor down */
+            if (id[0] == 'c' && id[1] == 'r') return (char *)"\r";        /* carriage return */
+            if (id[0] == 'c' && id[1] == 'e') return (char *)"\x1b[K";    /* clear to EOL */
+            if (id[0] == 'c' && id[1] == 'd') return (char *)"\x1b[J";    /* clear to EOS */
+            if (id[0] == 'c' && id[1] == 'l') return (char *)"\x1b[H\x1b[J"; /* clear screen */
+            if (id[0] == 'k' && id[1] == 'b') return (char *)"\x7f";      /* key for backspace */
+        }
+        return 0;
+    }
     char *tgoto(const char *cap, int col, int row)
     { (void)col; (void)row; return (char *)cap; }
     int   tputs(const char *str, int affcnt, int (*putcfn)(int))

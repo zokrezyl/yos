@@ -81,6 +81,15 @@ def _wasm_type(t: dict, types: dict) -> str:
     if k == 'pointer':
         # Every wasm32 pointer is a u32 offset into linear memory.
         return 'uint32_t'
+    if k == 'flex_array':
+        # `T fds[]` in a function-prototype position decays to `T *` at
+        # the call site (C11 6.7.6.3p7). On wasm32 that's the same as
+        # any other pointer — a 4-byte linear-memory offset. Treat it
+        # as pointer so functions like poll() (whose <poll.h> decl is
+        # `int poll(struct pollfd fds[], nfds_t nfds, int timeout)`)
+        # can be routed through custom_<area> impls instead of being
+        # silently dropped by codegen.
+        return 'uint32_t'
     if k == 'builtin':
         size = t.get('size')
         name = (t.get('name') or '')

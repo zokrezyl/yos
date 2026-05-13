@@ -4,6 +4,7 @@
 #include "yos/ydebug.h"
 #include "impl/clone-abi.h"
 #include <stdint.h>
+#include <time.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <signal.h>
@@ -298,6 +299,13 @@ static void *fork_thread_func(void *arg)
 {
     ydebug("fork_thread_func: child thread tid=%d\n", (int)syscall(SYS_gettid));
     fork_thread_arg_t *fork_thread_arg = (fork_thread_arg_t *)arg;
+    /* Label this thread's per-thread trace file with the inheriting
+     * proc's comm so YTRACE_FILE_PREFIX produces readable filenames
+     * (e.g. "trace-zsh-1234" rather than "trace-yos-1234"). The
+     * child inherits comm from the parent at fork; execve later
+     * relabels via yos_ytrace_set_comm in the exec block. */
+    if (fork_thread_arg->proc && fork_thread_arg->proc->comm[0])
+        yos_ytrace_set_comm(fork_thread_arg->proc->comm);
 
     /* Create new wasm3 environment and runtime for child */
     IM3Environment env = m3_NewEnvironment();
@@ -454,14 +462,28 @@ static void *fork_thread_func(void *arg)
 
         res = m3_CallV(start_fn);
 
-        /* Drive setjmp/longjmp asyncify round-trips until they settle.
-         * The child runtime is its own pump — without this loop the
-         * first setjmp unwinds out of _start and we'd mistake it for a
-         * clean exit. yos_setjmp_pump is shared with main.c. */
+        /* Drive setjmp/longjmp AND fork asyncify round-trips until
+         * they settle. main.c's loop only services the initial
+         * process — a forked child that itself calls fork() (nvim
+         * spawning its UI helper, zsh running $(command)
+         * substitution, …) lands here, and without pumping fork
+         * the grand-child thread never gets spawned and the parent
+         * falls through to "child finished, mark zombie". Mirror
+         * main.c's pump loop. */
         extern void yos_setjmp_pump(struct yos_exec_ctx *);
-        while (child_ctx->setjmp_pending || child_ctx->longjmp_pending) {
-            yos_setjmp_pump(child_ctx);
+        extern void yos_fork_pump  (struct yos_exec_ctx *);
+        for (;;) {
+            int progress = 0;
+            if (child_ctx->fork_pending) {
+                yos_fork_pump(child_ctx);
+                progress = 1;
+            }
+            if (child_ctx->setjmp_pending || child_ctx->longjmp_pending) {
+                yos_setjmp_pump(child_ctx);
+                progress = 1;
+            }
             if (child_ctx->pump_trap) break;
+            if (!progress) break;
         }
         /* Surface a pump-internal trap as the loop's res. Without this,
          * a wasm crash inside the rewound _start would silently fall into
@@ -485,7 +507,27 @@ static void *fork_thread_func(void *arg)
         /* Handle exec - load new module */
         ydebug("child exec: loading %s\n", child_ctx->exec_path);
 
-        m3_FreeRuntime(rt);
+        /* DELIBERATE LEAK: don't m3_FreeRuntime(rt) here.
+         *
+         * yos's host allocator (impl/alloc.c → mimalloc) lives
+         * INSIDE the wasm guest's linear memory via
+         * mi_manage_os_memory_ex. mimalloc has no API to
+         * unregister an arena once registered (only mi_subproc
+         * which has its own constraints) — releasing the linear
+         * memory while mimalloc still holds page metadata
+         * pointing into it crashes the very next allocation with
+         * "page->prev == NULL" or "heap != NULL" in
+         * mi_page_init / mi_heap_page_queue_of.
+         *
+         * Trade-off: every execve leaks ~256 MiB of wasm linear
+         * memory until the host process exits. Bad for long
+         * interactive sessions; acceptable to make nvim launch
+         * at all. Proper fix is mi_subproc-per-ctx in alloc.c —
+         * see TODO at the top of impl/alloc.c.
+         *
+         * Free only the environment (which doesn't hold
+         * mimalloc-managed memory). */
+        (void)rt;
         m3_FreeEnvironment(env);
 
         child_ctx->argc = child_ctx->exec_argc;
@@ -600,6 +642,18 @@ static void *fork_thread_func(void *arg)
          * itself at memory_size/2 by clearing the watermark. */
         child_ctx->mmap_top = 0;
         child_ctx->free_count = 0;
+        /* mimalloc arena state — the pre-execve image's heap/arena
+         * pointed into the OLD wasm linear memory which is now
+         * freed (m3_FreeRuntime above released it). Leaving these
+         * non-NULL makes alloc_init's lazy-init skip the new arena
+         * setup; the next mi_heap_new_in_arena then walks page
+         * metadata pointing into freed memory and trips
+         * "heap!=NULL" in mi_heap_page_queue_of. Reset so the new
+         * image starts with a clean arena. */
+        child_ctx->mi_heap = NULL;
+        child_ctx->mi_arena_id = 0;
+        child_ctx->mi_arena_lo = 0;
+        child_ctx->mi_arena_hi = 0;
         /* Stale setjmp slots from the pre-execve image refer to
          * jmp_buf addresses in the OLD module's stack. After execve
          * they are dead but sj_alloc_slot still treats them as
@@ -635,6 +689,7 @@ static void *fork_thread_func(void *arg)
             strncpy(child_ctx->proc->exe, child_ctx->exec_path,
                     sizeof(child_ctx->proc->exe) - 1);
             child_ctx->proc->exe[sizeof(child_ctx->proc->exe) - 1] = '\0';
+            yos_ytrace_set_comm(child_ctx->proc->comm);
         }
 
         child_ctx->exec_pending = 0;
@@ -661,6 +716,43 @@ static void *fork_thread_func(void *arg)
     free(child_ctx);
 
     return NULL;
+}
+
+/* Snapshot wasm linear memory page-by-page, honouring host
+ * /proc/self/maps. mimalloc (yos's host allocator for the wasm
+ * arena) decommits unused pages with mprotect(PROT_NONE) — a
+ * naive memcpy(dst, mem, mem_size) hits one of those after the
+ * guest has touched-then-released a few pages and the SIGSEGV
+ * freezes the fork pump (the resulting fault is absorbed
+ * silently upstream). Pre-zero the destination, then copy only
+ * the regions /proc/self/maps marks readable: PROT_NONE pages
+ * are by definition not in use by the guest so leaving the
+ * snapshot's matching range zero is byte-accurate. Returns 0 on
+ * success, -1 on /proc/self/maps unavailability. */
+static int snapshot_wasm_memory(uint8_t *dst, const uint8_t *src,
+                                size_t size)
+{
+    memset(dst, 0, size);
+    FILE *mf = fopen("/proc/self/maps", "r");
+    if (!mf) return -1;
+    unsigned long src_lo = (unsigned long)src;
+    unsigned long src_hi = src_lo + size;
+    char line[512];
+    while (fgets(line, sizeof line, mf)) {
+        unsigned long lo, hi;
+        char perms[8] = {0};
+        if (sscanf(line, "%lx-%lx %7s", &lo, &hi, perms) < 3) continue;
+        if (hi <= src_lo || lo >= src_hi) continue;
+        if (perms[0] != 'r') continue;  /* skip PROT_NONE (---p) and write-only */
+        unsigned long copy_lo = (lo > src_lo) ? lo : src_lo;
+        unsigned long copy_hi = (hi < src_hi) ? hi : src_hi;
+        if (copy_hi <= copy_lo) continue;
+        memcpy(dst + (copy_lo - src_lo),
+               (const void *)copy_lo,
+               (size_t)(copy_hi - copy_lo));
+    }
+    fclose(mf);
+    return 0;
 }
 
 /* yos_fork_pump - called after WASM execution returns */
@@ -705,7 +797,13 @@ void yos_fork_pump(struct yos_exec_ctx *ctx)
             if (child) child->state = YOS_PROC_FREE;
             return;
         }
-        memcpy(mem_copy, mem, mem_size);
+        if (snapshot_wasm_memory(mem_copy, mem, mem_size) < 0) {
+            fprintf(stderr, "yos: fork pump: snapshot failed\n");
+            free(mem_copy);
+            struct yos_proc *child = yos_proc_find(ctx->rt, ctx->fork_return);
+            if (child) child->state = YOS_PROC_FREE;
+            return;
+        }
 
         /* Save WASM globals */
         uint32_t num_globals = mod->numGlobals;
@@ -1537,7 +1635,14 @@ void yos_vfork_pump(struct yos_exec_ctx *ctx)
             if (child) child->state = YOS_PROC_FREE;
             return;
         }
-        memcpy(mem_copy, mem, mem_size);
+        /* Same PROT_NONE-page hazard as yos_fork_pump — use the
+         * /proc/self/maps-aware snapshot helper. */
+        if (snapshot_wasm_memory(mem_copy, mem, mem_size) < 0) {
+            free(mem_copy);
+            struct yos_proc *child = yos_proc_find(ctx->rt, ctx->fork_return);
+            if (child) child->state = YOS_PROC_FREE;
+            return;
+        }
 
         /* Save globals */
         uint32_t num_globals = mod->numGlobals;

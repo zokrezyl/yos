@@ -43,7 +43,8 @@ subdir('codegen')        # api_bridge_dep, yos_imports.h
 
 yos_inc = include_directories(
   '..',                  # `yos/types.h`
-  '../../include',       # `yos/yos_pthread.h`
+  '../../include',       # `yos/yos_pthread.h`, `yos/ytrace/ytrace.h`,
+                         # `yos/yplatform/{time,thread,term}.h`
   '.',                   # `impl/<area>.h`, `vfs/<x>.h`, `generated/<x>.h`
   'generated',           # `host64_structs.h`, `struct_convert.h`
   'vfs',                 # vfs/*.c sees sibling `file.h` etc.
@@ -87,6 +88,15 @@ yos_runtime_sources = files(
   'impl/tier2.c',
   'impl/printf.c',
   'impl/dir.c',
+  # ytrace + yplatform — switchable trace-point machinery imported
+  # verbatim from yetty (with yetty_yplatform → yos_yplatform).
+  # ytrace.h defines ydebug/yinfo/ywarn/yerror/ytrace and the
+  # ytime_start/ytime_report timer macros; ytrace.c provides the
+  # registry, output formatting and runtime enable/disable.
+  'ytrace/ytrace.c',
+  'yplatform/time/default.c',
+  'yplatform/thread/default.c',
+  'yplatform/term/default.c',
   'vfs/file.c',
   'vfs/mount.c',
   'vfs/procfs.c',

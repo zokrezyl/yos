@@ -287,6 +287,16 @@ custom_vfs:
   - rewinddir
   # copy_file_range: keep cp(1) on the portable read/write fallback.
   - copy_file_range
+  # poll(2): the auto-bridge can't render it (nfds is unsigned int on
+  # FreeBSD/wasm32 and unsigned long on host x86_64 — a kind_mismatch
+  # delta), so it landed in `needs_policy` and shipped as nothing. zsh's
+  # ZLE calls poll() from getbyte() to wait for the next key — without
+  # this bridge, every interactive zsh session traps with `env.poll
+  # unresolved` the moment you press an arrow key (or any key zsh's
+  # multi-byte sequence reader peeks ahead for). Hand-written in
+  # impl/vfs.c: translate per-pollfd fd through fd_map, leave events/
+  # revents unchanged (POLL* bit values match between FreeBSD and Linux).
+  - poll
 
 # ─── Memory ───────────────────────────────────────────────────────────
 custom_mem:
