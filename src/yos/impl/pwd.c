@@ -47,6 +47,9 @@
 #include <signal.h>         /* strsignal — declared in <string.h>
                              * with _GNU_SOURCE but pulling signal
                              * via posix.h ensures it's seen. */
+#include <locale.h>          /* setlocale */
+#include <langinfo.h>        /* nl_langinfo */
+#include <libgen.h>          /* dirname (POSIX), basename */
 
 #include "yos/types.h"
 #include "yos/ydebug.h"
@@ -57,6 +60,7 @@
  * impl/*.c don't have the codegen output dir on their -I path; the
  * forward decl + 44-byte size constant is all we need. */
 extern void cv_tm_h2w(uint8_t *w, const struct tm *h);
+extern void cv_tm_w2h(struct tm *h, const uint8_t *w);
 #define CV_TM_GUEST_SZ 44u
 
 extern uint32_t yos_malloc(struct yos_exec_ctx *ctx, uint32_t size);
@@ -579,6 +583,252 @@ uint32_t yos_hstrerror(struct yos_exec_ctx *ctx, int32_t errnum)
 uint32_t yos_strsignal(struct yos_exec_ctx *ctx, int32_t signum)
 {
     return copy_const_to_wasm(ctx, &signam_buf_off, strsignal(signum));
+}
+
+/* ── more static-buffer string returners ────────────────────────
+ *
+ * Same pattern as strerror / gai_strerror: host returns a pointer to
+ * libc-internal memory; we copy into a per-ctx wasm slot and return
+ * the wasm offset. Each fn gets its own slot so calls don't trample
+ * each other within a single statement.
+ */
+
+static uint32_t ttyname_buf_off;
+static uint32_t ctermid_buf_off;
+static uint32_t dirname_buf_off;
+static uint32_t l64a_buf_off;
+static uint32_t nl_langinfo_buf_off;
+static uint32_t setlocale_buf_off;
+static uint32_t getwd_buf_off;
+static uint32_t tempnam_buf_off;
+static uint32_t getusershell_buf_off;
+#define TTYNAME_BUF_SZ   256u
+#define CTERMID_BUF_SZ   64u
+#define DIRNAME_BUF_SZ   1024u
+#define L64A_BUF_SZ      8u
+#define NL_LANGINFO_SZ   128u
+#define SETLOCALE_SZ     64u
+#define GETWD_BUF_SZ     1024u
+#define TEMPNAM_BUF_SZ   512u
+
+extern int yos_fd_get(struct yos_exec_ctx *ctx, int wfd);
+
+uint32_t yos_ttyname(struct yos_exec_ctx *ctx, int32_t wfd)
+{
+    int hfd = yos_fd_get(ctx, wfd);
+    if (hfd < 0) return 0;
+    return copy_const_to_wasm(ctx, &ttyname_buf_off, ttyname(hfd));
+}
+
+int32_t yos_ttyname_r(struct yos_exec_ctx *ctx, int32_t wfd,
+                      uint32_t buf_off, uint32_t buflen)
+{
+    int hfd = yos_fd_get(ctx, wfd);
+    if (hfd < 0) return EBADF;
+    if (!buf_off || buf_off + buflen > ctx->memory_size) return EFAULT;
+    return ttyname_r(hfd, (char *)(ctx->memory + buf_off), buflen);
+}
+
+uint32_t yos_ctermid(struct yos_exec_ctx *ctx, uint32_t s_off)
+{
+    /* If s_off is non-NULL, the result is written there (caller-
+     * supplied buffer of L_ctermid bytes). Otherwise we use our slot. */
+    char hostbuf[64];
+    char *p = ctermid(hostbuf);
+    if (!p) return 0;
+    if (s_off) {
+        if (s_off + strlen(p) + 1 > ctx->memory_size) return 0;
+        strcpy((char *)(ctx->memory + s_off), p);
+        return s_off;
+    }
+    return copy_const_to_wasm(ctx, &ctermid_buf_off, p);
+}
+
+/* dirname / basename — POSIX permits modifying the input buffer
+ * in-place. Our auto-bridge handles `basename` via the
+ * RET_OFFSET_INTO_FIRST classifier (returns a wasm offset INTO
+ * the input). dirname is harder because it may rewrite the
+ * input AND return a pointer to either the input or a static
+ * buffer; allocate our own copy and dirname() into it. */
+uint32_t yos_dirname(struct yos_exec_ctx *ctx, uint32_t path_off)
+{
+    if (!path_off || path_off >= ctx->memory_size) return 0;
+    const char *src = (const char *)(ctx->memory + path_off);
+    uint32_t buf = ensure_buf(ctx, &dirname_buf_off, DIRNAME_BUF_SZ);
+    if (!buf) return 0;
+    size_t n = strnlen(src, DIRNAME_BUF_SZ - 1);
+    memcpy(ctx->memory + buf, src, n);
+    ctx->memory[buf + n] = 0;
+    char *r = dirname((char *)(ctx->memory + buf));
+    if (!r) return 0;
+    /* dirname may return a pointer to a static "/" or "." instead
+     * of into our buffer — copy whatever it returned into our slot
+     * unconditionally so the wasm offset is always valid. */
+    if (r != (char *)(ctx->memory + buf)) {
+        size_t rn = strnlen(r, DIRNAME_BUF_SZ - 1);
+        memcpy(ctx->memory + buf, r, rn);
+        ctx->memory[buf + rn] = 0;
+    }
+    return buf;
+}
+
+/* getwd — old-style getcwd that uses caller's buffer (PATH_MAX
+ * bytes). Linux: deprecated in favor of getcwd. Map to host
+ * getcwd into the caller's buffer. */
+uint32_t yos_getwd(struct yos_exec_ctx *ctx, uint32_t path_off)
+{
+    if (!path_off) return 0;
+    char *p = (char *)(ctx->memory + path_off);
+    if (path_off + 1024 > ctx->memory_size) return 0;
+    if (!getcwd(p, 1024)) return 0;
+    return path_off;
+}
+
+/* tempnam — generate a unique temp-file name. Returns a malloc'd
+ * string; we copy it into our wasm slot. */
+uint32_t yos_tempnam(struct yos_exec_ctx *ctx, uint32_t dir_off, uint32_t prefix_off)
+{
+    const char *dir    = dir_off    ? (const char *)(ctx->memory + dir_off)    : NULL;
+    const char *prefix = prefix_off ? (const char *)(ctx->memory + prefix_off) : NULL;
+    char *r = tempnam(dir, prefix);
+    if (!r) return 0;
+    uint32_t off = copy_const_to_wasm(ctx, &tempnam_buf_off, r);
+    free(r);
+    return off;
+}
+
+/* mktemp — modify input template in place, return same buffer
+ * (or empty string on failure). Linux deprecates in favor of
+ * mkstemp; tools like sh's tempfile use it. */
+uint32_t yos_mktemp(struct yos_exec_ctx *ctx, uint32_t template_off)
+{
+    if (!template_off || template_off >= ctx->memory_size) return 0;
+    char *t = (char *)(ctx->memory + template_off);
+    char *r = mktemp(t);
+    if (!r) return 0;
+    return template_off;  /* mktemp returned the input, in-place */
+}
+
+/* l64a — convert a 32-bit int to a 6-char base-64 string in a
+ * libc-internal buffer. Used by /etc/passwd parsers historically. */
+uint32_t yos_l64a(struct yos_exec_ctx *ctx, int32_t value)
+{
+    return copy_const_to_wasm(ctx, &l64a_buf_off, l64a((long)value));
+}
+
+/* nl_langinfo — return locale-specific descriptive string for the
+ * given item (e.g. CODESET, D_T_FMT, AM_STR). Returns "" or
+ * placeholder when the item isn't supported.
+ *
+ * FreeBSD nl_item is a small contiguous enum (0..69). glibc uses
+ * (LC_CTYPE<<16 | offset) — completely different values. The wasm
+ * guest passes its FreeBSD enum value; we must translate to the
+ * host's enum before calling host nl_langinfo. The table uses
+ * symbolic glibc names so the same source compiles on Linux,
+ * macOS (libSystem) and FreeBSD (where translation is identity). */
+static int yos_freebsd_nl_item_to_host(int32_t fbsd_item)
+{
+    /* All host-side names live in <langinfo.h>; missing ones map
+     * to -1 and we let the host return "" rather than a wrong key. */
+    static const int xlat[] = {
+        [0]  = CODESET,
+        [1]  = D_T_FMT,   [2]  = D_FMT,    [3]  = T_FMT,    [4]  = T_FMT_AMPM,
+        [5]  = AM_STR,    [6]  = PM_STR,
+        [7]  = DAY_1,     [8]  = DAY_2,    [9]  = DAY_3,    [10] = DAY_4,
+        [11] = DAY_5,     [12] = DAY_6,    [13] = DAY_7,
+        [14] = ABDAY_1,   [15] = ABDAY_2,  [16] = ABDAY_3,  [17] = ABDAY_4,
+        [18] = ABDAY_5,   [19] = ABDAY_6,  [20] = ABDAY_7,
+        [21] = MON_1,     [22] = MON_2,    [23] = MON_3,    [24] = MON_4,
+        [25] = MON_5,     [26] = MON_6,    [27] = MON_7,    [28] = MON_8,
+        [29] = MON_9,     [30] = MON_10,   [31] = MON_11,   [32] = MON_12,
+        [33] = ABMON_1,   [34] = ABMON_2,  [35] = ABMON_3,  [36] = ABMON_4,
+        [37] = ABMON_5,   [38] = ABMON_6,  [39] = ABMON_7,  [40] = ABMON_8,
+        [41] = ABMON_9,   [42] = ABMON_10, [43] = ABMON_11, [44] = ABMON_12,
+        [45] = ERA,       [46] = ERA_D_FMT,[47] = ERA_D_T_FMT,[48] = ERA_T_FMT,
+        [49] = ALT_DIGITS,[50] = RADIXCHAR,[51] = THOUSEP,
+        [52] = YESEXPR,   [53] = NOEXPR,
+        /* glibc lacks YESSTR (54), NOSTR (55), D_MD_ORDER (57), ALTMON_* (58..69). */
+        [54] = -1,        [55] = -1,
+        [56] = CRNCYSTR,
+        [57] = -1,
+        [58] = -1, [59] = -1, [60] = -1, [61] = -1, [62] = -1, [63] = -1,
+        [64] = -1, [65] = -1, [66] = -1, [67] = -1, [68] = -1, [69] = -1,
+    };
+    if (fbsd_item < 0 || fbsd_item >= (int32_t)(sizeof(xlat)/sizeof(xlat[0])))
+        return -1;
+    return xlat[fbsd_item];
+}
+
+uint32_t yos_nl_langinfo(struct yos_exec_ctx *ctx, int32_t item)
+{
+    int host_item = yos_freebsd_nl_item_to_host(item);
+    if (host_item < 0) return copy_const_to_wasm(ctx, &nl_langinfo_buf_off, "");
+    return copy_const_to_wasm(ctx, &nl_langinfo_buf_off, nl_langinfo(host_item));
+}
+
+/* setlocale(category, locale) — query/set the locale. When
+ * `locale` is NULL it queries; otherwise it sets and returns the
+ * new locale name. Returning a wasm-side string in both cases. */
+uint32_t yos_setlocale(struct yos_exec_ctx *ctx, int32_t category, uint32_t locale_off)
+{
+    const char *locale = locale_off ? (const char *)(ctx->memory + locale_off) : NULL;
+    char *r = setlocale(category, locale);
+    if (!r) return 0;
+    return copy_const_to_wasm(ctx, &setlocale_buf_off, r);
+}
+
+/* getusershell — return next entry from /etc/shells. NULL when
+ * exhausted. */
+uint32_t yos_getusershell(struct yos_exec_ctx *ctx)
+{
+    char *r = getusershell();
+    if (!r) return 0;
+    return copy_const_to_wasm(ctx, &getusershell_buf_off, r);
+}
+void yos_setusershell(struct yos_exec_ctx *ctx) { (void)ctx; setusershell(); }
+void yos_endusershell(struct yos_exec_ctx *ctx) { (void)ctx; endusershell(); }
+
+/* strftime — format struct tm into a buffer using a strftime format
+ * string. Wasm guest passes wasm offsets for buf, format, and tm.
+ * struct tm is 44 bytes on FreeBSD-i386 wasm32, ~56 bytes on
+ * x86_64 host glibc — convert wasm-shape tm to host shape, call host
+ * strftime into a host buffer, copy back to the wasm buffer.
+ *
+ * Auto-bridge stubs because struct tm is on the struct_convert table
+ * but not in a way that handles the in-pointer for this signature. */
+size_t yos_strftime(struct yos_exec_ctx *ctx, uint32_t buf_off, uint32_t maxsize,
+                    uint32_t fmt_off, uint32_t tm_off)
+{
+    if (!buf_off || buf_off + maxsize > ctx->memory_size) return 0;
+    if (!fmt_off || fmt_off >= ctx->memory_size) return 0;
+    if (!tm_off  || tm_off + CV_TM_GUEST_SZ > ctx->memory_size) return 0;
+
+    struct tm host_tm;
+    memset(&host_tm, 0, sizeof host_tm);
+    cv_tm_w2h(&host_tm, ctx->memory + tm_off);
+
+    /* Format directly into wasm memory — strftime is purely byte-output,
+     * doesn't care if the destination is in the heap or shared memory. */
+    return strftime((char *)(ctx->memory + buf_off), maxsize,
+                    (const char *)(ctx->memory + fmt_off), &host_tm);
+}
+
+/* tmpnam — generate a unique temp-file name. Like tempnam but no
+ * dir/prefix args. Wasm side may pass NULL → use static buffer; or
+ * a buffer pointer (FreeBSD L_tmpnam = 1024 bytes). */
+static uint32_t tmpnam_buf_off;
+uint32_t yos_tmpnam(struct yos_exec_ctx *ctx, uint32_t s_off)
+{
+    char host[1024];
+    char *r = tmpnam(host);  /* deprecated but spec-required */
+    if (!r) return 0;
+    if (s_off) {
+        size_t n = strlen(r);
+        if (s_off + n + 1 > ctx->memory_size) return 0;
+        memcpy(ctx->memory + s_off, r, n + 1);
+        return s_off;
+    }
+    return copy_const_to_wasm(ctx, &tmpnam_buf_off, r);
 }
 
 /* ── strtok / strtok_r / strsep (pointer-into-input return) ─────

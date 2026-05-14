@@ -383,6 +383,33 @@ Bridges return wasm offsets, not host pointers.
 
 ## Build / dev rules
 
+- **PORTABILITY: every host-side change must compile and run on
+  Linux, macOS (darwin), iOS, and tvOS.** Apple platforms are the
+  primary deployment target — the whole reason yos exists is to run
+  one wasm binary across them via `env.<libc-name>` bridges. Before
+  you reach for a Linux-specific header (`<linux/...>`, `<sys/epoll.h>`,
+  `<sys/inotify.h>`, `<sys/eventfd.h>`, `bits/...`), `<asm/...>`),
+  a Linux-only syscall (`syscall(SYS_*)`, `pidfd_*`, `splice`,
+  `tee`, `vmsplice`, `process_vm_*`, `getrandom`, `memfd_create`,
+  `name_to_handle_at`, `copy_file_range`'s direct syscall flavour),
+  or a glibc-ism (`canonicalize_file_name`, `mempcpy`, `__error()`
+  in the wrong place, `strerror_l` with NULL locale, `program_invocation_name`,
+  `__progname`), STOP and find the POSIX equivalent — or guard with
+  `#if defined(__linux__)` and provide the darwin/BSD branch
+  explicitly. The same rule applies to `clock_gettime`'s
+  Linux-specific clocks (`CLOCK_BOOTTIME`, `CLOCK_TAI`,
+  `CLOCK_MONOTONIC_COARSE`), to `MAP_POPULATE` / `MAP_HUGETLB` /
+  `O_TMPFILE` / `O_PATH`, to `signalfd` / `timerfd` / `eventfd`,
+  and to anything that ends in `_np`. Linker side: don't add
+  `-lrt` / `-lresolv` / `-lcrypt` to host-side flags; macOS doesn't
+  have those. Use `dispatch_*` / `kqueue` / `pthread_setname_np`'s
+  darwin signature when there's no portable answer; else gate the
+  whole block behind a platform `#ifdef`. Test:
+  `ssh macbook 'cd ~/work/my/<repo>--cc && git pull && nix build .#yos'`
+  AND `ssh rb00 'cd ~/work/my/<repo>--cc && git pull && nix build .#yos'`
+  if you touched something portability-flavoured (the rb00 build is
+  aarch64-linux but the same constraints apply since iOS/tvOS are
+  also aarch64).
 - Build dir is `build-<host_os>` (e.g. `build-linux`,
   `build-darwin`, `build-freebsd`). Refuse in-source builds.
 - Long output goes to `tmp/` files, not stdout. Don't pipe

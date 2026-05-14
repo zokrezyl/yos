@@ -415,14 +415,39 @@ def _emit_bridge(name: str, gf: dict, hf: dict, gtypes: dict, htypes: dict,
             break
 
     # Functions whose return is the first ptr arg unchanged.
+    # (Whatever the host returns, we know it's the same address — so
+    # we can return the WASM offset of the first ptr arg without any
+    # translation arithmetic.)
     RET_IS_DST = {
-        'memset', 'memcpy', 'memmove', 'strcpy', 'strncpy',
-        'strcat', 'strncat', 'mempcpy', 'stpcpy', 'stpncpy',
+        'memset',  'memcpy',  'memmove', 'strcpy',  'strncpy',
+        'strcat',  'strncat', 'mempcpy', 'stpcpy',  'stpncpy',
+        # Wide-char family — same convention with wchar_t.
+        'wmemset', 'wmemcpy', 'wmemmove', 'wcscpy',  'wcsncpy',
+        'wcscat',  'wcsncat', 'wcpcpy',  'wcpncpy',
     }
     # Functions whose return is a pointer INTO the first ptr arg.
+    # (host returns &input[N]; we compute N and add to the wasm
+    # offset of the input.)
     RET_OFFSET_INTO_FIRST = {
-        'strchr', 'strrchr', 'memchr', 'strstr', 'strpbrk',
-        'strcasestr', 'memrchr',
+        'strchr',    'strrchr',   'memchr',  'strstr',
+        'strpbrk',   'strcasestr','memrchr', 'strchrnul',
+        'memmem',    'memccpy',   'index',   'rindex',
+        'basename',
+        # Wide-char family.
+        'wmemchr',   'wcschr',    'wcsrchr', 'wcsstr',
+        'wcspbrk',   'wcstok',
+    }
+    # Functions that allocate a new buffer + copy the input string.
+    # The bridge: call host, read host string length, allocate
+    # wasm-side via yos_malloc, copy, free host buffer, return wasm
+    # offset. Without this the auto-bridge stubs them with NULL,
+    # which makes basically any tool that uses strdup() crash.
+    RET_NEW_DUP = {
+        'strdup', 'strndup',
+    }
+    # Wide-char allocate-and-copy.
+    RET_NEW_DUP_WIDE = {
+        'wcsdup',
     }
     ret_kind = None
     if ret_is_ptr and first_ptr_arg >= 0:
@@ -430,6 +455,10 @@ def _emit_bridge(name: str, gf: dict, hf: dict, gtypes: dict, htypes: dict,
             ret_kind = 'first_arg_alias'
         elif name in RET_OFFSET_INTO_FIRST:
             ret_kind = 'offset_into_first'
+        elif name in RET_NEW_DUP:
+            ret_kind = 'new_dup_str'
+        elif name in RET_NEW_DUP_WIDE:
+            ret_kind = 'new_dup_wcs'
     if ret_is_ptr and ret_kind is None:
         can_emit = False
 
@@ -519,6 +548,35 @@ def _emit_bridge(name: str, gf: dict, hf: dict, gtypes: dict, htypes: dict,
         body_lines.append(f'    if (!_r) return 0;')
         body_lines.append(f'    return (uint32_t)({first_arg_var} + '
                           f'((const char *)_r - (const char *){host_first}));')
+    elif ret_kind == 'new_dup_str':
+        # strdup/strndup: host returns a freshly malloc'd buffer. We
+        # can't hand that pointer back to the wasm guest (different
+        # address space). Allocate a wasm-side buffer via yos_malloc,
+        # copy the string in, free the host buffer, return wasm offset.
+        body_lines.append(f'    if (!_r) return 0;')
+        body_lines.append(f'    extern uint32_t yos_malloc(struct yos_exec_ctx *, uint32_t);')
+        body_lines.append(f'    extern void free(void *);')
+        body_lines.append(f'    size_t _n = strlen((const char *)_r) + 1;')
+        body_lines.append(f'    uint32_t _off = yos_malloc(ctx, (uint32_t)_n);')
+        body_lines.append(f'    if (!_off) {{ free((void *)_r); return 0; }}')
+        body_lines.append(f'    memcpy(ctx->memory + _off, _r, _n);')
+        body_lines.append(f'    free((void *)_r);')
+        body_lines.append(f'    return _off;')
+    elif ret_kind == 'new_dup_wcs':
+        # wcsdup: same idea but with wchar_t. Host wchar_t is 4 B
+        # (Linux/FreeBSD 64-bit); FreeBSD wasm32 wchar_t is also 4 B.
+        # Walk to terminator using the host wchar_t size.
+        body_lines.append(f'    if (!_r) return 0;')
+        body_lines.append(f'    extern uint32_t yos_malloc(struct yos_exec_ctx *, uint32_t);')
+        body_lines.append(f'    extern void free(void *);')
+        body_lines.append(f'    size_t _n = 0; while (((const wchar_t *)_r)[_n]) _n++;')
+        body_lines.append(f'    _n++;  /* trailing NUL */')
+        body_lines.append(f'    uint32_t _bytes = (uint32_t)(_n * sizeof(wchar_t));')
+        body_lines.append(f'    uint32_t _off = yos_malloc(ctx, _bytes);')
+        body_lines.append(f'    if (!_off) {{ free((void *)_r); return 0; }}')
+        body_lines.append(f'    memcpy(ctx->memory + _off, _r, _bytes);')
+        body_lines.append(f'    free((void *)_r);')
+        body_lines.append(f'    return _off;')
     else:
         # Error reporting: write mapped errno to the per-ctx wasm slot
         # so the FreeBSD `errno` macro (#define errno (*__error()))
@@ -642,15 +700,188 @@ _BRIDGE_PROLOGUE = '''\
 
 def _normalised_header(h: str) -> str | None:
     """Snapshot path → libc-style header name. Returns None for headers
-    that have no clean public include (linux/ uapi, glibc bits, asm)."""
+    that have no clean public include (linux/ uapi, asm); for glibc
+    `bits/<x>.h` returns the corresponding public umbrella so the
+    bridge can include it. Without the bits/ mapping, ~150 functions
+    that glibc keeps in private bits/ headers (most of <math.h>, all
+    of <signal.h>'s sigsetops, much of <stdio.h>, etc.) get flagged
+    as "no public header" and stubbed with -ENOSYS — even though the
+    public umbrella is perfectly includable. """
     if not h:
         return None
     if '/' in h:
         tail = h.split('/', 1)[1] if h[:3].startswith(('01-', '02-', '03-', '04-')) else h
     else:
         tail = h
-    if tail.startswith(('bits/', 'asm/', 'asm-generic/', 'linux/',
+
+    # Reject genuinely-private headers (kernel UAPI, hardware asm,
+    # SunRPC). These have no public umbrella we can include.
+    if tail.startswith(('asm/', 'asm-generic/', 'linux/',
                         'rpcsvc/', 'rpc/')):
+        return None
+
+    # Glibc puts the *declaration* of many libc fns in `bits/<x>.h`
+    # which `<x>.h` includes after defining feature macros. Map back
+    # to the umbrella so the bridge can `#include` something compilable.
+    BITS_TO_UMBRELLA = {
+        # math
+        'bits/mathcalls.h':                  'math.h',
+        'bits/mathcalls-helper-functions.h': 'math.h',
+        'bits/mathcalls-narrow.h':           'math.h',
+        'bits/math-finite.h':                'math.h',
+        'bits/math-vector.h':                'math.h',
+        'bits/cmathcalls.h':                 'complex.h',
+        # signal
+        'bits/sigaction.h':                  'signal.h',
+        'bits/sigthread.h':                  'signal.h',
+        'bits/sigstack.h':                   'signal.h',
+        'bits/signum-arch.h':                'signal.h',
+        'bits/signum-generic.h':             'signal.h',
+        'bits/sigevent-consts.h':            'signal.h',
+        'bits/siginfo-consts.h':             'signal.h',
+        'bits/sigcontext.h':                 'signal.h',
+        'bits/ss_flags.h':                   'signal.h',
+        'bits/signalfd.h':                   'sys/signalfd.h',
+        # string / strings
+        'bits/string_fortified.h':           'string.h',
+        'bits/strings_fortified.h':          'strings.h',
+        # stdio
+        'bits/stdio.h':                      'stdio.h',
+        'bits/stdio2.h':                     'stdio.h',
+        'bits/stdio-ldbl.h':                 'stdio.h',
+        'bits/stdio_lim.h':                  'stdio.h',
+        'bits/printf-ldbl.h':                'stdio.h',
+        # stdlib
+        'bits/stdlib.h':                     'stdlib.h',
+        'bits/stdlib-bsearch.h':             'stdlib.h',
+        'bits/stdlib-float.h':               'stdlib.h',
+        # wchar / wctype
+        'bits/wchar.h':                      'wchar.h',
+        'bits/wchar2.h':                     'wchar.h',
+        'bits/wchar-ldbl.h':                 'wchar.h',
+        'bits/wctype-wchar.h':               'wctype.h',
+        # getopt
+        'bits/getopt_core.h':                'unistd.h',
+        'bits/getopt_ext.h':                 'getopt.h',
+        'bits/getopt_posix.h':               'unistd.h',
+        # socket / uio / netdb / netinet
+        'bits/socket.h':                     'sys/socket.h',
+        'bits/socket2.h':                    'sys/socket.h',
+        'bits/socket_type.h':                'sys/socket.h',
+        'bits/sockaddr.h':                   'sys/socket.h',
+        'bits/socketpair.h':                 'sys/socket.h',
+        'bits/uio-ext.h':                    'sys/uio.h',
+        'bits/uio_lim.h':                    'sys/uio.h',
+        'bits/in.h':                         'netinet/in.h',
+        'bits/netdb.h':                      'netdb.h',
+        # fcntl / poll / select / mman / dirent
+        'bits/fcntl-linux.h':                'fcntl.h',
+        'bits/fcntl2.h':                     'fcntl.h',
+        'bits/fcntl.h':                      'fcntl.h',
+        'bits/poll.h':                       'poll.h',
+        'bits/poll2.h':                      'poll.h',
+        'bits/select.h':                     'sys/select.h',
+        'bits/select2.h':                    'sys/select.h',
+        'bits/mman-linux.h':                 'sys/mman.h',
+        'bits/mman-shared.h':                'sys/mman.h',
+        'bits/mman.h':                       'sys/mman.h',
+        'bits/mman-map-flags-generic.h':     'sys/mman.h',
+        'bits/dirent.h':                     'dirent.h',
+        'bits/dirent_ext.h':                 'dirent.h',
+        # IPC / SysV
+        'bits/ipc.h':                        'sys/ipc.h',
+        'bits/ipc-perm.h':                   'sys/ipc.h',
+        'bits/sem.h':                        'sys/sem.h',
+        'bits/shm.h':                        'sys/shm.h',
+        'bits/shmlba.h':                     'sys/shm.h',
+        'bits/msq.h':                        'sys/msg.h',
+        # Linux-specific event fds (genuinely Linux-only — only
+        # bridgeable on Linux hosts; macOS host build will skip
+        # them with #ifdef __linux__).
+        'bits/inotify.h':                    'sys/inotify.h',
+        'bits/eventfd.h':                    'sys/eventfd.h',
+        'bits/timerfd.h':                    'sys/timerfd.h',
+        'bits/epoll.h':                      'sys/epoll.h',
+        # ioctl / dlfcn / sched / resource / sysctl / time
+        'bits/ioctls.h':                     'sys/ioctl.h',
+        'bits/ioctl-types.h':                'sys/ioctl.h',
+        'bits/dlfcn.h':                      'dlfcn.h',
+        'bits/sched.h':                      'sched.h',
+        'bits/sysctl.h':                     'sys/sysctl.h',
+        'bits/resource.h':                   'sys/resource.h',
+        'bits/time.h':                       'time.h',
+        'bits/timex.h':                      'sys/timex.h',
+        'bits/timesize.h':                   'sys/types.h',
+        # locale / utmpx / utsname / utime
+        'bits/locale.h':                     'locale.h',
+        'bits/utmpx.h':                      'utmpx.h',
+        'bits/utsname.h':                    'sys/utsname.h',
+        'bits/utime.h':                      'utime.h',
+        # syslog / error / errno
+        'bits/syslog.h':                     'syslog.h',
+        'bits/error.h':                      'error.h',
+        'bits/errno.h':                      'errno.h',
+        # stat / statvfs / statfs
+        'bits/stat.h':                       'sys/stat.h',
+        'bits/statfs.h':                     'sys/statfs.h',
+        'bits/statvfs.h':                    'sys/statvfs.h',
+        # termios — multiple shards in glibc
+        'bits/termios.h':                    'termios.h',
+        'bits/termios-struct.h':             'termios.h',
+        'bits/termios-tcflow.h':             'termios.h',
+        'bits/termios-c_cc.h':               'termios.h',
+        'bits/termios-c_cflag.h':            'termios.h',
+        'bits/termios-c_oflag.h':            'termios.h',
+        'bits/termios-c_iflag.h':            'termios.h',
+        'bits/termios-c_lflag.h':            'termios.h',
+        'bits/termios-baud.h':               'termios.h',
+        # wait / pthread / semaphore — usually pulled by their umbrella
+        'bits/waitflags.h':                  'sys/wait.h',
+        'bits/waitstatus.h':                 'sys/wait.h',
+        'bits/pthreadtypes.h':               'pthread.h',
+        'bits/pthreadtypes-arch.h':          'pthread.h',
+        'bits/pthread_stack_min.h':          'pthread.h',
+        'bits/struct_mutex.h':               'pthread.h',
+        'bits/struct_rwlock.h':              'pthread.h',
+        'bits/semaphore.h':                  'semaphore.h',
+        # types — bits/types/*.h are type-only, not function decls,
+        # but show up in case a fn returns one. Map to <sys/types.h>.
+        'bits/types.h':                      'sys/types.h',
+        'bits/typesizes.h':                  'sys/types.h',
+        'bits/wordsize.h':                   'sys/types.h',
+        'bits/timesize.h':                   'sys/types.h',
+        'bits/long-double.h':                'sys/types.h',
+        'bits/floatn.h':                     'sys/types.h',
+        'bits/floatn-common.h':              'sys/types.h',
+        'bits/endian.h':                     'endian.h',
+        'bits/byteswap.h':                   'byteswap.h',
+        # confname / limits / param
+        'bits/confname.h':                   'unistd.h',
+        'bits/local_lim.h':                  'limits.h',
+        'bits/posix1_lim.h':                 'limits.h',
+        'bits/posix2_lim.h':                 'limits.h',
+        'bits/posix_opt.h':                  'unistd.h',
+        'bits/param.h':                      'sys/param.h',
+        # cpu-set / rseq / atomic
+        'bits/cpu-set.h':                    'sched.h',
+        'bits/rseq.h':                       'sys/rseq.h',
+        'bits/atomic_wide_counter.h':        'sys/types.h',
+        # Misc glue
+        'bits/libc-header-start.h':          'features.h',
+        'bits/environments.h':               'unistd.h',
+        'bits/fp-logb.h':                    'math.h',
+        'bits/ptrace-shared.h':              'sys/ptrace.h',
+        'bits/syscall.h':                    'sys/syscall.h',
+        'bits/thread-shared-types.h':        'pthread.h',
+        'bits/platform/features.h':          'features.h',
+        'bits/platform/x86.h':               'sys/types.h',
+    }
+    if tail in BITS_TO_UMBRELLA:
+        return BITS_TO_UMBRELLA[tail]
+    if tail.startswith('bits/'):
+        # Unknown bits/ header — reject conservatively rather than
+        # invent an umbrella. Add to the table above when a function
+        # we need shows up here.
         return None
     return tail
 

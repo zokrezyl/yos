@@ -738,6 +738,48 @@ static int oflags_fb_to_lx(int f)
 
 int oflags_fb_to_lx_fwd(int f) { return oflags_fb_to_lx(f); }
 
+/* ── AT_* flag translation (FreeBSD wasm ↔ host Linux) ───────────────
+ *
+ * These are passed to the openat/fstatat/faccessat/unlinkat/etc.
+ * `*at()` family. FreeBSD vs Linux values diverge — most painfully
+ * AT_SYMLINK_NOFOLLOW (FreeBSD 0x200, Linux 0x100) collides with
+ * Linux's AT_REMOVEDIR (0x200), which is why ls -l /tmp returns
+ * "Invalid argument" — host fstatat sees AT_REMOVEDIR and rejects.
+ *
+ * Mapping (only the bits user code actually passes):
+ *
+ *   constant            FreeBSD  Linux
+ *   AT_EACCESS          0x100    0x200
+ *   AT_SYMLINK_NOFOLLOW 0x200    0x100
+ *   AT_SYMLINK_FOLLOW   0x400    0x400
+ *   AT_REMOVEDIR        0x800    0x200
+ *   AT_NO_AUTOMOUNT     —        0x800   (FreeBSD has no equivalent;
+ *                                          ignore on guest→host)
+ *   AT_EMPTY_PATH       0x4000   0x1000
+ *
+ * AT_FDCWD = -100 on both, no translation needed.
+ */
+#ifndef AT_NO_AUTOMOUNT
+#define AT_NO_AUTOMOUNT 0x800
+#endif
+
+#define FB_AT_EACCESS          0x0100
+#define FB_AT_SYMLINK_NOFOLLOW 0x0200
+#define FB_AT_SYMLINK_FOLLOW   0x0400
+#define FB_AT_REMOVEDIR        0x0800
+#define FB_AT_EMPTY_PATH       0x4000
+
+int yos_at_flags_fb_to_lx(int f)
+{
+    int r = 0;
+    if (f & FB_AT_EACCESS)          r |= AT_EACCESS;
+    if (f & FB_AT_SYMLINK_NOFOLLOW) r |= AT_SYMLINK_NOFOLLOW;
+    if (f & FB_AT_SYMLINK_FOLLOW)   r |= AT_SYMLINK_FOLLOW;
+    if (f & FB_AT_REMOVEDIR)        r |= AT_REMOVEDIR;
+    if (f & FB_AT_EMPTY_PATH)       r |= AT_EMPTY_PATH;
+    return r;
+}
+
 static int oflags_lx_to_fb(int f)
 {
     int r = (f & 3);

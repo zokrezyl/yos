@@ -68,6 +68,23 @@ custom_proc:
   - getloadavg
   # impl/posix.c — page-align addr/len before host call.
   - posix_madvise
+  # impl/posix.c — wasm-side timeval[2] widen-to-host before host call.
+  # struct_convert handles single timeval but not 2-elem array form.
+  - utimes
+  - futimes
+  - lutimes
+  # impl/posix.c — host fd-translating, returns wasm offset to caller's
+  # buf. Auto-bridge stubs because of `char *` return alias.
+  - if_indextoname
+  # impl/posix.c — Linux extension to accept(2). Translates FreeBSD
+  # SOCK_CLOEXEC/SOCK_NONBLOCK and allocates a wasm fd.
+  - accept4
+  # impl/posix.c — uname's backend on FreeBSD (uname() is inline in
+  # <sys/utsname.h>). Returns FreeBSD wasm32 face fields.
+  - __xuname
+  # fstatat moved BACK to struct_convert; AT_* flag translation
+  # to be added there (or via auto-bridge enhancement) instead of
+  # hand-bridging — that change broke nvim-edit-session.
   # impl/posix.c — DNS / sockaddr conversion. Builds a wasm-side
   # linked list of addrinfo blocks via yos_malloc (same pattern as
   # getpwuid), translates FreeBSD↔host sockaddr layout (sin_len byte).
@@ -122,6 +139,27 @@ custom_proc:
   - gai_strerror
   - hstrerror
   - strsignal
+  # impl/pwd.c — more static-buffer string returners. Same pattern.
+  # Most were getting auto-stubbed because bridge.py can't translate
+  # `const char *` returns to wasm offsets. Each gets its own slot.
+  - ttyname
+  - ttyname_r
+  - ctermid
+  - dirname
+  - getwd
+  - tempnam
+  - mktemp
+  - l64a
+  - nl_langinfo
+  - setlocale
+  - getusershell
+  - setusershell
+  - endusershell
+  - tmpnam
+  # impl/pwd.c — strftime needs cv_tm_w2h to widen wasm tm to host tm
+  # before formatting. Auto-bridge can't see the in-pointer's struct
+  # converter requirement.
+  - strftime
   # impl/pwd.c — pointer-into-input return convention (the result
   # is a wasm offset into one of the input buffers).
   - strtok
@@ -425,6 +463,13 @@ custom_sig:
   - sigwaitinfo
   - sigtimedwait
   - signal
+  # Pure userspace bitmap ops on the FreeBSD-shape 16-byte sigset_t.
+  # No host call; we manipulate the wasm-side bytes directly.
+  - sigemptyset
+  - sigfillset
+  - sigaddset
+  - sigdelset
+  - sigismember
 
 # ─── Stat / time / rusage struct conversion ───────────────────────────
 # Each entry is name -> { which params need conversion, type-name }.
@@ -434,12 +479,9 @@ custom_sig:
 # names refer to converters emitted into struct_convert.{c,h} by our
 # generate_struct_convert.py.
 struct_convert:
-  # struct stat
+  # stat / lstat / fstatat: auto-bridge via struct_convert (cv_stat_h2w).
+  # fstat: hand-bridged in impl/posix.c (fd translation through fd_map).
   stat:           {out: statbuf, type: stat}
-  # fstat: hand-written in impl/posix.c so the wasm fd is translated
-  # through ctx->fd_map (the auto-bridge passes the wasm fd straight
-  # to host glibc, which stats yos's own stdio rather than the child's
-  # actual host fd — fatal for nvim --embed's channel_from_stdio).
   lstat:          {out: statbuf, type: stat}
   fstatat:        {out: statbuf, type: stat}
   # struct timespec
@@ -515,11 +557,9 @@ stub:
   # impl/signal.c binds layout-aware impls via yos_signal_link.
   # sigprocmask + sigpending are already in custom_sig (impl/sig.c).
   - pthread_sigmask
-  - sigemptyset
-  - sigfillset
-  - sigaddset
-  - sigdelset
-  - sigismember
+  # sigemptyset/sigfillset/sigaddset/sigdelset/sigismember moved to
+  # custom_sig (impl/sig.c) — pure userspace bitmap ops on the
+  # FreeBSD-shape 16-byte sigset_t.
   # sysctl + sysctlbyname moved to runtime_owned (impl/sysctl.c).
   - setproctitle
   # FreeBSD-internal helpers (rarely called in user code).
@@ -532,7 +572,7 @@ stub:
   - ___toupper
   - __srget
   - __swbuf
-  - __xuname
+  # __xuname (uname's backend) moved to custom_proc (impl/posix.c).
   # Linux-only that nvim/libuv reaches for; safe to stub.
   - sched_getcpu
   # copy_file_range moved to custom_vfs — cp(1) probes it first and
@@ -543,7 +583,7 @@ stub:
   # to host copy_file_range / sendfile lands.
   - recvmmsg
   - sendmmsg
-  - accept4
+  # accept4 moved to custom_proc (impl/posix.c).
   # __cxa_atexit moved to runtime_owned (impl/callback.c).
   - __stack_chk_fail
   # FreeBSD vs Linux signature mismatches — auto-bridge can't render
@@ -558,10 +598,8 @@ stub:
   - sendfile
   - setpgrp           # Linux: setpgrp(); FreeBSD: setpgrp(pid, pgid)
   # socketpair handled in impl/posix.c (custom_vfs).
-  - if_indextoname
-  - futimes
-  - lutimes
-  - utimes
+  # if_indextoname / futimes / lutimes / utimes / accept4 moved to
+  # custom_proc (impl/posix.c).
   # Locale-aware ctype family — glibc macros expand to (locale)->__ctype_b
   # but bridge.py passes the locale_t arg as void*, which can't dereference
   # the struct member. Stub until bridge.py learns to cast wasm pointers
@@ -607,7 +645,7 @@ stub:
   - vwscanf
   # regexec — bridge.py mis-renders signature (regmatch_t * + size_t).
   - regexec
-  - tmpnam
+  # tmpnam moved to custom_proc (impl/pwd.c).
   - pthread_getcpuclockid
   - pthread_getschedparam
   - pthread_setschedparam
@@ -629,7 +667,7 @@ stub:
   - versionsort
   # localtime/gmtime/ctime/asctime/strptime moved to custom_proc
   # (impl/pwd.c) — same wasm-side static-buffer pattern as getpwuid.
-  - strftime
+  # strftime moved to custom_proc (impl/pwd.c) — needs cv_tm_w2h.
   # struct passwd/group families: moved to custom_proc (impl/pwd.c)
   # so getpwuid actually returns a non-NULL entry. The user's ssh
   # bug was "No user exists for uid 1000" caused by these being
@@ -647,8 +685,8 @@ stub:
   - freeifaddrs
   - getprotobyname
   - getprotobynumber
-  # struct utsname differs between FreeBSD/Linux.
-  - uname
+  # struct utsname differs between FreeBSD/Linux. uname() is an inline
+  # shim around __xuname which is bridged in impl/posix.c.
   - sigaltstack
   # Note: sigsuspend used to be listed here as a stub. zsh's "fork+wait
   # for child" pattern is `block(SIGCHLD); sigsuspend(empty); waitpid()`
@@ -668,9 +706,7 @@ stub:
   # pread, pwrite, raise, killpg, getuid, geteuid, getgid, getegid,
   # sbrk — implemented in impl/posix.c (custom_vfs / custom_proc /
   # custom_mem / custom_sig per hooks.yaml).
-  - alarm
-  - sleep
-  - ualarm
+  # alarm / sleep / ualarm — fully portable; auto-passthrough works.
   - revoke
   - wait        # yos-private has wait4 only; map at next iteration
   # Note: wait3 was previously stubbed here. zsh's `wait_for_processes`

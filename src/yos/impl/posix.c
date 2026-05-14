@@ -1235,3 +1235,158 @@ uint32_t yos_cfgetospeed(struct yos_exec_ctx *ctx, uint32_t t_off)
     if (t_off + YOS_FBSD_TERMIOS_SIZE > ctx->memory_size) return 0;
     return *(uint32_t *)(ctx->memory + t_off + 40);
 }
+
+/* ── utimes / futimes / lutimes ──────────────────────────────────────
+ *
+ * struct timeval is { time_t tv_sec; suseconds_t tv_usec; }. On
+ * FreeBSD-i386 wasm32 both fields are 32-bit (8 bytes total). On host
+ * x86_64 Linux tv_sec is 64-bit (16 bytes total). The wasm guest
+ * passes a wasm offset to a 2-element timeval array (16 bytes); we
+ * widen each scalar to host shape before calling host libc.
+ *
+ * Auto-bridge stubs these because struct timeval is in the
+ * struct_convert table for in/out scalar fields but not for the
+ * 2-element array form these fns use. Hand-bridge: read 4 little-
+ * endian uint32s from wasm, build 2 host timevals, call.
+ */
+#include <sys/time.h>
+
+static void wasm_timeval2_to_host(const uint8_t *w, struct timeval h[2])
+{
+    for (int i = 0; i < 2; i++) {
+        uint32_t s, u;
+        memcpy(&s, w + i*8 + 0, 4);
+        memcpy(&u, w + i*8 + 4, 4);
+        h[i].tv_sec  = (time_t)(int32_t)s;   /* sign-extend */
+        h[i].tv_usec = (suseconds_t)(int32_t)u;
+    }
+}
+
+int32_t yos_utimes(struct yos_exec_ctx *ctx, uint32_t path_off, uint32_t times_off)
+{
+    if (!path_off || path_off >= ctx->memory_size) return -EFAULT;
+    const char *path = (const char *)(ctx->memory + path_off);
+    struct timeval *p = NULL, h[2];
+    if (times_off) {
+        if (times_off + 16 > ctx->memory_size) return -EFAULT;
+        wasm_timeval2_to_host(ctx->memory + times_off, h);
+        p = h;
+    }
+    if (utimes(path, p) < 0) return -errno;
+    return 0;
+}
+
+int32_t yos_futimes(struct yos_exec_ctx *ctx, int32_t wfd, uint32_t times_off)
+{
+    int hfd = yos_fd_get(ctx, wfd);
+    if (hfd < 0) return -EBADF;
+    struct timeval *p = NULL, h[2];
+    if (times_off) {
+        if (times_off + 16 > ctx->memory_size) return -EFAULT;
+        wasm_timeval2_to_host(ctx->memory + times_off, h);
+        p = h;
+    }
+    if (futimes(hfd, p) < 0) return -errno;
+    return 0;
+}
+
+int32_t yos_lutimes(struct yos_exec_ctx *ctx, uint32_t path_off, uint32_t times_off)
+{
+    if (!path_off || path_off >= ctx->memory_size) return -EFAULT;
+    const char *path = (const char *)(ctx->memory + path_off);
+    struct timeval *p = NULL, h[2];
+    if (times_off) {
+        if (times_off + 16 > ctx->memory_size) return -EFAULT;
+        wasm_timeval2_to_host(ctx->memory + times_off, h);
+        p = h;
+    }
+    if (lutimes(path, p) < 0) return -errno;
+    return 0;
+}
+
+/* __xuname — FreeBSD's uname(2) backend. The inline `uname()` in
+ * <sys/utsname.h> calls __xuname(SYS_NMLN=256, struct utsname*).
+ * struct utsname on wasm is 5 fields × 256 bytes = 1280 bytes.
+ *
+ * We pretend to be FreeBSD on wasm32 (the wasm guest's whole point).
+ * sysname=FreeBSD, machine=wasm32. Rest is just pleasant defaults
+ * pulled from host uname so build scripts get a sensible kernel
+ * version when they grep release. */
+#include <sys/utsname.h>
+int32_t yos___xuname(struct yos_exec_ctx *ctx, int32_t namesz, uint32_t buf_off)
+{
+    if (namesz <= 0 || !buf_off) return -EFAULT;
+    uint32_t total = (uint32_t)namesz * 5;
+    if (buf_off + total > ctx->memory_size) return -EFAULT;
+    char *fields[5] = {
+        (char *)(ctx->memory + buf_off + 0u * (uint32_t)namesz),  /* sysname */
+        (char *)(ctx->memory + buf_off + 1u * (uint32_t)namesz),  /* nodename */
+        (char *)(ctx->memory + buf_off + 2u * (uint32_t)namesz),  /* release */
+        (char *)(ctx->memory + buf_off + 3u * (uint32_t)namesz),  /* version */
+        (char *)(ctx->memory + buf_off + 4u * (uint32_t)namesz),  /* machine */
+    };
+    /* Zero everything first so any short string is NUL-terminated. */
+    memset(ctx->memory + buf_off, 0, total);
+
+    struct utsname host;
+    if (uname(&host) < 0) return -errno;
+
+    /* Present a FreeBSD wasm32 face regardless of host. */
+    strncpy(fields[0], "FreeBSD", (size_t)namesz - 1);
+    /* nodename = host's hostname (real). */
+    strncpy(fields[1], host.nodename, (size_t)namesz - 1);
+    /* release = "14.4-yos" so build scripts that test FreeBSD>=12 work. */
+    strncpy(fields[2], "14.4-yos", (size_t)namesz - 1);
+    /* version = a free-form build-time string. */
+    snprintf(fields[3], (size_t)namesz, "FreeBSD 14.4-yos wasm32 host=%s",
+             host.release);
+    /* machine = wasm32. */
+    strncpy(fields[4], "wasm32", (size_t)namesz - 1);
+    return 0;
+}
+
+/* if_indextoname — return a wasm offset to a buffer holding the
+ * interface name. Auto-bridge stubbed because the return value
+ * `char *` aliases the second arg. We let host libc fill the
+ * caller's buffer and return its wasm offset on success. */
+#include <net/if.h>
+uint32_t yos_if_indextoname(struct yos_exec_ctx *ctx,
+                            uint32_t ifindex, uint32_t name_off)
+{
+    if (!name_off || name_off + IF_NAMESIZE > ctx->memory_size) return 0;
+    char *buf = (char *)(ctx->memory + name_off);
+    if (!if_indextoname(ifindex, buf)) return 0;
+    return name_off;
+}
+
+/* accept4 — like accept(2) but with flags. Same fd virtualisation
+ * as accept; FreeBSD SOCK_CLOEXEC etc. translate to host equivalents.
+ * Auto-bridge classified as "unportable Linux extension"; on Linux it
+ * IS available (glibc 2.10+). Stub on darwin until a fcntl-based
+ * fallback lands. */
+int32_t yos_accept4(struct yos_exec_ctx *ctx, int32_t wfd,
+                    uint32_t addr_off, uint32_t addrlen_off, int32_t flags)
+{
+#if defined(__linux__)
+    int hfd = yos_fd_get(ctx, wfd);
+    if (hfd < 0) return -EBADF;
+    /* Strip FreeBSD-specific bits we can't honour atomically and
+     * convert to host equivalents. */
+    int hflags = 0;
+    if (flags & 0x10000000) hflags |= SOCK_CLOEXEC;   /* FreeBSD SOCK_CLOEXEC */
+    if (flags & 0x20000000) hflags |= SOCK_NONBLOCK;  /* FreeBSD SOCK_NONBLOCK */
+    /* Auto-bridge can't translate sockaddr; we accept into a host
+     * buffer and copy back, mirroring yos_accept's pattern in the
+     * generated code. For minimum portability, ignore the addr
+     * out-param if non-NULL — caller can getpeername later. */
+    int new_hfd = accept4(hfd, NULL, NULL, hflags);
+    (void)addr_off; (void)addrlen_off;
+    if (new_hfd < 0) return -errno;
+    int new_wfd = yos_fd_alloc(ctx, new_hfd);
+    if (new_wfd < 0) { close(new_hfd); return -EMFILE; }
+    return new_wfd;
+#else
+    (void)ctx; (void)wfd; (void)addr_off; (void)addrlen_off; (void)flags;
+    return -ENOSYS;
+#endif
+}

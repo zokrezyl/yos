@@ -1,6 +1,7 @@
 #include "yos/types.h"
 #include "yos/ydebug.h"
 #include <stdint.h>
+#include <string.h>     /* memset for sigemptyset/sigfillset */
 #include <errno.h>
 #include <pthread.h>
 #include <time.h>
@@ -245,4 +246,80 @@ int32_t yos_sigsuspend(struct yos_exec_ctx *ctx, uint32_t mask_off)
     if (ctx->memory && ctx->errno_off)
         *(int *)(ctx->memory + ctx->errno_off) = EINTR;
     return -1;
+}
+
+/* ── sigemptyset / sigfillset / sigaddset / sigdelset / sigismember
+ *
+ * FreeBSD `sigset_t` is `__uint32_t __bits[4]` — 16 bytes total,
+ * holding 128 bits (signal numbers 1..128). These are pure userspace
+ * bitmap manipulators: zero/fill/set-bit/clear-bit/test-bit on the
+ * 128-bit blob the wasm guest hands us. No host call, no host
+ * sigset_t involved (Linux's sigset_t is 128 bytes, totally different
+ * layout — we MUST do the manipulation on the wasm-side bytes
+ * directly, otherwise we'd corrupt 7 sigset_ts past the boundary).
+ *
+ * Auto-bridge stubs these because of the size mismatch — at the
+ * declaration level the bridge generator can't tell that the
+ * intended manipulation is purely on the FreeBSD layout.
+ */
+
+#define YOS_FBSD_SIGSET_BYTES 16
+
+static inline int yos_sigset_bound(struct yos_exec_ctx *ctx, uint32_t off)
+{
+    return off && off + YOS_FBSD_SIGSET_BYTES <= ctx->memory_size;
+}
+
+int32_t yos_sigemptyset(struct yos_exec_ctx *ctx, uint32_t set_off)
+{
+    if (!yos_sigset_bound(ctx, set_off)) return -EFAULT;
+    memset(ctx->memory + set_off, 0, YOS_FBSD_SIGSET_BYTES);
+    return 0;
+}
+
+int32_t yos_sigfillset(struct yos_exec_ctx *ctx, uint32_t set_off)
+{
+    if (!yos_sigset_bound(ctx, set_off)) return -EFAULT;
+    memset(ctx->memory + set_off, 0xff, YOS_FBSD_SIGSET_BYTES);
+    return 0;
+}
+
+/* FreeBSD sigaddset/sigdelset/sigismember:
+ *   bit (signo-1) within __bits[(signo-1)/32], bit (signo-1)%32.
+ * Signals are 1..128. Out-of-range returns -EINVAL. */
+static int yos_sigset_op_check(int32_t signo)
+{
+    return (signo >= 1 && signo <= 128) ? 0 : -EINVAL;
+}
+
+int32_t yos_sigaddset(struct yos_exec_ctx *ctx, uint32_t set_off, int32_t signo)
+{
+    if (!yos_sigset_bound(ctx, set_off)) return -EFAULT;
+    int rc = yos_sigset_op_check(signo);
+    if (rc) return rc;
+    uint32_t b = (uint32_t)(signo - 1);
+    uint32_t *bits = (uint32_t *)(ctx->memory + set_off);
+    bits[b / 32] |= 1u << (b % 32);
+    return 0;
+}
+
+int32_t yos_sigdelset(struct yos_exec_ctx *ctx, uint32_t set_off, int32_t signo)
+{
+    if (!yos_sigset_bound(ctx, set_off)) return -EFAULT;
+    int rc = yos_sigset_op_check(signo);
+    if (rc) return rc;
+    uint32_t b = (uint32_t)(signo - 1);
+    uint32_t *bits = (uint32_t *)(ctx->memory + set_off);
+    bits[b / 32] &= ~(1u << (b % 32));
+    return 0;
+}
+
+int32_t yos_sigismember(struct yos_exec_ctx *ctx, uint32_t set_off, int32_t signo)
+{
+    if (!yos_sigset_bound(ctx, set_off)) return -EFAULT;
+    int rc = yos_sigset_op_check(signo);
+    if (rc) return rc;
+    uint32_t b = (uint32_t)(signo - 1);
+    const uint32_t *bits = (const uint32_t *)(ctx->memory + set_off);
+    return (bits[b / 32] >> (b % 32)) & 1u;
 }
