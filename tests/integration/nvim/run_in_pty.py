@@ -37,9 +37,16 @@ import signal
 # uniformly so the same driver script is robust on both platforms.
 # Override per-test via env if the default 2x isn't enough.
 def _timing_mult():
+    # darwin needs 3x — empirically 2x still flakes ~2/3 of test runs
+    # because wasm3 interpretation under parallel meson load is slow
+    # enough that the (2.5s settle, 0.5s, 3.0s, 2.0s kill_after) sum
+    # leaves too little headroom for nvim to draw + receive :q! +
+    # exit. Bumping to 3x gives ~25s grace per test, which is
+    # comfortably above the worst-case ~15s wasm cold start observed
+    # under load. The whole suite still finishes in <2 min.
     try:
         return max(1.0, float(os.environ.get('YOS_PTY_TIMING_MULT',
-                                             '2.0' if sys.platform == 'darwin' else '1.0')))
+                                             '3.0' if sys.platform == 'darwin' else '1.0')))
     except ValueError:
         return 1.0
 
