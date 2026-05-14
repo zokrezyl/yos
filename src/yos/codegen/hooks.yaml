@@ -208,6 +208,15 @@ runtime_owned_pthread: &runtime_owned_pthread
   - pthread_attr_getstacksize
   - pthread_attr_setstackaddr
   - pthread_attr_getstackaddr
+  # pthread_spin_* — darwin libSystem has no pthread_spin family at all,
+  # so a tier-1 host-libc passthrough won't link there. yos provides them
+  # via C11 atomics on the wasm cell directly (impl/pthread.c) — same
+  # impl works on Linux + darwin.
+  - pthread_spin_init
+  - pthread_spin_destroy
+  - pthread_spin_lock
+  - pthread_spin_trylock
+  - pthread_spin_unlock
 
 # ─── VFS (fd virtualisation, cwd-relative paths) ──────────────────────
 custom_vfs:

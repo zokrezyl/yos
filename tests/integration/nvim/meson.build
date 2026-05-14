@@ -37,6 +37,14 @@ nvim_int_tests = {
 }
 
 foreach name, cfg : nvim_int_tests
+  # is_parallel: false — each test drives a full nvim TUI through a
+  # pty with hard-coded timing windows (`(2.5, b"")` etc. — wait 2.5s
+  # for nvim to settle before sending the next keystroke). Under
+  # parallel test load every yos host is competing for CPU, the wasm
+  # interpreter is much slower than expected, nvim hasn't drawn the
+  # screen yet when `:q!` arrives, and the input is dropped. The test
+  # then SIGKILLs after its 2s grace and reports status=9. Cheap to
+  # serialise — each test runs in ~10s and there are only 4 of them.
   test('nvim-' + name,
        py3,
        args : cfg['src'],
@@ -44,5 +52,6 @@ foreach name, cfg : nvim_int_tests
        env : nvim_int_env,
        depends : [yos_exe],
        should_fail : cfg['xfail'],
+       is_parallel : false,
        timeout : 30)
 endforeach

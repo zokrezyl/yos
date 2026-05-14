@@ -24,4 +24,16 @@
  *         are theoretical for our use (logging, ring-buffer keys). */
 pid_t yos_plat_gettid(void);
 
+/* posix_fadvise / posix_fallocate — host-libc on Linux, fcntl(2)
+ * equivalents on darwin (which has neither symbol). Both return 0 on
+ * success and a positive errno on failure, matching the POSIX spec
+ * (return value, *not* errno).
+ *   - fadvise advice values are the POSIX numeric constants 0..5
+ *     (NORMAL, RANDOM, SEQUENTIAL, WILLNEED, DONTNEED, NOREUSE) —
+ *     same on FreeBSD-guest, Linux-host, and our darwin shim.
+ *   - fallocate guarantees the file is at least offset+len bytes,
+ *     with the new range allocated and zero-filled. */
+int yos_plat_posix_fadvise(int fd, off_t offset, off_t len, int advice);
+int yos_plat_posix_fallocate(int fd, off_t offset, off_t len);
+
 #endif /* YOS_PLATFORM_POSIX_PLATFORM_H */

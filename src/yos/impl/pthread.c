@@ -537,6 +537,65 @@ static m3ApiRawFunction (host_pthread_mutex_unlock)
     m3ApiReturn (mu_unlock_cell (cell));
 }
 
+//---------------------------------------------------------------------------
+// Imports — spinlock
+//
+// pthread_spinlock_t is an opaque int in the FreeBSD guest. We treat the
+// 32-bit cell as a plain test-and-set lock with C11 atomics — the same
+// implementation works on Linux and darwin (darwin's libSystem has no
+// pthread_spin_* at all, so a tier-1 passthrough would fail to link).
+//---------------------------------------------------------------------------
+static m3ApiRawFunction (host_pthread_spin_init)
+{
+    m3ApiReturnType (int32_t)
+    m3ApiGetArgMem  (uint32_t *, cell)
+    m3ApiGetArg     (int32_t,    pshared) (void) pshared;
+    if (!cell) m3ApiReturn (22);  // EINVAL
+    __atomic_store_n (cell, 0u, __ATOMIC_SEQ_CST);
+    m3ApiReturn (0);
+}
+static m3ApiRawFunction (host_pthread_spin_destroy)
+{
+    m3ApiReturnType (int32_t)
+    m3ApiGetArgMem  (uint32_t *, cell) (void) cell;
+    m3ApiReturn (0);
+}
+static m3ApiRawFunction (host_pthread_spin_lock)
+{
+    m3ApiReturnType (int32_t)
+    m3ApiGetArgMem  (uint32_t *, cell)
+    if (!cell) m3ApiReturn (22);  // EINVAL
+    for (;;) {
+        uint32_t expected = 0;
+        if (__atomic_compare_exchange_n (cell, &expected, 1u, 0,
+                                         __ATOMIC_ACQUIRE, __ATOMIC_RELAXED))
+            m3ApiReturn (0);
+        /* Busy-wait with a relaxed load; this is a SPIN lock, so no
+         * futex/cond fallback. Pause hint would go here on archs that
+         * have one. */
+    }
+}
+static m3ApiRawFunction (host_pthread_spin_trylock)
+{
+    m3ApiReturnType (int32_t)
+    m3ApiGetArgMem  (uint32_t *, cell)
+    if (!cell) m3ApiReturn (22);
+    uint32_t expected = 0;
+    if (__atomic_compare_exchange_n (cell, &expected, 1u, 0,
+                                     __ATOMIC_ACQUIRE, __ATOMIC_RELAXED))
+        m3ApiReturn (0);
+    m3ApiReturn (16);  // EBUSY
+}
+static m3ApiRawFunction (host_pthread_spin_unlock)
+{
+    m3ApiReturnType (int32_t)
+    m3ApiGetArgMem  (uint32_t *, cell)
+    if (!cell) m3ApiReturn (22);
+    __atomic_store_n (cell, 0u, __ATOMIC_RELEASE);
+    m3ApiReturn (0);
+}
+
+
 // Mutex attr stubs — wasm code may legitimately call these even if we don't
 // honour kind / type / pshared / robust. Return 0 so it thinks they succeed.
 static m3ApiRawFunction (host_pthread_mutexattr_noop_1)
@@ -1005,6 +1064,12 @@ host_link_imports (yos_pthread_host * h, IM3Module mod)
     LINK ("pthread_mutex_lock",    "i(*)",     host_pthread_mutex_lock);
     LINK ("pthread_mutex_trylock", "i(*)",     host_pthread_mutex_trylock);
     LINK ("pthread_mutex_unlock",  "i(*)",     host_pthread_mutex_unlock);
+
+    LINK ("pthread_spin_init",     "i(*i)",  host_pthread_spin_init);
+    LINK ("pthread_spin_destroy",  "i(*)",   host_pthread_spin_destroy);
+    LINK ("pthread_spin_lock",     "i(*)",   host_pthread_spin_lock);
+    LINK ("pthread_spin_trylock",  "i(*)",   host_pthread_spin_trylock);
+    LINK ("pthread_spin_unlock",   "i(*)",   host_pthread_spin_unlock);
 
     LINK ("pthread_mutexattr_init",    "i(*)",   host_pthread_mutexattr_noop_1);
     LINK ("pthread_mutexattr_destroy", "i(*)",   host_pthread_mutexattr_noop_1);

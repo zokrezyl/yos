@@ -52,13 +52,36 @@ void yos_fd_table_init(struct yos_exec_ctx *ctx)
     ctx->fd_map[2] = 2;
 }
 
+/* FreeBSD's AT_FDCWD = -100 (also Linux). Darwin's AT_FDCWD = -2. The
+ * wasm guest is FreeBSD-shaped so it always passes -100; translate to
+ * the host value here. We accept either spelling on input so callers
+ * that already worked under the host value keep working. */
+#define YOS_FBSD_AT_FDCWD (-100)
+
 int32_t yos_fd_get(struct yos_exec_ctx *ctx, int32_t wfd)
 {
-    if (wfd == AT_FDCWD) return wfd;
+    if (wfd == AT_FDCWD || wfd == YOS_FBSD_AT_FDCWD) return AT_FDCWD;
     if (wfd < 0 || wfd >= YOS_FD_MAX) return -EBADF;
     int hfd = ctx->fd_map[wfd];
     if (hfd < 0) return -EBADF;
     return hfd;
+}
+
+/* Translate a wasm dirfd to the host's representation. Used by every
+ * *at() bridge — see codegen/bridge.py's _AT_FAMILY list. Returns
+ * the host AT_FDCWD when the guest passed AT_FDCWD (either platform's
+ * value), the mapped host fd for a regular wasm fd, or -1 to make the
+ * host call fail with EBADF for invalid input. */
+int yos_xlate_dfd(struct yos_exec_ctx *ctx, int32_t wfd)
+{
+    /* yos_fd_get returns:
+     *   - host AT_FDCWD when wfd is AT_FDCWD-like (darwin = -2,
+     *     Linux/FreeBSD = -100). Pass through; do NOT filter as
+     *     "negative ⇒ error" — AT_FDCWD itself is negative.
+     *   - positive host fd for valid wasm fds.
+     *   - -EBADF (-9) for invalid wasm fds, which the host call
+     *     will reject as a bad fd. */
+    return yos_fd_get(ctx, wfd);
 }
 
 int32_t yos_fd_alloc(struct yos_exec_ctx *ctx, int host_fd)

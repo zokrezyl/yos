@@ -1,6 +1,6 @@
 { stdenv, lib, fetchurl, fetchFromGitHub
 , meson, ninja, pkg-config, python3, llvmPackages_18, binaryen
-, libffi, libiconv
+, libffi, libiconv, apple-sdk_13 ? null
 , src
 }:
 
@@ -80,7 +80,26 @@ in stdenv.mkDerivation {
 
   buildInputs = [
     libffi
-  ] ++ lib.optionals stdenv.isDarwin [ libiconv ];
+  ] ++ lib.optionals stdenv.isDarwin [
+    libiconv
+    # Without this, nix's stdenv on darwin gates libSystem at the 10.12
+    # SDK; preadv / pwritev / mknodat (POSIX-2017, shipped in macOS 11+)
+    # don't appear in the header surface and the build fails with
+    # "call to undeclared function". The dev shell in flake.nix does
+    # the same override via shellHook — keep them in sync.
+    apple-sdk_13
+  ];
+
+  # MACOSX_DEPLOYMENT_TARGET / SDKROOT must be set BEFORE meson runs so
+  # the configure-time feature probes see the modern symbol set. nix's
+  # stdenv setup-hook pins SDKROOT to its default 10.12 SDK; override
+  # in preBuild (which fires after the hook).
+  preBuild = lib.optionalString stdenv.isDarwin ''
+    export MACOSX_DEPLOYMENT_TARGET=13.0
+    export SDKROOT=${apple-sdk_13}/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk
+    export NIX_CFLAGS_COMPILE="$NIX_CFLAGS_COMPILE -isysroot $SDKROOT"
+    export NIX_LDFLAGS="$NIX_LDFLAGS -L$SDKROOT/usr/lib"
+  '';
 
   # No standard configurePhase — we run meson manually below to
   # control where the build directory lives (Nix store paths are

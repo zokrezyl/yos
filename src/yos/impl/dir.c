@@ -285,8 +285,15 @@ uint32_t yos_readdir(struct yos_exec_ctx *ctx, uint32_t handle)
         return 0;
     }
     size_t namlen = strlen(e->d_name);
+#if defined(__APPLE__)
+    /* darwin spells the seek-offset field d_seekoff; same semantics as
+     * Linux d_off — opaque cookie to seekdir back to this entry. */
+    int64_t seekoff = (int64_t)e->d_seekoff;
+#else
+    int64_t seekoff = (int64_t)e->d_off;
+#endif
     return emit_fbsd_dirent(ctx, slot,
-                            (uint64_t)e->d_ino, (int64_t)e->d_off,
+                            (uint64_t)e->d_ino, seekoff,
                             (uint8_t)e->d_type, e->d_name, namlen);
 }
 

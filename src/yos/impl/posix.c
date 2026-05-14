@@ -40,6 +40,7 @@
 
 #include "yos/types.h"
 #include "yos/ydebug.h"
+#include "platform.h"
 
 extern int  yos_fd_alloc(struct yos_exec_ctx *ctx, int host_fd);
 extern int  yos_fd_get  (struct yos_exec_ctx *ctx, int wasm_fd);
@@ -367,7 +368,7 @@ int32_t yos_posix_fadvise(struct yos_exec_ctx *ctx, int32_t fd,
 {
     int hfd = yos_fd_get(ctx, fd);
     if (hfd < 0) return -hfd;  /* return positive error code */
-    return posix_fadvise(hfd, (off_t)offset, (off_t)len, advice);
+    return yos_plat_posix_fadvise(hfd, (off_t)offset, (off_t)len, advice);
 }
 
 int32_t yos_posix_fallocate(struct yos_exec_ctx *ctx, int32_t fd,
@@ -375,7 +376,7 @@ int32_t yos_posix_fallocate(struct yos_exec_ctx *ctx, int32_t fd,
 {
     int hfd = yos_fd_get(ctx, fd);
     if (hfd < 0) return -hfd;
-    return posix_fallocate(hfd, (off_t)offset, (off_t)len);
+    return yos_plat_posix_fallocate(hfd, (off_t)offset, (off_t)len);
 }
 
 /* lpathconf — FreeBSD-specific; Linux only has pathconf (which

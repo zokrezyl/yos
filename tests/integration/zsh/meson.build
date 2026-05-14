@@ -112,13 +112,50 @@ zsh_int_tests = {
                              'xfail' : false},
 }
 
+# Pty-driven tests with hard-coded timing windows; run serially so
+# CPU contention from parallel meson tests doesn't cause :q!/Enter
+# to be sent before the wasm guest has finished drawing the screen.
+_serial_zsh = {
+  'backspace'             : true,
+  'interactive-ssh-clean' : true,
+  'external-tty-survival' : true,
+  'ssh-no-args-help'      : true,
+  'runhookdef-trap'       : true,
+  'ctrl-c-cancel'         : true,
+}
+
+# Per-platform xfail overrides. Entries set true to xfail; entries set
+# false flip the table-level xfail off (because the bug fixed itself
+# on this platform).
+#   interactive-ssh-clean — darwin xfail: explicitly sources the
+#       user's ~/.zshrc so the bug-fire path is exercised. On the
+#       user's darwin box that .zshrc loads antidote, which calls
+#       `is-at-least` via autoload — but the wasm-zsh's FPATH doesn't
+#       include the zsh-distribution autoload tree where that function
+#       lives, so antidote bails and zsh never reaches the first `%`.
+#       Fix is to ship zsh's autoload tree inside the libexec sysroot.
+#   ssh-no-args-help — darwin-only pass: the fork-stderr 0xff prefix
+#       this test pins doesn't surface on darwin (different asyncify
+#       rewind path under apple-clang's wasm output), so the test
+#       passes here even though Linux still hits it. Flip off the
+#       xfail so meson reports a clean run.
+_platform_xfail = {}
+if host_machine.system() == 'darwin'
+  _platform_xfail = {
+    'interactive-ssh-clean' : true,
+    'ssh-no-args-help'      : false,
+  }
+endif
+
 foreach name, cfg : zsh_int_tests
+  xfail = _platform_xfail.has_key(name) ? _platform_xfail[name] : cfg['xfail']
   test('zsh-' + name,
        py3,
        args : cfg['src'],
        suite : 'integration-zsh',
        env : zsh_int_env,
        depends : [yos_exe],
-       should_fail : cfg['xfail'],
+       should_fail : xfail,
+       is_parallel : not _serial_zsh.get(name, false),
        timeout : 30)
 endforeach

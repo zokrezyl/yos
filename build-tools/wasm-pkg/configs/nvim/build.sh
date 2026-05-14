@@ -153,7 +153,14 @@ if [[ ! -x "$HOST_HELPER" ]]; then
     (
         cd "$HOST_BUILD"
         # Lua + lpeg + nvim mpack + nvim nlua0 + bit + our wrapper.
-        gcc -O2 -DLUA_USE_POSIX -DLUA_ANSI -DMAKE_LIB \
+        # `cc`, not `gcc`: darwin nix-stdenv (clang-wrapper) ships only
+        # `cc`; Linux nix-stdenv (gcc-wrapper) ships both `cc` and `gcc`
+        # as symlinks to the same wrapped compiler — picking `cc` keeps
+        # behavior identical on Linux while making the script work on
+        # darwin. Avoid `$CC`: the wasm toolchain on PATH symlinks
+        # *unwrapped* clang as `bin/clang`, which shadows the stdenv
+        # wrapper and loses the resource-dir (no stdarg.h).
+        cc -O2 -DLUA_USE_POSIX -DLUA_ANSI -DMAKE_LIB \
             -I"$HOST_BUILD" \
             -I"$LUA_SRC_DIR" -I"$LPEG_SRC_DIR" \
             -I"$SRC/src" -I"$SRC/src/mpack" \

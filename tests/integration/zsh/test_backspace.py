@@ -49,11 +49,18 @@ def main():
               f"(yos={yos}, zsh={zsh})")
         sys.exit(0)
 
+    # Use a sandbox HOME so the user's ~/.zshrc (antidote, plugins,
+    # custom keybindings) doesn't leak into the test. The test is
+    # asserting default ZLE behavior for backspace; user keybindings
+    # would mask the very byte sequence we're trying to pin.
+    import tempfile
+    sandbox_home = tempfile.mkdtemp(prefix="yos-zsh-bs-")
     pid, fd = pty.fork()
     if pid == 0:
         env = {"TERM": "xterm-256color",
                "PATH": os.environ.get("PATH", ""),
-               "HOME": os.environ.get("HOME", "/tmp"),
+               "HOME": sandbox_home,
+               "ZDOTDIR": sandbox_home,
                "USER": os.environ.get("USER", "test")}
         os.execvpe(yos, [yos, zsh, "-i"], env)
 
