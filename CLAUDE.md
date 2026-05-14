@@ -390,6 +390,21 @@ Bridges return wasm offsets, not host pointers.
   log file.
 - Python helpers run via the project venv: `uv venv && uv sync`
   populates `.venv/`; meson picks `.venv/bin/python3` if present.
+- **MANDATORY: before claiming any change is "done" or "fixed",
+  run `./tools/yos.sh zsh -c true` (or any quick `./tools/yos.sh
+  …` invocation) yourself.** This forces a `nix build` of the
+  full umbrella, which is what the user actually runs. `meson
+  test -C build-linux` works on the local working tree but does
+  NOT validate the nix build path. `nix build` uses `src = self`
+  and only sees git-TRACKED files: any new file you wrote but
+  didn't `git add` will make nix bail with `"File X does not
+  exist."` even though meson is green. So:
+    1. `git add` every new file you created (tests, headers,
+       sources, meson refs).
+    2. Run `./tools/yos.sh zsh -c true` and confirm it exits 0.
+    3. Only then say the change is shipped.
+  Don't make the user run the wrapper to discover your build is
+  broken.
 
 ## Diagnostic / trace output discipline
 

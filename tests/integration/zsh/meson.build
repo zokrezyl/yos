@@ -100,6 +100,16 @@ zsh_int_tests = {
   # from a non-tty stdin — separate downstream issue.
   'libexec-usage-clean' : {'src' : files('test_libexec_usage_clean.py'),
                            'xfail' : false},
+  # User-reported bug: INTERACTIVE `yos zsh` (PTY stdin,
+  # PATH=$libexec, NO `-i` flag — matching what tools/yos.sh does)
+  # typing `ssh<Enter>` used to produce "ad file descriptor" garbage
+  # and kill zsh with "error on TTY read". Fixed by the proc.c
+  # fork-fd-snapshot rework. external-tty-survival.py uses
+  # PATH=/bin:/usr/bin so its `ssh` case never actually executes
+  # the wasm ssh — false positive there. This test points PATH at
+  # libexec so the bug actually fires if it regresses.
+  'interactive-ssh-clean' : {'src' : files('test_interactive_ssh_clean.py'),
+                             'xfail' : false},
 }
 
 foreach name, cfg : zsh_int_tests

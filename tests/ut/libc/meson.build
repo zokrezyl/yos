@@ -138,6 +138,53 @@ test('test_perf_stress',
   timeout : 120,
 )
 
+# Comprehensive libc-coverage smoke test. One wasm program calls
+# every libc function we can probe safely (touches only /tmp,
+# 127.0.0.1 loopback, in-process pthread/mutex). Each call emits
+# `FN:<name>:PASS|FAIL|SKIP`. The Python runner parses the output,
+# cross-checks against the bridged-function list extracted from the
+# generated yos_bridge.h, and writes a markdown coverage table to
+# tmp/libc-coverage.md. Per-function failures show up in the table
+# but DO NOT fail this test — the goal is one-shot visibility into
+# which bridges work and which don't, so we don't have to fix them
+# one-at-a-time as nvim/zsh/ssh tripping over each. The test only
+# fails if the wasm aborts before printing COVERAGE-DONE.
+libc_coverage_raw = custom_target(
+  'test_libc_coverage-raw.wasm',
+  input            : files('test_libc_coverage.c'),
+  output           : 'test_libc_coverage-raw.wasm',
+  depends          : sysroot_skel,
+  command          : [wasm_cc,
+                      '-target', 'wasm32-unknown-unknown',
+                      '-nostdlib',
+                      '--sysroot=' + sysroot_dir,
+                      '-isystem', sysroot_dir / 'usr' / 'include',
+                      '-L', sysroot_dir / 'usr' / 'lib',
+                      '-Wl,--no-entry',
+                      '-Wl,--allow-undefined',
+                      '-Wl,--export=_start',
+                      '-Wl,--export=main',
+                      '-Wl,--export-all',
+                      '-O2',
+                      sysroot_dir / 'usr' / 'lib' / 'crt1.o',
+                      '-o', '@OUTPUT@', '@INPUT0@'],
+  build_by_default : true,
+)
+test('test_libc_coverage',
+  py,
+  args : [
+    files('run_libc_coverage.py'),
+    '--yos',       yos_bin,
+    '--src',       files('test_libc_coverage.c'),
+    '--wasm',      libc_coverage_raw,
+    '--repo',      meson.project_source_root(),
+    '--build-dir', meson.project_build_root().split('/')[-1],
+    '--timeout',   '60',
+  ],
+  suite   : 'libc',
+  timeout : 90,
+)
+
 # Tests in this set are known-failing pins for open bugs. The test
 # still RUNS — when the underlying bug is fixed, the suite reports
 # UNEXPECTEDPASS and the entry should be removed.
