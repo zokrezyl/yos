@@ -41,8 +41,25 @@ custom_proc:
   - geteuid
   - getgid
   - getegid
+  - issetugid
   - raise
   - killpg
+  # impl/posix.c — socket-side bridges that need wfd→hfd translation.
+  # The auto-bridge passes the wasm fd straight through to host
+  # bind/listen/etc. which then sees an unrelated fd or EBADF.
+  - bind
+  - listen
+  - connect
+  - accept
+  - send
+  - recv
+  - sendto
+  - recvfrom
+  - shutdown
+  - getpeername
+  # impl/posix.c — fd-taking, also need wfd→hfd translation.
+  - posix_fadvise
+  - posix_fallocate
   # impl/env.c — env table backed by wasm linear memory.
   - getenv
   - setenv
@@ -55,6 +72,51 @@ custom_proc:
   - arc4random
   - arc4random_buf
   - arc4random_uniform
+  # impl/pwd.c — struct passwd / group are pointer-heavy; the auto-
+  # bridge can't translate host pointers to wasm offsets, and these
+  # used to be stubbed with -ENOSYS — that's what made ssh print
+  # "No user exists for uid 1000" before exec.
+  - getpwuid
+  - getpwuid_r
+  - getpwnam
+  - getpwnam_r
+  - getpwent
+  - setpwent
+  - endpwent
+  - getgrgid
+  - getgrgid_r
+  - getgrnam
+  - getgrnam_r
+  - getgrent
+  - setgrent
+  - endgrent
+  - getlogin
+  - getlogin_r
+  # impl/pwd.c — same static-buffer pattern for the time-string
+  # family. Returns wasm offset to a per-ctx slot containing the
+  # struct tm / time string.
+  - gmtime
+  - localtime
+  - ctime
+  - ctime_r
+  - asctime
+  - asctime_r
+  # impl/pwd.c — string-returning helpers, all need wasm-side
+  # static-buffer pattern (auto-bridge can't translate const char *
+  # returns to wasm offsets).
+  - strerror
+  - gai_strerror
+  - hstrerror
+  - strsignal
+  # impl/pwd.c — pointer-into-input return convention (the result
+  # is a wasm offset into one of the input buffers).
+  - strtok
+  - strtok_r
+  - strsep
+  - strptime
+  # impl/pwd.c — opens a temp file and registers the FILE* in the
+  # wasm-side handle table (impl/file.c).
+  - tmpfile
   # impl/posix.c — FreeBSD libc only; glibc has no fmtcheck.
   - fmtcheck
   - fork
@@ -287,6 +349,16 @@ custom_vfs:
   - rewinddir
   # copy_file_range: keep cp(1) on the portable read/write fallback.
   - copy_file_range
+  # poll(2): the auto-bridge can't render it (nfds is unsigned int on
+  # FreeBSD/wasm32 and unsigned long on host x86_64 — a kind_mismatch
+  # delta), so it landed in `needs_policy` and shipped as nothing. zsh's
+  # ZLE calls poll() from getbyte() to wait for the next key — without
+  # this bridge, every interactive zsh session traps with `env.poll
+  # unresolved` the moment you press an arrow key (or any key zsh's
+  # multi-byte sequence reader peeks ahead for). Hand-written in
+  # impl/vfs.c: translate per-pollfd fd through fd_map, leave events/
+  # revents unchanged (POLL* bit values match between FreeBSD and Linux).
+  - poll
 
 # ─── Memory ───────────────────────────────────────────────────────────
 custom_mem:
@@ -362,22 +434,12 @@ struct_convert:
   localtime_r:    {out: result,  type: tm}
   gmtime_r:       {out: result,  type: tm}
 
-# ─── Tier 2: implementation comes from FreeBSD libc source files ──────
-# bridge.py emits an m3w_<name> wrapper that dispatches into yos's
-# sidecar wasm3 instance (libc-pure.wasm, built by build-tools/
-# freebsd-libc/). The sidecar may itself import lower-level libc fns
-# (e.g. printf calls write); those resolve back through this same yos
-# import surface, landing in Tier 1 / Tier 3 as appropriate.
-#
-# Each entry maps `name -> { src: <path under FreeBSD source tree> }`.
-# Today's set is intentionally tiny — we add functions on demand as
-# nvim's deps surface them. Scalar-only signatures are easiest; fns
-# with pointer args need cross-runtime memory marshalling that we'll
-# add when the first such function lands.
-from_freebsd_src:
-  abs:     {src: stdlib/abs.c}
-  # strlcpy is here too once we wire cross-runtime pointer marshalling.
-  # strlcpy: {src: string/strlcpy.c}
+# The Tier-2 sidecar (libc-pure.wasm, a second wasm3 instance hosting
+# pure FreeBSD libc sources) has been REMOVED. Every libc function is
+# now resolved as a single yos host bridge — either auto-passthrough
+# to host libc (the default for stateless fns like `abs`, `strlcpy`,
+# `strlen`, `memcpy`) or a hand-written `yos_<name>` in src/yos/impl/.
+# There is no second wasm runtime; one uniform `env.<name>` surface.
 
 # ─── Variadic — codegen skips emission; bodies hand-written ───────────
 variadic:
@@ -542,33 +604,13 @@ stub:
   # because they take a fn pointer that we'd need to translate.
   - alphasort
   - versionsort
-  # Host structs with embedded pointers (8B host vs 4B wasm) overflow
-  # the wasm-side struct slot when auto-bridge passes through. The
-  # *_r variants now go through struct_convert; the value-returning
-  # ones (localtime, gmtime, asctime, ctime) need a static-buffer
-  # convention we don't model yet — keep stubbed.
-  - localtime
-  - gmtime
-  - asctime
-  - asctime_r
-  - ctime
-  - ctime_r
+  # localtime/gmtime/ctime/asctime/strptime moved to custom_proc
+  # (impl/pwd.c) — same wasm-side static-buffer pattern as getpwuid.
   - strftime
-  - strptime
-  # struct passwd: ~30B host vs ~20B wasm (5 pointers + uid/gid).
-  - getpwnam
-  - getpwnam_r
-  - getpwuid
-  - getpwuid_r
-  - getpwent
-  - setpwent
-  - endpwent
-  # struct group: similar pointer-heavy.
-  - getgrnam
-  - getgrnam_r
-  - getgrgid
-  - getgrgid_r
-  - getgrent
+  # struct passwd/group families: moved to custom_proc (impl/pwd.c)
+  # so getpwuid actually returns a non-NULL entry. The user's ssh
+  # bug was "No user exists for uid 1000" caused by these being
+  # stubbed here.
   # struct hostent / addrinfo / etc.
   - gethostbyname
   - gethostbyname_r

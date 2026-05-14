@@ -28,6 +28,35 @@ static void record_handler(int signum, uint32_t handler_idx)
         g_signal_handlers[signum] = handler_idx;
 }
 
+/* Async signal forwarding from the host.
+ *
+ * When the user hits Ctrl-C (or any tty-driver signal — SIGINT,
+ * SIGQUIT, SIGTSTP, SIGWINCH, …) the KERNEL delivers it to yos's
+ * host process, not to any wasm guest directly. Without explicit
+ * handling the kernel default kicks in (SIGINT/QUIT terminate; the
+ * whole yos process dies, taking every guest with it).
+ *
+ * We want the signal forwarded to the foreground guest proc's
+ * recorded wasm handler instead, then the host runtime stays alive.
+ *
+ * Async-safety: signal handlers can't call m3_CallV (it locks
+ * pthread mutexes and walks runtime state). Two-stage delivery:
+ *
+ *   1. Host signal handler (installed by yos_install_host_signal_
+ *      handlers in main.c) sets a bit in g_host_pending_signals.
+ *   2. Any wasm thread, on its way out of a blocking syscall
+ *      (yos_read et al.) calls yos_signal_pump(ctx); the pump
+ *      drains the pending set and invokes the foreground guest's
+ *      wasm-side handler synchronously. */
+static volatile uint32_t g_host_pending_signals;  /* atomic bitmask, FreeBSD signums */
+
+void yos_signal_set_pending(int fbsd_signum)
+{
+    if (fbsd_signum <= 0 || fbsd_signum >= YOS_NSIG) return;
+    __atomic_or_fetch(&g_host_pending_signals, 1u << fbsd_signum,
+                      __ATOMIC_RELEASE);
+}
+
 /* Invoke the wasm-side handler for `signum` (if any). Function table
  * index was recorded by sigaction; we look it up in the same way
  * impl/callback.c does for qsort comparators. Bails silently on
@@ -56,6 +85,29 @@ static void invoke_signal_handler(struct yos_exec_ctx *ctx, int signum)
     /* sa_handler is `void (*)(int)`; pass the signum. */
     M3Result r = m3_CallV(fn, (uint32_t)signum);
     ydebug("invoke_signal_handler: m3_CallV returned %s\n", r ? r : "OK");
+}
+
+/* Drain the host-side pending-signal bitmask, dispatching each set
+ * bit to this proc's wasm handler. Called from yos_read (and other
+ * places where a guest thread is naturally about to re-enter wasm)
+ * to deliver host-originated SIGINT/SIGQUIT/SIGWINCH/SIGTSTP. The
+ * foreground-vs-background distinction is intentionally loose here:
+ * every wasm thread that reaches the pump drains the same global
+ * set, so the FIRST one to drain wins. That's what we want for
+ * Ctrl-C at zsh's prompt — zsh is the one blocked in read() and
+ * gets the signal. Multi-process delivery to non-foreground procs
+ * would need per-proc pending sets keyed on `proc->pgid ==
+ * rt->fg_pgid`; ignore for now. */
+void yos_signal_pump(struct yos_exec_ctx *ctx)
+{
+    if (!ctx) return;
+    uint32_t pending = __atomic_exchange_n(&g_host_pending_signals, 0,
+                                            __ATOMIC_ACQ_REL);
+    if (!pending) return;
+    for (int s = 0; s < YOS_NSIG; s++) {
+        if (pending & (1u << s))
+            invoke_signal_handler(ctx, s);
+    }
 }
 
 int32_t yos_sig_rt_sigaction(struct yos_exec_ctx *ctx, int32_t signum,

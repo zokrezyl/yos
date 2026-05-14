@@ -63,25 +63,53 @@ zsh_int_tests = {
   # Bug pins still standing (xfail). Each flips to UNEXPECTEDPASS when
   # fixed — remove the xfail entry as part of the fix commit.
   #
-  # NOTE on pipe-hang / cmdsubst-hang:  The chain of fixes landed
-  # in this round (wasm-opt --asyncify on zsh, SIGCHLD synchronously
-  # invoked from sigsuspend, waitpid/wait3/kill returning -1+errno,
-  # process-wide signal filtering, child fd cleanup on pthread_exit,
-  # stdio routing through fd_map) make these forward-progress: zsh
-  # reaches the right control flow, the parent reads bytes, the child
-  # exits cleanly. But pipe-hang passes only ~75% of the time (data
-  # arrives but sometimes garbled with 0xFF prefix); cmdsubst-hang
-  # delivers "inner" to host stdout instead of the captured pipe. Both
-  # symptoms point at the asyncify-rewind / fork fd-dup interaction
-  # for fds reallocated via movefd. xfail until that's tracked down.
-  #   pipe-hang            → mostly fixed but flaky.
-  #   cmdsubst-hang        → x=$(echo inner) doesn't capture; child's
-  #                           output escapes to host stdout.
-  #   ctrl-c-cancel        → Ctrl-C at the prompt kills zsh instead of
-  #                           cancelling the line (yos signal/asyncify).
-  'pipe-hang'           : {'src' : files('test_pipe_hang.py'),           'xfail' : true},
-  'cmdsubst-hang'       : {'src' : files('test_cmdsubst_hang.py'),       'xfail' : true},
+  # pipe-hang / cmdsubst-hang were in the same xfail family as the
+  # ssh stderr leak. Root cause: the forked child's host fd map was
+  # populated by the CHILD THREAD's F_DUPFD loop, which ran AFTER the
+  # parent's wasm code resumed and reused host fd numbers — pipe
+  # write fds ended up duplicating host stdout, etc. Fixed by moving
+  # the dup loop into yos_fork_pump (parent thread, BEFORE resume)
+  # so the snapshot captures stable host fds. See proc.c diff.
+  'pipe-hang'           : {'src' : files('test_pipe_hang.py'),           'xfail' : false},
+  'cmdsubst-hang'       : {'src' : files('test_cmdsubst_hang.py'),       'xfail' : false},
+  # ctrl-c-cancel is a separate signal/asyncify issue (Ctrl-C at the
+  # prompt kills zsh instead of cancelling the line). Still xfail.
   'ctrl-c-cancel'       : {'src' : files('test_ctrl_c_cancel.py'),       'xfail' : true},
+  # Catch-all "external command crashes zsh" regression. Each new
+  # tool port adds a one-line entry to CASES in
+  # test_external_tty_survival.py; the day yos's fork+exec fd
+  # plumbing breaks the TTY, this test goes red instead of us
+  # finding it by hand later. Self-handles xfail per case so the
+  # meson outer xfail stays false (the whole test still PASSes
+  # when nothing's regressed and the per-case xfails are correct).
+  'external-tty-survival' : {'src' : files('test_external_tty_survival.py'),
+                             'xfail' : false},
+  # `echo ssh | yos zsh` should print ssh's usage banner. Today the
+  # forked ssh's first stderr write surfaces with an asyncify-rewind
+  # 0xff prefix and "Bad file descriptor" with its leading 'B' eaten
+  # — same root cause as tests/ut/libc/test_post_fork_stderr_clean.c
+  # (xfail there too). Flip both sides when the fork-stderr leak is
+  # fixed.
+  'ssh-no-args-help'    : {'src' : files('test_ssh_no_args_help.py'),
+                           'xfail' : true},
+  # Sister of ssh-no-args-help. Now an expected-pass: it asserts only
+  # that the forked child's stderr is byte-clean (no 0xff prefix),
+  # which is exactly what the proc.c fork-fd-snapshot fix repairs.
+  # The end-to-end "ssh prints its banner" assertion (ssh-no-args-help)
+  # stays xfail because ssh additionally exits silently when started
+  # from a non-tty stdin — separate downstream issue.
+  'libexec-usage-clean' : {'src' : files('test_libexec_usage_clean.py'),
+                           'xfail' : false},
+  # User-reported bug: INTERACTIVE `yos zsh` (PTY stdin,
+  # PATH=$libexec, NO `-i` flag — matching what tools/yos.sh does)
+  # typing `ssh<Enter>` used to produce "ad file descriptor" garbage
+  # and kill zsh with "error on TTY read". Fixed by the proc.c
+  # fork-fd-snapshot rework. external-tty-survival.py uses
+  # PATH=/bin:/usr/bin so its `ssh` case never actually executes
+  # the wasm ssh — false positive there. This test points PATH at
+  # libexec so the bug actually fires if it regresses.
+  'interactive-ssh-clean' : {'src' : files('test_interactive_ssh_clean.py'),
+                             'xfail' : false},
 }
 
 foreach name, cfg : zsh_int_tests

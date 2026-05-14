@@ -43,7 +43,8 @@ subdir('codegen')        # api_bridge_dep, yos_imports.h
 
 yos_inc = include_directories(
   '..',                  # `yos/types.h`
-  '../../include',       # `yos/yos_pthread.h`
+  '../../include',       # `yos/yos_pthread.h`, `yos/ytrace/ytrace.h`,
+                         # `yos/yplatform/{time,thread,term}.h`
   '.',                   # `impl/<area>.h`, `vfs/<x>.h`, `generated/<x>.h`
   'generated',           # `host64_structs.h`, `struct_convert.h`
   'vfs',                 # vfs/*.c sees sibling `file.h` etc.
@@ -78,15 +79,24 @@ yos_runtime_sources = files(
   'impl/file.c',
   'impl/kqueue.c',
   'impl/posix.c',
+  'impl/pwd.c',
   'impl/fmtcheck_freebsd.c',
   'impl/random.c',
   'impl/signal.c',
   'impl/strto.c',
   'impl/freebsd_userland.c',
   'impl/sysctl.c',
-  'impl/tier2.c',
   'impl/printf.c',
   'impl/dir.c',
+  # ytrace + yplatform — switchable trace-point machinery imported
+  # verbatim from yetty (with yetty_yplatform → yos_yplatform).
+  # ytrace.h defines ydebug/yinfo/ywarn/yerror/ytrace and the
+  # ytime_start/ytime_report timer macros; ytrace.c provides the
+  # registry, output formatting and runtime enable/disable.
+  'ytrace/ytrace.c',
+  'yplatform/time/default.c',
+  'yplatform/thread/default.c',
+  'yplatform/term/default.c',
   'vfs/file.c',
   'vfs/mount.c',
   'vfs/procfs.c',
@@ -105,15 +115,12 @@ yos_exe = executable(
   dependencies : [
     wasm3_dep,
     api_bridge_dep,      # m3w_<fn> wrappers + yos_brg_link_imports()
-    mimalloc_dep,        # impl/alloc.c — guest malloc backed by mimalloc
     threads_dep,
     m_dep,
     iconv_dep,           # darwin/BSD: separate libiconv
   ],
   c_args : [
     '-D_GNU_SOURCE',
-    # Path to the Tier-2 sidecar wasm. yos opens this at startup.
-    '-DYOS_LIBC_PURE_PATH="' + libc_pure_path + '"',
     '-Wno-unused-parameter',
     '-Wno-unused-but-set-variable',
     '-Wno-unused-variable',

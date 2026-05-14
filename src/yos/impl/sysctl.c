@@ -31,8 +31,28 @@
 static int32_t do_kern_proc_pathname(struct yos_exec_ctx *ctx,
                                      uint32_t old_off, uint32_t oldlenp_off)
 {
-    if (!ctx->rt || !ctx->rt->argv || !ctx->rt->argv[0]) return -ENOENT;
-    const char *path = ctx->rt->argv[0];
+    /* Return the CURRENT process's executable, not yos's argv[0].
+     *
+     * `ctx->rt->argv` is the yos commandline shifted by 1 — i.e. the
+     * very first guest's argv. It is NEVER updated across execve(),
+     * so every fork+exec'd guest sees the original zsh/init path
+     * here. libuv's uv_exepath() consults this via
+     * sysctl(KERN_PROC_PATHNAME) and assumes "this is my own
+     * executable"; uv_spawn then re-execs that path to launch a
+     * helper (nvim's UI client, the :terminal shell, etc.). Result
+     * before the fix: nvim's grandchild ended up exec'ing zsh with
+     * argv = [nvim, --embed] and zsh complained "no such option:
+     * embed".
+     *
+     * The per-proc `exe` field is set on every execve (impl/proc.c
+     * child loop, main.c initial loop) and inherited on fork
+     * (impl/proc.c yos_fork). Reading it here gives every guest
+     * its own correct self-path. */
+    const char *path = NULL;
+    if (ctx->proc && ctx->proc->exe[0]) path = ctx->proc->exe;
+    else if (ctx->rt && ctx->rt->argv && ctx->rt->argv[0])
+        path = ctx->rt->argv[0];
+    if (!path) return -ENOENT;
     size_t need = strlen(path) + 1;
 
     /* Read caller's old buffer length (oldlenp is a uint32_t* in

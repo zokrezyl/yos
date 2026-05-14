@@ -39,8 +39,6 @@ libc_tests = [
   'test_generated_imports',
   'test_fork_basic',
   'test_pthread_create_join',
-  'test_tier2_sidecar',
-  'test_tier2_abs',
   'test_freebsd_headers',
   'test_malloc_basic',
   # nvim-on-darwin trouble-area pins (tmp/nvim-runtime-issues.md).
@@ -74,11 +72,131 @@ libc_tests = [
   # explain why uv_guess_handle on a SOCK fd silently returns the
   # wrong type without ever calling getsockname.
   'test_stat_layout_probe',
+  # Asyncify-leak regression. The forked child's first stderr write
+  # must be byte-clean — no 0xff prefix from the rewound stack frame.
+  # The visible symptom of this leak in openssh was "Bad file
+  # descriptor" rendered as 0xff×8 + "ad file descriptor". The yos
+  # workaround in vfs.c::yos_write only catches pure-0xff payloads;
+  # this test exercises a MIXED payload (single byte 'X') over a pipe
+  # so the workaround is bypassed and the raw leak shows.
+  'test_post_fork_stderr_clean',
 ]
 
 # Path to the generator's output dir, exposed by src/yos/codegen.
 # api_bridge_outputs[2] is yos_imports.h — used to derive the include path.
 yos_imports_dir = meson.project_build_root() / 'src' / 'yos' / 'codegen'
+
+# Combined performance + stress test. Different from the others: links
+# against crt1.o so main() gets argv (needed because the test execve's
+# itself, passing argv[0] as the wasm path). Built standalone, not
+# inside the libc_tests foreach.
+perf_stress_raw = custom_target(
+  'test_perf_stress-raw.wasm',
+  input            : files('test_perf_stress.c'),
+  output           : 'test_perf_stress-raw.wasm',
+  depends          : sysroot_skel,
+  command          : [wasm_cc,
+                      '-target', 'wasm32-unknown-unknown',
+                      '-nostdlib',
+                      '--sysroot=' + sysroot_dir,
+                      '-isystem', sysroot_dir / 'usr' / 'include',
+                      '-L', sysroot_dir / 'usr' / 'lib',
+                      '-Wl,--no-entry',
+                      '-Wl,--allow-undefined',
+                      '-Wl,--export=_start',
+                      '-Wl,--export=main',
+                      # pthread_create looks up start_routine by index
+                      # into the wasm function table; without
+                      # --export-all the table is empty and every
+                      # thread traps with "fn_idx N out of table".
+                      '-Wl,--export-all',
+                      '-O2',
+                      sysroot_dir / 'usr' / 'lib' / 'crt1.o',
+                      '-o', '@OUTPUT@', '@INPUT0@'],
+  build_by_default : true,
+)
+perf_stress_wasm = custom_target(
+  'test_perf_stress.wasm',
+  input            : perf_stress_raw,
+  output           : 'test_perf_stress.wasm',
+  command          : [wasm_opt, '--asyncify', '-o', '@OUTPUT@', '@INPUT@'],
+  build_by_default : true,
+)
+test('test_perf_stress',
+  py,
+  args : [
+    files('run_libc_test.py'),
+    '--yos',     yos_bin,
+    '--src',     files('test_perf_stress.c'),
+    '--wasm',    perf_stress_wasm,
+    '--timeout', '90',
+  ],
+  suite   : 'libc',
+  # Stress test spawns many forks + threads + execve'd processes; the
+  # default 30 s per-test timeout is tight when the host is under
+  # load. 120 s is plenty even on a slow VM.
+  timeout : 120,
+)
+
+# Comprehensive libc-coverage smoke test. One wasm program calls
+# every libc function we can probe safely (touches only /tmp,
+# 127.0.0.1 loopback, in-process pthread/mutex). Each call emits
+# `FN:<name>:PASS|FAIL|SKIP`. The Python runner parses the output,
+# cross-checks against the bridged-function list extracted from the
+# generated yos_bridge.h, and writes a markdown coverage table to
+# tmp/libc-coverage.md. Per-function failures show up in the table
+# but DO NOT fail this test — the goal is one-shot visibility into
+# which bridges work and which don't, so we don't have to fix them
+# one-at-a-time as nvim/zsh/ssh tripping over each. The test only
+# fails if the wasm aborts before printing COVERAGE-DONE.
+libc_coverage_raw = custom_target(
+  'test_libc_coverage-raw.wasm',
+  input            : files('test_libc_coverage.c'),
+  output           : 'test_libc_coverage-raw.wasm',
+  depends          : sysroot_skel,
+  command          : [wasm_cc,
+                      '-target', 'wasm32-unknown-unknown',
+                      '-nostdlib',
+                      '--sysroot=' + sysroot_dir,
+                      '-isystem', sysroot_dir / 'usr' / 'include',
+                      '-L', sysroot_dir / 'usr' / 'lib',
+                      '-Wl,--no-entry',
+                      '-Wl,--allow-undefined',
+                      '-Wl,--export=_start',
+                      '-Wl,--export=main',
+                      '-Wl,--export-all',
+                      '-O2',
+                      sysroot_dir / 'usr' / 'lib' / 'crt1.o',
+                      '-o', '@OUTPUT@', '@INPUT0@'],
+  build_by_default : true,
+)
+test('test_libc_coverage',
+  py,
+  args : [
+    files('run_libc_coverage.py'),
+    '--yos',       yos_bin,
+    '--src',       files('test_libc_coverage.c'),
+    '--wasm',      libc_coverage_raw,
+    '--repo',      meson.project_source_root(),
+    '--build-dir', meson.project_build_root().split('/')[-1],
+    '--timeout',   '60',
+  ],
+  suite   : 'libc',
+  timeout : 90,
+)
+
+# Tests in this set are known-failing pins for open bugs. The test
+# still RUNS — when the underlying bug is fixed, the suite reports
+# UNEXPECTEDPASS and the entry should be removed.
+#
+# `test_post_fork_stderr_clean` was in this list. Fixed by moving
+# the per-fd F_DUPFD loop from the forked child thread into
+# yos_fork_pump (parent thread, before resume) so the snapshot
+# captures stable host fds rather than racing fd-table slots
+# against the parent's post-fork close/reuse traffic. See
+# src/yos/impl/proc.c diff.
+libc_tests_xfail = [
+]
 
 foreach t : libc_tests
   src = files(t + '.c')
@@ -89,7 +207,7 @@ foreach t : libc_tests
   extra_inputs = []
   extra_cflags = []
   if t in ['test_generated_imports', 'test_fork_basic',
-           'test_pthread_create_join', 'test_tier2_abs']
+           'test_pthread_create_join']
     extra_inputs += [api_bridge_outputs]
     extra_cflags += ['-I' + yos_imports_dir]
   endif
@@ -109,7 +227,9 @@ foreach t : libc_tests
   # Tests that exercise fork / setjmp / longjmp need the Binaryen
   # asyncify pass applied so the host runtime can unwind/rewind the
   # wasm call stack. Plain stateless tests skip the pass.
-  needs_asyncify = t in ['test_fork_basic', 'test_fork_channel_from_stdio']
+  needs_asyncify = t in ['test_fork_basic',
+                         'test_fork_channel_from_stdio',
+                         'test_post_fork_stderr_clean']
 
   if needs_asyncify
     wasm = custom_target(
@@ -131,6 +251,7 @@ foreach t : libc_tests
       '--src',  src,
       '--wasm', wasm,
     ],
-    suite : 'libc',
+    suite       : 'libc',
+    should_fail : t in libc_tests_xfail,
   )
 endforeach

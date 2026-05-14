@@ -11,6 +11,11 @@
 #include "m3_core.h"
 #include "m3_env.h"
 
+#include <sys/mman.h>   /* mmap/munmap for the linear-memory fast path
+                         * — keeps pages lazy so fork()'s mincore
+                         * snapshot only sees what the guest touched. */
+#include <pthread.h>    /* registry mutex */
+
 void m3_Abort(const char* message) {
 #ifdef DEBUG
     fprintf(stderr, "Error: %s\n", message);
@@ -114,9 +119,68 @@ void *  m3_Malloc  (size_t i_size)
     return ptr;
 }
 
+/* Tiny registry of mmap-backed wasm3 allocations. m3_FreeImpl can
+ * receive pointers from BOTH calloc() (small allocs in m3_Malloc)
+ * and mmap() (the linear-memory buffer). It must call the matching
+ * deallocator. A sentinel-header-before-user-pointer would be
+ * unsafe to dereference for the calloc'd allocations (UB on pointer
+ * arithmetic into another mapping). A small registry keeps the
+ * test page-safe: lookup is O(N) where N is "number of live linear-
+ * memory buffers", which is 1 for a single guest and bounded by
+ * concurrent sibling runtimes.
+ *
+ * Protected by a pthread spinlock-equivalent mutex — m3_Realloc and
+ * m3_FreeImpl can both run from different host pthreads
+ * (forked-child fork_thread_func runs on its own thread). */
+#define M3_MMAP_REG_MAX  256
+static struct {
+    void *ptr;     /* user pointer (NULL = slot free) */
+    size_t size;   /* mmap'd size */
+} g_m3_mmap_reg [M3_MMAP_REG_MAX];
+static pthread_mutex_t g_m3_mmap_reg_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static void m3_mmap_reg_add (void *p, size_t sz)
+{
+    pthread_mutex_lock (&g_m3_mmap_reg_lock);
+    for (int i = 0; i < M3_MMAP_REG_MAX; i++) {
+        if (g_m3_mmap_reg[i].ptr == NULL) {
+            g_m3_mmap_reg[i].ptr  = p;
+            g_m3_mmap_reg[i].size = sz;
+            pthread_mutex_unlock (&g_m3_mmap_reg_lock);
+            return;
+        }
+    }
+    pthread_mutex_unlock (&g_m3_mmap_reg_lock);
+    /* Registry full — caller's mmap leaks if it ever frees this
+     * pointer (which they will). Increase M3_MMAP_REG_MAX. */
+}
+
+static size_t m3_mmap_reg_take (void *p)
+{
+    pthread_mutex_lock (&g_m3_mmap_reg_lock);
+    for (int i = 0; i < M3_MMAP_REG_MAX; i++) {
+        if (g_m3_mmap_reg[i].ptr == p) {
+            size_t sz = g_m3_mmap_reg[i].size;
+            g_m3_mmap_reg[i].ptr  = NULL;
+            g_m3_mmap_reg[i].size = 0;
+            pthread_mutex_unlock (&g_m3_mmap_reg_lock);
+            return sz;
+        }
+    }
+    pthread_mutex_unlock (&g_m3_mmap_reg_lock);
+    return 0;
+}
+
 void  m3_FreeImpl  (void * io_ptr)
 {
-//    if (io_ptr) printf("== free %p\n", io_ptr);
+    if (!io_ptr) return;
+    /* If the registry knows this pointer, it's one of our mmap'd
+     * linear-memory buffers — release with munmap, not free. */
+    size_t mmap_size = m3_mmap_reg_take (io_ptr);
+    if (mmap_size > 0) {
+        munmap (io_ptr, mmap_size);
+        return;
+    }
     free (io_ptr);
 }
 
@@ -124,8 +188,39 @@ void *  m3_Realloc  (void * i_ptr, size_t i_newSize, size_t i_oldSize)
 {
     if (UNLIKELY(i_newSize == i_oldSize)) return i_ptr;
 
-    void * newPtr = realloc (i_ptr, i_newSize);
+    /* Fresh allocation: mmap(MAP_ANONYMOUS). Pages stay LAZY on
+     * every supported OS — no physical commit until first touch.
+     * The original realloc()+memset() path committed all 64 K pages
+     * of a 256 MiB linear-memory grow eagerly just to zero them
+     * (~100 ms wasted per call) AND made fork()'s mincore snapshot
+     * see them all as resident. mmap fixes both. */
+    if (i_ptr == NULL) {
+        void *p = mmap (NULL, i_newSize, PROT_READ | PROT_WRITE,
+                        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (p == MAP_FAILED) return NULL;
+        m3_mmap_reg_add (p, i_newSize);
+        return p;
+    }
 
+    /* Grow path. If the pointer is in our registry, allocate a new
+     * mmap, copy live data, munmap old. Else fall back to realloc. */
+    size_t old_mmap_size = m3_mmap_reg_take (i_ptr);
+    if (old_mmap_size > 0) {
+        void *np = mmap (NULL, i_newSize, PROT_READ | PROT_WRITE,
+                         MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (np == MAP_FAILED) {
+            /* Re-add to registry so future free still works. */
+            m3_mmap_reg_add (i_ptr, old_mmap_size);
+            return NULL;
+        }
+        size_t copy = (i_oldSize < i_newSize) ? i_oldSize : i_newSize;
+        if (copy > 0) memcpy (np, i_ptr, copy);
+        munmap (i_ptr, old_mmap_size);
+        m3_mmap_reg_add (np, i_newSize);
+        return np;
+    }
+
+    void * newPtr = realloc (i_ptr, i_newSize);
     if (LIKELY(newPtr))
     {
         if (i_newSize > i_oldSize) {

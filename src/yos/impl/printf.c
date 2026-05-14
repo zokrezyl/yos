@@ -35,6 +35,7 @@
 #include <stdint.h>
 
 #include "yos/types.h"
+#include "yos/ydebug.h"
 
 /* Read one slot from the guest's va_list region.
  *
@@ -258,6 +259,8 @@ int32_t yos_vfprintf(struct yos_exec_ctx *ctx,
     if (n < 0) return -1;
     size_t w = n < (int)sizeof(buf) ? (size_t)n : sizeof(buf) - 1;
     FILE *f = guest_fp_to_host(ctx, fp);
+    ydebug("vfprintf(fp=%u, host_fp=%p, len=%zu): %.*s\n",
+           fp, (void *)f, w, (int)(w > 80 ? 80 : w), buf);
     fwrite(buf, 1, w, f);
     return n;
 }

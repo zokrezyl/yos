@@ -207,21 +207,36 @@ struct yos_exec_ctx {
      * correct); pthread workers need their own slot — TODO. */
     uint32_t errno_off;
 
-    /* Guest-facing allocator state (impl/alloc.c, mimalloc-backed).
-     * mi_heap is `mi_heap_t *`; mi_arena_id is `mi_arena_id_t` (int).
-     * Kept opaque to avoid pulling mimalloc.h into types.h.
-     * mi_arena_lo/hi bracket the wasm offsets reserved as mimalloc's
-     * arena — bridges in impl/alloc.c lazy-init on first malloc. */
-    void    *mi_heap;
-    int      mi_arena_id;
-    uint32_t mi_arena_lo;
-    uint32_t mi_arena_hi;
+    /* Guest-facing allocator state (impl/alloc.c).
+     *
+     * Pure free-list allocator inside [alloc_lo, alloc_hi) of the
+     * guest's wasm linear memory. State (free-list head + block
+     * headers) lives IN ctx->memory itself, so on execve the new
+     * runtime's fresh linear memory starts with a clean allocator
+     * automatically — no host-side global registry to dangle, no
+     * mimalloc, no per-ctx cleanup needed. Lazy-inited on first
+     * malloc by impl/alloc.c.
+     *
+     *   alloc_lo, alloc_hi        — wasm-offset bounds of the heap
+     *                               region. Zero = not initialised.
+     *   alloc_free_head           — wasm offset of the first free
+     *                               block, or 0 if the list is empty.
+     */
+    uint32_t alloc_lo;
+    uint32_t alloc_hi;
+    uint32_t alloc_free_head;
 };
 
 /* Global runtime state */
 struct yos_runtime {
     struct yos_proc procs[YOS_MAX_PROCS];
     pthread_mutex_t proc_lock;
+    /* Broadcast every time ANY proc transitions to ZOMBIE — main.c
+     * waits on it during shutdown so yos doesn't exit while a
+     * forked child is still running. Per-proc wait_cond is for
+     * waitpid() consumers (one cond var per child); this one is
+     * a runtime-wide "something exited" event. */
+    pthread_cond_t  any_exit_cond;
     int32_t next_pid;
 
     /* Foreground process-group of the controlling tty, virtualized in

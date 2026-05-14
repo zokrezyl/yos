@@ -81,6 +81,15 @@ def _wasm_type(t: dict, types: dict) -> str:
     if k == 'pointer':
         # Every wasm32 pointer is a u32 offset into linear memory.
         return 'uint32_t'
+    if k == 'flex_array':
+        # `T fds[]` in a function-prototype position decays to `T *` at
+        # the call site (C11 6.7.6.3p7). On wasm32 that's the same as
+        # any other pointer — a 4-byte linear-memory offset. Treat it
+        # as pointer so functions like poll() (whose <poll.h> decl is
+        # `int poll(struct pollfd fds[], nfds_t nfds, int timeout)`)
+        # can be routed through custom_<area> impls instead of being
+        # silently dropped by codegen.
+        return 'uint32_t'
     if k == 'builtin':
         size = t.get('size')
         name = (t.get('name') or '')
@@ -430,6 +439,12 @@ def _emit_bridge(name: str, gf: dict, hf: dict, gtypes: dict, htypes: dict,
     body_lines.append(f'{wret} yos_{name}({", ".join(arg_decls)}) {{')
     body_lines.append('    (void)ctx;')
     body_lines.extend(setups)
+    # Clear host errno before the call so the post-call `if (errno)`
+    # check below picks up errors set by THIS call, not stale errno
+    # from a prior call. Without this, e.g. nice(0) succeeds without
+    # touching errno but the bridge sees a leftover ENOTTY from a
+    # previous syscall and corrupts the wasm-side errno slot.
+    body_lines.append('    errno = 0;')
     body_lines.append(f'    {hret} _r = {call};')
     body_lines.extend(post_writebacks)
     if ret_kind == 'first_arg_alias':
@@ -1087,76 +1102,6 @@ def emit_bridge(analyse: dict, guest_api: dict, host_api: dict,
             sigs[name] = wsig
             continue
 
-        # ── from_freebsd_src (Tier 2): bridge dispatches into the
-        # sidecar libc-pure.wasm runtime. The body resolves the
-        # sidecar function once on first call (cached) and forwards
-        # via m3_CallV. Today only scalar signatures are supported;
-        # pointer args need cross-runtime memory marshalling (TBD). ──
-        if category == 'from_freebsd_src':
-            # Refuse if any arg or return is a pointer — we don't yet
-            # marshal across runtimes. Fall through to stub instead.
-            has_ptr = any(c == 'i' and (
-                spelling.endswith('*')
-            ) for c, spelling in zip(wsig[1], arg_spellings))
-            ret_is_ptr = (ret_spelling or '').rstrip().endswith('*')
-            if has_ptr or ret_is_ptr:
-                # Emit as -ENOSYS until cross-runtime pointer
-                # marshalling lands.
-                wargs, ok = _wargs_decl(gf)
-                if not ok:
-                    counts['skipped'] += 1
-                    continue
-                wret = _wasm_type(g_types.get(gf['ret']), g_types) or 'int32_t'
-                sig  = (f'{wret} yos_{name}(struct yos_exec_ctx *ctx'
-                        f'{(", " + ", ".join(wargs)) if wargs else ""})')
-                decls.append(sig + ';')
-                ret_line = (f'    return ({wret})(-38); /* -ENOSYS */\n'
-                            if wret != 'void' else '')
-                defs.append(
-                    f'{sig} {{\n'
-                    f'    /* {name}: from_freebsd_src needs pointer marshalling. */\n'
-                    f'    (void)ctx;\n'
-                    + ''.join(f'    (void){a.split()[-1]};\n' for a in wargs)
-                    + ret_line
-                    + f'}}'
-                )
-                counts['enosys_stub'] += 1
-                sigs[name] = wsig
-                continue
-            # Scalar-only: emit yos_<name>(ctx, ...) that calls the
-            # sidecar via the helpers in impl/tier2.h.
-            wargs, ok = _wargs_decl(gf)
-            if not ok:
-                counts['skipped'] += 1
-                continue
-            wret = _wasm_type(g_types.get(gf['ret']), g_types) or 'int32_t'
-            arg_names = [a.split()[-1] for a in wargs]
-            sig  = (f'{wret} yos_{name}(struct yos_exec_ctx *ctx'
-                    f'{(", " + ", ".join(wargs)) if wargs else ""})')
-            decls.append(sig + ';')
-            body_lines = [
-                f'{sig} {{',
-                f'    (void)ctx;',
-                f'    static IM3Function _f;',
-                f'    IM3Function f = yos_tier2_resolve_once(&_f, "{name}");',
-                f'    if (!f) return ({wret})(-38);  /* -ENOSYS */',
-            ]
-            call_args = ', '.join(arg_names) if arg_names else ''
-            if call_args:
-                body_lines.append(f'    M3Result _r = m3_CallV(f, {call_args});')
-            else:
-                body_lines.append(f'    M3Result _r = m3_CallV(f);')
-            body_lines.append(f'    if (_r) return ({wret})-1;')
-            if wret != 'void':
-                body_lines.append(f'    {wret} _out = 0;')
-                body_lines.append(f'    m3_GetResultsV(f, &_out);')
-                body_lines.append(f'    return _out;')
-            body_lines.append('}')
-            defs.append('\n'.join(body_lines))
-            counts['from_freebsd_src'] = counts.get('from_freebsd_src', 0) + 1
-            sigs[name] = wsig
-            continue
-
         # ── Hand-marked stub: -ENOSYS body. ───────────────────────────
         if category == 'stub':
             wargs, ok = _wargs_decl(gf)
@@ -1280,7 +1225,6 @@ def emit_bridge(analyse: dict, guest_api: dict, host_api: dict,
          + '#include "yos_bridge.h"\n'
          + '#include "yos/types.h"  /* full struct yos_exec_ctx for ctx->memory */\n'
          + '#include "wasm3.h"     /* m3ApiRawFunction, m3_LinkRawFunction, ... */\n'
-         + '#include "impl/tier2.h" /* yos_tier2_resolve_once for from_freebsd_src */\n'
          + '#include "yos_struct_convert.h" /* cv_<name>_h2w / w2h */\n'
          + include_block + '\n'
          + 'extern int yos_remap_errno_h2g(int);\n\n'
@@ -1317,8 +1261,6 @@ def _load_hooks(path: Path | None) -> tuple[dict[str, str], dict[str, dict]]:
     sc_meta = raw.get('struct_convert') or {}
     for name in sc_meta:
         cat_map[name] = 'struct_convert'
-    for name in (raw.get('from_freebsd_src') or {}):
-        cat_map[name] = 'from_freebsd_src'
     return cat_map, sc_meta
 
 

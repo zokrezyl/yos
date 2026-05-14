@@ -195,6 +195,186 @@ int32_t yos_socket(struct yos_exec_ctx *ctx, int32_t domain, int32_t type, int32
     return wfd;
 }
 
+/* Socket-side bridges that need wfd → hfd translation. The auto-
+ * bridge for these passes the wasm fd straight through to the host
+ * which sees an unrelated fd (or EBADF) — that's what makes the
+ * coverage probe's `bind(127.0.0.1:0)` and `listen()` fail with
+ * errno=9 (EBADF). */
+/* FreeBSD sockaddr_in (and sockaddr_in6) put a 1-byte sin_len at
+ * offset 0 and sa_family at offset 1. Linux drops sin_len and uses
+ * a 2-byte sin_family at offset 0. Without translation, the host
+ * bind/connect/sendto see family=0x0002 (sin_len=2 in the low
+ * byte, AF_INET=2 in the high byte → 0x0202, an unknown family)
+ * and silently fail. Same for sockaddr_in6 (family always at
+ * offset 0/1 regardless, but sin6_len needs stripping). */
+static void freebsd_sockaddr_to_host(uint8_t *buf, socklen_t len)
+{
+#ifndef __FreeBSD__
+#ifndef __APPLE__
+    if (len >= 2) {
+        uint8_t sin_len_byte    = buf[0];
+        uint8_t sin_family_byte = buf[1];
+        (void)sin_len_byte;
+        /* Linux: sin_family is uint16 little-endian at offset 0/1.
+         * Just zero the high byte and put sa_family in the low. */
+        buf[0] = sin_family_byte;
+        buf[1] = 0;
+    }
+#endif
+#endif
+}
+
+int32_t yos_bind(struct yos_exec_ctx *ctx, int32_t fd, uint32_t addr_off,
+                 uint32_t addrlen)
+{
+    int hfd = yos_fd_get(ctx, fd);
+    if (hfd < 0) return hfd;
+    if (addr_off >= ctx->memory_size) return -EFAULT;
+    /* Make a host-shape copy of the address and convert in-place. */
+    uint8_t hostbuf[256];
+    if (addrlen > sizeof(hostbuf)) return -EINVAL;
+    memcpy(hostbuf, ctx->memory + addr_off, addrlen);
+    freebsd_sockaddr_to_host(hostbuf, (socklen_t)addrlen);
+    return bind(hfd, (struct sockaddr *)hostbuf, (socklen_t)addrlen) < 0
+           ? -errno : 0;
+}
+
+int32_t yos_listen(struct yos_exec_ctx *ctx, int32_t fd, int32_t backlog)
+{
+    int hfd = yos_fd_get(ctx, fd);
+    if (hfd < 0) return hfd;
+    return listen(hfd, backlog) < 0 ? -errno : 0;
+}
+
+int32_t yos_connect(struct yos_exec_ctx *ctx, int32_t fd, uint32_t addr_off,
+                    uint32_t addrlen)
+{
+    int hfd = yos_fd_get(ctx, fd);
+    if (hfd < 0) return hfd;
+    if (addr_off >= ctx->memory_size) return -EFAULT;
+    uint8_t hostbuf[256];
+    if (addrlen > sizeof(hostbuf)) return -EINVAL;
+    memcpy(hostbuf, ctx->memory + addr_off, addrlen);
+    freebsd_sockaddr_to_host(hostbuf, (socklen_t)addrlen);
+    return connect(hfd, (struct sockaddr *)hostbuf, (socklen_t)addrlen) < 0
+           ? -errno : 0;
+}
+
+int32_t yos_accept(struct yos_exec_ctx *ctx, int32_t fd, uint32_t addr_off,
+                   uint32_t addrlen_off)
+{
+    int hfd = yos_fd_get(ctx, fd);
+    if (hfd < 0) return hfd;
+    socklen_t hlen = 0;
+    socklen_t *hlen_p = NULL;
+    struct sockaddr *haddr = NULL;
+    if (addr_off && addrlen_off &&
+        addr_off < ctx->memory_size && addrlen_off + 4 <= ctx->memory_size) {
+        hlen   = (socklen_t)*(uint32_t *)(ctx->memory + addrlen_off);
+        hlen_p = &hlen;
+        haddr  = (struct sockaddr *)(ctx->memory + addr_off);
+    }
+    int newhfd = accept(hfd, haddr, hlen_p);
+    if (newhfd < 0) return -errno;
+    if (addrlen_off) *(uint32_t *)(ctx->memory + addrlen_off) = (uint32_t)hlen;
+    int newwfd = yos_fd_alloc(ctx, newhfd);
+    if (newwfd < 0) { close(newhfd); return -EMFILE; }
+    return newwfd;
+}
+
+ssize_t yos_send(struct yos_exec_ctx *ctx, int32_t fd, uint32_t buf_off,
+                 uint32_t len, int32_t flags)
+{
+    int hfd = yos_fd_get(ctx, fd);
+    if (hfd < 0) return hfd;
+    if (buf_off >= ctx->memory_size) return -EFAULT;
+    ssize_t n = send(hfd, ctx->memory + buf_off, len, flags);
+    return n < 0 ? -errno : n;
+}
+
+ssize_t yos_recv(struct yos_exec_ctx *ctx, int32_t fd, uint32_t buf_off,
+                 uint32_t len, int32_t flags)
+{
+    int hfd = yos_fd_get(ctx, fd);
+    if (hfd < 0) return hfd;
+    if (buf_off >= ctx->memory_size) return -EFAULT;
+    ssize_t n = recv(hfd, ctx->memory + buf_off, len, flags);
+    return n < 0 ? -errno : n;
+}
+
+ssize_t yos_sendto(struct yos_exec_ctx *ctx, int32_t fd, uint32_t buf_off,
+                   uint32_t len, int32_t flags, uint32_t dst_off,
+                   uint32_t dst_len)
+{
+    int hfd = yos_fd_get(ctx, fd);
+    if (hfd < 0) return hfd;
+    const struct sockaddr *dst = NULL;
+    if (dst_off && dst_off < ctx->memory_size)
+        dst = (const struct sockaddr *)(ctx->memory + dst_off);
+    ssize_t n = sendto(hfd, ctx->memory + buf_off, len, flags, dst,
+                       (socklen_t)dst_len);
+    return n < 0 ? -errno : n;
+}
+
+ssize_t yos_recvfrom(struct yos_exec_ctx *ctx, int32_t fd, uint32_t buf_off,
+                     uint32_t len, int32_t flags, uint32_t src_off,
+                     uint32_t srclen_off)
+{
+    int hfd = yos_fd_get(ctx, fd);
+    if (hfd < 0) return hfd;
+    socklen_t hlen = 0;
+    socklen_t *hlen_p = NULL;
+    struct sockaddr *src = NULL;
+    if (src_off && srclen_off && srclen_off + 4 <= ctx->memory_size) {
+        hlen   = (socklen_t)*(uint32_t *)(ctx->memory + srclen_off);
+        hlen_p = &hlen;
+        src    = (struct sockaddr *)(ctx->memory + src_off);
+    }
+    ssize_t n = recvfrom(hfd, ctx->memory + buf_off, len, flags, src, hlen_p);
+    if (n < 0) return -errno;
+    if (srclen_off) *(uint32_t *)(ctx->memory + srclen_off) = (uint32_t)hlen;
+    return n;
+}
+
+int32_t yos_shutdown(struct yos_exec_ctx *ctx, int32_t fd, int32_t how)
+{
+    int hfd = yos_fd_get(ctx, fd);
+    if (hfd < 0) return hfd;
+    return shutdown(hfd, how) < 0 ? -errno : 0;
+}
+
+int32_t yos_getpeername(struct yos_exec_ctx *ctx, int32_t fd,
+                        uint32_t addr_off, uint32_t addrlen_off)
+{
+    int hfd = yos_fd_get(ctx, fd);
+    if (hfd < 0) return hfd;
+    if (!addr_off || !addrlen_off) return -EFAULT;
+    socklen_t hlen = (socklen_t)*(uint32_t *)(ctx->memory + addrlen_off);
+    if (getpeername(hfd, (struct sockaddr *)(ctx->memory + addr_off), &hlen) < 0)
+        return -errno;
+    *(uint32_t *)(ctx->memory + addrlen_off) = (uint32_t)hlen;
+    return 0;
+}
+
+/* posix_fadvise / posix_fallocate — fd-taking; the auto-bridge
+ * passed the wasm fd straight to host which then sees EBADF. They
+ * return the error code as the function value (not via errno). */
+int32_t yos_posix_fadvise(struct yos_exec_ctx *ctx, int32_t fd,
+                          int64_t offset, int64_t len, int32_t advice)
+{
+    int hfd = yos_fd_get(ctx, fd);
+    if (hfd < 0) return -hfd;  /* return positive error code */
+    return posix_fadvise(hfd, (off_t)offset, (off_t)len, advice);
+}
+
+int32_t yos_posix_fallocate(struct yos_exec_ctx *ctx, int32_t fd,
+                            int64_t offset, int64_t len)
+{
+    int hfd = yos_fd_get(ctx, fd);
+    if (hfd < 0) return -hfd;
+    return posix_fallocate(hfd, (off_t)offset, (off_t)len);
+}
+
 #include <stdlib.h>  /* mkdtemp/mkstemp */
 
 /* realpath: resolve absolute pathname. Two calling conventions:
@@ -428,6 +608,15 @@ int32_t yos_getuid (struct yos_exec_ctx *ctx) { (void)ctx; return (int32_t)getui
 int32_t yos_geteuid(struct yos_exec_ctx *ctx) { (void)ctx; return (int32_t)geteuid(); }
 int32_t yos_getgid (struct yos_exec_ctx *ctx) { (void)ctx; return (int32_t)getgid();  }
 int32_t yos_getegid(struct yos_exec_ctx *ctx) { (void)ctx; return (int32_t)getegid(); }
+
+/* issetugid: BSD/macOS only — Linux glibc doesn't ship it. Returns
+ * non-zero if the process is running with elevated privileges that
+ * make it unsafe to honour environment variables. Under yos a wasm
+ * guest is always running as the user that launched it — never
+ * privileged — so return 0. openssl's ossl_safe_getenv and openssh's
+ * ssh_get_progname/etc. use this to decide whether to trust $PATH,
+ * $HOME, etc. (we DO want them to trust). */
+int32_t yos_issetugid(struct yos_exec_ctx *ctx) { (void)ctx; return 0; }
 
 uint32_t yos_umask(struct yos_exec_ctx *ctx, uint32_t mask)
 {
