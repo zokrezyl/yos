@@ -85,7 +85,6 @@ yos_runtime_sources = files(
   'impl/strto.c',
   'impl/freebsd_userland.c',
   'impl/sysctl.c',
-  'impl/tier2.c',
   'impl/printf.c',
   'impl/dir.c',
   # ytrace + yplatform — switchable trace-point machinery imported
@@ -121,8 +120,6 @@ yos_exe = executable(
   ],
   c_args : [
     '-D_GNU_SOURCE',
-    # Path to the Tier-2 sidecar wasm. yos opens this at startup.
-    '-DYOS_LIBC_PURE_PATH="' + libc_pure_path + '"',
     '-Wno-unused-parameter',
     '-Wno-unused-but-set-variable',
     '-Wno-unused-variable',

@@ -386,7 +386,8 @@ def extract(inputs: ExtractInputs) -> dict:
             # `getdirentries(...)` looks fine at compile time but fails
             # to link. The replacement on darwin is `getdirentries$INODE64`
             # (which doesn't exist) or `readdir`. Just drop the bridge
-            # — guests that need it should fall through to libc-pure.wasm.
+            # — guests that need it should fall back to readdir() through
+            # the regular yos bridge surface instead.
             'getdirentries',
             'profil',
             'unwhiteout',

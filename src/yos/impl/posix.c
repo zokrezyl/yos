@@ -429,6 +429,15 @@ int32_t yos_geteuid(struct yos_exec_ctx *ctx) { (void)ctx; return (int32_t)geteu
 int32_t yos_getgid (struct yos_exec_ctx *ctx) { (void)ctx; return (int32_t)getgid();  }
 int32_t yos_getegid(struct yos_exec_ctx *ctx) { (void)ctx; return (int32_t)getegid(); }
 
+/* issetugid: BSD/macOS only — Linux glibc doesn't ship it. Returns
+ * non-zero if the process is running with elevated privileges that
+ * make it unsafe to honour environment variables. Under yos a wasm
+ * guest is always running as the user that launched it — never
+ * privileged — so return 0. openssl's ossl_safe_getenv and openssh's
+ * ssh_get_progname/etc. use this to decide whether to trust $PATH,
+ * $HOME, etc. (we DO want them to trust). */
+int32_t yos_issetugid(struct yos_exec_ctx *ctx) { (void)ctx; return 0; }
+
 uint32_t yos_umask(struct yos_exec_ctx *ctx, uint32_t mask)
 {
     (void)ctx;

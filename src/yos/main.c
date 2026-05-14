@@ -18,7 +18,6 @@
 #include "yos/vfs/mount.h"
 #include "yos/vfs/procfs.h"
 #include "impl/pthread.h"
-#include "impl/tier2.h"
 
 /* Legacy yos-private number-indexed dispatcher REMOVED — see CLAUDE.md
  * non-negotiable #5. The wasm guest must import each libc function by
@@ -281,32 +280,6 @@ static m3ApiRawFunction(m3_main_argc_argv)
     int32_t rc = 0;
     m3_GetResultsV(f_main, &rc);
     m3ApiReturn(rc);
-}
-
-/* Tier-2 demo: forwards env.__yos_t2_demo(int, int) into the sidecar
- * wasm runtime that hosts libc-pure.wasm. Once bridge.py can emit
- * `from_freebsd_src` wrappers programmatically, this hand-written
- * helper goes away. Kept here as the canary for the sidecar
- * dispatch path. */
-static m3ApiRawFunction(m3_t2_demo)
-{
-    m3ApiReturnType(int32_t);
-    m3ApiGetArg(int32_t, a);
-    m3ApiGetArg(int32_t, b);
-    (void)runtime; (void)_ctx; (void)_mem;
-
-    static IM3Function f_demo;
-    IM3Function f = yos_tier2_resolve_once(&f_demo, "__yos_t2_demo");
-    if (!f) m3ApiReturn((int32_t)-38 /* -ENOSYS */);
-
-    M3Result r = m3_CallV(f, a, b);
-    if (r) {
-        fprintf(stderr, "yos: tier2 __yos_t2_demo: %s\n", r);
-        m3ApiReturn((int32_t)-1);
-    }
-    int32_t out = 0;
-    m3_GetResultsV(f, &out);
-    m3ApiReturn(out);
 }
 
 /* env.__error: FreeBSD's errno accessor — `int *__error(void)`. The
@@ -1452,9 +1425,6 @@ void yos_link_imports(IM3Module module, struct yos_exec_ctx *ctx)
     extern void yos_f128_link (IM3Module mod);
     yos_f128_link (module);
 
-    /* Tier-2 demo binding (canary for the sidecar dispatch path). */
-    m3_LinkRawFunction(module, "env", "__yos_t2_demo", "i(ii)", m3_t2_demo);
-
     /* clang renames user main(int, char**) to __main_argc_argv and
      * emits a wrapper main(void) that's exported. Our crt1's call to
      * main(argc, argv) therefore becomes env.__main_argc_argv. Bind
@@ -1843,20 +1813,6 @@ int main(int argc, char **argv)
     yos_mount_table_init(&mount_table);
     yos_mount_add(&mount_table, "/proc", &yos_procfs_ops);
     g_runtime.mount_table = &mount_table;
-
-    /* Tier 2: load libc-pure.wasm into a sidecar wasm3 instance. The
-     * exact path comes from meson via -DYOS_LIBC_PURE_PATH. If the
-     * sidecar fails to load, yos still runs — Tier-2 fns will return
-     * -ENOSYS at call time. */
-#ifdef YOS_LIBC_PURE_PATH
-    if (yos_tier2_init(YOS_LIBC_PURE_PATH) != 0) {
-        /* Informational only — the guest still runs, Tier-2 fns just
-         * trap on first call. Gate via ydebug so default runs stay
-         * quiet (per CLAUDE.md). */
-        ydebug("tier2: libc-pure.wasm unavailable, "
-               "Tier-2 imports will trap\n");
-    }
-#endif
 
     IM3Environment env = m3_NewEnvironment();
 

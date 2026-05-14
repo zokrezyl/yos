@@ -82,8 +82,11 @@ int32_t yos_fd_assign(struct yos_exec_ctx *ctx, int32_t newfd, int host_fd)
         return -EBADF;
     }
     int old = ctx->fd_map[newfd];
-    if (old >= 0 && old != host_fd)
+    if (old >= 0 && old != host_fd) {
+        ydebug("fd_assign: wfd %d evict host_fd=%d (replaced by %d)\n",
+               newfd, old, host_fd);
         close(old);
+    }
     ctx->fd_map[newfd] = host_fd;
     return newfd;
 }
@@ -247,15 +250,18 @@ int32_t yos_write(struct yos_exec_ctx *ctx, int32_t fd, uint32_t buf, uint32_t c
         }
     }
     ssize_t r = write(hfd, p, count);
+    int saved_errno = (r < 0) ? errno : 0;
     if (ydebug_enabled() && fd != 4 && fd != 5) {
         pid_t tid = yos_plat_gettid();
-        ydebug("write(tid=%d wfd=%d hfd=%d count=%u) = %zd%s%.*s%s\n",
+        ydebug("write(tid=%d wfd=%d hfd=%d count=%u) = %zd%s%s%s%.*s%s\n",
                (int)tid, fd, hfd, count, r,
+               r < 0 ? " errno=" : "",
+               r < 0 ? strerror(saved_errno) : "",
                r > 0 ? " head=\"" : "",
                (int)(r > 0 ? (r > 32 ? 32 : r) : 0), (const char *)p,
                r > 0 ? "\"" : "");
     }
-    return r < 0 ? -errno : (int32_t)r;
+    return r < 0 ? -saved_errno : (int32_t)r;
 }
 
 /* Forward decls — definitions are further down with the fcntl

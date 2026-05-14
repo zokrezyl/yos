@@ -41,6 +41,7 @@ custom_proc:
   - geteuid
   - getgid
   - getegid
+  - issetugid
   - raise
   - killpg
   # impl/env.c — env table backed by wasm linear memory.
@@ -372,22 +373,12 @@ struct_convert:
   localtime_r:    {out: result,  type: tm}
   gmtime_r:       {out: result,  type: tm}
 
-# ─── Tier 2: implementation comes from FreeBSD libc source files ──────
-# bridge.py emits an m3w_<name> wrapper that dispatches into yos's
-# sidecar wasm3 instance (libc-pure.wasm, built by build-tools/
-# freebsd-libc/). The sidecar may itself import lower-level libc fns
-# (e.g. printf calls write); those resolve back through this same yos
-# import surface, landing in Tier 1 / Tier 3 as appropriate.
-#
-# Each entry maps `name -> { src: <path under FreeBSD source tree> }`.
-# Today's set is intentionally tiny — we add functions on demand as
-# nvim's deps surface them. Scalar-only signatures are easiest; fns
-# with pointer args need cross-runtime memory marshalling that we'll
-# add when the first such function lands.
-from_freebsd_src:
-  abs:     {src: stdlib/abs.c}
-  # strlcpy is here too once we wire cross-runtime pointer marshalling.
-  # strlcpy: {src: string/strlcpy.c}
+# The Tier-2 sidecar (libc-pure.wasm, a second wasm3 instance hosting
+# pure FreeBSD libc sources) has been REMOVED. Every libc function is
+# now resolved as a single yos host bridge — either auto-passthrough
+# to host libc (the default for stateless fns like `abs`, `strlcpy`,
+# `strlen`, `memcpy`) or a hand-written `yos_<name>` in src/yos/impl/.
+# There is no second wasm runtime; one uniform `env.<name>` surface.
 
 # ─── Variadic — codegen skips emission; bodies hand-written ───────────
 variadic:

@@ -394,17 +394,14 @@ static void *fork_thread_func(void *arg)
      * relies on this — without it the post-pseudo-exec failure path
      * keeps writing into a pipe the parent treats as live, so the
      * parent thinks the spawn failed and never paints. */
+    /* Copy the parent's fd dups straight in. The parent thread
+     * already F_DUPFD'd each entry in yos_fork_pump (BEFORE
+     * resuming the parent's wasm code), so parent_fd_map here
+     * holds STABLE host fds that point to the kernel objects the
+     * parent had at fork time — NOT host fd numbers that race
+     * against the parent's post-fork close/dup2 traffic. */
     for (int i = 0; i < YOS_FD_MAX; i++) {
-        int phfd = fork_thread_arg->parent_fd_map[i];
-        if (phfd < 0) {
-            child_ctx->fd_map[i] = -1;
-            continue;
-        }
-        int flags = fcntl(phfd, F_GETFD);
-        int dupcmd = (flags >= 0 && (flags & FD_CLOEXEC))
-                       ? F_DUPFD_CLOEXEC : F_DUPFD;
-        int chfd = fcntl(phfd, dupcmd, 0);
-        child_ctx->fd_map[i] = (chfd >= 0) ? chfd : -1;
+        child_ctx->fd_map[i] = fork_thread_arg->parent_fd_map[i];
     }
     child_ctx->argc = fork_thread_arg->argc;
     child_ctx->argv = fork_thread_arg->argv;
@@ -739,6 +736,23 @@ static void *fork_thread_func(void *arg)
             yos_ytrace_set_comm(child_ctx->proc->comm);
         }
 
+        /* POSIX execve: every fd with FD_CLOEXEC set must be closed.
+         * Without this, a shell that opens many fds for ZLE / job
+         * control passes them all through to the exec'd child, which
+         * then sees /dev/null at fd 9 instead of fd 3 — and worse,
+         * tools that closefrom(3) miss them because yos's fd table
+         * is virtual. Query each host fd's FD_CLOEXEC bit and drop
+         * the close-on-exec ones from the child's fd_map. */
+        for (int i = 3; i < YOS_FD_MAX; i++) {
+            int hfd = child_ctx->fd_map[i];
+            if (hfd < 0) continue;
+            int flags = fcntl(hfd, F_GETFD);
+            if (flags >= 0 && (flags & FD_CLOEXEC)) {
+                close(hfd);
+                child_ctx->fd_map[i] = -1;
+            }
+        }
+
         child_ctx->exec_pending = 0;
         child_ctx->exec_argv = NULL;
         child_ctx->exec_argc = 0;
@@ -998,8 +1012,39 @@ void yos_fork_pump(struct yos_exec_ctx *ctx)
         fork_thread_arg->envp = ctx->envp;
         fork_thread_arg->wasm_bytes = ctx->wasm_bytes;
         fork_thread_arg->wasm_bytes_size = ctx->wasm_bytes_size;
-        memcpy(fork_thread_arg->parent_fd_map, ctx->fd_map,
-               sizeof(ctx->fd_map));
+        /* F_DUPFD each parent host fd RIGHT NOW, in the parent
+         * thread, before the child thread runs and before the
+         * parent's wasm code resumes (asyncify_start_rewind, below).
+         *
+         * Why: the snapshot used to store host fd NUMBERS and let
+         * the child thread call F_DUPFD on each one later. Those
+         * numbers are unstable references — between snapshot and the
+         * child thread's dup loop, the parent's rewound wasm code
+         * runs (e.g. zsh's post-fork close(forkpipe[1]); read; …)
+         * and closes/reuses host fd numbers. The child's later
+         * F_DUPFD then duplicates whatever the SLOT now points to,
+         * not what the parent originally referenced — so e.g. the
+         * pipe write end becomes a dup of host stdout, and zsh's
+         * 8-byte fork-pipe errno write surfaces on the user's
+         * terminal as "\xff\xff\xff\xff\xff\xff\xff\xff" + truncated
+         * "ad file descriptor" (see test_ssh_no_args_help.py).
+         *
+         * Doing the dup synchronously here pins each kernel object
+         * before the parent can race ahead. POSIX fork preserves
+         * FD_CLOEXEC; F_DUPFD strips it, so re-set via
+         * F_DUPFD_CLOEXEC when the source had it. */
+        for (int i = 0; i < YOS_FD_MAX; i++) {
+            int phfd = ctx->fd_map[i];
+            if (phfd < 0) {
+                fork_thread_arg->parent_fd_map[i] = -1;
+                continue;
+            }
+            int flags = fcntl(phfd, F_GETFD);
+            int dupcmd = (flags >= 0 && (flags & FD_CLOEXEC))
+                           ? F_DUPFD_CLOEXEC : F_DUPFD;
+            int chfd = fcntl(phfd, dupcmd, 0);
+            fork_thread_arg->parent_fd_map[i] = (chfd >= 0) ? chfd : -1;
+        }
         memcpy(fork_thread_arg->parent_cwd, ctx->cwd,
                sizeof(fork_thread_arg->parent_cwd));
 
@@ -1841,8 +1886,21 @@ void yos_vfork_pump(struct yos_exec_ctx *ctx)
         fork_thread_arg->envp = ctx->envp;
         fork_thread_arg->wasm_bytes = ctx->wasm_bytes;
         fork_thread_arg->wasm_bytes_size = ctx->wasm_bytes_size;
-        memcpy(fork_thread_arg->parent_fd_map, ctx->fd_map,
-               sizeof(ctx->fd_map));
+        /* Same stable-snapshot reasoning as in the fork path above —
+         * dup parent's host fds NOW so the child sees what was open
+         * at vfork time, not what's open whenever its dup loop runs. */
+        for (int i = 0; i < YOS_FD_MAX; i++) {
+            int phfd = ctx->fd_map[i];
+            if (phfd < 0) {
+                fork_thread_arg->parent_fd_map[i] = -1;
+                continue;
+            }
+            int flags = fcntl(phfd, F_GETFD);
+            int dupcmd = (flags >= 0 && (flags & FD_CLOEXEC))
+                           ? F_DUPFD_CLOEXEC : F_DUPFD;
+            int chfd = fcntl(phfd, dupcmd, 0);
+            fork_thread_arg->parent_fd_map[i] = (chfd >= 0) ? chfd : -1;
+        }
         memcpy(fork_thread_arg->parent_cwd, ctx->cwd,
                sizeof(fork_thread_arg->parent_cwd));
 

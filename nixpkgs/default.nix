@@ -74,6 +74,16 @@ let
   # build-tools/wasm-pkg/configs/<name>/build.sh recipe.
   zsh = pkgs.callPackage ./pkgs/zsh { inherit buildRecipe; };
 
+  # Network stack: zlib → openssl → openssh. Static-linked,
+  # cross-compiled to wasm32 against the FreeBSD sysroot. Built as
+  # plain stdenv.mkDerivation recipes (no shared shell script): each
+  # package declares its own build-time tooling (perl for openssl,
+  # python3 for openssh's config.sub patch), and the wasm toolchain
+  # + sysroot are passed in explicitly.
+  zlib    = pkgs.callPackage ./pkgs/zlib    { inherit toolchain sysroot; };
+  openssl = pkgs.callPackage ./pkgs/openssl { inherit toolchain sysroot zlib; };
+  openssh = pkgs.callPackage ./pkgs/openssh { inherit toolchain sysroot zlib openssl; };
+
   # Umbrella package: every user-facing yos artefact merged into one
   # tree via symlinkJoin. Lets users do
   #   nix run .#                    # drops into wasm zsh under yos (sandbox)
@@ -90,7 +100,7 @@ let
   # sandbox boundary.
   all = pkgs.symlinkJoin {
     name = "yos-all";
-    paths = [ yos zsh nvim freebsd-tools ];
+    paths = [ yos zsh nvim freebsd-tools openssh ];
     postBuild = ''
       cat > $out/bin/yos-shell <<RUNNER_EOF
       #!/usr/bin/env bash
@@ -127,5 +137,6 @@ in {
           lpeg lua-mpack luv nvim
           freebsd-tools
           zsh
+          zlib openssl openssh
           all;
 }

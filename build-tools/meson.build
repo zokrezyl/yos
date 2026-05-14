@@ -20,5 +20,7 @@ subdir('host-libc')
 # keeps all its state IN the wasm linear memory, so there's no host-
 # side bookkeeping to clean up on execve and we don't need mimalloc's
 # host runtime at all. See the comment at the top of impl/alloc.c.
-subdir('freebsd-libc')  # Tier 2 sidecar wasm (libc-pure.wasm)
+# Tier-2 sidecar removed — all libc fns are resolved as direct yos
+# host bridges (auto-passthrough or hand-written yos_<name>). No
+# second wasm3 instance is loaded at runtime.
 subdir('sysroot')       # wasm sysroot for guest .c compilation

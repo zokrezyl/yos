@@ -39,8 +39,6 @@ libc_tests = [
   'test_generated_imports',
   'test_fork_basic',
   'test_pthread_create_join',
-  'test_tier2_sidecar',
-  'test_tier2_abs',
   'test_freebsd_headers',
   'test_malloc_basic',
   # nvim-on-darwin trouble-area pins (tmp/nvim-runtime-issues.md).
@@ -74,6 +72,14 @@ libc_tests = [
   # explain why uv_guess_handle on a SOCK fd silently returns the
   # wrong type without ever calling getsockname.
   'test_stat_layout_probe',
+  # Asyncify-leak regression. The forked child's first stderr write
+  # must be byte-clean — no 0xff prefix from the rewound stack frame.
+  # The visible symptom of this leak in openssh was "Bad file
+  # descriptor" rendered as 0xff×8 + "ad file descriptor". The yos
+  # workaround in vfs.c::yos_write only catches pure-0xff payloads;
+  # this test exercises a MIXED payload (single byte 'X') over a pipe
+  # so the workaround is bypassed and the raw leak shows.
+  'test_post_fork_stderr_clean',
 ]
 
 # Path to the generator's output dir, exposed by src/yos/codegen.
@@ -132,6 +138,19 @@ test('test_perf_stress',
   timeout : 120,
 )
 
+# Tests in this set are known-failing pins for open bugs. The test
+# still RUNS — when the underlying bug is fixed, the suite reports
+# UNEXPECTEDPASS and the entry should be removed.
+#
+# `test_post_fork_stderr_clean` was in this list. Fixed by moving
+# the per-fd F_DUPFD loop from the forked child thread into
+# yos_fork_pump (parent thread, before resume) so the snapshot
+# captures stable host fds rather than racing fd-table slots
+# against the parent's post-fork close/reuse traffic. See
+# src/yos/impl/proc.c diff.
+libc_tests_xfail = [
+]
+
 foreach t : libc_tests
   src = files(t + '.c')
 
@@ -141,7 +160,7 @@ foreach t : libc_tests
   extra_inputs = []
   extra_cflags = []
   if t in ['test_generated_imports', 'test_fork_basic',
-           'test_pthread_create_join', 'test_tier2_abs']
+           'test_pthread_create_join']
     extra_inputs += [api_bridge_outputs]
     extra_cflags += ['-I' + yos_imports_dir]
   endif
@@ -161,7 +180,9 @@ foreach t : libc_tests
   # Tests that exercise fork / setjmp / longjmp need the Binaryen
   # asyncify pass applied so the host runtime can unwind/rewind the
   # wasm call stack. Plain stateless tests skip the pass.
-  needs_asyncify = t in ['test_fork_basic', 'test_fork_channel_from_stdio']
+  needs_asyncify = t in ['test_fork_basic',
+                         'test_fork_channel_from_stdio',
+                         'test_post_fork_stderr_clean']
 
   if needs_asyncify
     wasm = custom_target(
@@ -183,6 +204,7 @@ foreach t : libc_tests
       '--src',  src,
       '--wasm', wasm,
     ],
-    suite : 'libc',
+    suite       : 'libc',
+    should_fail : t in libc_tests_xfail,
   )
 endforeach

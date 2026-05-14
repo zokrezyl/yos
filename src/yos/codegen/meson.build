@@ -217,8 +217,6 @@ alias_target('api-bridge',   api_bridge_outputs)
 yos_types_inc = include_directories('../../..' / 'src')
 yos_inc       = include_directories('../../..' / 'include')
 
-# Bridge .c also pulls in `"impl/tier2.h"` for from_freebsd_src
-# routings; that resolves via -Isrc/yos.
 yos_impl_inc  = include_directories('..')
 
 api_bridge_lib = static_library(
