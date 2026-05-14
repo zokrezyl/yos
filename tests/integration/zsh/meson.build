@@ -127,13 +127,6 @@ _serial_zsh = {
 # Per-platform xfail overrides. Entries set true to xfail; entries set
 # false flip the table-level xfail off (because the bug fixed itself
 # on this platform).
-#   interactive-ssh-clean — darwin xfail: explicitly sources the
-#       user's ~/.zshrc so the bug-fire path is exercised. On the
-#       user's darwin box that .zshrc loads antidote, which calls
-#       `is-at-least` via autoload — but the wasm-zsh's FPATH doesn't
-#       include the zsh-distribution autoload tree where that function
-#       lives, so antidote bails and zsh never reaches the first `%`.
-#       Fix is to ship zsh's autoload tree inside the libexec sysroot.
 #   ssh-no-args-help — darwin-only pass: the fork-stderr 0xff prefix
 #       this test pins doesn't surface on darwin (different asyncify
 #       rewind path under apple-clang's wasm output), so the test
@@ -142,7 +135,6 @@ _serial_zsh = {
 _platform_xfail = {}
 if host_machine.system() == 'darwin'
   _platform_xfail = {
-    'interactive-ssh-clean' : true,
     'ssh-no-args-help'      : false,
   }
 endif

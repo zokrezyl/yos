@@ -330,6 +330,8 @@ LDFLAGS="$LDFLAGS_W" \
 LIBS="-lc -lyos_stubs" \
 CPP="$WASM_CC -E $CFLAGS_W" \
 "$SRC/configure" \
+    --enable-etcdir="$PREFIX/etc" \
+    --enable-fndir="$PREFIX/share/zsh/${VERSION}/functions" \
     --host=wasm32-unknown-unknown \
     --prefix="$PREFIX" \
     --cache-file="$CACHE" \
@@ -365,6 +367,39 @@ make -j"$(nproc 2>/dev/null || echo 4)" || {
 # nvim and the freebsd-tools use.
 mkdir -p "$PREFIX/bin"
 wasm-opt --asyncify -O2 "$BLD/Src/zsh" -o "$PREFIX/bin/zsh.wasm"
+
+# ── autoload Functions/ tree ───────────────────────────────────────
+# zsh's autoload-on-demand scripts live in Functions/<Section>/<name>
+# in the source tree (Misc/is-at-least, Misc/zed, Newuser/zsh-newuser-
+# install, …). Antidote and most plugin managers call `is-at-least
+# 5.4.2` to gate on zsh version; without these files on FPATH the
+# call fails with "function definition file not found", antidote
+# bails, and the user's interactive ~/.zshrc never finishes loading.
+# Install the whole tree under $PREFIX/share/zsh/<ver>/functions/ —
+# the same layout stock zsh uses on Linux/macOS. fpath is set at
+# zsh startup via /etc/zshenv (which we ALSO install below).
+SHARE="$PREFIX/share/zsh/${VERSION}"
+mkdir -p "$SHARE/functions"
+# Flatten Functions/<Section>/* → functions/<name>. (zsh historically
+# uses the per-section structure for organisation only; the actual
+# fpath lookup is flat.)
+for f in "$SRC"/Functions/*/*; do
+    [ -f "$f" ] && cp "$f" "$SHARE/functions/$(basename "$f")"
+done
+
+# ── /etc/zshenv: bootstrap fpath ───────────────────────────────────
+# zsh reads /etc/zshenv before anything else (even with NO_RCS). Set
+# the system-wide fpath here so autoload finds our Functions/ even
+# when the host's /etc/zshenv (which yos can't override per-guest)
+# isn't suitable. Guests source this via the wasm sysroot's /etc.
+mkdir -p "$PREFIX/etc"
+cat > "$PREFIX/etc/zshenv" <<ZSHENV_EOF
+# yos wasm-zsh — system-wide environment.
+# Prepend our autoload functions dir so antidote / oh-my-zsh /
+# is-at-least and friends resolve even when the host \$fpath has
+# entries pointing at incompatible function trees.
+fpath=( $SHARE/functions \$fpath )
+ZSHENV_EOF
 
 cat > "$PREFIX/manifest.txt" <<EOF
 name=zsh
