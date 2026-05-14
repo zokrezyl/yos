@@ -84,6 +84,10 @@ static uint32_t alloc_handle(FILE *f)
     return 0;
 }
 
+/* Public version for other impl files (impl/pwd.c::yos_tmpfile etc.)
+ * that need to register a host FILE in the wasm-side handle table. */
+uint32_t yos_alloc_file_handle(FILE *f) { return alloc_handle(f); }
+
 static void free_handle(uint32_t h)
 {
     if (h < 4 || h >= YOS_FILE_MAX) return;

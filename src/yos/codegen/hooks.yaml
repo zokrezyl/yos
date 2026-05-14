@@ -44,6 +44,22 @@ custom_proc:
   - issetugid
   - raise
   - killpg
+  # impl/posix.c — socket-side bridges that need wfd→hfd translation.
+  # The auto-bridge passes the wasm fd straight through to host
+  # bind/listen/etc. which then sees an unrelated fd or EBADF.
+  - bind
+  - listen
+  - connect
+  - accept
+  - send
+  - recv
+  - sendto
+  - recvfrom
+  - shutdown
+  - getpeername
+  # impl/posix.c — fd-taking, also need wfd→hfd translation.
+  - posix_fadvise
+  - posix_fallocate
   # impl/env.c — env table backed by wasm linear memory.
   - getenv
   - setenv
@@ -56,6 +72,51 @@ custom_proc:
   - arc4random
   - arc4random_buf
   - arc4random_uniform
+  # impl/pwd.c — struct passwd / group are pointer-heavy; the auto-
+  # bridge can't translate host pointers to wasm offsets, and these
+  # used to be stubbed with -ENOSYS — that's what made ssh print
+  # "No user exists for uid 1000" before exec.
+  - getpwuid
+  - getpwuid_r
+  - getpwnam
+  - getpwnam_r
+  - getpwent
+  - setpwent
+  - endpwent
+  - getgrgid
+  - getgrgid_r
+  - getgrnam
+  - getgrnam_r
+  - getgrent
+  - setgrent
+  - endgrent
+  - getlogin
+  - getlogin_r
+  # impl/pwd.c — same static-buffer pattern for the time-string
+  # family. Returns wasm offset to a per-ctx slot containing the
+  # struct tm / time string.
+  - gmtime
+  - localtime
+  - ctime
+  - ctime_r
+  - asctime
+  - asctime_r
+  # impl/pwd.c — string-returning helpers, all need wasm-side
+  # static-buffer pattern (auto-bridge can't translate const char *
+  # returns to wasm offsets).
+  - strerror
+  - gai_strerror
+  - hstrerror
+  - strsignal
+  # impl/pwd.c — pointer-into-input return convention (the result
+  # is a wasm offset into one of the input buffers).
+  - strtok
+  - strtok_r
+  - strsep
+  - strptime
+  # impl/pwd.c — opens a temp file and registers the FILE* in the
+  # wasm-side handle table (impl/file.c).
+  - tmpfile
   # impl/posix.c — FreeBSD libc only; glibc has no fmtcheck.
   - fmtcheck
   - fork
@@ -543,33 +604,13 @@ stub:
   # because they take a fn pointer that we'd need to translate.
   - alphasort
   - versionsort
-  # Host structs with embedded pointers (8B host vs 4B wasm) overflow
-  # the wasm-side struct slot when auto-bridge passes through. The
-  # *_r variants now go through struct_convert; the value-returning
-  # ones (localtime, gmtime, asctime, ctime) need a static-buffer
-  # convention we don't model yet — keep stubbed.
-  - localtime
-  - gmtime
-  - asctime
-  - asctime_r
-  - ctime
-  - ctime_r
+  # localtime/gmtime/ctime/asctime/strptime moved to custom_proc
+  # (impl/pwd.c) — same wasm-side static-buffer pattern as getpwuid.
   - strftime
-  - strptime
-  # struct passwd: ~30B host vs ~20B wasm (5 pointers + uid/gid).
-  - getpwnam
-  - getpwnam_r
-  - getpwuid
-  - getpwuid_r
-  - getpwent
-  - setpwent
-  - endpwent
-  # struct group: similar pointer-heavy.
-  - getgrnam
-  - getgrnam_r
-  - getgrgid
-  - getgrgid_r
-  - getgrent
+  # struct passwd/group families: moved to custom_proc (impl/pwd.c)
+  # so getpwuid actually returns a non-NULL entry. The user's ssh
+  # bug was "No user exists for uid 1000" caused by these being
+  # stubbed here.
   # struct hostent / addrinfo / etc.
   - gethostbyname
   - gethostbyname_r

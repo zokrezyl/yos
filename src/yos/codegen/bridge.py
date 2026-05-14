@@ -439,6 +439,12 @@ def _emit_bridge(name: str, gf: dict, hf: dict, gtypes: dict, htypes: dict,
     body_lines.append(f'{wret} yos_{name}({", ".join(arg_decls)}) {{')
     body_lines.append('    (void)ctx;')
     body_lines.extend(setups)
+    # Clear host errno before the call so the post-call `if (errno)`
+    # check below picks up errors set by THIS call, not stale errno
+    # from a prior call. Without this, e.g. nice(0) succeeds without
+    # touching errno but the bridge sees a leftover ENOTTY from a
+    # previous syscall and corrupts the wasm-side errno slot.
+    body_lines.append('    errno = 0;')
     body_lines.append(f'    {hret} _r = {call};')
     body_lines.extend(post_writebacks)
     if ret_kind == 'first_arg_alias':

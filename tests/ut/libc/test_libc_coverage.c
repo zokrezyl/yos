@@ -1087,9 +1087,13 @@ static void probe_file_more(void)
         write(fd, "x", 1);
         close(fd);
     } else emit_fail("open", errno, NULL);
-    /* openat(AT_FDCWD). */
+    /* openat(AT_FDCWD). The real openat takes (dfd, path, flags,
+     * [mode]) but FreeBSD sysroot may declare it with the mode arg
+     * always present — pass 0 explicitly so the bridge sees a
+     * defined value. */
     {
-        int fd2 = openat(AT_FDCWD, p, O_RDONLY);
+        errno = 0;
+        int fd2 = openat(AT_FDCWD, p, O_RDONLY, 0);
         if (fd2 >= 0) { emit_pass("openat"); close(fd2); }
         else emit_fail("openat", errno, NULL);
     }
@@ -1111,6 +1115,8 @@ static void probe_file_more(void)
     {
         char d[64];
         snprintf(d, sizeof(d), "/tmp/yos-cov-md-%d", (int)getpid());
+        rmdir(d);  /* ignore — clean slate */
+        errno = 0;
         if (mkdirat(AT_FDCWD, d, 0700) == 0) {
             emit_pass("mkdirat");
             unlinkat(AT_FDCWD, d, AT_REMOVEDIR);
@@ -1400,8 +1406,9 @@ static void probe_misc_more(void)
     /* getloadavg. */
     {
         double l[3];
+        errno = 0;
         int r = getloadavg(l, 3);
-        if (r >= 0) emit_pass("getloadavg"); else emit_fail("getloadavg", errno, NULL);
+        if (r > 0) emit_pass("getloadavg"); else emit_fail("getloadavg", errno, NULL);
     }
     /* gethostname. */
     {
@@ -1425,14 +1432,14 @@ static void probe_misc_more(void)
         (void)old;
         emit_pass("alarm");
     }
-    /* nice. */
+    /* nice(0) — returns current nice (may legitimately be -20..19,
+     * including -1, so checking return alone is ambiguous). Per
+     * POSIX: set errno=0 first, then on -1 check errno != 0. */
     {
         errno = 0;
-        int r = nice(0);
-        /* nice() is allowed to return -1 with errno=0 on success */
+        (void)nice(0);
         if (errno == 0) emit_pass("nice");
         else emit_fail("nice", errno, NULL);
-        (void)r;
     }
     /* getitimer (no-op query). */
     {
@@ -1440,12 +1447,12 @@ static void probe_misc_more(void)
         if (getitimer(ITIMER_REAL, &it) == 0) emit_pass("getitimer");
         else emit_fail("getitimer", errno, NULL);
     }
-    /* getpriority. */
+    /* getpriority — return value can legitimately be -1; per POSIX
+     * set errno=0 first and check errno on -1. */
     {
         errno = 0;
-        int r = getpriority(PRIO_PROCESS, 0);
+        (void)getpriority(PRIO_PROCESS, 0);
         if (errno == 0) emit_pass("getpriority"); else emit_fail("getpriority", errno, NULL);
-        (void)r;
     }
     /* getopt / glob — skipped (require argv setup). */
     emit_skip("getopt", "needs argv");
@@ -1771,11 +1778,14 @@ static void probe_posix_advise(void)
     char p[64]; snprintf(p, sizeof(p), "/tmp/yos-cov-pa-%d", (int)getpid());
     int fd = open(p, O_CREAT | O_RDWR, 0600);
     if (fd >= 0) {
-        if (posix_fallocate(fd, 0, 4096) == 0) emit_pass("posix_fallocate");
-        else emit_fail("posix_fallocate", errno, NULL);
-        if (posix_fadvise(fd, 0, 4096, POSIX_FADV_NORMAL) == 0)
-            emit_pass("posix_fadvise");
-        else emit_fail("posix_fadvise", errno, NULL);
+        /* posix_fallocate / posix_fadvise return the error code as
+         * the function value (NOT -1 + errno). 0 = success. */
+        int r = posix_fallocate(fd, 0, 4096);
+        if (r == 0) emit_pass("posix_fallocate");
+        else emit_fail("posix_fallocate", r, NULL);
+        r = posix_fadvise(fd, 0, 4096, POSIX_FADV_NORMAL);
+        if (r == 0) emit_pass("posix_fadvise");
+        else emit_fail("posix_fadvise", r, NULL);
         close(fd);
         unlink(p);
     } else {
@@ -1786,9 +1796,9 @@ static void probe_posix_advise(void)
         void *m = mmap(NULL, 4096, PROT_READ | PROT_WRITE,
                        MAP_ANON | MAP_PRIVATE, -1, 0);
         if (m && m != MAP_FAILED) {
-            if (posix_madvise(m, 4096, POSIX_MADV_NORMAL) == 0)
-                emit_pass("posix_madvise");
-            else emit_fail("posix_madvise", errno, NULL);
+            int r = posix_madvise(m, 4096, POSIX_MADV_NORMAL);
+            if (r == 0) emit_pass("posix_madvise");
+            else emit_fail("posix_madvise", r, NULL);
             munmap(m, 4096);
         }
     }
