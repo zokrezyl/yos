@@ -73,7 +73,13 @@ HOST_BUILD="$WORK/host-build"
 rm -rf "$HOST_BUILD"; cp -r "$SRC" "$HOST_BUILD"
 cd "$HOST_BUILD/src"
 make clean   # drop stale wasm32 .o files inherited from the cross build
-make -j posix MYCFLAGS="-DLUA_USE_POSIX -DLUA_ANSI" MYLIBS=""
+# Host build: lua's Makefile defaults to CC=gcc, which doesn't exist
+# on darwin under nix; and a bare CC=$CC resolves to `clang`, which is
+# shadowed on PATH by the wasm toolchain's *unwrapped* clang symlink
+# (no resource-dir → no stdarg.h). The toolchain doesn't ship a `cc`
+# binary, so naming `cc` here reliably picks up nix-stdenv's wrapped
+# host compiler on both Linux and darwin.
+make -j posix CC=cc MYCFLAGS="-DLUA_USE_POSIX -DLUA_ANSI" MYLIBS=""
 cp lua "$PREFIX/bin/lua"
 cp luac "$PREFIX/bin/luac" 2>/dev/null || true
 "$PREFIX/bin/lua" -e 'print("[lua] host interpreter OK: " .. _VERSION)'

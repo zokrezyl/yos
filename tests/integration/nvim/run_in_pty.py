@@ -20,6 +20,7 @@ fallback fires if the program is still alive after the script finishes).
 """
 
 import os
+import sys
 import pty
 import fcntl
 import termios
@@ -27,6 +28,20 @@ import struct
 import select
 import time
 import signal
+
+
+# Wall-clock timing multiplier. The wasm interpreter is much slower than
+# native and on macOS in particular the hard-coded settle waits / quit
+# grace below can run short under any kind of host CPU contention
+# (parallel meson tests, background activity, etc.). Scale every wait
+# uniformly so the same driver script is robust on both platforms.
+# Override per-test via env if the default 2x isn't enough.
+def _timing_mult():
+    try:
+        return max(1.0, float(os.environ.get('YOS_PTY_TIMING_MULT',
+                                             '2.0' if sys.platform == 'darwin' else '1.0')))
+    except ValueError:
+        return 1.0
 
 
 def run_in_pty(argv, rows=24, cols=80, driver=None, kill_after=2.0,
@@ -38,8 +53,12 @@ def run_in_pty(argv, rows=24, cols=80, driver=None, kill_after=2.0,
     it to put the pty into raw mode (cfmakeraw) for tests that send
     single bytes and don't want the kernel's cooked-mode line buffering.
     """
+    mult = _timing_mult()
     if driver is None:
         driver = [(3.0, b"")]
+    # Scale every settle/quit-grace window by the platform multiplier.
+    driver = [(w * mult, p) for (w, p) in driver]
+    kill_after = kill_after * mult
     pid, fd = pty.fork()
     if pid == 0:
         if env is not None:

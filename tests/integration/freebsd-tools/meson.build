@@ -62,13 +62,39 @@ ftools_int_tests = {
   'nvim-zsh'   : {'src' : files('test_nvim_from_zsh.py'),'xfail' : false},
 }
 
+# Tests that drive heavy interactive guests through a pty are
+# CPU-bound on the wasm interpreter and have timing-sensitive
+# expectations; running them in parallel produces flaky drops. Keep
+# the cheap byte-in/byte-out tests parallel and serialise only the
+# pty-driven ones (~10s each).
+_serial_ftools = {
+  'nvim-zsh'  : true,
+  'ps-tty'    : true,
+  'backspace' : true,
+}
+
+# Per-platform xfail overrides — see the parallel comment in
+# tests/integration/zsh/meson.build for the pattern.
+#   cut — darwin-only pass: the rune-locale isalpha/isspace gap that
+#       breaks cut's delimiter parsing on Linux doesn't fire on darwin
+#       (libSystem's locale tables ship differently). Flip the xfail
+#       off here so meson reports a clean run.
+_platform_xfail = {}
+if host_machine.system() == 'darwin'
+  _platform_xfail = {
+    'cut' : false,
+  }
+endif
+
 foreach name, cfg : ftools_int_tests
+  xfail = _platform_xfail.has_key(name) ? _platform_xfail[name] : cfg['xfail']
   test('freebsd-tool-' + name,
        py3,
        args : cfg['src'],
        suite : 'integration-freebsd-tools',
        env : ftools_int_env,
        depends : [yos_exe],
-       should_fail : cfg['xfail'],
+       should_fail : xfail,
+       is_parallel : not _serial_ftools.get(name, false),
        timeout : 30)
 endforeach

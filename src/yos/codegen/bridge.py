@@ -35,6 +35,30 @@ from pathlib import Path
 import yaml
 
 
+# ─── *at-family functions ────────────────────────────────────────────
+#
+# These take a `dirfd` as their first int argument, conventionally
+# `AT_FDCWD` to mean "interpret the path relative to cwd". Two reasons
+# the auto-bridge needs special handling for them:
+#
+#  - **AT_FDCWD value mismatch.** FreeBSD/Linux use AT_FDCWD = -100;
+#    darwin uses -2. The wasm guest is FreeBSD-shaped so it always
+#    passes -100; if we forward that straight to a darwin host fstatat
+#    it reads -100 as "fd #-100" → EBADF. yos_xlate_dfd (impl/vfs.c)
+#    swaps -100 → host AT_FDCWD.
+#  - **fd_map translation.** Regular wasm fds are slot numbers into
+#    ctx->fd_map and must be looked up to get the host fd. Happens to
+#    match on Linux when host_fd==wasm_fd by luck; doesn't on darwin.
+#
+# Keep this list in sync with the POSIX *at family (man 2 *at).
+_AT_FAMILY = frozenset({
+    'faccessat', 'fchmodat', 'fchownat', 'fstatat', 'futimesat',
+    'linkat', 'mkdirat', 'mkfifoat', 'mknodat', 'openat', 'readlinkat',
+    'renameat', 'renameat2', 'symlinkat', 'unlinkat', 'utimensat',
+    'name_to_handle_at', 'execveat', 'statx', 'getdents64_at',
+})
+
+
 # ─── Type-renderer helpers ───────────────────────────────────────────
 
 def _resolve(t: dict, types: dict) -> dict | None:
@@ -200,13 +224,29 @@ def _guest_type(t: dict, types: dict) -> str | None:
 
 # ─── Bridge emitter ──────────────────────────────────────────────────
 
+# Identifier names that collide with locals the bridge body already
+# defines (e.g. `ctx` is our `struct yos_exec_ctx *ctx` first arg;
+# `errno`/`_r` are touched by the auto-emitted body).
+_RESERVED_ARG_NAMES = frozenset({
+    'ctx', 'errno', '_r', '_e', '_p', '_hdfd',
+    'host_stat_scratch', 'host_statvfs_scratch', 'host_statfs_scratch',
+    'host_timespec_scratch', 'host_timeval_scratch', 'host_rlimit_scratch',
+    'host_tm_scratch',
+})
+
+
 def _bridge_arg_decl(name: str, idx: int, t: dict, types: dict) -> str | None:
     """Emit the wasm-side function-arg declaration. Returns None on
     types we don't yet render."""
     wt = _wasm_type(t, types)
     if wt is None:
         return None
-    return f'{wt} {name or f"a{idx}"}'
+    # Avoid colliding with reserved locals (e.g. `ctx`). When the guest
+    # decl names an arg `ctx` the wrapper sig conflicts with our own
+    # `struct yos_exec_ctx *ctx`. Fall back to the positional name.
+    if not name or name in _RESERVED_ARG_NAMES:
+        name = f'a{idx}'
+    return f'{wt} {name}'
 
 
 def _arg_translation(name: str, idx: int, gt: dict, ht: dict, types: dict) -> tuple[str, str] | None:
@@ -294,10 +334,23 @@ def _emit_bridge(name: str, gf: dict, hf: dict, gtypes: dict, htypes: dict,
     arity_skew = len(g_args) != len(h_args)
     if arity_skew:
         can_emit = False
+    is_at_family = name in _AT_FAMILY
     for i, (ga, ha) in enumerate(zip(g_args, h_args)):
         gt = gtypes.get(ga['type_uid']);  ht = htypes.get(ha['type_uid'])
         decl = _bridge_arg_decl(ga.get('name'), i, gt, gtypes)
         tr = _arg_translation_full(ga.get('name'), i, gt, ht, gtypes, htypes)
+        # *at family: route the first int arg through yos_xlate_dfd so
+        # AT_FDCWD (-100 vs -2) and wasm→host fd_map translation work
+        # across hosts. See _AT_FAMILY comment above. The auto-bridge's
+        # default translation emits `(<host_t>)<var>`; we wrap that
+        # whole expression in the helper.
+        if (is_at_family and i == 0 and tr is not None
+                and gt is not None and ht is not None
+                and _resolve(gt, gtypes).get('kind') == 'builtin'
+                and _resolve(ht, htypes).get('kind') == 'builtin'):
+            inner = tr[1]
+            tr = (tr[0], f'yos_xlate_dfd(ctx, (int32_t)({inner}))',
+                  tr[2] if len(tr) > 2 else '')
         if decl is None or tr is None:
             can_emit = False
             # Don't break — the body falls back to the TODO stub but
@@ -851,6 +904,7 @@ def _emit_struct_convert_body(name: str, gf: dict, hf: dict,
     struct_wname = None
     extra_setups: list[str] = []
     extra_posts: list[str] = []
+    is_at_family = name in _AT_FAMILY
     for i, ga in enumerate(gf.get('args', [])):
         wname = wargs[i].split()[-1]
         if i == struct_arg_idx:
@@ -894,7 +948,13 @@ def _emit_struct_convert_body(name: str, gf: dict, hf: dict,
                 f'({wname}) ? ({ht_str})(ctx->memory + {wname}) : ({ht_str})0'
             )
         elif host_t:
-            call_args.append(f'({host_t}){wname}')
+            if is_at_family and i == 0:
+                # *at family: translate dfd via yos_xlate_dfd — see the
+                # _AT_FAMILY comment near the top of this file.
+                call_args.append(
+                    f'yos_xlate_dfd(ctx, (int32_t)({host_t}){wname})')
+            else:
+                call_args.append(f'({host_t}){wname}')
         else:
             call_args.append(wname)
 
@@ -1009,6 +1069,13 @@ def emit_bridge(analyse: dict, guest_api: dict, host_api: dict,
         list((analyse.get('needs_policy') or {}).keys())
         + list((analyse.get('unsupported') or {}).keys())
         + list(analyse.get('variadic_skipped') or [])
+        # guest_only — function exists in the FreeBSD guest header set
+        # but the host libc doesn't expose it (e.g. sched_getparam on
+        # darwin). Without a bridge the wasm import is unresolved and
+        # any call traps the guest. Emit an ENOSYS stub so the call
+        # returns -1/errno=ENOSYS instead — sane libc behaviour and
+        # callers that probe for feature support get a clean signal.
+        + list(analyse.get('guest_only') or [])
     )
 
     # Anything in hooks.yaml that is NOT already in the analyse-report
@@ -1064,9 +1131,14 @@ def emit_bridge(analyse: dict, guest_api: dict, host_api: dict,
             continue
         # Host fn isn't strictly required for routed (custom_*) bridges,
         # but is required for passthrough bodies that call host libc.
+        # If the host doesn't have it (FreeBSD-only fn on a darwin host,
+        # e.g. sched_getparam, pthread_attr_get_np), reroute to ENOSYS
+        # stub so the wasm import resolves to *something* and the guest
+        # gets a clean errno rather than trapping with "unresolved
+        # import". Without this every host-API gap becomes a hard
+        # abort the moment the guest happens to call that fn.
         if category == 'passthrough' and not hf:
-            counts['skipped'] += 1
-            continue
+            category = 'stub'
 
         wsig = _wasm_sig(name, gf, g_types)
         if wsig is None:
@@ -1230,7 +1302,8 @@ def emit_bridge(analyse: dict, guest_api: dict, host_api: dict,
          + '#include "wasm3.h"     /* m3ApiRawFunction, m3_LinkRawFunction, ... */\n'
          + '#include "yos_struct_convert.h" /* cv_<name>_h2w / w2h */\n'
          + include_block + '\n'
-         + 'extern int yos_remap_errno_h2g(int);\n\n'
+         + 'extern int yos_remap_errno_h2g(int);\n'
+         + 'extern int yos_xlate_dfd(struct yos_exec_ctx *, int32_t);\n\n'
          + '/* ---- bridge bodies (call host libc) ---- */\n\n'
          + '\n\n'.join(defs)
          + '\n\n/* ---- wasm3 raw-function wrappers ---- */\n\n'
