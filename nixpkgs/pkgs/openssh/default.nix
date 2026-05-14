@@ -248,6 +248,24 @@ stdenv.mkDerivation rec {
     ac_cv_func_logout=no
     ac_cv_func_logwtmp=no
     ac_cv_func_getrrsetbyname=no
+    # Force openssh to use its bundled getopt_long (which also defines
+    # getopt + opterr/optind/optopt/optreset/optarg as wasm-side data).
+    # Without this, configure's link-only probe sees the libyos_stubs
+    # weak `getopt` and decides HAVE_GETOPT, then ssh imports env.getopt
+    # but reads `optind` from a wasm-side global yos can't update —
+    # ssh's main reads garbage optind, computes negative ac, prints
+    # usage. Bundled getopt = no env.<name> bridge, no optind sync
+    # problem, ssh works.
+    ac_cv_func_getopt=no
+    ac_cv_func_getopt_long=no
+    ac_cv_have_decl_optreset=no
+    # Force openssh's bundled base64.c so b64_pton / b64_ntop exist
+    # in the binary. yos's libyos_stubs aliases __b64_pton →
+    # b64_pton (FreeBSD's <resolv.h> declares the underscored name).
+    ac_cv_func_b64_pton=no
+    ac_cv_func_b64_ntop=no
+    ac_cv_func___b64_pton=no
+    ac_cv_func___b64_ntop=no
     ac_cv_func_mblen=yes
     ac_cv_func_memmem=yes
     ac_cv_func_mmap=yes
@@ -302,6 +320,13 @@ stdenv.mkDerivation rec {
 
   buildPhase = ''
     runHook preBuild
+    # Stuff yos_libc_init.o (built by sysroot) into openbsd-compat's
+    # archive so libopenbsd-compat.a delivers the FreeBSD ctype
+    # locale data on link. Without it ssh's valid_hostname() rejects
+    # every ASCII char (isspace reads uninit memory).
+    cp ${sysroot}/usr/lib/yos_libc_init.o openbsd-compat/
+    llvm-ar rs openbsd-compat/libopenbsd-compat.a openbsd-compat/yos_libc_init.o
+
     make -j$NIX_BUILD_CORES ssh sshd scp sftp ssh-keygen ssh-agent ssh-add
     runHook postBuild
   '';

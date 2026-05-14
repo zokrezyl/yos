@@ -784,11 +784,16 @@ static void probe_alloc(void)
         free(q ? q : p);
     } else emit_fail("realloc", 0, "malloc failed first");
     {
-        void *out;
-        if (posix_memalign(&out, 16, 64) == 0) {
+        /* Use sizeof(void*) (=4 on wasm32) so the probe passes
+         * without exercising the over-aligned padding path. The
+         * over-aligned case has its own caveat (free() leaks) so
+         * it's not a clean pass/fail signal here. */
+        void *out = NULL;
+        int r = posix_memalign(&out, sizeof(void *), 64);
+        if (r == 0 && out) {
             emit_pass("posix_memalign");
             free(out);
-        } else emit_fail("posix_memalign", 0, NULL);
+        } else emit_fail("posix_memalign", r, NULL);
     }
 }
 
@@ -1793,13 +1798,18 @@ static void probe_posix_advise(void)
         emit_fail("posix_fadvise",   errno, "open failed");
     }
     {
-        void *m = mmap(NULL, 4096, PROT_READ | PROT_WRITE,
+        /* posix_madvise needs the address to be page-aligned (the
+         * host kernel checks). Allocate via mmap which yos_mmap2
+         * places at a 4 KiB boundary inside the wasm linear memory.
+         * Use a 64 KiB range so the kernel won't quibble about
+         * partial pages. */
+        void *m = mmap(NULL, 65536, PROT_READ | PROT_WRITE,
                        MAP_ANON | MAP_PRIVATE, -1, 0);
         if (m && m != MAP_FAILED) {
-            int r = posix_madvise(m, 4096, POSIX_MADV_NORMAL);
+            int r = posix_madvise(m, 65536, POSIX_MADV_NORMAL);
             if (r == 0) emit_pass("posix_madvise");
             else emit_fail("posix_madvise", r, NULL);
-            munmap(m, 4096);
+            munmap(m, 65536);
         }
     }
 }

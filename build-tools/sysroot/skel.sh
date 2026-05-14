@@ -29,11 +29,29 @@ empty_c="$sysroot_out/usr/lib/.empty.c"
 : > "$empty_c"
 clang -target wasm32-unknown-unknown -nostdlib -c "$empty_c" -o "$empty_o" \
     || { echo "skel.sh: clang failed compiling empty stub" >&2; exit 1; }
-for lib in dl m util pthread rt c c++ cxx anl crypt resolv; do
+
+# yos_libc_init.o — FreeBSD's _DefaultRuneLocale ctype table, compiled
+# from build-tools/wasm-pkg/configs/nvim/yos_libc_init.c. Every wasm
+# binary built against this sysroot pulls it in via libc.a so isalpha,
+# isspace, iscntrl, isdigit, … return the right answers for ASCII.
+# Without it ssh's valid_hostname("yetty") rejects every char because
+# the runetype table reads as 0xff (uninit memory) → isspace('y')→true.
+yos_libc_init_o="$sysroot_out/usr/lib/.yos_libc_init.o"
+yos_libc_init_c="$(dirname "$0")/../wasm-pkg/configs/nvim/yos_libc_init.c"
+clang -target wasm32-unknown-unknown -nostdlib -nostdinc \
+      --sysroot="$sysroot_out" \
+      -isystem "$sysroot_out/usr/include" \
+      -O2 -c "$yos_libc_init_c" -o "$yos_libc_init_o" \
+    || { echo "skel.sh: clang failed compiling yos_libc_init.c" >&2; exit 1; }
+
+for lib in dl m util pthread rt c++ cxx anl crypt resolv; do
     out="$sysroot_out/usr/lib/lib${lib}.a"
     rm -f "$out"
     llvm-ar rcs "$out" "$empty_o"
 done
+# libc.a additionally carries _DefaultRuneLocale / _CurrentRuneLocale.
+rm -f "$sysroot_out/usr/lib/libc.a"
+llvm-ar rcs "$sysroot_out/usr/lib/libc.a" "$empty_o" "$yos_libc_init_o"
 rm -f "$empty_c"
 
 

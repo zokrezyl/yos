@@ -60,6 +60,20 @@ custom_proc:
   # impl/posix.c — fd-taking, also need wfd→hfd translation.
   - posix_fadvise
   - posix_fallocate
+  # impl/posix.c — FreeBSD-only, mapped to host pathconf so ls's
+  # ACL probe returns sensible values instead of ENOSYS (which
+  # makes ls warn "Invalid argument" for every entry).
+  - lpathconf
+  # impl/posix.c — output through wasm pointer to double array.
+  - getloadavg
+  # impl/posix.c — page-align addr/len before host call.
+  - posix_madvise
+  # impl/posix.c — DNS / sockaddr conversion. Builds a wasm-side
+  # linked list of addrinfo blocks via yos_malloc (same pattern as
+  # getpwuid), translates FreeBSD↔host sockaddr layout (sin_len byte).
+  - getaddrinfo
+  - freeaddrinfo
+  - getnameinfo
   # impl/env.c — env table backed by wasm linear memory.
   - getenv
   - setenv
@@ -615,9 +629,11 @@ stub:
   - gethostbyname
   - gethostbyname_r
   - gethostbyaddr
-  - getaddrinfo
-  - freeaddrinfo
-  - getnameinfo
+  # getaddrinfo / freeaddrinfo / getnameinfo moved to custom_proc
+  # (impl/posix.c) — same wasm-side linked-list-of-allocated-blocks
+  # pattern as getpwuid: builds the result inside the wasm linear
+  # memory so the guest can dereference the addrinfo's `ai_next` /
+  # `ai_addr` / `ai_canonname` pointers as wasm offsets.
   - getifaddrs
   - freeifaddrs
   - getprotobyname

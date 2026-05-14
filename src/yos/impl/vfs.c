@@ -918,6 +918,25 @@ int32_t yos_chown(struct yos_exec_ctx *ctx, uint32_t filename, int32_t user, int
 
 int32_t yos_getcwd(struct yos_exec_ctx *ctx, uint32_t buf, uint32_t size)
 {
+    /* Linux extension: getcwd(NULL, 0) → libc allocates a buffer big
+     * enough for the path. We honour that by allocating wasm-side
+     * memory via yos_malloc and returning the new offset. pwd
+     * (FreeBSD) uses this convention; without it, my bridge
+     * returned -EFAULT and pwd dereferenced 0xfffffff2 as a string
+     * → SIGSEGV. */
+    if (buf == 0) {
+        char hostbuf[4096];
+        const char *src = NULL;
+        if (ctx->cwd[0] == '/') src = ctx->cwd;
+        else if (getcwd(hostbuf, sizeof(hostbuf))) src = hostbuf;
+        else return -errno;
+        size_t n = strlen(src) + 1;
+        extern uint32_t yos_malloc(struct yos_exec_ctx *ctx, uint32_t size);
+        uint32_t off = yos_malloc(ctx, (uint32_t)n);
+        if (!off) return -ENOMEM;
+        memcpy(ctx->memory + off, src, n);
+        return (int32_t)off;
+    }
     char *b = wptr(ctx, buf);
     if (!b) return -EFAULT;
     /* Prefer the per-runtime tracked cwd over host getcwd() so that two
@@ -951,8 +970,13 @@ int32_t yos_openat(struct yos_exec_ctx *ctx, int32_t dfd, uint32_t filename, int
     /* Translate dfd through the per-runtime fd table. AT_FDCWD passes
      * through. Without this, dfd was the wasm-side fd number and the
      * host kernel interpreted it as some unrelated host fd. */
+    /* dfd may legitimately be AT_FDCWD (-100) — only treat it as
+     * an error if it's negative AND not AT_FDCWD. The previous
+     * check returned -100 immediately for AT_FDCWD so the host
+     * openat call never fired. */
     int host_dfd = (dfd == AT_FDCWD) ? AT_FDCWD : yos_fd_get(ctx, dfd);
-    if (host_dfd < 0) return host_dfd;
+    if (host_dfd < 0 && host_dfd != AT_FDCWD)
+        return host_dfd;
 
     int hflags = oflags_fb_to_lx(flags);
     /* See yos_open: openat is also variadic; mode comes via a wasm

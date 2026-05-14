@@ -94,6 +94,17 @@ in stdenv.mkDerivation {
       llvm-ar rcs "$out/usr/lib/lib''${libname}.a" "$EMPTY_O"
     done
 
+    # yos_libc_init.o — standalone .o (NOT in libc.a so it doesn't
+    # conflict with tools that bundle their own yos_locale_stub.c
+    # like ls/cut/tr). Tools that need the C-locale ctype table
+    # (ssh's valid_hostname checks isspace etc.) link this object
+    # explicitly. Path: $sysroot/usr/lib/yos_libc_init.o.
+    clang -target wasm32-unknown-unknown -nostdlib -nostdinc \
+        --sysroot="$out" \
+        -isystem "$out/usr/include" \
+        -O2 -c "$src/build-tools/wasm-pkg/configs/nvim/yos_libc_init.c" \
+        -o "$out/usr/lib/yos_libc_init.o"
+
     # crt1.o — yos-flavoured. The C source lives inline in
     # build-tools/sysroot/skel.sh; extract the heredoc and compile it
     # so the two paths stay byte-identical.
@@ -366,6 +377,12 @@ in stdenv.mkDerivation {
     FILE *__stdinp  = (FILE *)1;
     FILE *__stdoutp = (FILE *)2;
     FILE *__stderrp = (FILE *)3;
+
+    /* __b64_pton / __b64_ntop intentionally NOT stubbed here:
+     * openssh's openbsd-compat/base64.c provides BOTH `b64_pton` and
+     * `__b64_pton` (when configure is told ac_cv_func_b64_pton=no)
+     * and a stub here would collide. Other tools that don't bundle
+     * openssh's compat won't reference __b64_pton at all. */
     STUBS_EOF
     YOS_STUBS_O="$TMPDIR/yos_capsicum_stubs.o"
     # clang-unwrapped doesn't ship its resource dir on the include

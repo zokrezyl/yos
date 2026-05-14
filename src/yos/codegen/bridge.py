@@ -439,12 +439,15 @@ def _emit_bridge(name: str, gf: dict, hf: dict, gtypes: dict, htypes: dict,
     body_lines.append(f'{wret} yos_{name}({", ".join(arg_decls)}) {{')
     body_lines.append('    (void)ctx;')
     body_lines.extend(setups)
-    # Clear host errno before the call so the post-call `if (errno)`
-    # check below picks up errors set by THIS call, not stale errno
-    # from a prior call. Without this, e.g. nice(0) succeeds without
-    # touching errno but the bridge sees a leftover ENOTTY from a
-    # previous syscall and corrupts the wasm-side errno slot.
-    body_lines.append('    errno = 0;')
+    # NOTE: don't `errno = 0` here. Tools rely on POSIX semantics
+    # where successful calls don't clobber a previously-set errno;
+    # resetting it confuses callers like FreeBSD ls's fts.c which
+    # check errno across multiple calls. Trade-off: tools that
+    # intentionally check errno after a "may set errno on success"
+    # call (rare — nice/getpriority style) need to set errno=0
+    # themselves, per POSIX. The previous version reset errno here
+    # and broke `ls -alrt` (fts saw stale errno=22 from an earlier
+    # call sequence and bailed with "Invalid argument").
     body_lines.append(f'    {hret} _r = {call};')
     body_lines.extend(post_writebacks)
     if ret_kind == 'first_arg_alias':

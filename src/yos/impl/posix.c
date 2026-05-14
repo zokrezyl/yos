@@ -6,8 +6,11 @@
 
 #define _GNU_SOURCE
 #include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <sys/mman.h>      /* posix_madvise */
 
 #if defined(__APPLE__)
 /* darwin has no fdatasync; fsync is the closest equivalent (it does
@@ -373,6 +376,203 @@ int32_t yos_posix_fallocate(struct yos_exec_ctx *ctx, int32_t fd,
     int hfd = yos_fd_get(ctx, fd);
     if (hfd < 0) return -hfd;
     return posix_fallocate(hfd, (off_t)offset, (off_t)len);
+}
+
+/* lpathconf — FreeBSD-specific; Linux only has pathconf (which
+ * follows symlinks; lpathconf doesn't). Map to host lstat-then-
+ * pathconf for the typical _PC_ACL_* / _PC_LINK_MAX queries. ls
+ * calls lpathconf(name, _PC_ACL_NFS4) for every entry; without a
+ * bridge it returned -1 with ENOSYS in wasm errno → ls's check
+ * `errno != EINVAL` was true → ls warned `<name>: Invalid argument`
+ * for every entry, then exited. Returning EINVAL (which is the
+ * error Linux pathconf produces for ACL queries on filesystems
+ * without ACL support) makes ls skip the warn cleanly. */
+int32_t yos_lpathconf(struct yos_exec_ctx *ctx, uint32_t path_off, int32_t name)
+{
+    if (!path_off) { errno = EFAULT; return -1; }
+    const char *path = (const char *)(ctx->memory + path_off);
+    /* Try host pathconf — works for many _PC_* values (LINK_MAX,
+     * NAME_MAX, …). Linux has no lpathconf; pathconf follows
+     * symlinks but for ls's use case that's fine. */
+    long r = pathconf(path, name);
+    if (r < 0) {
+        /* Many FreeBSD-only _PC_* (NFS4 ACL, ACL_PATH_MAX) return -1
+         * on Linux with EINVAL, which is exactly what ls expects to
+         * mean "no ACLs". Pass that through. */
+        return -1;
+    }
+    return (int32_t)r;
+}
+
+#include <netdb.h>
+
+/* getaddrinfo — auto-bridge stubs this with -ENOSYS. ssh, scp, sftp,
+ * curl, anything that resolves a hostname needs it. We translate the
+ * wasm-side hints struct, call host getaddrinfo, then build a wasm-
+ * side `struct addrinfo` linked-list inside the wasm linear memory
+ * via yos_malloc. ssh's freeaddrinfo is bridged separately to walk
+ * and free that wasm-side list.
+ *
+ * FreeBSD wasm32 struct addrinfo (sizeof = 32):
+ *   off  0: int  ai_flags
+ *   off  4: int  ai_family
+ *   off  8: int  ai_socktype
+ *   off 12: int  ai_protocol
+ *   off 16: socklen_t ai_addrlen   (4)
+ *   off 20: char *ai_canonname     (4)
+ *   off 24: struct sockaddr *ai_addr (4)
+ *   off 28: struct addrinfo *ai_next (4)
+ *
+ * sockaddr_in is 16 bytes (FreeBSD: sin_len 1, sin_family 1, sin_port 2,
+ * sin_addr 4, sin_zero[8]). The bridge writes sockaddr_in / in6 to the
+ * wasm side in FreeBSD layout (sin_len byte then family byte).
+ */
+
+extern uint32_t yos_malloc(struct yos_exec_ctx *ctx, uint32_t size);
+
+#define WASM_ADDRINFO_SZ 32u
+
+static void host_sockaddr_to_freebsd(uint8_t *out, const struct sockaddr *src,
+                                     socklen_t len)
+{
+    memcpy(out, src, len);
+    /* Convert host sa_family (uint16 @0) to FreeBSD sa_len@0,
+     * sa_family@1. */
+    if (len >= 2) {
+        uint16_t fam = ((uint16_t)((unsigned char)out[0])) |
+                       (((uint16_t)((unsigned char)out[1])) << 8);
+        out[0] = (uint8_t)len;
+        out[1] = (uint8_t)(fam & 0xff);
+    }
+}
+
+int32_t yos_getaddrinfo(struct yos_exec_ctx *ctx, uint32_t node_off,
+                        uint32_t service_off, uint32_t hints_off,
+                        uint32_t res_off)
+{
+    if (!res_off || res_off + 4 > ctx->memory_size) return EAI_SYSTEM;
+    const char *node    = node_off    ? (const char *)(ctx->memory + node_off)    : NULL;
+    const char *service = service_off ? (const char *)(ctx->memory + service_off) : NULL;
+
+    struct addrinfo host_hints = {0};
+    struct addrinfo *host_hints_p = NULL;
+    if (hints_off && hints_off + WASM_ADDRINFO_SZ <= ctx->memory_size) {
+        const uint8_t *w = ctx->memory + hints_off;
+        host_hints.ai_flags    = *(int32_t *)(w +  0);
+        host_hints.ai_family   = *(int32_t *)(w +  4);
+        host_hints.ai_socktype = *(int32_t *)(w +  8);
+        host_hints.ai_protocol = *(int32_t *)(w + 12);
+        host_hints_p = &host_hints;
+    }
+
+    struct addrinfo *host_res = NULL;
+    int rc = getaddrinfo(node, service, host_hints_p, &host_res);
+    if (rc != 0) {
+        *(uint32_t *)(ctx->memory + res_off) = 0;
+        return rc;
+    }
+
+    /* Build wasm-side linked list. Each entry: struct + sockaddr +
+     * canonname (if present) — all in one yos_malloc per node so the
+     * matching freeaddrinfo can release the lot. */
+    uint32_t first = 0;
+    uint32_t prev = 0;
+    for (struct addrinfo *p = host_res; p; p = p->ai_next) {
+        uint32_t addrlen = p->ai_addrlen;
+        size_t namelen = p->ai_canonname ? strlen(p->ai_canonname) + 1 : 0;
+        uint32_t total = WASM_ADDRINFO_SZ + addrlen + (uint32_t)namelen;
+        uint32_t blk = yos_malloc(ctx, total);
+        if (!blk) { freeaddrinfo(host_res); return EAI_MEMORY; }
+        uint8_t *w = ctx->memory + blk;
+        memset(w, 0, total);
+        *(int32_t *)(w +  0) = p->ai_flags;
+        *(int32_t *)(w +  4) = p->ai_family;
+        *(int32_t *)(w +  8) = p->ai_socktype;
+        *(int32_t *)(w + 12) = p->ai_protocol;
+        *(uint32_t *)(w + 16) = addrlen;
+        uint32_t addr_off = blk + WASM_ADDRINFO_SZ;
+        host_sockaddr_to_freebsd(ctx->memory + addr_off, p->ai_addr, addrlen);
+        *(uint32_t *)(w + 24) = addr_off;
+        if (namelen) {
+            uint32_t name_off = addr_off + addrlen;
+            memcpy(ctx->memory + name_off, p->ai_canonname, namelen);
+            *(uint32_t *)(w + 20) = name_off;
+        }
+        /* ai_next */
+        if (prev) *(uint32_t *)(ctx->memory + prev + 28) = blk;
+        else      first = blk;
+        prev = blk;
+    }
+    freeaddrinfo(host_res);
+    *(uint32_t *)(ctx->memory + res_off) = first;
+    return 0;
+}
+
+/* freeaddrinfo — walk the wasm-side list, yos_free each block. */
+extern void yos_free(struct yos_exec_ctx *ctx, uint32_t off);
+
+void yos_freeaddrinfo(struct yos_exec_ctx *ctx, uint32_t res_off)
+{
+    while (res_off && res_off + WASM_ADDRINFO_SZ <= ctx->memory_size) {
+        uint32_t next = *(uint32_t *)(ctx->memory + res_off + 28);
+        yos_free(ctx, res_off);
+        res_off = next;
+    }
+}
+
+/* getnameinfo — host call with FreeBSD→host sockaddr conversion. */
+int32_t yos_getnameinfo(struct yos_exec_ctx *ctx, uint32_t sa_off,
+                        uint32_t salen, uint32_t host_off, uint32_t hostlen,
+                        uint32_t serv_off, uint32_t servlen, int32_t flags)
+{
+    if (!sa_off || sa_off + salen > ctx->memory_size) return EAI_SYSTEM;
+    uint8_t hostbuf_sa[256];
+    if (salen > sizeof(hostbuf_sa)) return EAI_SYSTEM;
+    memcpy(hostbuf_sa, ctx->memory + sa_off, salen);
+    /* FreeBSD layout → Linux: sa_family at offset 0/1 (low byte). */
+    if (salen >= 2) { uint8_t fam = hostbuf_sa[1]; hostbuf_sa[0] = fam; hostbuf_sa[1] = 0; }
+    char *hbuf = host_off ? (char *)(ctx->memory + host_off) : NULL;
+    char *sbuf = serv_off ? (char *)(ctx->memory + serv_off) : NULL;
+    return getnameinfo((const struct sockaddr *)hostbuf_sa, (socklen_t)salen,
+                       hbuf, (socklen_t)hostlen, sbuf, (socklen_t)servlen, flags);
+}
+
+/* posix_madvise — auto-bridge passes wasm offset converted to host
+ * pointer, but the conversion happens on EVERY call without checking
+ * the offset's validity, and certain Linux versions reject our addr
+ * range with EINVAL because the bridge passes addr without rounding
+ * to a page boundary. Hand-bridge to round addr/len to the page
+ * boundary on the host side. */
+int32_t yos_posix_madvise(struct yos_exec_ctx *ctx, uint32_t addr_off,
+                          uint32_t len, int32_t advice)
+{
+    if (!addr_off || addr_off + len > ctx->memory_size) return EINVAL;
+    long ps = sysconf(_SC_PAGESIZE);
+    uintptr_t host_addr = (uintptr_t)(ctx->memory + addr_off);
+    uintptr_t aligned = host_addr & ~((uintptr_t)ps - 1);
+    size_t pad = host_addr - aligned;
+    /* posix_madvise returns the errno-style code directly. */
+    return posix_madvise((void *)aligned, len + pad, advice);
+}
+
+/* getloadavg — auto-bridge stubs this with -ENOSYS because the
+ * output type is `double *`. Hand-bridge: take a wasm offset to an
+ * array of nelem doubles, write the values directly into wasm
+ * memory. */
+int32_t yos_getloadavg(struct yos_exec_ctx *ctx, uint32_t loadavg_off,
+                       int32_t nelem)
+{
+    if (nelem <= 0) return 0;
+    if (nelem > 3) nelem = 3;
+    if (!loadavg_off ||
+        loadavg_off + (uint32_t)nelem * 8 > ctx->memory_size)
+        return -EFAULT;
+    double host[3];
+    int n = getloadavg(host, nelem);
+    if (n < 0) return -1;
+    for (int i = 0; i < n; i++)
+        memcpy(ctx->memory + loadavg_off + (uint32_t)i * 8, &host[i], 8);
+    return n;
 }
 
 #include <stdlib.h>  /* mkdtemp/mkstemp */
