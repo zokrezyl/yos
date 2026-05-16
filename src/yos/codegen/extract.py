@@ -350,9 +350,21 @@ def extract(inputs: ExtractInputs) -> dict:
         index = clang.cindex.Index.create()
         opts = clang.cindex.TranslationUnit.PARSE_DETAILED_PROCESSING_RECORD
         tu = index.parse(tmp, args=inputs.cflags, options=opts)
-        for d in tu.diagnostics:
-            if d.severity >= clang.cindex.Diagnostic.Error:
-                print(f'  clang: {d}', file=sys.stderr)
+        errors = [d for d in tu.diagnostics
+                  if d.severity >= clang.cindex.Diagnostic.Error]
+        for d in errors:
+            print(f'  clang: {d}', file=sys.stderr)
+        if errors:
+            print(f'[api-extract] {len(errors)} clang error(s) — refusing to '
+                  f'emit a partial yaml. After hitting -ferror-limit clang '
+                  f'stops parsing, so any header listed AFTER the failure '
+                  f'point silently drops every declaration it would have '
+                  f'contributed. That used to produce a green build with '
+                  f'half the bridges missing. Fix the failing header (most '
+                  f'commonly: a kernel-internal arch header pulled in by '
+                  f'--enum walking machine/ or x86/ — see _ARCH_ASM_SKIP).',
+                  file=sys.stderr)
+            sys.exit(1)
 
         types     = TypeRegistry('t')
         functions: dict[str, dict] = {}

@@ -1,5 +1,35 @@
 # yos — what this project is and what NOT to do
 
+## ABSOLUTELY FORBIDDEN — ASSISTANT ATTRIBUTION
+
+**Never write the word "Claude", "Anthropic", "Opus", "Sonnet",
+"Haiku", "claude.ai", "AI assistant", "AI", or any assistant /
+model name into this repository in ANY form, for ANY reason.
+STRICTLY FORBIDDEN.**
+
+This applies to:
+- Source code (comments, string literals, log/format strings,
+  symbol names).
+- Headers, build files, config / data files (YAML, JSON, TOML,
+  INI, shell, CMake, meson, Nix).
+- Documentation (`*.md`, `*.rst`, READMEs, ADRs).
+- **Commit messages, PR titles, PR descriptions, branch names.**
+- **Co-Authored-By lines, sign-offs, "Generated with …" footers.**
+- Templates, scaffolding, generated code.
+
+There is **no** "Co-Authored-By" trailer of any kind on commits in
+this repo. Author/committer is the user. End of story.
+
+Citing internal rules by name is also forbidden — write the
+constraint, not its source. ❌ `// per CLAUDE.md` / ❌ `// as the
+assistant guidelines say` — just state the rule.
+
+**Why this matters:** every leak compromises the credibility of
+the project. The user audits commits and code for these strings.
+This has happened before; it does not happen again.
+
+If you are unsure whether something counts: it counts. Strip it.
+
 ## Vision (one paragraph)
 
 yos is a host-side **libc emulator** for wasm32 guests. The wasm

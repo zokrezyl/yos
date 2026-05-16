@@ -49,27 +49,50 @@ api_top_headers = [
   'termios.h', 'utime.h',
 ]
 
-# Top-level header subdirs to walk recursively. Same on both sides.
-# Some (sys/event.h, vm/) only exist on FreeBSD; that's fine, the host
-# extract just won't see them.
-api_top_dirs = [
-  'sys/', 'arpa/', 'net/', 'netinet/',
+# Public subdir umbrellas. Listed by *filename*, not by *directory* —
+# walking 'sys/' (or 'machine/') drags in kernel-internal headers
+# (sys/_lock.h, sys/proc.h, machine/atomic.h, machine/cpufunc.h, …)
+# that no userland code would ever #include directly. Those are i386-
+# asm-laden and break extraction under -target wasm32 (clang refuses
+# '=q', 'iq', 'inb'/'outb' and hits -ferror-limit, after which the
+# whole TU is dropped and half the bridges silently vanish).
+#
+# Userland gets these transitively via the umbrellas: e.g. <sys/stat.h>
+# pulls in <machine/_types.h>, <signal.h> pulls in <machine/signal.h>,
+# etc. Each umbrella's own header chain knows which feature macros to
+# set and which guards to fire; we don't try to second-guess it.
+#
+# If a missing-bridge surfaces later, add the responsible umbrella here
+# (not the implementation header it ends up reaching).
+api_top_subdir_headers = [
+  # sys/
+  'sys/types.h',    'sys/stat.h',     'sys/socket.h',  'sys/mman.h',
+  'sys/wait.h',     'sys/select.h',   'sys/time.h',    'sys/times.h',
+  'sys/resource.h', 'sys/uio.h',      'sys/un.h',      'sys/ioctl.h',
+  'sys/file.h',     'sys/utsname.h',  'sys/param.h',   'sys/statvfs.h',
+  'sys/mount.h',    'sys/sysctl.h',   'sys/random.h',  'sys/poll.h',
+  'sys/ucontext.h', 'sys/ipc.h',      'sys/sem.h',     'sys/shm.h',
+  'sys/msg.h',      'sys/event.h',    'sys/timeb.h',
+  # arpa/
+  'arpa/inet.h',    'arpa/telnet.h',  'arpa/nameser.h',
+  # net/
+  'net/if.h',       'net/if_arp.h',   'net/if_dl.h',   'net/route.h',
+  'net/ethernet.h',
+  # netinet/
+  'netinet/in.h',   'netinet/ip.h',   'netinet/tcp.h', 'netinet/udp.h',
+  'netinet/ip_icmp.h',
 ]
 
-# FreeBSD-only header subdirs (machine/, x86/, vm/, netinet6/) — extract
-# from the guest only.
-api_guest_only_dirs = [
-  'machine/', 'x86/', 'vm/', 'netinet6/',
-]
-
-# Build the --restrict-to argument vector once per side. Meson doesn't
-# have list-flatten, so we splat manually below.
+# Build the --restrict-to argument vector once per side. Same set on
+# host and guest — feature differences (FreeBSD-only umbrellas missing
+# on the host) surface as guest_only/host_only entries in
+# analyse-report.yaml, which is the intended signal channel.
 guest_restrict_args = []
-foreach h : api_top_headers + api_top_dirs + api_guest_only_dirs
+foreach h : api_top_headers + api_top_subdir_headers
   guest_restrict_args += ['--restrict-to', h]
 endforeach
 host_restrict_args = []
-foreach h : api_top_headers + api_top_dirs
+foreach h : api_top_headers + api_top_subdir_headers
   host_restrict_args += ['--restrict-to', h]
 endforeach
 
@@ -84,6 +107,12 @@ guest_api_yaml = custom_target(
     '--include-dir',  '@INPUT@/usr/include',
     '--root-marker',  'usr/include/',
     '--target',       'wasm32-unknown-unknown',
+    # The FreeBSD-i386 header chain gates arch-specific decls (mcontext_t
+    # in <x86/ucontext.h>, register sizes in <machine/_types.h>, etc.)
+    # on `__i386__`. -target wasm32 doesn't set it, so without this define
+    # mcontext_t never gets typedef'd and <sys/_ucontext.h> fails. Match
+    # the WASM_BASE_CFLAGS the Makefile uses for actual guest compilation.
+    '--define',       '__i386__=1',
     '--enum',
     guest_restrict_args,
     '--out',          '@OUTPUT@',
