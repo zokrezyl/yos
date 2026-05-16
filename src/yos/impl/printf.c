@@ -257,6 +257,7 @@ extern int yos_fd_get(struct yos_exec_ctx *ctx, int wasm_fd);
 int32_t yos_vfprintf(struct yos_exec_ctx *ctx,
                      uint32_t fp, uint32_t fmt_off, uint32_t va_off)
 {
+    if (fp == 3) ctx->stderr_written_since_exec = 1;
     char buf[8192];
     int n = yos_vsnprintf_core(ctx, buf, sizeof(buf), fmt_off, va_off);
     if (n < 0) return -1;

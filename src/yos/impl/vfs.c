@@ -232,6 +232,7 @@ int32_t yos_write(struct yos_exec_ctx *ctx, int32_t fd, uint32_t buf, uint32_t c
     if (!p) return yos_errno_neg(ctx, EFAULT);
     int32_t hfd = yos_fd_get(ctx, fd);
     if (hfd < 0) return hfd;
+    if (fd == 2 && count > 0) ctx->stderr_written_since_exec = 1;
     /* DEBUG: dump nvim's vim._init_packages module bytes (linear memory
      * 0x6aa70) on every write so we see corruption timeline. */
     if (getenv("YOS_DUMP_INIT")) {

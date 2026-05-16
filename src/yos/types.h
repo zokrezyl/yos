@@ -117,6 +117,19 @@ struct yos_exec_ctx {
     int32_t fork_return;
     int is_child;
 
+    /* "Did this ctx write to stderr (wfd=2) since the last failed exec?"
+     * Used by yos_exit to detect a forked child that died after exec
+     * failure without printing — under asyncify-fork, zsh's zwarning code
+     * path doesn't reach env.fputc in the child (the *parent* path prints
+     * fine). Yos synthesises the diagnostic itself in that case so the
+     * user sees something instead of dead silence. Bumped by yos_write/
+     * yos_fputc/yos_fwrite/yos_fputs/yos_vfprintf when fd/handle resolves
+     * to wfd 2; reset by yos_execve on each attempt. last_failed_exec_*
+     * remember the most recent ENOENT-class execve so we can format it. */
+    int stderr_written_since_exec;
+    char last_failed_exec_path[256];
+    int last_failed_exec_errno;
+
     /* setjmp/longjmp state (asyncify-based, see m3_setjmp/m3_longjmp).
      *
      * Each LIVE setjmp has its own slot in sj_slots[] keyed by the user's

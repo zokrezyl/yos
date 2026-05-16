@@ -100,7 +100,49 @@ struct yos_proc *yos_proc_find(struct yos_runtime *rt, int32_t pid)
 
 int32_t yos_exit(struct yos_exec_ctx *ctx, int32_t code)
 {
-    ydebug("exit(%d)\n", code);
+    ydebug("exit(%d) is_child=%d\n", code, ctx->is_child);
+    /* Asyncify-fork-child silence workaround.
+     *
+     * When a forked child wasm-zsh tries to exec a missing command it
+     * walks PATH, every execve returns -1/ENOENT, and zsh's source code
+     * is supposed to reach `zerr("command not found: %s", arg0)` →
+     * zwarning → env.fputc. Under asyncify-based fork the child's
+     * zwarning path is never reached: the trace shows the child does
+     * the whole PATH search then jumps to _exit(1) (via the fatal:
+     * label, errflag-driven) without any env import write. The single-
+     * command case (no fork, exec-in-place) does print correctly.
+     *
+     * Until the asyncify-fork code-path bug is rooted out, synthesise
+     * the diagnostic at the bridge boundary: when a child exits with
+     * non-zero code, the most recent execve attempt failed, and the
+     * child wrote NOTHING to stderr since that attempt, write the
+     * standard "zsh: command not found: <name>" / equivalent line to
+     * host fd 2 ourselves. Without this the user sees dead silence on
+     * every `bad-cmd; <anything>` invocation — interactive zsh, scripts
+     * with multiple commands, anything that forces a fork. */
+    if (ctx->is_child && code != 0 &&
+        ctx->last_failed_exec_path[0] != '\0' &&
+        !ctx->stderr_written_since_exec) {
+        const char *path = ctx->last_failed_exec_path;
+        const char *base = strrchr(path, '/');
+        base = base ? base + 1 : path;
+        const char *kind = (ctx->last_failed_exec_errno == ENOENT)
+            ? "command not found" : strerror(ctx->last_failed_exec_errno);
+        /* zsh's user-visible name is the BASENAME of the failed exec
+         * (PATH search prepends dirs to the original argv[0], so the
+         * leaf is what the user typed). */
+        char msg[512];
+        int n = snprintf(msg, sizeof(msg),
+                         "zsh:1: %s: %s\n", kind, base);
+        if (n > 0) {
+            /* Write to the child's wfd 2 mapping if available, else
+             * host stderr directly. */
+            int hfd = ctx->fd_map[2];
+            if (hfd < 0) hfd = 2;
+            ssize_t _ = write(hfd, msg, (size_t)n);
+            (void)_;
+        }
+    }
     if (ctx->proc) {
         /* Signal vfork parent if applicable */
         if (ctx->proc->vfork_parent_pid > 0) {
@@ -1278,6 +1320,14 @@ int32_t yos_execve(struct yos_exec_ctx *ctx, uint32_t filename, uint32_t argv_pt
     if (access(fn, R_OK) != 0) {
         int saved = errno;
         ydebug("execve: %s: %s\n", fn, strerror(saved));
+        /* Remember this attempt so yos_exit can synthesise a
+         * "command not found"-style diagnostic if the guest's own
+         * print path is wedged (asyncify-fork-child silence regression). */
+        strncpy(ctx->last_failed_exec_path, fn,
+                sizeof(ctx->last_failed_exec_path) - 1);
+        ctx->last_failed_exec_path[sizeof(ctx->last_failed_exec_path) - 1] = 0;
+        ctx->last_failed_exec_errno = saved;
+        ctx->stderr_written_since_exec = 0;
         return yos_errno_neg(ctx, saved);
     }
 

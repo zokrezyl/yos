@@ -177,6 +177,7 @@ static inline int yos__drop_0xff_garbage(int hfd, const void *p, size_t n)
 uint32_t yos_fwrite(struct yos_exec_ctx *ctx, uint32_t buf, uint32_t size,
                     uint32_t nmemb, uint32_t fp)
 {
+    if (fp == 3 && size && nmemb) ctx->stderr_written_since_exec = 1;
     if (!size) return 0;
     if (buf + (uint64_t)size * nmemb > ctx->memory_size) return 0;
     /* Route stream handles through the per-ctx host fd so dup2'd
@@ -256,6 +257,7 @@ int32_t yos_getc_unlocked (struct yos_exec_ctx *ctx, uint32_t fp) {
     FILE *f = handle_to_file(fp); return f?getc_unlocked(f):-1;
 }
 int32_t yos_fputc(struct yos_exec_ctx *ctx, int32_t c, uint32_t fp) {
+    if (fp == 3) ctx->stderr_written_since_exec = 1;
     int r = stdio_fputc_via_fdmap(ctx, c, fp);
     if (r != -2) return r;
     FILE *f = handle_to_file(fp); return f?fputc(c,f):-1;
@@ -282,6 +284,7 @@ uint32_t yos_fgets(struct yos_exec_ctx *ctx, uint32_t buf, int32_t n, uint32_t f
 
 int32_t yos_fputs(struct yos_exec_ctx *ctx, uint32_t s, uint32_t fp)
 {
+    if (fp == 3) ctx->stderr_written_since_exec = 1;
     if (!s || s >= ctx->memory_size) return -1;
     int hfd = std_handle_hfd(ctx, fp);
     if (hfd >= 0) {
