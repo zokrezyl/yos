@@ -456,6 +456,11 @@ custom_alloc:
 custom_sig:
   - sigaction
   - sigprocmask
+  # impl/sig.c — same layout as sigprocmask (16B FreeBSD ↔ 128B host
+  # sigset_t, FreeBSD SIG_BLOCK=1/UNBLOCK=2/SETMASK=3 → host 0/1/2),
+  # but operates on the calling pthread's mask instead of the process
+  # mask. Used by zsh's job-control + nvim's libuv.
+  - pthread_sigmask
   - sigpending
   - sigsuspend
   - sigaltstack
@@ -555,8 +560,7 @@ stub:
   # FreeBSD sigset_t is 16 bytes (__uint32_t[4]) but Linux sigset_t is
   # 128 bytes (unsigned long[16]). Auto-passthrough corrupts memory.
   # impl/signal.c binds layout-aware impls via yos_signal_link.
-  # sigprocmask + sigpending are already in custom_sig (impl/sig.c).
-  - pthread_sigmask
+  # sigprocmask + sigpending + pthread_sigmask are in custom_sig (impl/sig.c).
   # sigemptyset/sigfillset/sigaddset/sigdelset/sigismember moved to
   # custom_sig (impl/sig.c) — pure userspace bitmap ops on the
   # FreeBSD-shape 16-byte sigset_t.

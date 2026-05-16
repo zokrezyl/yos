@@ -23,13 +23,44 @@
 # and these derivations pick it up.
 
 let
+  # Per-derivation src scoping. The whole yos repo is the flake src,
+  # but most derivations only read a small subtree under build-tools/.
+  # Filter to just what each one needs so edits in src/yos/impl/ don't
+  # invalidate the wasm-pkg cache. See ./lib/scope-src.nix.
+  scopeSrc = pkgs.callPackage ./lib/scope-src.nix { };
+
+  toolchainSrc = scopeSrc {
+    inherit src;
+    name = "yos-toolchain-src";
+    keep = [ "build-tools/wasm-clang" ];
+  };
+
+  sysrootSrc = scopeSrc {
+    inherit src;
+    name = "yos-sysroot-src";
+    keep = [
+      "build-tools/freebsd"
+      "build-tools/sysroot"
+      # sysroot compiles yos_libc_init.c into the sysroot; this file
+      # is also read by nvim's recipe.
+      "build-tools/wasm-pkg/configs/nvim/yos_libc_init.c"
+    ];
+  };
+
   freebsd-src = pkgs.callPackage ./freebsd-src { };
   yos         = pkgs.callPackage ./yos        { inherit src; };
-  sysroot     = pkgs.callPackage ./sysroot    { inherit src freebsd-src; };
-  toolchain   = pkgs.callPackage ./toolchain  { inherit src; };
+  sysroot     = pkgs.callPackage ./sysroot    { inherit freebsd-src; src = sysrootSrc; };
+  toolchain   = pkgs.callPackage ./toolchain  { src = toolchainSrc; };
 
   buildRecipe = pkgs.callPackage ./lib/build-recipe.nix {
-    inherit toolchain sysroot src yos;
+    inherit toolchain sysroot src;
+    # Don't bake yos's store path into the wasm-pkg runner scripts —
+    # doing so would re-introduce a full umbrella rebuild every time
+    # any yos host source changes (since the runner string is part of
+    # the derivation hash). The runner falls back to `yos` on PATH; the
+    # umbrella .#all derivation supplies an absolute-path runner for
+    # `nix run .#` consumers via its own wrapper.
+    yos = null;
   };
 
   buildFreebsdTool = pkgs.callPackage ./lib/build-freebsd-tool.nix {
@@ -66,7 +97,12 @@ let
   # against our sysroot. Output: $out/bin/<name> + $out/libexec/<name>
   # for each tool. See pkgs/freebsd-tools/default.nix to add one.
   freebsd-tools = pkgs.callPackage ./pkgs/freebsd-tools {
-    inherit toolchain sysroot freebsd-src yos;
+    inherit toolchain sysroot freebsd-src;
+    # Same reason as buildRecipe above — don't bake the yos store path
+    # into runner scripts, or every yos-host edit invalidates this
+    # derivation. Runner falls back to `yos` on PATH; the .#all umbrella
+    # supplies an absolute-path runner for `nix run .#` consumers.
+    yos = null;
   };
 
   # Upstream-tarball ports (autoconf, cmake, …) — wasm32 cross-builds

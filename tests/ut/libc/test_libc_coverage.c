@@ -619,6 +619,35 @@ static void probe_signals(void)
             sigaction(SIGURG, &old, NULL);
         } else emit_fail("sigaction", errno, NULL);
     }
+    /* pthread_sigmask — query, then BLOCK SIGUSR1, verify, UNBLOCK,
+     * verify. Validates the 16B↔128B sigset_t translation AND the
+     * FreeBSD↔Linux SIG_BLOCK/UNBLOCK/SETMASK enum remap. */
+    {
+        sigset_t cur;
+        int rc = pthread_sigmask(SIG_SETMASK, NULL, &cur);
+        if (rc == 0) emit_pass("pthread_sigmask:query");
+        else emit_fail("pthread_sigmask:query", rc, NULL);
+
+        sigset_t block_usr1, restore;
+        sigemptyset(&block_usr1);
+        sigaddset(&block_usr1, SIGUSR1);
+        rc = pthread_sigmask(SIG_BLOCK, &block_usr1, &restore);
+        if (rc == 0) {
+            sigset_t now;
+            pthread_sigmask(SIG_SETMASK, NULL, &now);
+            if (sigismember(&now, SIGUSR1) == 1) emit_pass("pthread_sigmask:block");
+            else emit_fail("pthread_sigmask:block", 0,
+                           "SIGUSR1 not in mask after SIG_BLOCK");
+            /* Restore exactly to avoid leaking masks into later probes. */
+            pthread_sigmask(SIG_SETMASK, &restore, NULL);
+            pthread_sigmask(SIG_SETMASK, NULL, &now);
+            if (sigismember(&now, SIGUSR1) == 0) emit_pass("pthread_sigmask:unblock");
+            else emit_fail("pthread_sigmask:unblock", 0,
+                           "SIGUSR1 still in mask after restore");
+        } else {
+            emit_fail("pthread_sigmask:block", rc, NULL);
+        }
+    }
 }
 
 static void probe_pthread(void)

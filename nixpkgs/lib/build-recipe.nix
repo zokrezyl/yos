@@ -57,6 +57,38 @@ let
     file = fetchurl { inherit (e) url sha256; name = e.name; };
   }) extraTarballs;
 
+  # Scope the src derivation passes to ONLY the files this recipe
+  # actually reads from $ROOT — its own configs/<recipeName>/ subtree.
+  # Previously `inherit src` here meant every wasm-pkg derivation (zsh,
+  # nvim, lua, libuv, openssl, openssh, …) took the entire yos repo as
+  # input. Editing src/yos/impl/sig.c then invalidated the input hash
+  # of every wasm-pkg, forcing a full umbrella rebuild even though the
+  # wasm packages don't depend on host-side yos source at all.
+  #
+  # Filter src to build-tools/wasm-pkg/configs/<recipeName>/ + the
+  # shared sha256sum shim under tools/wasm-pkg-shims/. After this,
+  # changes outside those paths leave the cached wasm-pkg outputs
+  # untouched. Each recipe lives in its own subdir, so per-recipe edits
+  # still invalidate only that one wasm-pkg.
+  scopedSrc = lib.cleanSourceWith {
+    name = "yos-recipe-${recipeName}-src";
+    inherit src;
+    filter = path: _type:
+      let
+        rel = lib.removePrefix ((toString src) + "/") (toString path);
+        keepDir = "build-tools/wasm-pkg/configs/${recipeName}";
+        keepShim = "tools/wasm-pkg-shims";
+      in
+           lib.hasPrefix keepDir rel
+        || lib.hasPrefix keepShim rel
+        # Parent directories of the kept paths must pass too, otherwise
+        # cleanSourceWith prunes them and the leaves become unreachable.
+        || rel == "build-tools"
+        || rel == "build-tools/wasm-pkg"
+        || rel == "build-tools/wasm-pkg/configs"
+        || rel == "tools";
+  };
+
   # Mirror the COMMON_CFLAGS / COMMON_LDFLAGS arrays from
   # tools/wasm-pkg.sh. Recipes append to these via $WASM_CFLAGS rather
   # than setting their own from scratch — keeping the two drivers in
@@ -84,7 +116,8 @@ let
     "-Wl,--export-all"
   ];
 in stdenv.mkDerivation (lib.recursiveUpdate {
-  inherit pname version src;
+  inherit pname version;
+  src = scopedSrc;
 
   nativeBuildInputs = [
     toolchain
