@@ -2004,7 +2004,7 @@ int32_t yos_waitid(struct yos_exec_ctx *ctx, int32_t which, int32_t pid, uint32_
     int ret = waitid((idtype_t)which, (id_t)pid, &info, options);
     if (ret < 0) {
         ydebug("waitid = %d (errno=%d)\n", -errno, errno);
-        return -errno;
+        return yos_errno_neg(ctx, errno);
     }
     /* Copy siginfo to wasm memory - simplified, just copy pid and status */
     if (infop && infop < ctx->memory_size - 128) {
@@ -2133,14 +2133,14 @@ int32_t yos_proc_clock_gettime(struct yos_exec_ctx *ctx, int32_t clockid, uint32
     ydebug("clock_gettime(%d, 0x%x)\n", clockid, tp_addr);
 
     if (tp_addr == 0 || tp_addr >= ctx->memory_size - sizeof(struct old_timespec32)) {
-        return -EFAULT;
+        return yos_errno_neg(ctx, EFAULT);
     }
 
     struct timespec ts;
     int ret = clock_gettime(clockid, &ts);
     if (ret < 0) {
         ydebug("clock_gettime = %d\n", -errno);
-        return -errno;
+        return yos_errno_neg(ctx, errno);
     }
 
     /* Convert host64 timespec to wasm32 old_timespec32 */
@@ -2159,7 +2159,7 @@ int32_t yos_proc_clock_getres(struct yos_exec_ctx *ctx, int32_t clockid, uint32_
     struct timespec ts;
     int ret = clock_getres(clockid, res_addr ? &ts : NULL);
     if (ret < 0) {
-        return -errno;
+        return yos_errno_neg(ctx, errno);
     }
 
     if (res_addr && res_addr < ctx->memory_size - sizeof(struct old_timespec32)) {
@@ -2176,7 +2176,7 @@ int32_t yos_proc_nanosleep(struct yos_exec_ctx *ctx, uint32_t rqtp_addr, uint32_
     ydebug("nanosleep(0x%x, 0x%x)\n", rqtp_addr, rmtp_addr);
 
     if (rqtp_addr == 0 || rqtp_addr >= ctx->memory_size - sizeof(struct old_timespec32)) {
-        return -EFAULT;
+        return yos_errno_neg(ctx, EFAULT);
     }
 
     /* Convert wasm32 old_timespec32 to host64 timespec */
@@ -2195,7 +2195,7 @@ int32_t yos_proc_nanosleep(struct yos_exec_ctx *ctx, uint32_t rqtp_addr, uint32_
             rmtp->tv_sec = (int32_t)rem.tv_sec;
             rmtp->tv_nsec = (int32_t)rem.tv_nsec;
         }
-        return -errno;
+        return yos_errno_neg(ctx, errno);
     }
 
     return 0;

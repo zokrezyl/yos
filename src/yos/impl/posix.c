@@ -41,6 +41,7 @@
 #include "yos/types.h"
 #include "yos/ydebug.h"
 #include "platform.h"
+#include "impl/errno_helpers.h"
 
 extern int  yos_fd_alloc(struct yos_exec_ctx *ctx, int host_fd);
 extern int  yos_fd_get  (struct yos_exec_ctx *ctx, int wasm_fd);
@@ -52,15 +53,15 @@ int32_t yos_dup(struct yos_exec_ctx *ctx, int32_t wfd)
 {
     int hfd = yos_fd_get(ctx, wfd);
     ydebug("dup(wfd=%d hfd=%d)\n", wfd, hfd);
-    if (hfd < 0) return -EBADF;
+    if (hfd < 0) return yos_errno_neg(ctx, EBADF);
     int new_hfd = dup(hfd);
     if (new_hfd < 0) {
         ydebug("dup(wfd=%d hfd=%d) host dup failed: %s\n",
                wfd, hfd, strerror(errno));
-        return -errno;
+        return yos_errno_neg(ctx, errno);
     }
     int new_wfd = yos_fd_alloc(ctx, new_hfd);
-    if (new_wfd < 0) { close(new_hfd); return -EMFILE; }
+    if (new_wfd < 0) { close(new_hfd); return yos_errno_neg(ctx, EMFILE); }
     ydebug("dup(wfd=%d hfd=%d) -> new_wfd=%d new_hfd=%d\n",
            wfd, hfd, new_wfd, new_hfd);
     return new_wfd;
@@ -87,7 +88,7 @@ int32_t yos_getsockname(struct yos_exec_ctx *ctx, int32_t wfd,
 {
     int hfd = yos_fd_get(ctx, wfd);
     ydebug("getsockname(wfd=%d hfd=%d)\n", wfd, hfd);
-    if (hfd < 0) return -EBADF;
+    if (hfd < 0) return yos_errno_neg(ctx, EBADF);
     uint32_t *addrlen_p = (uint32_t *)(ctx->memory + addrlen_off);
     socklen_t cap = (socklen_t)*addrlen_p;
     if (cap > 256) cap = 256;  /* cap; libuv only needs the family */
@@ -95,7 +96,7 @@ int32_t yos_getsockname(struct yos_exec_ctx *ctx, int32_t wfd,
     socklen_t host_len = cap;
     if (getsockname(hfd, (struct sockaddr *)host_buf, &host_len) < 0) {
         ydebug("getsockname host failed: %s\n", strerror(errno));
-        return -errno;
+        return yos_errno_neg(ctx, errno);
     }
     /* Decode the host family. Linux: sa_family is uint16_t at offset
      * 0. BSD-lineage hosts (darwin/FreeBSD) put sa_len uint8 at 0,
@@ -166,25 +167,25 @@ int32_t yos_getsockopt(struct yos_exec_ctx *ctx, int32_t wfd, int32_t level,
                        int32_t opt, uint32_t valbuf, uint32_t lenptr)
 {
     int hfd = yos_fd_get(ctx, wfd);
-    if (hfd < 0) return -EBADF;
+    if (hfd < 0) return yos_errno_neg(ctx, EBADF);
     int hlevel = sol_fb_to_lx(level);
     int hopt = soopt_fb_to_lx(level, opt);
     void *vbuf = ctx->memory + valbuf;
     socklen_t *lp = (socklen_t *)(ctx->memory + lenptr);
     int r = getsockopt(hfd, hlevel, hopt, vbuf, lp);
-    return r < 0 ? -errno : r;
+    return yos_errno_check(ctx, (int32_t)r);
 }
 
 int32_t yos_setsockopt(struct yos_exec_ctx *ctx, int32_t wfd, int32_t level,
                        int32_t opt, uint32_t valbuf, uint32_t valbuflen)
 {
     int hfd = yos_fd_get(ctx, wfd);
-    if (hfd < 0) return -EBADF;
+    if (hfd < 0) return yos_errno_neg(ctx, EBADF);
     int hlevel = sol_fb_to_lx(level);
     int hopt = soopt_fb_to_lx(level, opt);
     const void *vbuf = ctx->memory + valbuf;
     int r = setsockopt(hfd, hlevel, hopt, vbuf, valbuflen);
-    return r < 0 ? -errno : r;
+    return yos_errno_check(ctx, (int32_t)r);
 }
 
 extern int sock_type_fb_to_lx_fwd(int t);  /* defined below */
@@ -193,9 +194,9 @@ int32_t yos_socket(struct yos_exec_ctx *ctx, int32_t domain, int32_t type, int32
 {
     int htype = sock_type_fb_to_lx_fwd(type);
     int hfd = socket(domain, htype, protocol);
-    if (hfd < 0) return -errno;
+    if (hfd < 0) return yos_errno_neg(ctx, errno);
     int wfd = yos_fd_alloc(ctx, hfd);
-    if (wfd < 0) { close(hfd); return -EMFILE; }
+    if (wfd < 0) { close(hfd); return yos_errno_neg(ctx, EMFILE); }
     return wfd;
 }
 
@@ -233,21 +234,21 @@ int32_t yos_bind(struct yos_exec_ctx *ctx, int32_t fd, uint32_t addr_off,
 {
     int hfd = yos_fd_get(ctx, fd);
     if (hfd < 0) return hfd;
-    if (addr_off >= ctx->memory_size) return -EFAULT;
+    if (addr_off >= ctx->memory_size) return yos_errno_neg(ctx, EFAULT);
     /* Make a host-shape copy of the address and convert in-place. */
     uint8_t hostbuf[256];
-    if (addrlen > sizeof(hostbuf)) return -EINVAL;
+    if (addrlen > sizeof(hostbuf)) return yos_errno_neg(ctx, EINVAL);
     memcpy(hostbuf, ctx->memory + addr_off, addrlen);
     freebsd_sockaddr_to_host(hostbuf, (socklen_t)addrlen);
-    return bind(hfd, (struct sockaddr *)hostbuf, (socklen_t)addrlen) < 0
-           ? -errno : 0;
+    return yos_errno_check(ctx,
+        bind(hfd, (struct sockaddr *)hostbuf, (socklen_t)addrlen));
 }
 
 int32_t yos_listen(struct yos_exec_ctx *ctx, int32_t fd, int32_t backlog)
 {
     int hfd = yos_fd_get(ctx, fd);
     if (hfd < 0) return hfd;
-    return listen(hfd, backlog) < 0 ? -errno : 0;
+    return yos_errno_check(ctx, listen(hfd, backlog));
 }
 
 int32_t yos_connect(struct yos_exec_ctx *ctx, int32_t fd, uint32_t addr_off,
@@ -255,13 +256,13 @@ int32_t yos_connect(struct yos_exec_ctx *ctx, int32_t fd, uint32_t addr_off,
 {
     int hfd = yos_fd_get(ctx, fd);
     if (hfd < 0) return hfd;
-    if (addr_off >= ctx->memory_size) return -EFAULT;
+    if (addr_off >= ctx->memory_size) return yos_errno_neg(ctx, EFAULT);
     uint8_t hostbuf[256];
-    if (addrlen > sizeof(hostbuf)) return -EINVAL;
+    if (addrlen > sizeof(hostbuf)) return yos_errno_neg(ctx, EINVAL);
     memcpy(hostbuf, ctx->memory + addr_off, addrlen);
     freebsd_sockaddr_to_host(hostbuf, (socklen_t)addrlen);
-    return connect(hfd, (struct sockaddr *)hostbuf, (socklen_t)addrlen) < 0
-           ? -errno : 0;
+    return yos_errno_check(ctx,
+        connect(hfd, (struct sockaddr *)hostbuf, (socklen_t)addrlen));
 }
 
 int32_t yos_accept(struct yos_exec_ctx *ctx, int32_t fd, uint32_t addr_off,
@@ -279,10 +280,10 @@ int32_t yos_accept(struct yos_exec_ctx *ctx, int32_t fd, uint32_t addr_off,
         haddr  = (struct sockaddr *)(ctx->memory + addr_off);
     }
     int newhfd = accept(hfd, haddr, hlen_p);
-    if (newhfd < 0) return -errno;
+    if (newhfd < 0) return yos_errno_neg(ctx, errno);
     if (addrlen_off) *(uint32_t *)(ctx->memory + addrlen_off) = (uint32_t)hlen;
     int newwfd = yos_fd_alloc(ctx, newhfd);
-    if (newwfd < 0) { close(newhfd); return -EMFILE; }
+    if (newwfd < 0) { close(newhfd); return yos_errno_neg(ctx, EMFILE); }
     return newwfd;
 }
 
@@ -291,9 +292,9 @@ ssize_t yos_send(struct yos_exec_ctx *ctx, int32_t fd, uint32_t buf_off,
 {
     int hfd = yos_fd_get(ctx, fd);
     if (hfd < 0) return hfd;
-    if (buf_off >= ctx->memory_size) return -EFAULT;
+    if (buf_off >= ctx->memory_size) return yos_errno_neg(ctx, EFAULT);
     ssize_t n = send(hfd, ctx->memory + buf_off, len, flags);
-    return n < 0 ? -errno : n;
+    return yos_errno_check(ctx, (int32_t)n);
 }
 
 ssize_t yos_recv(struct yos_exec_ctx *ctx, int32_t fd, uint32_t buf_off,
@@ -301,9 +302,9 @@ ssize_t yos_recv(struct yos_exec_ctx *ctx, int32_t fd, uint32_t buf_off,
 {
     int hfd = yos_fd_get(ctx, fd);
     if (hfd < 0) return hfd;
-    if (buf_off >= ctx->memory_size) return -EFAULT;
+    if (buf_off >= ctx->memory_size) return yos_errno_neg(ctx, EFAULT);
     ssize_t n = recv(hfd, ctx->memory + buf_off, len, flags);
-    return n < 0 ? -errno : n;
+    return yos_errno_check(ctx, (int32_t)n);
 }
 
 ssize_t yos_sendto(struct yos_exec_ctx *ctx, int32_t fd, uint32_t buf_off,
@@ -317,7 +318,7 @@ ssize_t yos_sendto(struct yos_exec_ctx *ctx, int32_t fd, uint32_t buf_off,
         dst = (const struct sockaddr *)(ctx->memory + dst_off);
     ssize_t n = sendto(hfd, ctx->memory + buf_off, len, flags, dst,
                        (socklen_t)dst_len);
-    return n < 0 ? -errno : n;
+    return yos_errno_check(ctx, (int32_t)n);
 }
 
 ssize_t yos_recvfrom(struct yos_exec_ctx *ctx, int32_t fd, uint32_t buf_off,
@@ -335,7 +336,7 @@ ssize_t yos_recvfrom(struct yos_exec_ctx *ctx, int32_t fd, uint32_t buf_off,
         src    = (struct sockaddr *)(ctx->memory + src_off);
     }
     ssize_t n = recvfrom(hfd, ctx->memory + buf_off, len, flags, src, hlen_p);
-    if (n < 0) return -errno;
+    if (n < 0) return yos_errno_neg(ctx, errno);
     if (srclen_off) *(uint32_t *)(ctx->memory + srclen_off) = (uint32_t)hlen;
     return n;
 }
@@ -344,7 +345,7 @@ int32_t yos_shutdown(struct yos_exec_ctx *ctx, int32_t fd, int32_t how)
 {
     int hfd = yos_fd_get(ctx, fd);
     if (hfd < 0) return hfd;
-    return shutdown(hfd, how) < 0 ? -errno : 0;
+    return yos_errno_check(ctx, shutdown(hfd, how));
 }
 
 int32_t yos_getpeername(struct yos_exec_ctx *ctx, int32_t fd,
@@ -352,10 +353,10 @@ int32_t yos_getpeername(struct yos_exec_ctx *ctx, int32_t fd,
 {
     int hfd = yos_fd_get(ctx, fd);
     if (hfd < 0) return hfd;
-    if (!addr_off || !addrlen_off) return -EFAULT;
+    if (!addr_off || !addrlen_off) return yos_errno_neg(ctx, EFAULT);
     socklen_t hlen = (socklen_t)*(uint32_t *)(ctx->memory + addrlen_off);
     if (getpeername(hfd, (struct sockaddr *)(ctx->memory + addr_off), &hlen) < 0)
-        return -errno;
+        return yos_errno_neg(ctx, errno);
     *(uint32_t *)(ctx->memory + addrlen_off) = (uint32_t)hlen;
     return 0;
 }
@@ -567,7 +568,7 @@ int32_t yos_getloadavg(struct yos_exec_ctx *ctx, uint32_t loadavg_off,
     if (nelem > 3) nelem = 3;
     if (!loadavg_off ||
         loadavg_off + (uint32_t)nelem * 8 > ctx->memory_size)
-        return -EFAULT;
+        return yos_errno_neg(ctx, EFAULT);
     double host[3];
     int n = getloadavg(host, nelem);
     if (n < 0) return -1;
@@ -637,40 +638,40 @@ uint32_t yos_mkdtemp(struct yos_exec_ctx *ctx, uint32_t template_off)
 
 int32_t yos_mkstemp(struct yos_exec_ctx *ctx, uint32_t template_off)
 {
-    if (!template_off || template_off >= ctx->memory_size) return -EFAULT;
+    if (!template_off || template_off >= ctx->memory_size) return yos_errno_neg(ctx, EFAULT);
     char *t = (char *)(ctx->memory + template_off);
     int hfd = mkstemp(t);
-    if (hfd < 0) return -errno;
+    if (hfd < 0) return yos_errno_neg(ctx, errno);
     int wfd = yos_fd_alloc(ctx, hfd);
-    if (wfd < 0) { close(hfd); return -EMFILE; }
+    if (wfd < 0) { close(hfd); return yos_errno_neg(ctx, EMFILE); }
     return wfd;
 }
 
 int32_t yos_mkostemp(struct yos_exec_ctx *ctx, uint32_t template_off, int32_t flags)
 {
-    if (!template_off || template_off >= ctx->memory_size) return -EFAULT;
+    if (!template_off || template_off >= ctx->memory_size) return yos_errno_neg(ctx, EFAULT);
     char *t = (char *)(ctx->memory + template_off);
     /* flags here are FreeBSD O_* (e.g. O_CLOEXEC) — translate to host. */
     extern int oflags_fb_to_lx_fwd(int);
     int hflags = oflags_fb_to_lx_fwd(flags);
     int hfd = mkostemp(t, hflags);
-    if (hfd < 0) return -errno;
+    if (hfd < 0) return yos_errno_neg(ctx, errno);
     int wfd = yos_fd_alloc(ctx, hfd);
-    if (wfd < 0) { close(hfd); return -EMFILE; }
+    if (wfd < 0) { close(hfd); return yos_errno_neg(ctx, EMFILE); }
     return wfd;
 }
 
 int32_t yos_mkostemps(struct yos_exec_ctx *ctx, uint32_t template_off,
                      int32_t suffixlen, int32_t flags)
 {
-    if (!template_off || template_off >= ctx->memory_size) return -EFAULT;
+    if (!template_off || template_off >= ctx->memory_size) return yos_errno_neg(ctx, EFAULT);
     char *t = (char *)(ctx->memory + template_off);
     extern int oflags_fb_to_lx_fwd(int);
     int hflags = oflags_fb_to_lx_fwd(flags);
     int hfd = mkostemps(t, suffixlen, hflags);
-    if (hfd < 0) return -errno;
+    if (hfd < 0) return yos_errno_neg(ctx, errno);
     int wfd = yos_fd_alloc(ctx, hfd);
-    if (wfd < 0) { close(hfd); return -EMFILE; }
+    if (wfd < 0) { close(hfd); return yos_errno_neg(ctx, EMFILE); }
     return wfd;
 }
 
@@ -716,10 +717,10 @@ extern void cv_stat_h2w(uint8_t *w, const struct stat *h);
 int32_t yos_fstat(struct yos_exec_ctx *ctx, int32_t wfd, uint32_t statbuf_off)
 {
     int hfd = yos_fd_get(ctx, wfd);
-    if (hfd < 0) return -EBADF;
+    if (hfd < 0) return yos_errno_neg(ctx, EBADF);
     struct stat h;
     memset(&h, 0, sizeof h);
-    if (fstat(hfd, &h) < 0) return -errno;
+    if (fstat(hfd, &h) < 0) return yos_errno_neg(ctx, errno);
     if (ydebug_enabled()) {
         const char *kind = "?";
         if (S_ISREG(h.st_mode))  kind = "REG";
@@ -763,22 +764,22 @@ uint32_t yos_fmtcheck(struct yos_exec_ctx *ctx, uint32_t user_off,
 int32_t yos_fsync(struct yos_exec_ctx *ctx, int32_t wfd)
 {
     int hfd = yos_fd_get(ctx, wfd);
-    if (hfd < 0) return -EBADF;
-    return fsync(hfd) < 0 ? -errno : 0;
+    if (hfd < 0) return yos_errno_neg(ctx, EBADF);
+    return yos_errno_check(ctx, fsync(hfd));
 }
 
 int32_t yos_fdatasync(struct yos_exec_ctx *ctx, int32_t wfd)
 {
     int hfd = yos_fd_get(ctx, wfd);
-    if (hfd < 0) return -EBADF;
-    return fdatasync(hfd) < 0 ? -errno : 0;
+    if (hfd < 0) return yos_errno_neg(ctx, EBADF);
+    return yos_errno_check(ctx, fdatasync(hfd));
 }
 
 int32_t yos_fchdir(struct yos_exec_ctx *ctx, int32_t wfd)
 {
     int hfd = yos_fd_get(ctx, wfd);
-    if (hfd < 0) return -EBADF;
-    return fchdir(hfd) < 0 ? -errno : 0;
+    if (hfd < 0) return yos_errno_neg(ctx, EBADF);
+    return yos_errno_check(ctx, fchdir(hfd));
 }
 
 /* ── pread / pwrite (host has same signature, just need fd remap) ── */
@@ -787,20 +788,20 @@ int32_t yos_pread(struct yos_exec_ctx *ctx, int32_t wfd, uint32_t buf,
                   uint32_t count, int64_t off)
 {
     int hfd = yos_fd_get(ctx, wfd);
-    if (hfd < 0) return -EBADF;
-    if (buf + count > ctx->memory_size) return -EFAULT;
+    if (hfd < 0) return yos_errno_neg(ctx, EBADF);
+    if (buf + count > ctx->memory_size) return yos_errno_neg(ctx, EFAULT);
     ssize_t r = pread(hfd, ctx->memory + buf, count, (off_t)off);
-    return r < 0 ? -errno : (int32_t)r;
+    return yos_errno_check(ctx, (int32_t)r);
 }
 
 int32_t yos_pwrite(struct yos_exec_ctx *ctx, int32_t wfd, uint32_t buf,
                    uint32_t count, int64_t off)
 {
     int hfd = yos_fd_get(ctx, wfd);
-    if (hfd < 0) return -EBADF;
-    if (buf + count > ctx->memory_size) return -EFAULT;
+    if (hfd < 0) return yos_errno_neg(ctx, EBADF);
+    if (buf + count > ctx->memory_size) return yos_errno_neg(ctx, EFAULT);
     ssize_t r = pwrite(hfd, ctx->memory + buf, count, (off_t)off);
-    return r < 0 ? -errno : (int32_t)r;
+    return yos_errno_check(ctx, (int32_t)r);
 }
 
 /* ── trivial host passthroughs (no fd, no memory) ─────────────────── */
@@ -837,13 +838,13 @@ int32_t yos_sync(struct yos_exec_ctx *ctx)
 int32_t yos_raise(struct yos_exec_ctx *ctx, int32_t sig)
 {
     (void)ctx;
-    return raise(sig) < 0 ? -errno : 0;
+    return yos_errno_check(ctx, raise(sig));
 }
 
 int32_t yos_killpg(struct yos_exec_ctx *ctx, int32_t pgrp, int32_t sig)
 {
     (void)ctx;
-    return killpg(pgrp, sig) < 0 ? -errno : 0;
+    return yos_errno_check(ctx, killpg(pgrp, sig));
 }
 
 /* ── sbrk: thin proxy to brk-style heap. yos_brk lives in impl/mem.c
@@ -891,7 +892,7 @@ int sock_type_fb_to_lx_fwd(int t) { return sock_type_fb_to_lx(t); }
 int32_t yos_socketpair(struct yos_exec_ctx *ctx, int32_t domain,
                        int32_t type, int32_t protocol, uint32_t sv_off)
 {
-    if (sv_off + 8 > ctx->memory_size) return -EFAULT;
+    if (sv_off + 8 > ctx->memory_size) return yos_errno_neg(ctx, EFAULT);
     int hfds[2];
     /* Detect the FreeBSD high-bit flags before they get masked away
      * by sock_type_fb_to_lx (which on darwin maps both to 0 because
@@ -901,7 +902,7 @@ int32_t yos_socketpair(struct yos_exec_ctx *ctx, int32_t domain,
     int want_nonblock = !!(type & 0x20000000);
     int want_cloexec  = !!(type & 0x10000000);
     if (socketpair(domain, sock_type_fb_to_lx(type), protocol, hfds) < 0)
-        return -errno;
+        return yos_errno_neg(ctx, errno);
     for (int i = 0; i < 2; i++) {
         if (want_nonblock) {
             int fl = fcntl(hfds[i], F_GETFL);
@@ -913,9 +914,9 @@ int32_t yos_socketpair(struct yos_exec_ctx *ctx, int32_t domain,
         }
     }
     int32_t wa = yos_fd_alloc(ctx, hfds[0]);
-    if (wa < 0) { close(hfds[0]); close(hfds[1]); return -EMFILE; }
+    if (wa < 0) { close(hfds[0]); close(hfds[1]); return yos_errno_neg(ctx, EMFILE); }
     int32_t wb = yos_fd_alloc(ctx, hfds[1]);
-    if (wb < 0) { yos_fd_close(ctx, wa); close(hfds[1]); return -EMFILE; }
+    if (wb < 0) { yos_fd_close(ctx, wa); close(hfds[1]); return yos_errno_neg(ctx, EMFILE); }
     int32_t *sv = (int32_t *)(ctx->memory + sv_off);
     sv[0] = wa;
     sv[1] = wb;
@@ -1150,11 +1151,11 @@ static void termios_lx_to_fb(uint8_t *w, const struct termios *h)
 
 int32_t yos_tcgetattr(struct yos_exec_ctx *ctx, int32_t wfd, uint32_t t_off)
 {
-    if (t_off + YOS_FBSD_TERMIOS_SIZE > ctx->memory_size) return -EFAULT;
+    if (t_off + YOS_FBSD_TERMIOS_SIZE > ctx->memory_size) return yos_errno_neg(ctx, EFAULT);
     int hfd = yos_fd_get(ctx, wfd);
-    if (hfd < 0) return -EBADF;
+    if (hfd < 0) return yos_errno_neg(ctx, EBADF);
     struct termios h;
-    if (tcgetattr(hfd, &h) < 0) return -errno;
+    if (tcgetattr(hfd, &h) < 0) return yos_errno_neg(ctx, errno);
     termios_lx_to_fb(ctx->memory + t_off, &h);
     return 0;
 }
@@ -1162,20 +1163,20 @@ int32_t yos_tcgetattr(struct yos_exec_ctx *ctx, int32_t wfd, uint32_t t_off)
 int32_t yos_tcsetattr(struct yos_exec_ctx *ctx, int32_t wfd,
                       int32_t actions, uint32_t t_off)
 {
-    if (t_off + YOS_FBSD_TERMIOS_SIZE > ctx->memory_size) return -EFAULT;
+    if (t_off + YOS_FBSD_TERMIOS_SIZE > ctx->memory_size) return yos_errno_neg(ctx, EFAULT);
     int hfd = yos_fd_get(ctx, wfd);
-    if (hfd < 0) return -EBADF;
+    if (hfd < 0) return yos_errno_neg(ctx, EBADF);
     /* FreeBSD TCSANOW=0, TCSADRAIN=1, TCSAFLUSH=2 — same on Linux, no
      * remap needed. */
     struct termios h;
     /* Read current host state first so any flag bit we don't translate
      * is preserved across a guest tcgetattr+tcsetattr round trip. */
-    if (tcgetattr(hfd, &h) < 0) return -errno;
+    if (tcgetattr(hfd, &h) < 0) return yos_errno_neg(ctx, errno);
     /* Now overlay the guest's desired flags. termios_fb_to_lx zeros
      * the host struct and writes the flags we know — the cfsetispeed
      * /cfsetospeed inside it pull in the speed bits. */
     termios_fb_to_lx(&h, ctx->memory + t_off);
-    if (tcsetattr(hfd, actions, &h) < 0) return -errno;
+    if (tcsetattr(hfd, actions, &h) < 0) return yos_errno_neg(ctx, errno);
     return 0;
 }
 
@@ -1212,14 +1213,14 @@ void yos_cfmakeraw(struct yos_exec_ctx *ctx, uint32_t t_off)
 
 int32_t yos_cfsetispeed(struct yos_exec_ctx *ctx, uint32_t t_off, uint32_t speed)
 {
-    if (t_off + YOS_FBSD_TERMIOS_SIZE > ctx->memory_size) return -EFAULT;
+    if (t_off + YOS_FBSD_TERMIOS_SIZE > ctx->memory_size) return yos_errno_neg(ctx, EFAULT);
     *(uint32_t *)(ctx->memory + t_off + 36) = speed;
     return 0;
 }
 
 int32_t yos_cfsetospeed(struct yos_exec_ctx *ctx, uint32_t t_off, uint32_t speed)
 {
-    if (t_off + YOS_FBSD_TERMIOS_SIZE > ctx->memory_size) return -EFAULT;
+    if (t_off + YOS_FBSD_TERMIOS_SIZE > ctx->memory_size) return yos_errno_neg(ctx, EFAULT);
     *(uint32_t *)(ctx->memory + t_off + 40) = speed;
     return 0;
 }
@@ -1264,43 +1265,43 @@ static void wasm_timeval2_to_host(const uint8_t *w, struct timeval h[2])
 
 int32_t yos_utimes(struct yos_exec_ctx *ctx, uint32_t path_off, uint32_t times_off)
 {
-    if (!path_off || path_off >= ctx->memory_size) return -EFAULT;
+    if (!path_off || path_off >= ctx->memory_size) return yos_errno_neg(ctx, EFAULT);
     const char *path = (const char *)(ctx->memory + path_off);
     struct timeval *p = NULL, h[2];
     if (times_off) {
-        if (times_off + 16 > ctx->memory_size) return -EFAULT;
+        if (times_off + 16 > ctx->memory_size) return yos_errno_neg(ctx, EFAULT);
         wasm_timeval2_to_host(ctx->memory + times_off, h);
         p = h;
     }
-    if (utimes(path, p) < 0) return -errno;
+    if (utimes(path, p) < 0) return yos_errno_neg(ctx, errno);
     return 0;
 }
 
 int32_t yos_futimes(struct yos_exec_ctx *ctx, int32_t wfd, uint32_t times_off)
 {
     int hfd = yos_fd_get(ctx, wfd);
-    if (hfd < 0) return -EBADF;
+    if (hfd < 0) return yos_errno_neg(ctx, EBADF);
     struct timeval *p = NULL, h[2];
     if (times_off) {
-        if (times_off + 16 > ctx->memory_size) return -EFAULT;
+        if (times_off + 16 > ctx->memory_size) return yos_errno_neg(ctx, EFAULT);
         wasm_timeval2_to_host(ctx->memory + times_off, h);
         p = h;
     }
-    if (futimes(hfd, p) < 0) return -errno;
+    if (futimes(hfd, p) < 0) return yos_errno_neg(ctx, errno);
     return 0;
 }
 
 int32_t yos_lutimes(struct yos_exec_ctx *ctx, uint32_t path_off, uint32_t times_off)
 {
-    if (!path_off || path_off >= ctx->memory_size) return -EFAULT;
+    if (!path_off || path_off >= ctx->memory_size) return yos_errno_neg(ctx, EFAULT);
     const char *path = (const char *)(ctx->memory + path_off);
     struct timeval *p = NULL, h[2];
     if (times_off) {
-        if (times_off + 16 > ctx->memory_size) return -EFAULT;
+        if (times_off + 16 > ctx->memory_size) return yos_errno_neg(ctx, EFAULT);
         wasm_timeval2_to_host(ctx->memory + times_off, h);
         p = h;
     }
-    if (lutimes(path, p) < 0) return -errno;
+    if (lutimes(path, p) < 0) return yos_errno_neg(ctx, errno);
     return 0;
 }
 
@@ -1315,9 +1316,9 @@ int32_t yos_lutimes(struct yos_exec_ctx *ctx, uint32_t path_off, uint32_t times_
 #include <sys/utsname.h>
 int32_t yos___xuname(struct yos_exec_ctx *ctx, int32_t namesz, uint32_t buf_off)
 {
-    if (namesz <= 0 || !buf_off) return -EFAULT;
+    if (namesz <= 0 || !buf_off) return yos_errno_neg(ctx, EFAULT);
     uint32_t total = (uint32_t)namesz * 5;
-    if (buf_off + total > ctx->memory_size) return -EFAULT;
+    if (buf_off + total > ctx->memory_size) return yos_errno_neg(ctx, EFAULT);
     char *fields[5] = {
         (char *)(ctx->memory + buf_off + 0u * (uint32_t)namesz),  /* sysname */
         (char *)(ctx->memory + buf_off + 1u * (uint32_t)namesz),  /* nodename */
@@ -1329,7 +1330,7 @@ int32_t yos___xuname(struct yos_exec_ctx *ctx, int32_t namesz, uint32_t buf_off)
     memset(ctx->memory + buf_off, 0, total);
 
     struct utsname host;
-    if (uname(&host) < 0) return -errno;
+    if (uname(&host) < 0) return yos_errno_neg(ctx, errno);
 
     /* Present a FreeBSD wasm32 face regardless of host. */
     strncpy(fields[0], "FreeBSD", (size_t)namesz - 1);
@@ -1369,7 +1370,7 @@ int32_t yos_accept4(struct yos_exec_ctx *ctx, int32_t wfd,
 {
 #if defined(__linux__)
     int hfd = yos_fd_get(ctx, wfd);
-    if (hfd < 0) return -EBADF;
+    if (hfd < 0) return yos_errno_neg(ctx, EBADF);
     /* Strip FreeBSD-specific bits we can't honour atomically and
      * convert to host equivalents. */
     int hflags = 0;
@@ -1381,19 +1382,17 @@ int32_t yos_accept4(struct yos_exec_ctx *ctx, int32_t wfd,
      * out-param if non-NULL — caller can getpeername later. */
     int new_hfd = accept4(hfd, NULL, NULL, hflags);
     (void)addr_off; (void)addrlen_off;
-    if (new_hfd < 0) return -errno;
+    if (new_hfd < 0) return yos_errno_neg(ctx, errno);
     int new_wfd = yos_fd_alloc(ctx, new_hfd);
-    if (new_wfd < 0) { close(new_hfd); return -EMFILE; }
+    if (new_wfd < 0) { close(new_hfd); return yos_errno_neg(ctx, EMFILE); }
     return new_wfd;
 #else
     (void)ctx; (void)wfd; (void)addr_off; (void)addrlen_off; (void)flags;
-    return -ENOSYS;
+    return yos_errno_neg(ctx, ENOSYS);
 #endif
 }
 
-#include "errno_helpers.h"
 #include <grp.h>
-#include <errno.h>
 
 /* ── getgroups(int gidsetsize, gid_t grouplist[]) ────────────────────
  *

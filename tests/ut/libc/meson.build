@@ -80,6 +80,11 @@ libc_tests = [
   # this test exercises a MIXED payload (single byte 'X') over a pipe
   # so the workaround is bypassed and the raw leak shows.
   'test_post_fork_stderr_clean',
+  # Stdio (fprintf) write from a forked child must reach the host
+  # stderr. zsh-wasm's "command not found" is emitted from a forked
+  # child via fputc on stderr — under yos that output disappears
+  # because the child exits without an stdio flush.
+  'test_fork_fprintf_stderr',
 ]
 
 # Path to the generator's output dir, exposed by src/yos/codegen.

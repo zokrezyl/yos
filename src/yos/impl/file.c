@@ -30,6 +30,7 @@
 
 #include "yos/types.h"
 #include "yos/ydebug.h"
+#include "impl/errno_helpers.h"
 
 #define YOS_FILE_MAX 256
 static FILE *yos_files[YOS_FILE_MAX];
@@ -139,12 +140,11 @@ uint32_t yos_fdopen(struct yos_exec_ctx *ctx, int32_t wfd, uint32_t mode_off)
 
 int32_t yos_fclose(struct yos_exec_ctx *ctx, uint32_t fp)
 {
-    (void)ctx;
     FILE *f = handle_to_file(fp);
-    if (!f) { errno = EBADF; return -1; }
+    if (!f) return yos_errno_neg(ctx, EBADF);
     int r = fclose(f);
     if (fp >= 4 && fp < YOS_FILE_MAX) free_handle(fp);
-    return r < 0 ? -errno : 0;
+    return yos_errno_check(ctx, r);
 }
 
 /* ── fread / fwrite ─────────────────────────────────────────────────── */
@@ -315,12 +315,11 @@ int32_t yos_fflush(struct yos_exec_ctx *ctx, uint32_t fp)
      * through fd_map (correct) and the format-prefix wrote through
      * host glibc's buffer (then flushed to the wrong fd), producing
      * garbled output like "o such file or directoryzsh:1: N: …". */
-    if (fp == 1 || fp == 2 || fp == 3) { (void)ctx; return 0; }
-    (void)ctx;
-    if (fp == 0) return fflush(NULL);   /* flush all */
+    if (fp == 1 || fp == 2 || fp == 3) return 0;
+    if (fp == 0) return yos_errno_check(ctx, fflush(NULL));   /* flush all */
     FILE *f = handle_to_file(fp);
     if (!f) return 0;                    /* unknown handle: treat as no-op */
-    return fflush(f) < 0 ? -errno : 0;
+    return yos_errno_check(ctx, fflush(f));
 }
 
 int32_t yos_feof   (struct yos_exec_ctx *ctx, uint32_t fp) { (void)ctx; FILE *f=handle_to_file(fp); return f?feof(f):0; }
