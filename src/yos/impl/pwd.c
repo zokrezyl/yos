@@ -919,3 +919,70 @@ uint32_t yos_tmpfile(struct yos_exec_ctx *ctx)
     if (!h) fclose(f);
     return h;
 }
+
+/* ── getprotobyname / getprotobynumber ────────────────────────────────
+ *
+ * Returns a wasm-side `struct protoent` (12 bytes: p_name@0, p_aliases@4,
+ * p_proto@8) populated from a small static table covering the protocols
+ * that real wasm callers (curl, ssh, libuv) actually ask about. We
+ * skip the libc-side getprotobyname() because its `struct protoent`
+ * contains host pointers (p_name, p_aliases[]) that the auto-bridge
+ * can't translate to wasm offsets.
+ *
+ * Per-process static slab (same lifetime contract as libc's `_proto`
+ * slot), lazily allocated via yos_malloc. Each lookup overwrites the
+ * slab — POSIX explicitly warns that the returned pointer is only
+ * valid until the next call.
+ */
+#define WASM_PROTOENT_SZ 12u
+#define PROTO_BUF_SZ     128u
+static uint32_t proto_buf_off;
+
+struct yos_proto_entry { const char *name; int number; };
+static const struct yos_proto_entry yos_proto_table[] = {
+    { "ip",   0 },
+    { "icmp", 1 },
+    { "tcp",  6 },
+    { "udp",  17 },
+};
+
+static uint32_t emit_protoent(struct yos_exec_ctx *ctx,
+                              const struct yos_proto_entry *e)
+{
+    uint32_t buf = ensure_buf(ctx, &proto_buf_off, PROTO_BUF_SZ);
+    if (!buf) return 0;
+    /* Layout in the slab:
+     *    [0 .. 11]   struct protoent (p_name, p_aliases, p_proto)
+     *    [12 .. 15]  p_aliases slot: one NULL terminator
+     *    [16 ..  ]   p_name string                                 */
+    uint8_t *w = ctx->memory + buf;
+    memset(w, 0, WASM_PROTOENT_SZ + 4);
+    uint32_t aliases_off = buf + WASM_PROTOENT_SZ;
+    *(uint32_t *)(ctx->memory + aliases_off) = 0;   /* NULL terminator */
+    uint32_t cursor = WASM_PROTOENT_SZ + 4;
+    uint32_t name_off = pack_string(ctx, buf, PROTO_BUF_SZ, &cursor, e->name);
+    *(uint32_t *)(w + 0) = name_off;
+    *(uint32_t *)(w + 4) = aliases_off;
+    *(uint32_t *)(w + 8) = (uint32_t)e->number;
+    return buf;
+}
+
+uint32_t yos_getprotobyname(struct yos_exec_ctx *ctx, uint32_t name_off)
+{
+    if (!name_off || name_off >= ctx->memory_size) return 0;
+    const char *name = (const char *)(ctx->memory + name_off);
+    for (size_t i = 0; i < sizeof yos_proto_table / sizeof yos_proto_table[0]; i++) {
+        if (strcmp(name, yos_proto_table[i].name) == 0)
+            return emit_protoent(ctx, &yos_proto_table[i]);
+    }
+    return 0;
+}
+
+uint32_t yos_getprotobynumber(struct yos_exec_ctx *ctx, int32_t number)
+{
+    for (size_t i = 0; i < sizeof yos_proto_table / sizeof yos_proto_table[0]; i++) {
+        if (yos_proto_table[i].number == number)
+            return emit_protoent(ctx, &yos_proto_table[i]);
+    }
+    return 0;
+}

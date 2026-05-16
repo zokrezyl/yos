@@ -65,12 +65,22 @@ void yos_signal_set_pending(int fbsd_signum)
  * impl/callback.c does for qsort comparators. Bails silently on
  * any error — the caller is sigsuspend, and we still want to return
  * EINTR so the wait loop sees forward progress. */
+/* Special FreeBSD signal(3) handler values. */
+#define YOS_SIG_DFL ((uint32_t)0)
+#define YOS_SIG_IGN ((uint32_t)1)
+#define YOS_SIG_ERR ((uint32_t)0xffffffffu)
+
 static void invoke_signal_handler(struct yos_exec_ctx *ctx, int signum)
 {
     if (signum <= 0 || signum >= YOS_NSIG) return;
     uint32_t idx = g_signal_handlers[signum];
     ydebug("invoke_signal_handler: sig=%d idx=%u\n", signum, idx);
-    if (!idx) return;
+    /* SIG_DFL (0): no handler installed — default kernel disposition,
+     * which for SIGCHLD is "ignore" — we just return.
+     * SIG_IGN (1): caller explicitly asked us to drop the signal —
+     * also return. Without this check, idx=1 would dereference
+     * function-table slot 1, which is some unrelated wasm function. */
+    if (idx == YOS_SIG_DFL || idx == YOS_SIG_IGN) return;
     IM3Runtime rt = (IM3Runtime)ctx->runtime;
     if (!rt) return;
     IM3Module mod = rt->modules;
@@ -172,6 +182,31 @@ int32_t yos_sigaction(struct yos_exec_ctx *ctx, int32_t signum,
         }
     }
     return 0;
+}
+
+/* ── signal(int, void (*)(int)) → void (*)(int) ──────────────────────
+ *
+ * BSD-style signal(3): record the wasm-side handler index, return the
+ * previously-installed one. Same handler table as sigaction (we don't
+ * distinguish signal() vs sigaction() callers — both end up in the same
+ * yos_sigsuspend-synthesised SIGCHLD dispatch path).
+ *
+ * The handler arg + return value are function-table indices in wasm
+ * land. The caller passes SIG_DFL=0 / SIG_IGN=1 as raw small ints;
+ * those flow through unchanged and invoke_signal_handler treats them
+ * as "skip" (see the SIG_DFL/SIG_IGN guard there).
+ *
+ * Signum is validated against YOS_NSIG (32); out-of-range returns
+ * SIG_ERR=0xFFFFFFFF, matching what the FreeBSD libc-level shim would
+ * expect for an EINVAL response. */
+uint32_t yos_signal(struct yos_exec_ctx *ctx, int32_t signum, uint32_t handler)
+{
+    (void)ctx;
+    if (signum <= 0 || signum >= YOS_NSIG) return YOS_SIG_ERR;
+    uint32_t old = g_signal_handlers[signum];
+    record_handler(signum, handler);
+    ydebug("signal(sig=%d) old=%u new=%u\n", signum, old, handler);
+    return old;
 }
 
 int32_t yos_sigprocmask(struct yos_exec_ctx *ctx, int32_t how,
@@ -438,5 +473,176 @@ int32_t yos_pthread_sigmask(struct yos_exec_ctx *ctx, int32_t how,
 
     if (oset_off)
         host_sigset_to_fbsd(&host_old, ctx->memory + oset_off);
+    return 0;
+}
+
+/* ── sigaltstack(const stack_t *ss, stack_t *oss) ────────────────────
+ *
+ * FreeBSD wasm32 stack_t is { void *ss_sp; size_t ss_size; int ss_flags; }
+ * laid out 4+4+4=12 bytes (wasm pointers + i386 size_t are both 32-bit).
+ *
+ * yos can't honour a guest-supplied alt stack: synthesised signal
+ * delivery (invoke_signal_handler) runs the wasm-side handler via
+ * m3_CallV on the *host's* regular thread stack, not on any wasm-
+ * linear-memory region. The guest's ss_sp value names a wasm offset
+ * — handing that to host sigaltstack would point the host kernel at
+ * a host-VA inside our linear-memory mmap, almost certainly faulting
+ * the next time a signal landed.
+ *
+ * Behaviour: validate bounds; report SS_DISABLE in oss so callers
+ * (libuv probes, runtime libs) see "no alt stack installed" and pick
+ * the regular-stack code path. Input ss is bounds-checked then
+ * ignored. Returns success — failing here would make libuv refuse to
+ * start.
+ */
+#ifndef YOS_SS_DISABLE
+#define YOS_SS_DISABLE 4   /* SS_DISABLE on both FreeBSD and Linux */
+#endif
+#define YOS_FBSD_STACK_T_BYTES 12
+
+int32_t yos_sigaltstack(struct yos_exec_ctx *ctx,
+                         uint32_t ss_off, uint32_t oss_off)
+{
+    if (ss_off) {
+        if (ss_off + YOS_FBSD_STACK_T_BYTES > ctx->memory_size)
+            return yos_errno_neg(ctx, EFAULT);
+        /* Honestly we'd want to remember these for the oss query on a
+         * later call; nothing in tree consumes that yet. Drop the
+         * values silently for now — invokers that read back through
+         * oss only care whether the kernel accepted the call. */
+    }
+    if (oss_off) {
+        if (oss_off + YOS_FBSD_STACK_T_BYTES > ctx->memory_size)
+            return yos_errno_neg(ctx, EFAULT);
+        uint8_t *p = ctx->memory + oss_off;
+        memset(p, 0, YOS_FBSD_STACK_T_BYTES);
+        /* ss_flags at byte offset 8 (after the 4-byte ss_sp and the
+         * 4-byte ss_size). */
+        *(uint32_t *)(p + 8) = YOS_SS_DISABLE;
+    }
+    return 0;
+}
+
+/* ── sigwait(const sigset_t *set, int *sig) ─────────────────────────
+ *
+ * Blocks the calling thread until one of the signals in `set` is
+ * delivered; writes the signal number (FreeBSD numbering) to `*sig`.
+ * POSIX return: 0 on success, errno on error (NOT -1 + errno).
+ *
+ * Host call uses the converted host sigset; the host returns a host
+ * signum that we map back to FreeBSD numbering before writing it out. */
+int32_t yos_sigwait(struct yos_exec_ctx *ctx,
+                    uint32_t set_off, uint32_t sig_out_off)
+{
+    if (!yos_sigset_bound(ctx, set_off))             return EFAULT;
+    if (!sig_out_off || sig_out_off + 4 > ctx->memory_size)
+        return EFAULT;
+
+    sigset_t host;
+    fbsd_sigset_to_host(ctx->memory + set_off, &host);
+
+    int hsig = 0;
+    int rc = sigwait(&host, &hsig);
+    if (rc != 0) return yos_remap_errno_h2g(rc);
+
+    int fbsig = host_to_fbsd_signo(hsig);
+    *(int32_t *)(ctx->memory + sig_out_off) = (fbsig > 0) ? fbsig : hsig;
+    return 0;
+}
+
+/* ── sigwaitinfo(const sigset_t *set, siginfo_t *info) ───────────────
+ *
+ * Same as sigwait but returns the signum directly (or -1+errno). The
+ * `info` out-buffer carries siginfo_t which has very different layouts
+ * between FreeBSD and Linux (host: 128 bytes; FreeBSD-i386: 64). We
+ * don't convert it yet — guests that need siginfo fields will see all
+ * zeros. Most callers only consume the return value, so this works for
+ * the common path; flag siginfo as TODO when a real consumer surfaces.
+ */
+int32_t yos_sigwaitinfo(struct yos_exec_ctx *ctx,
+                        uint32_t set_off, uint32_t info_off)
+{
+    if (!yos_sigset_bound(ctx, set_off)) return yos_errno_neg(ctx, EFAULT);
+
+    sigset_t host;
+    fbsd_sigset_to_host(ctx->memory + set_off, &host);
+
+    int rc = sigwaitinfo(&host, NULL);
+    if (rc < 0) return yos_errno_neg(ctx, errno);
+
+    /* Zero the wasm siginfo_t if provided so callers don't read stale
+     * memory. FreeBSD-i386 siginfo_t is 64 bytes. */
+    if (info_off && info_off + 64 <= ctx->memory_size)
+        memset(ctx->memory + info_off, 0, 64);
+
+    int fbsig = host_to_fbsd_signo(rc);
+    return (fbsig > 0) ? fbsig : rc;
+}
+
+/* ── sigtimedwait(set, info, timeout) ────────────────────────────────
+ *
+ * Like sigwaitinfo but bounded. FreeBSD-i386 timespec is 8 bytes
+ * (4-byte time_t + 4-byte long); host glibc x86_64 timespec is 16
+ * bytes. Read the 8-byte wasm form and build a host struct.
+ *
+ * Linux-only: sigtimedwait() doesn't exist on darwin/iOS. Guard the
+ * body so the host build still links; the bridge returns -ENOSYS
+ * everywhere else. */
+int32_t yos_sigtimedwait(struct yos_exec_ctx *ctx,
+                         uint32_t set_off, uint32_t info_off,
+                         uint32_t timeout_off)
+{
+#if defined(__linux__)
+    if (!yos_sigset_bound(ctx, set_off)) return yos_errno_neg(ctx, EFAULT);
+
+    sigset_t host;
+    fbsd_sigset_to_host(ctx->memory + set_off, &host);
+
+    struct timespec ts, *tsp = NULL;
+    if (timeout_off) {
+        if (timeout_off + 8 > ctx->memory_size)
+            return yos_errno_neg(ctx, EFAULT);
+        uint32_t s, n;
+        memcpy(&s, ctx->memory + timeout_off,     4);
+        memcpy(&n, ctx->memory + timeout_off + 4, 4);
+        ts.tv_sec  = (time_t)(int32_t)s;
+        ts.tv_nsec = (long)(int32_t)n;
+        tsp = &ts;
+    }
+
+    int rc = sigtimedwait(&host, NULL, tsp);
+    if (rc < 0) return yos_errno_neg(ctx, errno);
+
+    if (info_off && info_off + 64 <= ctx->memory_size)
+        memset(ctx->memory + info_off, 0, 64);
+
+    int fbsig = host_to_fbsd_signo(rc);
+    return (fbsig > 0) ? fbsig : rc;
+#else
+    (void)set_off; (void)info_off; (void)timeout_off;
+    return yos_errno_neg(ctx, ENOSYS);
+#endif
+}
+
+/* ── sigpending(sigset_t *set) ─────────────────────────────────────────
+ *
+ * Returns the set of signals pending delivery to (or blocked + queued
+ * for) the calling process. Real shells (zsh's job control) check this
+ * to see whether SIGCHLD is queued — when sigsuspend is unreliable they
+ * fall back to: sigprocmask(BLOCK,SIGCHLD); sigpending; if pending then
+ * waitpid; else sigsuspend.
+ *
+ * Host call + sigset_t out-conversion to FreeBSD layout. Bounds-check
+ * the wasm offset; on bound failure return -1+EFAULT POSIX-style. */
+int32_t yos_sigpending(struct yos_exec_ctx *ctx, uint32_t set_off)
+{
+    if (!set_off) return yos_errno_neg(ctx, EFAULT);
+    if (!yos_sigset_bound(ctx, set_off)) return yos_errno_neg(ctx, EFAULT);
+
+    sigset_t host;
+    if (sigpending(&host) != 0)
+        return yos_errno_neg(ctx, errno);
+
+    host_sigset_to_fbsd(&host, ctx->memory + set_off);
     return 0;
 }

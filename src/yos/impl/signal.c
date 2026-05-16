@@ -113,64 +113,6 @@ static m3ApiRawFunction(m3_yos_sigismember)
     m3ApiReturn((s[bit >> 5] >> (bit & 31)) & 1u);
 }
 
-/* pthread_sigmask(how, const sigset_t *set, sigset_t *oset) — no-op
- * success. If oset is non-NULL we zero it (claim "no signals masked").
- * Real masking would need sigset_t conversion + per-thread state. */
-static m3ApiRawFunction(m3_yos_pthread_sigmask)
-{
-    m3ApiReturnType(int32_t);
-    m3ApiGetArg(int32_t,  how);
-    m3ApiGetArg(uint32_t, set_off);
-    m3ApiGetArg(uint32_t, oset_off);
-    (void)how; (void)set_off;
-    struct yos_exec_ctx *ctx = (struct yos_exec_ctx *)m3_GetUserData(runtime);
-    uint32_t mem_size = 0;
-    ctx->memory = m3_GetMemory(runtime, &mem_size, 0);
-    ctx->memory_size = mem_size;
-
-    if (oset_off) {
-        uint32_t *o = sigset_at(ctx, oset_off);
-        if (o) o[0] = o[1] = o[2] = o[3] = 0;
-    }
-    m3ApiReturn(0);
-}
-
-/* sigprocmask — same shape, same no-op. */
-static m3ApiRawFunction(m3_yos_sigprocmask)
-{
-    m3ApiReturnType(int32_t);
-    m3ApiGetArg(int32_t,  how);
-    m3ApiGetArg(uint32_t, set_off);
-    m3ApiGetArg(uint32_t, oset_off);
-    (void)how; (void)set_off;
-    struct yos_exec_ctx *ctx = (struct yos_exec_ctx *)m3_GetUserData(runtime);
-    uint32_t mem_size = 0;
-    ctx->memory = m3_GetMemory(runtime, &mem_size, 0);
-    ctx->memory_size = mem_size;
-
-    if (oset_off) {
-        uint32_t *o = sigset_at(ctx, oset_off);
-        if (o) o[0] = o[1] = o[2] = o[3] = 0;
-    }
-    m3ApiReturn(0);
-}
-
-/* sigpending — write zeros (no signals pending). */
-static m3ApiRawFunction(m3_yos_sigpending)
-{
-    m3ApiReturnType(int32_t);
-    m3ApiGetArg(uint32_t, set_off);
-    struct yos_exec_ctx *ctx = (struct yos_exec_ctx *)m3_GetUserData(runtime);
-    uint32_t mem_size = 0;
-    ctx->memory = m3_GetMemory(runtime, &mem_size, 0);
-    ctx->memory_size = mem_size;
-
-    uint32_t *s = sigset_at(ctx, set_off);
-    if (!s) m3ApiReturn(-1);
-    s[0] = s[1] = s[2] = s[3] = 0;
-    m3ApiReturn(0);
-}
-
 void yos_signal_link(IM3Module mod)
 {
     m3_LinkRawFunction(mod, "env", "sigemptyset",   "i(i)",   m3_yos_sigemptyset);
@@ -178,8 +120,8 @@ void yos_signal_link(IM3Module mod)
     m3_LinkRawFunction(mod, "env", "sigaddset",     "i(ii)",  m3_yos_sigaddset);
     m3_LinkRawFunction(mod, "env", "sigdelset",     "i(ii)",  m3_yos_sigdelset);
     m3_LinkRawFunction(mod, "env", "sigismember",   "i(ii)",  m3_yos_sigismember);
-    m3_LinkRawFunction(mod, "env", "pthread_sigmask","i(iii)",m3_yos_pthread_sigmask);
-    /* sigprocmask + sigpending are bound via the auto-generated bridges
-     * pointing at impl/sig.c's existing yos_sigprocmask / yos_sigpending. */
-    (void)m3_yos_sigprocmask; (void)m3_yos_sigpending;
+    /* pthread_sigmask, sigprocmask, sigpending, signal are bound via
+     * the auto-generated bridges pointing at impl/sig.c. The old no-op
+     * raw-function stubs that used to live here would otherwise win the
+     * binding race and silently mask away the layout-aware impls. */
 }

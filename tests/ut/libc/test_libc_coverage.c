@@ -55,6 +55,7 @@
 #include <netdb.h>
 #include <pwd.h>
 #include <grp.h>
+#include <regex.h>     /* probe_misc_bridges: regcomp/regexec round-trip */
 /* Top-level <signal.h> pulls in <sys/_ucontext.h> which
  * references mcontext_t — undefined in the wasm32 sysroot's
  * <machine/ucontext.h>. Provide a stub before including signal.h
@@ -619,6 +620,111 @@ static void probe_signals(void)
             sigaction(SIGURG, &old, NULL);
         } else emit_fail("sigaction", errno, NULL);
     }
+    /* sigtimedwait — non-blocking probe with all-zero timeout. We
+     * expect EAGAIN because no signal is queued. Validates the
+     * timespec wasm32->host widen and sigset_t conversion. */
+    {
+        sigset_t s; sigemptyset(&s); sigaddset(&s, SIGUSR1);
+        struct timespec zero = {0, 0};
+        int rc = sigtimedwait(&s, NULL, &zero);
+        if (rc < 0 && errno == EAGAIN) emit_pass("sigtimedwait:nowait");
+        else emit_fail("sigtimedwait:nowait", errno,
+                       "expected -1+EAGAIN with empty zero-timeout");
+    }
+    /* sigwait — block SIGUSR1, raise() it on ourselves, then sigwait
+     * should immediately return with the FreeBSD signo of SIGUSR1.
+     * Validates the host→FreeBSD signo reverse-map on the out-param. */
+    {
+        sigset_t s, old;
+        sigemptyset(&s);
+        sigaddset(&s, SIGUSR1);
+        if (pthread_sigmask(SIG_BLOCK, &s, &old) == 0) {
+            raise(SIGUSR1);
+            int got = -1;
+            int rc = sigwait(&s, &got);
+            if (rc == 0 && got == SIGUSR1) emit_pass("sigwait");
+            else emit_fail("sigwait", rc,
+                           "sigwait did not return SIGUSR1");
+            pthread_sigmask(SIG_SETMASK, &old, NULL);
+        } else {
+            emit_fail("sigwait:setup", 0, "pthread_sigmask BLOCK failed");
+        }
+    }
+    /* sigwaitinfo — same shape as sigwait. Block, raise, expect the
+     * signal number as the return value (NOT through *sig out-param —
+     * sigwaitinfo returns signo directly). */
+    {
+        sigset_t s, old;
+        sigemptyset(&s);
+        sigaddset(&s, SIGUSR2);
+        if (pthread_sigmask(SIG_BLOCK, &s, &old) == 0) {
+            raise(SIGUSR2);
+            int rc = sigwaitinfo(&s, NULL);
+            if (rc == SIGUSR2) emit_pass("sigwaitinfo");
+            else emit_fail("sigwaitinfo", errno,
+                           "sigwaitinfo did not return SIGUSR2");
+            pthread_sigmask(SIG_SETMASK, &old, NULL);
+        } else {
+            emit_fail("sigwaitinfo:setup", 0, "pthread_sigmask BLOCK failed");
+        }
+    }
+    /* pthread_sigmask negative path: bad `how` → EINVAL. */
+    {
+        sigset_t s; sigemptyset(&s); sigaddset(&s, SIGUSR1);
+        int rc = pthread_sigmask(99 /* invalid */, &s, NULL);
+        if (rc == EINVAL) emit_pass("pthread_sigmask:einval");
+        else emit_fail("pthread_sigmask:einval", rc,
+                       "expected EINVAL for invalid how");
+    }
+    /* sigaltstack — query oss with NULL ss. Should return success and
+     * report SS_DISABLE in the out struct (yos doesn't honour alt-stack
+     * requests; it advertises "none installed" so callers fall to the
+     * regular-stack code path). */
+    {
+        stack_t oss;
+        memset(&oss, 0xff, sizeof oss);
+        if (sigaltstack(NULL, &oss) == 0) {
+            emit_pass("sigaltstack:query");
+            if (oss.ss_flags & SS_DISABLE) emit_pass("sigaltstack:disabled");
+            else emit_fail("sigaltstack:disabled", 0,
+                           "expected SS_DISABLE in oss.ss_flags");
+        } else {
+            emit_fail("sigaltstack:query", errno, NULL);
+        }
+    }
+    /* sigpending — query, expect success + empty set in a quiescent
+     * test process. Validates host→FreeBSD sigset_t out-conversion. */
+    {
+        sigset_t pending;
+        if (sigpending(&pending) == 0) {
+            emit_pass("sigpending");
+            /* No signal sent in this probe — set should be empty. Spot-
+             * check by querying SIGUSR1 / SIGURG; both should be 0. */
+            if (sigismember(&pending, SIGUSR1) == 0 &&
+                sigismember(&pending, SIGURG)  == 0)
+                emit_pass("sigpending:empty");
+            else
+                emit_fail("sigpending:empty", 0,
+                          "pending set unexpectedly non-empty");
+        } else {
+            emit_fail("sigpending", errno, NULL);
+        }
+    }
+    /* signal(SIGURG, SIG_IGN) — install + capture old + restore. Validates
+     * the FreeBSD `signal(3)` BSD-semantics shim: handler-table record,
+     * SIG_ERR error sentinel, prior-handler return. */
+    {
+        void (*prev)(int) = signal(SIGURG, SIG_IGN);
+        if (prev != SIG_ERR) {
+            emit_pass("signal:install");
+            void (*now)(int) = signal(SIGURG, prev);
+            if (now == SIG_IGN) emit_pass("signal:old-returned");
+            else emit_fail("signal:old-returned", 0,
+                           "prior handler != SIG_IGN");
+        } else {
+            emit_fail("signal:install", errno, NULL);
+        }
+    }
     /* pthread_sigmask — query, then BLOCK SIGUSR1, verify, UNBLOCK,
      * verify. Validates the 16B↔128B sigset_t translation AND the
      * FreeBSD↔Linux SIG_BLOCK/UNBLOCK/SETMASK enum remap. */
@@ -648,6 +754,116 @@ static void probe_signals(void)
             emit_fail("pthread_sigmask:block", rc, NULL);
         }
     }
+}
+
+static void probe_misc_bridges(void)
+{
+    /* getgroups — POSIX query (gidsetsize=0) returns the count. */
+    {
+        int n = getgroups(0, NULL);
+        if (n >= 0) emit_pass("getgroups:count");
+        else emit_fail("getgroups:count", errno, NULL);
+    }
+    /* getprotobyname — must find "tcp" → protocol number 6. */
+    {
+        struct protoent *p = getprotobyname("tcp");
+        if (p && p->p_proto == 6) emit_pass("getprotobyname:tcp");
+        else emit_fail("getprotobyname:tcp", 0,
+                       p ? "p_proto != 6" : "NULL return");
+        struct protoent *q = getprotobynumber(17);
+        if (q && q->p_name && strcmp(q->p_name, "udp") == 0)
+            emit_pass("getprotobynumber:udp");
+        else emit_fail("getprotobynumber:udp", 0,
+                       q ? "p_name != udp" : "NULL return");
+    }
+    /* regcomp / regexec / regfree — full round-trip: compile a
+     * pattern, match it against a string, capture the substring
+     * offsets, free. Validates the handle-table indirection in
+     * impl/regex.c plus regmatch_t out-conversion. */
+    {
+        regex_t re;
+        if (regcomp(&re, "([a-z]+)([0-9]+)", REG_EXTENDED) == 0) {
+            emit_pass("regcomp");
+            regmatch_t m[3];
+            int rc = regexec(&re, "foo42bar", 3, m, 0);
+            if (rc == 0 && m[1].rm_so == 0 && m[1].rm_eo == 3 &&
+                m[2].rm_so == 3 && m[2].rm_eo == 5)
+                emit_pass("regexec");
+            else
+                emit_fail("regexec", rc,
+                          "substring offsets did not match");
+            /* regexec NOMATCH path: string without the pattern. */
+            rc = regexec(&re, "XYZ", 0, NULL, 0);
+            if (rc == REG_NOMATCH) emit_pass("regexec:nomatch");
+            else emit_fail("regexec:nomatch", rc,
+                           "expected REG_NOMATCH on non-matching input");
+            regfree(&re);
+            emit_pass("regfree");
+        } else {
+            emit_fail("regcomp", 0, "compile failed");
+        }
+    }
+    /* regcomp negative path: syntactically broken pattern.
+     * regerror: format the error code into a buffer, expect a non-
+     * empty string and a needed-size > 1. */
+    {
+        regex_t re;
+        int rc = regcomp(&re, "[unbalanced", REG_EXTENDED);
+        if (rc != 0) {
+            emit_pass("regcomp:badpat");
+            char buf[64] = {0};
+            size_t need = regerror(rc, &re, buf, sizeof buf);
+            if (need > 1 && buf[0] != '\0') emit_pass("regerror");
+            else emit_fail("regerror", (int)need,
+                           "regerror produced empty / 0-length message");
+        } else {
+            emit_fail("regcomp:badpat", 0,
+                      "expected compile failure for unbalanced bracket");
+            regfree(&re);
+        }
+    }
+    /* alphasort — build two minimal FreeBSD-shape dirents (24-byte
+     * header + d_name), point at them through const struct dirent **,
+     * and verify the comparator returns negative for "alpha" < "bravo".
+     * The struct dirent layout reach-through is what would break if
+     * the d_name offset (24) is ever wrong. */
+    {
+        unsigned char a[24 + 8] = {0};
+        unsigned char b[24 + 8] = {0};
+        memcpy(a + 24, "alpha", 6);
+        memcpy(b + 24, "bravo", 6);
+        struct dirent *pa = (struct dirent *)a, *pb = (struct dirent *)b;
+        int cmp = alphasort((const struct dirent **)&pa,
+                            (const struct dirent **)&pb);
+        if (cmp < 0) emit_pass("alphasort");
+        else emit_fail("alphasort", cmp,
+                       "expected negative for 'alpha' < 'bravo'");
+        /* Equal names → 0. */
+        int eq = alphasort((const struct dirent **)&pa,
+                           (const struct dirent **)&pa);
+        if (eq == 0) emit_pass("alphasort:equal");
+        else emit_fail("alphasort:equal", eq,
+                       "expected 0 for self-comparison");
+    }
+    /* versionsort — same shape as alphasort, but with names that
+     * differ only in their numeric suffix. strverscmp orders "file2"
+     * before "file10"; plain strcoll would put "file10" first. */
+    {
+        unsigned char a[24 + 16] = {0};
+        unsigned char b[24 + 16] = {0};
+        memcpy(a + 24, "file2",  6);
+        memcpy(b + 24, "file10", 7);
+        struct dirent *pa = (struct dirent *)a, *pb = (struct dirent *)b;
+        int cmp = versionsort((const struct dirent **)&pa,
+                              (const struct dirent **)&pb);
+        if (cmp < 0) emit_pass("versionsort");
+        else emit_fail("versionsort", cmp,
+                       "expected file2 < file10 in version order");
+    }
+    /* setproctitle — not in the FreeBSD libc headers we ship under
+     * the wasm32 sysroot, so we don't probe it from the libc-coverage
+     * test. The yos bridge is exercised via real consumers (sshd
+     * startup) once they come online. */
 }
 
 static void probe_pthread(void)
@@ -2556,6 +2772,7 @@ int main(void)
     probe_pipe();
     probe_socket();
     probe_signals();
+    probe_misc_bridges();
     probe_pthread();
     probe_pthread_attr();
     probe_sched();

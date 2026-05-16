@@ -85,6 +85,22 @@ custom_proc:
   # fstatat moved BACK to struct_convert; AT_* flag translation
   # to be added there (or via auto-bridge enhancement) instead of
   # hand-bridging — that change broke nvim-edit-session.
+  # impl/posix.c — gid_t is u32 both sides; just copy through.
+  - getgroups
+  # impl/regex.c — handle-table indirection; see header comment there.
+  - regcomp
+  - regexec
+  - regfree
+  - regerror
+  # impl/posix.c — variadic no-op (no observable process title in wasm).
+  - setproctitle
+  # impl/posix.c — scandir(3) comparators. const struct dirent ** →
+  # reach through twice for d_name, call strcoll / strverscmp.
+  - alphasort
+  - versionsort
+  # impl/pwd.c — static protocol table covering tcp/udp/icmp/ip.
+  - getprotobyname
+  - getprotobynumber
   # impl/posix.c — DNS / sockaddr conversion. Builds a wasm-side
   # linked list of addrinfo blocks via yos_malloc (same pattern as
   # getpwuid), translates FreeBSD↔host sockaddr layout (sin_len byte).
@@ -565,7 +581,7 @@ stub:
   # custom_sig (impl/sig.c) — pure userspace bitmap ops on the
   # FreeBSD-shape 16-byte sigset_t.
   # sysctl + sysctlbyname moved to runtime_owned (impl/sysctl.c).
-  - setproctitle
+  # setproctitle moved to custom_proc (impl/posix.c) — variadic, no-op.
   # FreeBSD-internal helpers (rarely called in user code).
   - charsettype
   - getbytefromcharset
@@ -647,8 +663,12 @@ stub:
   - vswscanf
   - vwprintf
   - vwscanf
-  # regexec — bridge.py mis-renders signature (regmatch_t * + size_t).
-  - regexec
+  # regexec / regcomp / regfree / regerror moved to custom_proc — the
+  # impl in impl/regex.c uses a host-side regex_t handle table so the
+  # opaque regex_t doesn't expose host layout to the wasm guest. The
+  # auto-bridge for regcomp was casting the wasm offset straight to
+  # `struct re_pattern_buffer *`, writing host pointers into wasm
+  # memory; regexec then could not safely read it back.
   # tmpnam moved to custom_proc (impl/pwd.c).
   - pthread_getcpuclockid
   - pthread_getschedparam
@@ -665,10 +685,10 @@ stub:
   # sbrk, raise, killpg. Those are now auto-passthrough bridges.
   # fread/fwrite stay stubbed (need FILE* table).
   # FILE* family routed to impl/file.c — moved to custom_vfs below.
-  # alphasort/versionsort are comparator fns scandir uses; stubbed
-  # because they take a fn pointer that we'd need to translate.
-  - alphasort
-  - versionsort
+  # alphasort/versionsort moved to custom_proc (impl/posix.c). They
+  # are scandir comparators that take const struct dirent **; we
+  # reach through twice to find the d_name field and call strcoll /
+  # strverscmp directly.
   # localtime/gmtime/ctime/asctime/strptime moved to custom_proc
   # (impl/pwd.c) — same wasm-side static-buffer pattern as getpwuid.
   # strftime moved to custom_proc (impl/pwd.c) — needs cv_tm_w2h.
@@ -687,22 +707,19 @@ stub:
   # `ai_addr` / `ai_canonname` pointers as wasm offsets.
   - getifaddrs
   - freeifaddrs
-  - getprotobyname
-  - getprotobynumber
+  # getprotobyname / getprotobynumber moved to custom_proc (impl/pwd.c).
   # struct utsname differs between FreeBSD/Linux. uname() is an inline
   # shim around __xuname which is bridged in impl/posix.c.
-  - sigaltstack
   # Note: sigsuspend used to be listed here as a stub. zsh's "fork+wait
   # for child" pattern is `block(SIGCHLD); sigsuspend(empty); waitpid()`
   # — with a stub, sigsuspend returns ENOSYS without blocking and zsh
   # busy-loops forever, hanging on every external command. The custom
   # body in impl/sig.c polls the proc table for child state changes,
   # then returns -1/EINTR so zsh's loop falls through to waitpid.
-  - sigwait
-  - sigwaitinfo
-  - sigtimedwait
-  - sigpending
-  - signal
+  # signal/sigpending/sigaltstack/sigwait/sigwaitinfo/sigtimedwait
+  # are routed via custom_sig — impl/sig.c provides the impls.
+  # Leaving them in stub: would emit colliding yos_<name> bodies in
+  # the auto-bridge and break the link.
   - sigreturn
   - sigstack
   # execv / execvp / execvpe — implemented in impl/proc.c (custom_proc).

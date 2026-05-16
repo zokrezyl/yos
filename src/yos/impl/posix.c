@@ -1390,3 +1390,107 @@ int32_t yos_accept4(struct yos_exec_ctx *ctx, int32_t wfd,
     return -ENOSYS;
 #endif
 }
+
+#include "errno_helpers.h"
+#include <grp.h>
+#include <errno.h>
+
+/* ── getgroups(int gidsetsize, gid_t grouplist[]) ────────────────────
+ *
+ * gid_t is 32-bit on both FreeBSD-i386 and Linux x86_64, so the per-
+ * element copy is straight uint32. Bounds-check the wasm out-array;
+ * POSIX `gidsetsize=0` means "tell me how many groups, don't write
+ * anything". */
+int32_t yos_getgroups(struct yos_exec_ctx *ctx, int32_t gidsetsize,
+                      uint32_t list_off)
+{
+    if (gidsetsize == 0) {
+        int n = getgroups(0, NULL);
+        if (n < 0) return yos_errno_neg(ctx, errno);
+        return n;
+    }
+    if (gidsetsize < 0) return yos_errno_neg(ctx, EINVAL);
+    if (!list_off ||
+        (uint64_t)list_off + (uint64_t)gidsetsize * 4u > ctx->memory_size)
+        return yos_errno_neg(ctx, EFAULT);
+
+    gid_t *host = malloc((size_t)gidsetsize * sizeof(gid_t));
+    if (!host) return yos_errno_neg(ctx, ENOMEM);
+
+    int n = getgroups(gidsetsize, host);
+    if (n < 0) {
+        int saved = errno;
+        free(host);
+        return yos_errno_neg(ctx, saved);
+    }
+    uint32_t *out = (uint32_t *)(ctx->memory + list_off);
+    for (int i = 0; i < n; i++) out[i] = (uint32_t)host[i];
+    free(host);
+    return n;
+}
+
+/* ── alphasort / versionsort — scandir(3) comparators ────────────────
+ *
+ * scandir collects directory entries into an array and runs qsort with
+ * a caller-supplied comparator. alphasort sorts by strcoll on d_name;
+ * versionsort uses strverscmp (GNU extension, also in glibc).
+ *
+ * Arguments are `const struct dirent **`: wasm offsets at which
+ * another wasm offset (the dirent pointer) lives. Reach through once
+ * to get the dirent base, then read d_name at offset 24 (FreeBSD-i386
+ * struct dirent layout: 8 + 8 + 2 + 1 + 1 + 2 + 2 = 24, then 256-byte
+ * d_name).
+ *
+ * Bounds-check both levels of indirection. Returns 0 on bad input —
+ * collapses any pair we can't read into "equal", which is safe for a
+ * comparator: qsort still terminates.
+ */
+#define YOS_FBSD_DIRENT_NAME_OFFSET 24
+#define YOS_FBSD_DIRENT_MIN_SIZE    (YOS_FBSD_DIRENT_NAME_OFFSET + 1)
+
+static const char *dirent_name_from_pp(struct yos_exec_ctx *ctx, uint32_t pp)
+{
+    if (!pp || pp + 4 > ctx->memory_size) return NULL;
+    uint32_t ent = *(uint32_t *)(ctx->memory + pp);
+    if (!ent || (uint64_t)ent + YOS_FBSD_DIRENT_MIN_SIZE > ctx->memory_size)
+        return NULL;
+    return (const char *)(ctx->memory + ent + YOS_FBSD_DIRENT_NAME_OFFSET);
+}
+
+int32_t yos_alphasort(struct yos_exec_ctx *ctx, uint32_t a_pp, uint32_t b_pp)
+{
+    const char *a = dirent_name_from_pp(ctx, a_pp);
+    const char *b = dirent_name_from_pp(ctx, b_pp);
+    if (!a || !b) return 0;
+    return strcoll(a, b);
+}
+
+int32_t yos_versionsort(struct yos_exec_ctx *ctx, uint32_t a_pp, uint32_t b_pp)
+{
+    const char *a = dirent_name_from_pp(ctx, a_pp);
+    const char *b = dirent_name_from_pp(ctx, b_pp);
+    if (!a || !b) return 0;
+    /* strverscmp is glibc; on darwin libSystem doesn't ship it. Fall
+     * back to strcoll there — close enough that callers (find, ls
+     * -v) still get a deterministic order. */
+#if defined(__GLIBC__)
+    return strverscmp(a, b);
+#else
+    return strcoll(a, b);
+#endif
+}
+
+/* ── setproctitle(const char *fmt, ...) ──────────────────────────────
+ *
+ * No observable process title on wasm: we don't fork host children
+ * that show up in ps. The function exists as a libc-level no-op
+ * success — daemons (sshd) call it during startup, and refusing here
+ * makes them fail to come up.
+ *
+ * Variadic — bridge.py skips it as "variadic-skipped" and emits a
+ * stub. We re-bind here with a custom impl that accepts (fmt, va_ptr)
+ * and ignores both. */
+void yos_setproctitle(struct yos_exec_ctx *ctx, uint32_t fmt, uint32_t va_ptr)
+{
+    (void)ctx; (void)fmt; (void)va_ptr;
+}
