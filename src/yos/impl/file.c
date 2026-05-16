@@ -214,12 +214,62 @@ uint32_t yos_fwrite_unlocked(struct yos_exec_ctx *ctx, uint32_t buf,
 
 /* ── single-char and string I/O ───────────────────────────────────── */
 
-int32_t yos_fgetc(struct yos_exec_ctx *ctx, uint32_t fp) { (void)ctx; FILE *f=handle_to_file(fp); return f?fgetc(f):-1; }
-int32_t yos_getc (struct yos_exec_ctx *ctx, uint32_t fp) { (void)ctx; FILE *f=handle_to_file(fp); return f?getc(f):-1; }
-int32_t yos_getc_unlocked (struct yos_exec_ctx *ctx, uint32_t fp) { (void)ctx; FILE *f=handle_to_file(fp); return f?getc_unlocked(f):-1; }
-int32_t yos_fputc(struct yos_exec_ctx *ctx, int32_t c, uint32_t fp) { (void)ctx; FILE *f=handle_to_file(fp); return f?fputc(c,f):-1; }
-int32_t yos_putc (struct yos_exec_ctx *ctx, int32_t c, uint32_t fp) { (void)ctx; FILE *f=handle_to_file(fp); return f?putc(c,f):-1; }
-int32_t yos_putc_unlocked (struct yos_exec_ctx *ctx, int32_t c, uint32_t fp) { (void)ctx; FILE *f=handle_to_file(fp); return f?putc_unlocked(c,f):-1; }
+/* Per-character stdio for stream handles 1/2/3 MUST use fd_map, not
+ * host glibc's FILE* — otherwise bytes buffer in glibc's stderr/stdout
+ * and later flush to the wrong host fd (see yos_fflush). One unsigned
+ * byte read/written to/from the wasm-side fd_map'd host fd. */
+static int stdio_fputc_via_fdmap(struct yos_exec_ctx *ctx, int c, uint32_t fp)
+{
+    int hfd = std_handle_hfd(ctx, fp);
+    if (hfd < 0) return -2;
+    unsigned char ch = (unsigned char)c;
+    /* Honor the same fork-asyncify 0xff scratch workaround the fwrite
+     * path applies. A single-byte fputc(0xff) reaches a TTY as a
+     * stray invalid-UTF-8 codepoint that breaks column accounting
+     * (the "backspace inserts a space" symptom under zsh ZLE). */
+    if (yos__drop_0xff_garbage(hfd, &ch, 1)) return (int)ch;
+    if (write(hfd, &ch, 1) != 1) return -1;
+    return (int)ch;
+}
+static int stdio_fgetc_via_fdmap(struct yos_exec_ctx *ctx, uint32_t fp)
+{
+    int hfd = std_handle_hfd(ctx, fp);
+    if (hfd < 0) return -2;
+    unsigned char ch;
+    ssize_t n = read(hfd, &ch, 1);
+    return n == 1 ? (int)ch : -1;  /* EOF on n==0 or error on n<0 */
+}
+
+int32_t yos_fgetc(struct yos_exec_ctx *ctx, uint32_t fp) {
+    int r = stdio_fgetc_via_fdmap(ctx, fp);
+    if (r != -2) return r;
+    FILE *f = handle_to_file(fp); return f?fgetc(f):-1;
+}
+int32_t yos_getc (struct yos_exec_ctx *ctx, uint32_t fp) {
+    int r = stdio_fgetc_via_fdmap(ctx, fp);
+    if (r != -2) return r;
+    FILE *f = handle_to_file(fp); return f?getc(f):-1;
+}
+int32_t yos_getc_unlocked (struct yos_exec_ctx *ctx, uint32_t fp) {
+    int r = stdio_fgetc_via_fdmap(ctx, fp);
+    if (r != -2) return r;
+    FILE *f = handle_to_file(fp); return f?getc_unlocked(f):-1;
+}
+int32_t yos_fputc(struct yos_exec_ctx *ctx, int32_t c, uint32_t fp) {
+    int r = stdio_fputc_via_fdmap(ctx, c, fp);
+    if (r != -2) return r;
+    FILE *f = handle_to_file(fp); return f?fputc(c,f):-1;
+}
+int32_t yos_putc (struct yos_exec_ctx *ctx, int32_t c, uint32_t fp) {
+    int r = stdio_fputc_via_fdmap(ctx, c, fp);
+    if (r != -2) return r;
+    FILE *f = handle_to_file(fp); return f?putc(c,f):-1;
+}
+int32_t yos_putc_unlocked (struct yos_exec_ctx *ctx, int32_t c, uint32_t fp) {
+    int r = stdio_fputc_via_fdmap(ctx, c, fp);
+    if (r != -2) return r;
+    FILE *f = handle_to_file(fp); return f?putc_unlocked(c,f):-1;
+}
 int32_t yos_ungetc(struct yos_exec_ctx *ctx, int32_t c, uint32_t fp) { (void)ctx; FILE *f=handle_to_file(fp); return f?ungetc(c,f):-1; }
 
 uint32_t yos_fgets(struct yos_exec_ctx *ctx, uint32_t buf, int32_t n, uint32_t fp)
@@ -248,6 +298,24 @@ int32_t yos_fputs(struct yos_exec_ctx *ctx, uint32_t s, uint32_t fp)
 
 int32_t yos_fflush(struct yos_exec_ctx *ctx, uint32_t fp)
 {
+    /* Stream handles 1/2/3 are the wasm guest's stdin/stdout/stderr.
+     * Their writes are routed through fd_map by yos_fwrite/yos_fputs
+     * et al. — they go to the kernel via host write() directly, NOT
+     * through host glibc's FILE* buffer. So a flush here is a no-op:
+     * there's nothing left in any host buffer for these handles.
+     *
+     * WHY this matters: handle_to_file(3) returns the host process's
+     * literal `stderr` FILE* (the one tied to host fd 2 = yos's own
+     * terminal). If anyone earlier wrote BUFFERED bytes through that
+     * FILE* (a stray yos_fputc, an unbridged libc call), this flush
+     * would dump them on host fd 2 — bypassing the wasm guest's
+     * fd_map[2] redirect and landing on the user's terminal regardless
+     * of what the guest tried to do. zsh's "command not found"
+     * message split exactly that way: the strerror() body wrote
+     * through fd_map (correct) and the format-prefix wrote through
+     * host glibc's buffer (then flushed to the wrong fd), producing
+     * garbled output like "o such file or directoryzsh:1: N: …". */
+    if (fp == 1 || fp == 2 || fp == 3) { (void)ctx; return 0; }
     (void)ctx;
     if (fp == 0) return fflush(NULL);   /* flush all */
     FILE *f = handle_to_file(fp);

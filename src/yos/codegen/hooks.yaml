@@ -87,6 +87,14 @@ custom_proc:
   # hand-bridging — that change broke nvim-edit-session.
   # impl/posix.c — gid_t is u32 both sides; just copy through.
   - getgroups
+  # impl/posix.c — multibyte-width accessor; yos's wasm side has no
+  # multibyte locale support, so always 1.
+  - ___mb_cur_max
+  # impl/posix.c — FreeBSD-internal stdio buffer-spill; routes through
+  # yos_fputc (which uses fd_map for the stream handles).
+  - __swbuf
+  # impl/posix.c — host fstatfs + FreeBSD-shape struct (2344 bytes).
+  - fstatfs
   # impl/regex.c — handle-table indirection; see header comment there.
   - regcomp
   - regexec
@@ -591,7 +599,7 @@ stub:
   - ___tolower
   - ___toupper
   - __srget
-  - __swbuf
+  # __swbuf moved to custom_proc (impl/posix.c) — wraps yos_fputc.
   # __xuname (uname's backend) moved to custom_proc (impl/posix.c).
   # Linux-only that nvim/libuv reaches for; safe to stub.
   - sched_getcpu

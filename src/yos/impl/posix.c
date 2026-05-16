@@ -1494,3 +1494,98 @@ void yos_setproctitle(struct yos_exec_ctx *ctx, uint32_t fmt, uint32_t va_ptr)
 {
     (void)ctx; (void)fmt; (void)va_ptr;
 }
+
+/* ── ___mb_cur_max(void) ──────────────────────────────────────────────
+ *
+ * FreeBSD-internal accessor for MB_CUR_MAX (the maximum number of
+ * bytes any multibyte character can have in the current locale).
+ * yos doesn't actually run a multibyte locale on the wasm side —
+ * setlocale forwards to host but we don't propagate __runes-style
+ * state into the guest — so the safe answer is 1 (single-byte
+ * single-char encoding).
+ *
+ * Returning -ENOSYS here makes zsh's locale init log a noisy warning
+ * and fall back to ASCII anyway; returning 1 silently does the same
+ * thing without the warning. */
+/* Name has triple underscore — bridge.py mangles to yos____<rest>
+ * (the `yos_` prefix + the literal `___mb_cur_max` symbol name). */
+int32_t yos____mb_cur_max(struct yos_exec_ctx *ctx)
+{
+    (void)ctx;
+    return 1;
+}
+
+/* ── __swbuf(int c, FILE *fp) ─────────────────────────────────────────
+ *
+ * FreeBSD-internal stdio buffer-spill function. The `putc(c, fp)`
+ * macro inlines a fast path that writes into the FILE's buffer; when
+ * the buffer is full (or fp is unbuffered) the macro falls back to
+ * `__swbuf(c, fp)` which flushes + writes c, returning c on success
+ * or EOF on error.
+ *
+ * yos's FILE* table doesn't expose a buffer to the guest — every
+ * fputc/putc goes through yos_fputc which talks straight to the
+ * host fd. So __swbuf is functionally identical to yos_fputc for our
+ * purposes. */
+/* Name has double underscore — bridge.py mangles to yos___<rest>. */
+int32_t yos___swbuf(struct yos_exec_ctx *ctx, int32_t c, uint32_t fp)
+{
+    extern int32_t yos_fputc(struct yos_exec_ctx *, int32_t, uint32_t);
+    return yos_fputc(ctx, c, fp);
+}
+
+/* ── fstatfs(int fd, struct statfs *buf) ──────────────────────────────
+ *
+ * FreeBSD's struct statfs is 2344 bytes — much larger than Linux's
+ * ~64-byte equivalent because it carries f_fstypename[16],
+ * f_mntonname[1024], f_mntfromname[1024]. The bridge can't be a
+ * mechanical struct copy.
+ *
+ * Real-world consumers (zsh's `df`, `du`) check f_bsize, f_blocks,
+ * f_bfree, f_bavail, f_files, f_ffree, and treat the mount-path
+ * strings as informational. We zero the FreeBSD struct, fd-translate
+ * the wasm fd through fd_map, fstatfs the host, and copy the numeric
+ * fields into the FreeBSD layout. Mount-path strings stay zero
+ * (callers that need them open /proc/mounts directly anyway). */
+#include <sys/vfs.h>
+
+/* FreeBSD statfs field offsets (from yaml extraction). All u64 on
+ * wasm32 except f_version/f_type (u32) at the head. */
+#define FB_STATFS_F_VERSION_OFF   0
+#define FB_STATFS_F_TYPE_OFF      4
+#define FB_STATFS_F_FLAGS_OFF     8
+#define FB_STATFS_F_BSIZE_OFF    16
+#define FB_STATFS_F_IOSIZE_OFF   24
+#define FB_STATFS_F_BLOCKS_OFF   32
+#define FB_STATFS_F_BFREE_OFF    40
+#define FB_STATFS_F_BAVAIL_OFF   48
+#define FB_STATFS_F_FILES_OFF    56
+#define FB_STATFS_F_FFREE_OFF    64
+#define FB_STATFS_SIZE          2344
+#define FB_STATFS_F_VERSION     0x20140518u  /* FreeBSD STATFS_VERSION */
+
+int32_t yos_fstatfs(struct yos_exec_ctx *ctx, int32_t wfd, uint32_t buf_off)
+{
+    extern int yos_fd_get(struct yos_exec_ctx *, int);
+    if (!buf_off || (uint64_t)buf_off + FB_STATFS_SIZE > ctx->memory_size)
+        return yos_errno_neg(ctx, EFAULT);
+    int hfd = yos_fd_get(ctx, wfd);
+    if (hfd < 0) return yos_errno_neg(ctx, EBADF);
+
+    struct statfs h;
+    if (fstatfs(hfd, &h) < 0) return yos_errno_neg(ctx, errno);
+
+    uint8_t *w = ctx->memory + buf_off;
+    memset(w, 0, FB_STATFS_SIZE);
+    *(uint32_t *)(w + FB_STATFS_F_VERSION_OFF) = FB_STATFS_F_VERSION;
+    *(uint32_t *)(w + FB_STATFS_F_TYPE_OFF)    = (uint32_t)h.f_type;
+    *(uint64_t *)(w + FB_STATFS_F_FLAGS_OFF)   = 0;  /* mount flags differ; leave 0 */
+    *(uint64_t *)(w + FB_STATFS_F_BSIZE_OFF)   = (uint64_t)h.f_bsize;
+    *(uint64_t *)(w + FB_STATFS_F_IOSIZE_OFF)  = (uint64_t)h.f_bsize;  /* iosize == bsize on most filesystems */
+    *(uint64_t *)(w + FB_STATFS_F_BLOCKS_OFF)  = (uint64_t)h.f_blocks;
+    *(uint64_t *)(w + FB_STATFS_F_BFREE_OFF)   = (uint64_t)h.f_bfree;
+    *(uint64_t *)(w + FB_STATFS_F_BAVAIL_OFF)  = (uint64_t)h.f_bavail;
+    *(uint64_t *)(w + FB_STATFS_F_FILES_OFF)   = (uint64_t)h.f_files;
+    *(uint64_t *)(w + FB_STATFS_F_FFREE_OFF)   = (uint64_t)h.f_ffree;
+    return 0;
+}

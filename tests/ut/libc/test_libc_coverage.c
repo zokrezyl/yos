@@ -56,6 +56,7 @@
 #include <pwd.h>
 #include <grp.h>
 #include <regex.h>     /* probe_misc_bridges: regcomp/regexec round-trip */
+#include <sys/mount.h> /* probe_misc_bridges: fstatfs (FreeBSD's struct statfs) */
 /* Top-level <signal.h> pulls in <sys/_ucontext.h> which
  * references mcontext_t — undefined in the wasm32 sysroot's
  * <machine/ucontext.h>. Provide a stub before including signal.h
@@ -864,6 +865,48 @@ static void probe_misc_bridges(void)
      * the wasm32 sysroot, so we don't probe it from the libc-coverage
      * test. The yos bridge is exercised via real consumers (sshd
      * startup) once they come online. */
+
+    /* The 4 stubs zsh's import scan surfaced (issue #4): _mktemp,
+     * ___mb_cur_max, __swbuf, fstatfs. Probe each for its core
+     * contract. */
+    /* _mktemp — same call as mktemp, just the FreeBSD-internal alias. */
+    extern char *_mktemp(char *tmpl);
+    {
+        char tmpl[32] = "/tmp/yos-probeXXXXXX";
+        char *r = _mktemp(tmpl);
+        if (r && r[0] != '\0') emit_pass("_mktemp:alias");
+        else emit_fail("_mktemp:alias", errno, NULL);
+    }
+    /* ___mb_cur_max — multibyte-max accessor. Single-byte locale → 1. */
+    {
+        extern int ___mb_cur_max(void);
+        int v = ___mb_cur_max();
+        if (v == 1) emit_pass("___mb_cur_max");
+        else emit_fail("___mb_cur_max", v, "expected 1 for C/POSIX locale");
+    }
+    /* __swbuf — FreeBSD-internal stdio spill. We can't easily reach
+     * it directly (it's the slow path of the putc macro); exercise the
+     * equivalent by forcing a buffer flush via fputc on stderr. */
+    {
+        int rc = fputc('\0', stderr);
+        if (rc == '\0' || rc == 0) emit_pass("__swbuf:via-fputc");
+        else emit_fail("__swbuf:via-fputc", rc, "fputc returned unexpected value");
+    }
+    /* fstatfs — call on an open fd, check we get a sensible f_bsize. */
+    {
+        int fd = open("/tmp", O_RDONLY);
+        if (fd >= 0) {
+            struct statfs st;
+            int rc = fstatfs(fd, &st);
+            if (rc == 0 && st.f_bsize > 0)
+                emit_pass("fstatfs");
+            else
+                emit_fail("fstatfs", errno, "f_bsize not populated");
+            close(fd);
+        } else {
+            emit_fail("fstatfs:setup", errno, "open(/tmp) failed");
+        }
+    }
 }
 
 static void probe_pthread(void)

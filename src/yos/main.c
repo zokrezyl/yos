@@ -868,6 +868,20 @@ static m3ApiRawFunction(m3_unresolved_stub)
     m3ApiTrap("unresolved import");
 }
 
+/* FreeBSD libc-internal alias for mktemp(). zsh-wasm imports
+ * `_mktemp` directly; route it to yos_mktemp (same semantics, just
+ * the underscored variant FreeBSD libc uses internally to bypass
+ * user interposers). Bound from below right after
+ * yos_brg_link_imports. */
+extern uint32_t yos_mktemp(struct yos_exec_ctx *ctx, uint32_t templ);
+static m3ApiRawFunction(m3_yos_mktemp_alias)
+{
+    m3ApiReturnType(uint32_t);
+    m3ApiGetArg(uint32_t, templ);
+    struct yos_exec_ctx *ctx = (struct yos_exec_ctx *)m3_GetUserData(runtime);
+    m3ApiReturn(yos_mktemp(ctx, templ));
+}
+
 /* ----------------------------------------------------------------------------
  * setjmp / longjmp via asyncify
  *
@@ -1473,6 +1487,19 @@ void yos_link_imports(IM3Module module, struct yos_exec_ctx *ctx)
                         "libc imports will fall through to the unresolved "
                         "stub\n", brg_rc);
     }
+
+    /* FreeBSD-internal libc-private aliases. The public POSIX name
+     * (mktemp) gets bridged via yos_brg_link_imports; the underscored
+     * variant (_mktemp) is what FreeBSD libc's *.c source calls when
+     * it wants to bypass user interposers — same semantics, different
+     * symbol. zsh-wasm pulls in _mktemp through one of those internal
+     * call paths and would trap on the unresolved-import wildcard
+     * without this bind. m3w_mktemp inside yos_bridge.c is `static`,
+     * so we wrap yos_mktemp ourselves rather than referencing the
+     * generated wrapper. Extend with more aliases as the import scan
+     * (tools/scan-imports.sh) surfaces them. */
+    m3_LinkRawFunction(module, "env", "_mktemp", "i(i)",
+                       m3_yos_mktemp_alias);
 
     /* link wildcard stub for all remaining unresolved imports */
     m3_LinkRawFunction(module, "env", "*", NULL, m3_unresolved_stub);

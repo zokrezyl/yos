@@ -3,6 +3,7 @@
 #include "yos/types.h"
 #include "yos/ydebug.h"
 #include "impl/clone-abi.h"
+#include "errno_helpers.h"   /* yos_errno_neg — exec failure POSIX errno */
 #include <stdint.h>
 #include <time.h>
 #include <unistd.h>
@@ -1267,10 +1268,17 @@ int32_t yos_execve(struct yos_exec_ctx *ctx, uint32_t filename, uint32_t argv_pt
     const char *fn = (const char *)(ctx->memory + filename);
     ydebug("execve(%s, ...)\n", fn);
 
-    /* Check file exists and is readable */
+    /* Check file exists and is readable. POSIX contract: execve returns
+     * -1 with errno set; never returns 0 on failure. Use yos_errno_neg
+     * to write the FreeBSD-remapped errno into the wasm-side slot AND
+     * return -1, so the guest's `execve(...) == -1` test fires correctly
+     * — without this, zsh's interactive command-not-found path treats a
+     * negative-errno return ("-2") as a non-standard error code, exits 1
+     * instead of 127, and never prints "command not found: foo". */
     if (access(fn, R_OK) != 0) {
-        ydebug("execve: %s: %s\n", fn, strerror(errno));
-        return -errno;
+        int saved = errno;
+        ydebug("execve: %s: %s\n", fn, strerror(saved));
+        return yos_errno_neg(ctx, saved);
     }
 
     char exec_path[PATH_MAX];

@@ -46,10 +46,31 @@ static inline const char *wstr(struct yos_exec_ctx *ctx, uint32_t offset)
 void yos_fd_table_init(struct yos_exec_ctx *ctx)
 {
     for (int i = 0; i < YOS_FD_MAX; i++) ctx->fd_map[i] = -1;
-    /* Inherit yos's stdio at the conventional positions. */
-    ctx->fd_map[0] = 0;
-    ctx->fd_map[1] = 1;
-    ctx->fd_map[2] = 2;
+    /* Inherit yos's stdio at the conventional positions — but as DUPS
+     * of the host's 0/1/2, not the originals.
+     *
+     * Why: if the guest's wasm code does `close(1)` (zsh interactive
+     * does this routinely when restructuring fds around fork+exec),
+     * yos_fd_close calls `close(host_fd)`. When host_fd is the host's
+     * literal stdout fd 1, that wipes out yos's own stdout for the
+     * rest of its lifetime. The kernel can then reuse fd 1 for the
+     * next allocation (a pipe from yos_fork_pump's F_DUPFD loop, for
+     * instance), so a later write to wfd 1 → host fd 1 lands in the
+     * pipe instead of on the user's terminal. The "command not found"
+     * message vanishes; subsequent writes hit EBADF when the pipe
+     * closes; the shell prompt comes back broken.
+     *
+     * Duplicating up-front guarantees the host's original 0/1/2 are
+     * never reachable through any wasm fd, so no guest action can
+     * close them. fcntl(F_DUPFD, 3) picks the smallest free fd >= 3,
+     * so we never collide with the originals. Fall back to the raw
+     * fds if the dup fails (e.g. fd already closed at exec time —
+     * yos as a daemon with stdio redirected to /dev/null), preserving
+     * the prior behaviour for that edge case. */
+    for (int i = 0; i < 3; i++) {
+        int dup_fd = fcntl(i, F_DUPFD, 3);
+        ctx->fd_map[i] = (dup_fd >= 0) ? dup_fd : i;
+    }
 }
 
 /* FreeBSD's AT_FDCWD = -100 (also Linux). Darwin's AT_FDCWD = -2. The

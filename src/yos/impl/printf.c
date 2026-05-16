@@ -36,6 +36,7 @@
 
 #include "yos/types.h"
 #include "yos/ydebug.h"
+#include <unistd.h>     /* write() for stream-handle fd_map routing */
 
 /* Read one slot from the guest's va_list region.
  *
@@ -251,6 +252,8 @@ static FILE *guest_fp_to_host(struct yos_exec_ctx *ctx, uint32_t fp_off)
     return f ? f : stdout;
 }
 
+extern int yos_fd_get(struct yos_exec_ctx *ctx, int wasm_fd);
+
 int32_t yos_vfprintf(struct yos_exec_ctx *ctx,
                      uint32_t fp, uint32_t fmt_off, uint32_t va_off)
 {
@@ -258,6 +261,30 @@ int32_t yos_vfprintf(struct yos_exec_ctx *ctx,
     int n = yos_vsnprintf_core(ctx, buf, sizeof(buf), fmt_off, va_off);
     if (n < 0) return -1;
     size_t w = n < (int)sizeof(buf) ? (size_t)n : sizeof(buf) - 1;
+
+    /* Stream handles 1/2/3 → route through fd_map. Going via host
+     * glibc's stdout/stderr FILE* writes to host fd 1/2 (yos's own
+     * stdio), which BYPASSES the wasm guest's fd_map[0/1/2] redirect
+     * (e.g. zsh's dup2 of a pipe over stderr). Symptom: zsh's
+     * `fprintf(stderr, "zsh:1: no such file or directory: %s\n", ...)`
+     * landed in host glibc's stderr buffer and flushed to host fd 2 —
+     * the user's terminal — but split across two writes that
+     * interleaved with the bytes yos_fwrite/fputs routed through
+     * fd_map, producing garbled output like "o such file or
+     * directoryzsh:1: N: /bin/no-such". Routing here uses fd_map
+     * exclusively, single write(), no host-glibc buffer involved. */
+    if (fp == 1 || fp == 2 || fp == 3) {
+        int wfd = (int)fp - 1;
+        int hfd = yos_fd_get(ctx, wfd);
+        if (hfd >= 0) {
+            ydebug("vfprintf(fp=%u via fd_map[%d]=hfd %d, len=%zu): %.*s\n",
+                   fp, wfd, hfd, w, (int)(w > 80 ? 80 : w), buf);
+            ssize_t r = write(hfd, buf, w);
+            return r < 0 ? -1 : (int32_t)r;
+        }
+        /* fd_map slot empty — fall through to host FILE* as last resort. */
+    }
+
     FILE *f = guest_fp_to_host(ctx, fp);
     ydebug("vfprintf(fp=%u, host_fp=%p, len=%zu): %.*s\n",
            fp, (void *)f, w, (int)(w > 80 ? 80 : w), buf);
