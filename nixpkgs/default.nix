@@ -158,6 +158,11 @@ let
   # / log-fd-setup any wasm program you point its run script at.
   runit = pkgs.callPackage ./pkgs/runit { inherit toolchain sysroot; };
 
+  # BSD telnetd from FreeBSD-13.4 libexec/, wasm32 port. NO auth /
+  # encryption — strictly a test-rig server for piping a connecting
+  # telnet client into a wasm program (e.g. zsh) under runit.
+  telnetd = pkgs.callPackage ./pkgs/telnetd { inherit toolchain sysroot; };
+
   # Umbrella package: every user-facing yos artefact merged into one
   # tree via symlinkJoin. Lets users do
   #   nix run .#                    # drops into wasm zsh under yos (sandbox)
@@ -174,7 +179,7 @@ let
   # sandbox boundary.
   all = pkgs.symlinkJoin {
     name = "yos-all";
-    paths = [ yos zsh nvim freebsd-tools openssh perf-stress runit ];  # cpython disabled — see above
+    paths = [ yos zsh nvim freebsd-tools openssh perf-stress runit telnetd ];  # cpython disabled — see above
     postBuild = ''
       cat > $out/bin/yos-shell <<RUNNER_EOF
       #!/usr/bin/env bash
@@ -214,5 +219,6 @@ in {
           zlib openssl openssh
           perf-stress
           runit
+          telnetd
           all;
 }
