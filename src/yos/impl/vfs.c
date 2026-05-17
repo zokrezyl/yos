@@ -1112,14 +1112,14 @@ int32_t yos_vfs_mknodat(struct yos_exec_ctx *ctx, int32_t dfd, uint32_t filename
 {
     const char *s = wstr(ctx, filename);
     if (!s) return yos_errno_neg(ctx, EFAULT);
-    return yos_errno_check(ctx, mknodat(dfd, s, mode, dev));
+    return yos_errno_check(ctx, mknodat(yos_xlate_dfd(ctx, dfd), s, mode, dev));
 }
 
 int32_t yos_fchownat(struct yos_exec_ctx *ctx, int32_t dfd, uint32_t filename, int32_t user, int32_t group, int32_t flag)
 {
     const char *s = wstr(ctx, filename);
     if (!s) return yos_errno_neg(ctx, EFAULT);
-    return yos_errno_check(ctx, fchownat(dfd, s, user, group, flag));
+    return yos_errno_check(ctx, fchownat(yos_xlate_dfd(ctx, dfd), s, user, group, yos_at_flags_fb_to_lx(flag)));
 }
 
 int32_t yos_vfs_fstatat64(struct yos_exec_ctx *ctx, int32_t dfd, uint32_t filename, uint32_t statbuf, int32_t flag)
@@ -1139,8 +1139,12 @@ int32_t yos_vfs_fstatat64(struct yos_exec_ctx *ctx, int32_t dfd, uint32_t filena
         }
     }
 
+    int host_dfd = yos_xlate_dfd(ctx, dfd);
+    int host_flag = yos_at_flags_fb_to_lx(flag);
+    ydebug("fstatat(dfd=%d->%d path=\"%s\" flag=0x%x->0x%x)\n",
+           dfd, host_dfd, path, flag, host_flag);
     struct stat st;
-    int ret = fstatat(dfd, path, &st, flag);
+    int ret = fstatat(host_dfd, path, &st, host_flag);
     if (ret < 0) return yos_errno_neg(ctx, errno);
     /* Convert host stat to wasm32 stat64 - simplified, copy key fields */
     if (statbuf && statbuf < ctx->memory_size - 96) {
@@ -1169,7 +1173,7 @@ int32_t yos_unlinkat(struct yos_exec_ctx *ctx, int32_t dfd, uint32_t pathname, i
 {
     const char *s = wstr(ctx, pathname);
     if (!s) return yos_errno_neg(ctx, EFAULT);
-    return yos_errno_check(ctx, unlinkat(dfd, s, flag));
+    return yos_errno_check(ctx, unlinkat(yos_xlate_dfd(ctx, dfd), s, yos_at_flags_fb_to_lx(flag)));
 }
 
 int32_t yos_renameat(struct yos_exec_ctx *ctx, int32_t olddfd, uint32_t oldname, int32_t newdfd, uint32_t newname)
@@ -1177,7 +1181,7 @@ int32_t yos_renameat(struct yos_exec_ctx *ctx, int32_t olddfd, uint32_t oldname,
     const char *o = wstr(ctx, oldname);
     const char *n = wstr(ctx, newname);
     if (!o || !n) return yos_errno_neg(ctx, EFAULT);
-    return yos_errno_check(ctx, renameat(olddfd, o, newdfd, n));
+    return yos_errno_check(ctx, renameat(yos_xlate_dfd(ctx, olddfd), o, yos_xlate_dfd(ctx, newdfd), n));
 }
 
 int32_t yos_linkat(struct yos_exec_ctx *ctx, int32_t olddfd, uint32_t oldname, int32_t newdfd, uint32_t newname, int32_t flags)
@@ -1185,7 +1189,7 @@ int32_t yos_linkat(struct yos_exec_ctx *ctx, int32_t olddfd, uint32_t oldname, i
     const char *o = wstr(ctx, oldname);
     const char *n = wstr(ctx, newname);
     if (!o || !n) return yos_errno_neg(ctx, EFAULT);
-    return yos_errno_check(ctx, linkat(olddfd, o, newdfd, n, flags));
+    return yos_errno_check(ctx, linkat(yos_xlate_dfd(ctx, olddfd), o, yos_xlate_dfd(ctx, newdfd), n, yos_at_flags_fb_to_lx(flags)));
 }
 
 int32_t yos_symlinkat(struct yos_exec_ctx *ctx, uint32_t oldname, int32_t newdfd, uint32_t newname)
@@ -1193,7 +1197,7 @@ int32_t yos_symlinkat(struct yos_exec_ctx *ctx, uint32_t oldname, int32_t newdfd
     const char *o = wstr(ctx, oldname);
     const char *n = wstr(ctx, newname);
     if (!o || !n) return yos_errno_neg(ctx, EFAULT);
-    return yos_errno_check(ctx, symlinkat(o, newdfd, n));
+    return yos_errno_check(ctx, symlinkat(o, yos_xlate_dfd(ctx, newdfd), n));
 }
 
 int32_t yos_readlinkat(struct yos_exec_ctx *ctx, int32_t dfd, uint32_t path, uint32_t buf, uint32_t bufsiz)
@@ -1212,7 +1216,7 @@ int32_t yos_readlinkat(struct yos_exec_ctx *ctx, int32_t dfd, uint32_t path, uin
         }
     }
 
-    ssize_t r = readlinkat(dfd, s, b, bufsiz);
+    ssize_t r = readlinkat(yos_xlate_dfd(ctx, dfd), s, b, bufsiz);
     return yos_errno_check(ctx, (int32_t)r);
 }
 
@@ -1220,14 +1224,14 @@ int32_t yos_fchmodat(struct yos_exec_ctx *ctx, int32_t dfd, uint32_t filename, i
 {
     const char *s = wstr(ctx, filename);
     if (!s) return yos_errno_neg(ctx, EFAULT);
-    return yos_errno_check(ctx, fchmodat(dfd, s, mode, 0));
+    return yos_errno_check(ctx, fchmodat(yos_xlate_dfd(ctx, dfd), s, mode, 0));
 }
 
 int32_t yos_faccessat(struct yos_exec_ctx *ctx, int32_t dfd, uint32_t filename, int32_t mode)
 {
     const char *s = wstr(ctx, filename);
     if (!s) return yos_errno_neg(ctx, EFAULT);
-    return yos_errno_check(ctx, faccessat(dfd, s, mode, 0));
+    return yos_errno_check(ctx, faccessat(yos_xlate_dfd(ctx, dfd), s, mode, 0));
 }
 
 /* dup2/dup3: assign a fresh host-fd dup of oldfd into wasm-slot newfd.
