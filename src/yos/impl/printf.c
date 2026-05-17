@@ -111,6 +111,7 @@ static void format_one(struct yos_exec_ctx *ctx,
     }
     /* length modifier */
     int is_ll = 0, is_l = 0, is_h = 0, is_z = 0, is_j = 0;
+    size_t mod_start = sp;  /* remember where length modifiers begin */
     while (sp + 1 < sizeof(spec) && strchr("hlLjztq", *p)) {
         if (*p == 'l' && p[1] == 'l') { is_ll = 1; spec[sp++] = *p++; }
         else if (*p == 'l') { is_l = 1; }
@@ -125,6 +126,48 @@ static void format_one(struct yos_exec_ctx *ctx,
     spec[sp++] = conv;
     spec[sp] = '\0';
     *fmt = p + 1;
+
+    /* GUEST-vs-HOST length-modifier mismatch.
+     *
+     * FreeBSD-i386 (the guest ABI) sizes:
+     *   long      = 4 B    → %ld / %lu / %lx
+     *   long long = 8 B    → %lld / %llu
+     *   size_t    = 4 B    → %zd / %zu
+     *   intmax_t  = 8 B    → %jd / %ju
+     *
+     * The host we'll forward to via host snprintf is typically x86_64
+     * Linux / macOS / aarch64 — where `long` is 8 B and `size_t` is 8 B.
+     * If we forward "%lu" literally and pass a 4-byte va arg, the host
+     * snprintf reads 8 bytes from the stack and 4 of them are whatever
+     * was adjacent. The visible symptom is what ls(1) was showing:
+     *   snprintf(NULL, 0, "%lu", maxnlink) returns wrong digit count
+     *   → every long-format column width collapses to ~0
+     *   → "%*ju" rendering produces unpadded, jagged columns.
+     *
+     * Two fixes that work, depending on the conversion:
+     *   1. For integer conversions where the guest expects 4 bytes
+     *      (single 'l' or 'z') — strip the modifier so host snprintf
+     *      reads a plain int / unsigned. We're already pulling a
+     *      4-byte va arg below; this just keeps the format width
+     *      promise in sync with what we hand the host varargs.
+     *   2. 'll' / 'j' stay (both = 8 B on guest AND host — match).
+     *      'h' / 'hh' stay (host snprintf handles short/char widths
+     *      from a promoted int correctly).
+     *
+     * `%ls` (wide-char string) is left alone — we don't decode wide
+     * strings from the guest today, and FreeBSD-i386 wchar_t happens
+     * to be 4 B same as host x86_64. */
+    if ((is_l && !is_ll) || is_z) {
+        int is_int_conv = (conv == 'd' || conv == 'i' || conv == 'u' ||
+                           conv == 'x' || conv == 'X' || conv == 'o');
+        if (is_int_conv) {
+            /* Drop the 'l' or 'z' that sits at spec[mod_start]. */
+            memmove(spec + mod_start, spec + mod_start + 1,
+                    sp - mod_start);
+            sp--;
+            spec[sp] = '\0';
+        }
+    }
 
     /* Pull star args first (host snprintf needs them in order). */
     int star_w = 0, star_p = 0;
@@ -208,10 +251,25 @@ static void format_one(struct yos_exec_ctx *ctx,
         n = snprintf(buf, sizeof(buf), "%%%c", conv);
     }
     if (n < 0) return;
+    /* snprintf semantics: the cursor (and the return value) MUST
+     * advance by the number of characters the spec WOULD have written,
+     * not by the number we were actually able to copy. The caller
+     * uses the position to derive the digit count for things like
+     *     snprintf(NULL, 0, "%lu", maxnlink)     // ls(1)
+     * which is exactly the column-width probe ls -l uses to right-
+     * align nlink / size / uid / gid. If we clamp the cursor at the
+     * buffer cap, every probe returns 0 and every long-format column
+     * collapses to zero padding — visible as the "ls -l columns are
+     * jagged / chaotic" symptom the user kept reporting.
+     *
+     * Two separate values:
+     *   cp = bytes safe to memcpy into `out` (clamped by out_cap)
+     *   n  = bytes the spec would have produced (always advance by this)
+     */
     size_t cp = (size_t)n;
     if (*outpos + cp > out_cap) cp = out_cap > *outpos ? out_cap - *outpos : 0;
     memcpy(out + *outpos, buf, cp);
-    *outpos += cp;
+    *outpos += (size_t)n;
 }
 
 /* Format `fmt` (with vararg slots starting at wasm offset `vap`) into
