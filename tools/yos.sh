@@ -74,7 +74,16 @@ if [ "$SERVER" = 1 ]; then
            $([ "$DAEMON" = 1 ] && echo --daemon) \
            --log-dir "$LOG_DIR" \
            "$ALL/libexec/runsvdir" -P "$SVCDIR"
-    exec env PATH="$ALL/libexec" LOG_DIR="$LOG_DIR" "$@"
+    # YOS_LIBEXEC is the umbrella's libexec/ on the HOST filesystem
+    # (a real /nix/store path). Service `run` scripts that need to
+    # set PATH explicitly (because something upstream wiped it, or
+    # because a sub-spawned shell needs an absolute fallback) can
+    # use `export PATH=$YOS_LIBEXEC`. yos's wasm guest sees these
+    # absolute store paths verbatim — there's no separate vfs root.
+    exec env PATH="$ALL/libexec" \
+             LOG_DIR="$LOG_DIR" \
+             YOS_LIBEXEC="$ALL/libexec" \
+             "$@"
 fi
 
 # ── non-server mode (interactive / one-shot) ────────────────────────

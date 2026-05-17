@@ -1,20 +1,18 @@
 #!/libexec/zsh -f
-# example service: TCP server giving wasm zsh per connection.
+# example service: TCP server giving each connection a wasm zsh.
 #
-# Listens on port 12323; each TCP connection forks a fresh wasm zsh
-# under yos and pipes the socket to its stdio. Connect from anywhere
-# reachable:
+# Each `telnet -E HOST 12323` (or `nc HOST 12323`) connection forks a
+# fresh wasm zsh under yos and pipes the socket to its stdio.
 #
-#     telnet -E HOST 12323
-#     nc HOST 12323
-#
-# This IS the real goal — runit keeps the listener alive across crashes
-# and yos-tcpserver gives multi-session. Known limitation: second
-# concurrent session crashes the listener (yos fork-after-fork race);
-# runsv will restart it on crash, so single-session-at-a-time works
-# robustly.
-#
-# yos.sh exports PATH=$ALL/libexec so the bare names resolve via
-# yos_execvp's PATH walk.
+# Why we set PATH explicitly here even though tools/yos.sh already
+# exported it: PATH propagation across the runit → runsvdir → runsv →
+# script → tcpserver → zsh chain is fragile — at least one hop drops
+# it on yos today (probably the wasm-libc execvp call), so the
+# connected zsh ends up with a stripped/empty PATH and every typed
+# command comes back as 'command not found'. yos.sh exports
+# YOS_LIBEXEC as the umbrella's libexec absolute store path; we
+# re-export it as PATH right here so the spawned zsh is guaranteed
+# to find ls / ps / cat / yos-tcpserver / etc.
+export PATH=$YOS_LIBEXEC
 exec 2>&1
 exec yos-tcpserver 12323 zsh
