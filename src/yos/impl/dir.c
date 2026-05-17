@@ -46,6 +46,7 @@
 #include <errno.h>
 #include <dirent.h>
 #include <pthread.h>
+#include <unistd.h>
 
 #include "yos/types.h"
 #include "yos/ydebug.h"
