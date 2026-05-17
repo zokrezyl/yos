@@ -58,6 +58,29 @@ _AT_FAMILY = frozenset({
     'name_to_handle_at', 'execveat', 'statx', 'getdents64_at',
 })
 
+# *at family functions whose flag arg uses the AT_* constant set
+# (AT_SYMLINK_NOFOLLOW, AT_REMOVEDIR, AT_EMPTY_PATH, AT_EACCESS …).
+# FreeBSD and Linux/darwin number these differently — e.g. FreeBSD's
+# AT_SYMLINK_NOFOLLOW is 0x0200 but Linux's is 0x0100 (its 0x0200 is
+# AT_REMOVEDIR), so forwarding the raw value silently corrupts every
+# *at call (typical failure mode: EINVAL from fstatat because the
+# guest's AT_SYMLINK_NOFOLLOW lands on the host as AT_REMOVEDIR, a
+# flag fstatat rejects). Maps fn name → positional index of the flag
+# arg in the FreeBSD signature.
+#
+# Excluded: openat (takes O_* flags, not AT_*), renameat (no flag),
+# renameat2 (RENAME_* flags), mkdirat/mkfifoat/mknodat (no flag),
+# readlinkat/symlinkat (no flag), futimesat (no flag), execveat (AT_*
+# subset overlaps with EMPTY_PATH; handled via AT_FAMILY translator
+# already for the dfd, the flag is rare and intentionally untouched
+# pending its own delta). statx/getdents64_at: not yet routed through
+# auto-bridge here; statx is hand-bridged with its own host path.
+_AT_FLAG_ARG = {
+    'faccessat': 3, 'fchmodat': 3, 'fchownat': 4, 'fstatat': 3,
+    'linkat': 4, 'unlinkat': 2, 'utimensat': 3,
+    'name_to_handle_at': 4,
+}
+
 
 # ─── Type-renderer helpers ───────────────────────────────────────────
 
@@ -335,6 +358,7 @@ def _emit_bridge(name: str, gf: dict, hf: dict, gtypes: dict, htypes: dict,
     if arity_skew:
         can_emit = False
     is_at_family = name in _AT_FAMILY
+    at_flag_idx = _AT_FLAG_ARG.get(name)
     for i, (ga, ha) in enumerate(zip(g_args, h_args)):
         gt = gtypes.get(ga['type_uid']);  ht = htypes.get(ha['type_uid'])
         decl = _bridge_arg_decl(ga.get('name'), i, gt, gtypes)
@@ -350,6 +374,16 @@ def _emit_bridge(name: str, gf: dict, hf: dict, gtypes: dict, htypes: dict,
                 and _resolve(ht, htypes).get('kind') == 'builtin'):
             inner = tr[1]
             tr = (tr[0], f'yos_xlate_dfd(ctx, (int32_t)({inner}))',
+                  tr[2] if len(tr) > 2 else '')
+        # *at family: the AT_* flag arg (position varies — see
+        # _AT_FLAG_ARG) carries FreeBSD-shape constants that don't match
+        # the host's, so translate before passing to host libc.
+        if (at_flag_idx is not None and i == at_flag_idx and tr is not None
+                and gt is not None and ht is not None
+                and _resolve(gt, gtypes).get('kind') == 'builtin'
+                and _resolve(ht, htypes).get('kind') == 'builtin'):
+            inner = tr[1]
+            tr = (tr[0], f'yos_at_flags_fb_to_lx((int)({inner}))',
                   tr[2] if len(tr) > 2 else '')
         if decl is None or tr is None:
             can_emit = False
@@ -1710,6 +1744,7 @@ def emit_bridge(analyse: dict, guest_api: dict, host_api: dict,
             if auto_globals_meta else '')
          + 'extern int yos_remap_errno_h2g(int);\n'
          + 'extern int yos_xlate_dfd(struct yos_exec_ctx *, int32_t);\n'
+         + 'extern int yos_at_flags_fb_to_lx(int);\n'
          + '/* Single mutex protecting every auto_save_restore wrapper.\n'
          + ' * Low-frequency fns (getopt/tzset/dns/locale); one lock fine. */\n'
          + 'pthread_mutex_t yos_autoglobals_lock = PTHREAD_MUTEX_INITIALIZER;\n\n'
