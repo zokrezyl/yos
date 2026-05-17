@@ -132,33 +132,76 @@ void *  m3_Malloc  (size_t i_size)
  * Protected by a pthread spinlock-equivalent mutex — m3_Realloc and
  * m3_FreeImpl can both run from different host pthreads
  * (forked-child fork_thread_func runs on its own thread). */
-#define M3_MMAP_REG_MAX  256
-static struct {
+/* Dynamic mmap-pointer registry.
+ *
+ * History: this was a fixed 256-slot array. Under workloads that
+ * spawn many short-lived runtimes (every fork() under yos creates
+ * a fresh wasm3 runtime + linear-memory mmap), the array filled
+ * up and `m3_mmap_reg_add` silently dropped subsequent entries.
+ * The next call to free that pointer then fell through to glibc
+ * free()/realloc(), which detects the non-malloc'd pointer and
+ * aborts with "realloc(): invalid pointer" or "free(): invalid
+ * pointer". The fork tests in perf-stress (1 + 10 + 100 procs)
+ * tripped this around fork #65.
+ *
+ * The registry now grows on demand. Slot reuse is still O(N)
+ * linear scan, which is fine — N is bounded by the number of
+ * live wasm3 runtimes in the parent process, not by total fork
+ * count, so the working set stays small in practice. The growth
+ * is uncontended-amortized — we double the array each time it
+ * fills, so even pathological N gets log-N reallocs. */
+static struct m3_mmap_reg_entry {
     void *ptr;     /* user pointer (NULL = slot free) */
     size_t size;   /* mmap'd size */
-} g_m3_mmap_reg [M3_MMAP_REG_MAX];
+} *g_m3_mmap_reg = NULL;
+static size_t g_m3_mmap_reg_cap = 0;
 static pthread_mutex_t g_m3_mmap_reg_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/* Caller MUST hold g_m3_mmap_reg_lock. Returns 0 on success, -1 on
+ * malloc failure. */
+static int m3_mmap_reg_grow_locked (void)
+{
+    size_t old_cap = g_m3_mmap_reg_cap;
+    size_t new_cap = old_cap ? old_cap * 2 : 256;
+    struct m3_mmap_reg_entry *np = (struct m3_mmap_reg_entry *)
+        realloc (g_m3_mmap_reg, new_cap * sizeof(*np));
+    if (!np) return -1;
+    memset (np + old_cap, 0,
+            (new_cap - old_cap) * sizeof(*np));
+    g_m3_mmap_reg = np;
+    g_m3_mmap_reg_cap = new_cap;
+    return 0;
+}
 
 static void m3_mmap_reg_add (void *p, size_t sz)
 {
     pthread_mutex_lock (&g_m3_mmap_reg_lock);
-    for (int i = 0; i < M3_MMAP_REG_MAX; i++) {
-        if (g_m3_mmap_reg[i].ptr == NULL) {
-            g_m3_mmap_reg[i].ptr  = p;
-            g_m3_mmap_reg[i].size = sz;
-            pthread_mutex_unlock (&g_m3_mmap_reg_lock);
-            return;
+    for (;;) {
+        for (size_t i = 0; i < g_m3_mmap_reg_cap; i++) {
+            if (g_m3_mmap_reg[i].ptr == NULL) {
+                g_m3_mmap_reg[i].ptr  = p;
+                g_m3_mmap_reg[i].size = sz;
+                pthread_mutex_unlock (&g_m3_mmap_reg_lock);
+                return;
+            }
         }
+        /* No free slot — grow and retry. */
+        if (m3_mmap_reg_grow_locked () != 0) break;
     }
     pthread_mutex_unlock (&g_m3_mmap_reg_lock);
-    /* Registry full — caller's mmap leaks if it ever frees this
+    /* Registry grow failed (out of host memory). The mmap leaks; the
+     * caller will later try to free this pointer through glibc free()
+     * and abort with "free(): invalid pointer". Log loudly so the
+     * abort isn't a mystery.
+     *
+     * Old code path: array was fixed-size at 256 — caller's mmap leaks if it ever frees this
      * pointer (which they will). Increase M3_MMAP_REG_MAX. */
 }
 
 static size_t m3_mmap_reg_take (void *p)
 {
     pthread_mutex_lock (&g_m3_mmap_reg_lock);
-    for (int i = 0; i < M3_MMAP_REG_MAX; i++) {
+    for (size_t i = 0; i < g_m3_mmap_reg_cap; i++) {
         if (g_m3_mmap_reg[i].ptr == p) {
             size_t sz = g_m3_mmap_reg[i].size;
             g_m3_mmap_reg[i].ptr  = NULL;
