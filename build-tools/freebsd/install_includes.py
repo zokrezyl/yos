@@ -277,8 +277,25 @@ def install_arch_headers(src_root: Path, out_root: Path, arch: str) -> None:
         text = cdefs.read_text()
         marker = '/* yos: wasm32-friendly asm-macro neutralisation */'
         if marker not in text:
+            i386_shim = ''
+            if arch == 'i386':
+                # Force the guest arch macro at the cdefs.h level.
+                # The whole FreeBSD header tree gates struct layouts,
+                # typedefs and decls on __i386__; clang -target wasm32
+                # never sets it, and meson's `--define __i386__=1`
+                # arg reaches extract.py on Linux but for unclear
+                # reasons (libclang version skew? cindex argument
+                # passing?) doesn't take effect under macOS' python
+                # libclang binding. Forcing it in the header itself
+                # is invariant across hosts and across cflags drift.
+                i386_shim = (
+                    '#ifndef __i386__\n'
+                    '#define __i386__ 1\n'
+                    '#endif\n'
+                )
             shim = (
                 '\n' + marker + '\n'
+                + i386_shim +
                 '#undef  __weak_reference\n'
                 '#undef  __warn_references\n'
                 '#undef  __sym_compat\n'
