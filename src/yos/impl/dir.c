@@ -212,11 +212,14 @@ static int alloc_wasm_fd_for_host_dir(struct yos_exec_ctx *ctx, DIR *d)
     return wfd;
 }
 
+extern const char *yos_path_resolve(struct yos_exec_ctx *, const char *);
+
 uint32_t yos_opendir(struct yos_exec_ctx *ctx, uint32_t path_off)
 {
     if (path_off == 0 || path_off >= ctx->memory_size)
         return yos_errno_null(ctx, EFAULT);
-    const char *path = (const char *)(ctx->memory + path_off);
+    const char *raw = (const char *)(ctx->memory + path_off);
+    const char *path = yos_path_resolve(ctx, raw);
 
     /* Mount-table lookup: if the path lands in a virtual filesystem
      * (today: /proc), route through it instead of opening on the host.

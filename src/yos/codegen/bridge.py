@@ -81,6 +81,49 @@ _AT_FLAG_ARG = {
     'name_to_handle_at': 4,
 }
 
+# Functions where one or more `const char *` arguments are PATHS
+# (filesystem paths the host must resolve against the per-process
+# cwd). yos's pthread-per-process fork model can't keep a per-
+# process host cwd, so the runtime fakes it: `chdir()` only updates
+# ctx->cwd, and every relative path passed in is wrapped at the
+# bridge boundary with `yos_path_resolve(ctx, path)` which prepends
+# ctx->cwd. Without this, fork+chdir(parent)→fork+chdir(child)
+# patterns (runsv, find, fts, …) race on the shared host cwd and
+# pick up the wrong base directory.
+#
+# Map: fn-name → tuple of arg indices that are paths. We use a
+# per-fn allowlist instead of "wrap every const char *" because
+# many non-path string args exist (setenv/getenv name, signal
+# desc, strerror, …) and wrapping THOSE would mangle them.
+#
+# *at family is intentionally NOT here — its path resolves against
+# the dfd (already handled via yos_xlate_dfd at arg 0), not
+# ctx->cwd. The codegen leaves those alone.
+_PATH_ARG_FNS = {
+    # Single-path ops.
+    'stat': (0,), 'lstat': (0,), 'access': (0,), 'eaccess': (0,),
+    'mkdir': (0,), 'unlink': (0,), 'rmdir': (0,),
+    'chmod': (0,), 'lchmod': (0,), 'chown': (0,), 'lchown': (0,),
+    'readlink': (0,), 'truncate': (0,), 'mkfifo': (0,), 'mknod': (0,),
+    'pathconf': (0,), 'utimes': (0,), 'utime': (0,), 'futimes': (0,),
+    'lutimes': (0,), 'statfs': (0,), 'statvfs': (0,),
+    'chroot': (0,),
+    # Two-path ops.
+    'rename': (0, 1), 'link': (0, 1), 'symlink': (0, 1),
+    # exec family — argv[0] is a path. yos has its own hand-written
+    # execve/execv/execvp in impl/proc.c (see yos_execvp's PATH
+    # search), but if codegen ever surfaces a fallback bridge, it
+    # should still resolve.
+    'execv': (0,), 'execve': (0,),
+    # We DON'T list execvp because the PATH search in
+    # yos_execvp already handles bare-name lookup; relative-with-
+    # slash names (e.g. "./run") fall back to yos_execve which is
+    # hand-bridged + resolves itself.
+    # opendir is hand-bridged (dir.c), patched separately.
+    # open is hand-bridged (vfs.c), patched separately.
+    # chdir is hand-bridged (vfs.c), patched separately.
+}
+
 
 # ─── Type-renderer helpers ───────────────────────────────────────────
 
@@ -359,6 +402,7 @@ def _emit_bridge(name: str, gf: dict, hf: dict, gtypes: dict, htypes: dict,
         can_emit = False
     is_at_family = name in _AT_FAMILY
     at_flag_idx = _AT_FLAG_ARG.get(name)
+    path_arg_idxs = _PATH_ARG_FNS.get(name, ())
     for i, (ga, ha) in enumerate(zip(g_args, h_args)):
         gt = gtypes.get(ga['type_uid']);  ht = htypes.get(ha['type_uid'])
         decl = _bridge_arg_decl(ga.get('name'), i, gt, gtypes)
@@ -384,6 +428,18 @@ def _emit_bridge(name: str, gf: dict, hf: dict, gtypes: dict, htypes: dict,
                 and _resolve(ht, htypes).get('kind') == 'builtin'):
             inner = tr[1]
             tr = (tr[0], f'yos_at_flags_fb_to_lx((int)({inner}))',
+                  tr[2] if len(tr) > 2 else '')
+        # PATH args: route relative paths through yos_path_resolve so
+        # they resolve against ctx->cwd (yos's faked per-process cwd —
+        # see comment on _PATH_ARG_FNS and impl/vfs.c::yos_path_resolve).
+        # The existing translation builds e.g. `(const char *)(ctx->memory
+        # + a0)`; we wrap that in yos_path_resolve.
+        if (i in path_arg_idxs and tr is not None
+                and gt is not None and ht is not None
+                and _resolve(gt, gtypes).get('kind') == 'pointer'
+                and _resolve(ht, htypes).get('kind') == 'pointer'):
+            inner = tr[1]
+            tr = (tr[0], f'yos_path_resolve(ctx, {inner})',
                   tr[2] if len(tr) > 2 else '')
         if decl is None or tr is None:
             can_emit = False
@@ -1171,6 +1227,7 @@ def _emit_struct_convert_body(name: str, gf: dict, hf: dict,
     extra_posts: list[str] = []
     is_at_family = name in _AT_FAMILY
     at_flag_idx = _AT_FLAG_ARG.get(name)
+    path_arg_idxs = _PATH_ARG_FNS.get(name, ())
     for i, ga in enumerate(gf.get('args', [])):
         wname = wargs[i].split()[-1]
         if i == struct_arg_idx:
@@ -1210,9 +1267,17 @@ def _emit_struct_convert_body(name: str, gf: dict, hf: dict,
             # args are required-non-NULL by the libc spec, but we
             # don't second-guess buggy callers).
             ht_str = host_t or 'void *'
-            call_args.append(
-                f'({wname}) ? ({ht_str})(ctx->memory + {wname}) : ({ht_str})0'
-            )
+            if i in path_arg_idxs:
+                # PATH arg: prepend ctx->cwd if relative. See
+                # comment on _PATH_ARG_FNS at top of this file.
+                call_args.append(
+                    f'({wname}) ? ({ht_str})yos_path_resolve(ctx, '
+                    f'(const char *)(ctx->memory + {wname})) : ({ht_str})0'
+                )
+            else:
+                call_args.append(
+                    f'({wname}) ? ({ht_str})(ctx->memory + {wname}) : ({ht_str})0'
+                )
         elif host_t:
             if is_at_family and i == 0:
                 # *at family: translate dfd via yos_xlate_dfd — see the
@@ -1751,6 +1816,7 @@ def emit_bridge(analyse: dict, guest_api: dict, host_api: dict,
          + 'extern int yos_remap_errno_h2g(int);\n'
          + 'extern int yos_xlate_dfd(struct yos_exec_ctx *, int32_t);\n'
          + 'extern int yos_at_flags_fb_to_lx(int);\n'
+         + 'extern const char *yos_path_resolve(struct yos_exec_ctx *, const char *);\n'
          + '/* Single mutex protecting every auto_save_restore wrapper.\n'
          + ' * Low-frequency fns (getopt/tzset/dns/locale); one lock fine. */\n'
          + 'pthread_mutex_t yos_autoglobals_lock = PTHREAD_MUTEX_INITIALIZER;\n\n'

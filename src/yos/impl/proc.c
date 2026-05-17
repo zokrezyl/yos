@@ -1306,10 +1306,22 @@ static int32_t host_execve_fallback(const char *fn, struct yos_exec_ctx *ctx,
 #endif
 }
 
+/* Forward decl: defined further down in this file. yos_execve's
+ * shebang-interp PATH lookup calls into it. */
+static int execvp_path_search(struct yos_exec_ctx *, const char *, char *);
+
 int32_t yos_execve(struct yos_exec_ctx *ctx, uint32_t filename, uint32_t argv_ptr, uint32_t envp)
 {
-    const char *fn = (const char *)(ctx->memory + filename);
-    ydebug("execve(%s, ...)\n", fn);
+    extern const char *yos_path_resolve(struct yos_exec_ctx *, const char *);
+    const char *raw_fn = (const char *)(ctx->memory + filename);
+    /* yos_path_resolve returns a TLS pointer — copy because we use
+     * it across many subsequent calls (access, open, etc. below). */
+    const char *res = yos_path_resolve(ctx, raw_fn);
+    static _Thread_local char fn_buf[PATH_MAX];
+    strncpy(fn_buf, res, sizeof fn_buf - 1);
+    fn_buf[sizeof fn_buf - 1] = 0;
+    const char *fn = fn_buf;
+    ydebug("execve(%s, ...) [raw=%s]\n", fn, raw_fn);
 
     /* Check file exists and is readable. POSIX contract: execve returns
      * -1 with errno set; never returns 0 on failure. Use yos_errno_neg
@@ -1343,14 +1355,38 @@ int32_t yos_execve(struct yos_exec_ctx *ctx, uint32_t filename, uint32_t argv_pt
         /* Direct WASM execution */
         strcpy(exec_path, fn);
     } else if (parse_shebang(fn, shebang_interp, shebang_arg) == 0) {
-        /* Script with shebang - interpreter must be WASM */
+        /* Script with shebang. The interpreter must end up being a
+         * wasm binary; the shebang itself can point at a literal host
+         * path OR a name resolvable via PATH. We try in order:
+         *   1. The interpreter path verbatim (e.g. /libexec/zsh
+         *      assuming the host fs has /libexec/zsh).
+         *   2. If that's not wasm OR doesn't exist, walk the guest's
+         *      $PATH using basename(interpreter). Lets scripts ship
+         *      with `#!/libexec/zsh` even though the actual umbrella
+         *      libexec dir lives at /nix/store/<hash>-yos-all/libexec/
+         *      — yos.sh exports PATH=<umbrella-libexec> and the
+         *      walked path finds zsh there. */
         ydebug("execve: shebang interp=%s arg=%s\n", shebang_interp, shebang_arg);
 
+        const char *interp_use = shebang_interp;
+        char resolved_interp[PATH_MAX];
         if (!check_wasm_magic(shebang_interp)) {
-            ydebug("execve: interpreter %s is not WASM\n", shebang_interp);
-            return host_execve_fallback(fn, ctx, argv_ptr);
+            const char *slash = strrchr(shebang_interp, '/');
+            const char *base = slash ? slash + 1 : shebang_interp;
+            if (execvp_path_search(ctx, base, resolved_interp) &&
+                check_wasm_magic(resolved_interp)) {
+                ydebug("execve: shebang interp %s → PATH resolved %s\n",
+                       shebang_interp, resolved_interp);
+                interp_use = resolved_interp;
+            } else {
+                ydebug("execve: interpreter %s is not WASM (PATH lookup also failed)\n",
+                       shebang_interp);
+                return host_execve_fallback(fn, ctx, argv_ptr);
+            }
         }
-        strcpy(exec_path, shebang_interp);
+        strcpy(exec_path, interp_use);
+        strncpy(shebang_interp, interp_use, sizeof shebang_interp - 1);
+        shebang_interp[sizeof shebang_interp - 1] = 0;
         is_script = 1;
         extra_args = shebang_arg[0] ? 2 : 1;  /* interp [arg] script */
     } else {

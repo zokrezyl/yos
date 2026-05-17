@@ -39,6 +39,48 @@ static inline const char *wstr(struct yos_exec_ctx *ctx, uint32_t offset)
     return (const char *)wptr(ctx, offset);
 }
 
+/* Resolve a guest path against ctx->cwd into an absolute host path.
+ *
+ * yos's fork model is "pthread of the same host process", so the host
+ * cwd is SHARED across every yos guest. That means `chdir()` in one
+ * guest (e.g. runsv child) silently changes another guest's (e.g.
+ * runsvdir parent) cwd, and subsequent relative-path ops resolve
+ * against the wrong base. The whole runit + runsvdir pattern (and any
+ * super-server that does fork-then-chdir-then-exec relative) used to
+ * race fatally on this.
+ *
+ * Fix: yos_chdir below NEVER calls host chdir — it only updates
+ * ctx->cwd. Every path-taking bridge (yos_open, yos_opendir,
+ * yos_execve, stat/lstat/access/mkdir/unlink/…) routes its path
+ * argument through this helper to get the host-absolute path.
+ *
+ * Returns: pointer to a thread-local buffer holding the resolved
+ * path. Valid until the next yos_path_resolve() call on the same
+ * thread (caller MUST copy if it needs to outlive that). If the
+ * input is already absolute, returns the input pointer unchanged
+ * (no copy needed — same lifetime as the caller's data).
+ *
+ * The TLS buffer is per-host-pthread which (under yos's pthread-per-
+ * forked-process model) is per-guest-process, so concurrent guests
+ * don't trample each other. */
+const char *yos_path_resolve(struct yos_exec_ctx *ctx, const char *p)
+{
+    if (!p) return NULL;
+    if (p[0] == '/') return p;     /* absolute — passthrough */
+    if (!ctx || ctx->cwd[0] == 0)  /* no cwd yet — let host decide */
+        return p;
+    static _Thread_local char buf[PATH_MAX];
+    size_t cwd_n = strlen(ctx->cwd);
+    if (cwd_n == 0 || cwd_n >= sizeof buf) return p;
+    memcpy(buf, ctx->cwd, cwd_n);
+    size_t pos = cwd_n;
+    if (buf[pos - 1] != '/' && pos + 1 < sizeof buf) buf[pos++] = '/';
+    size_t pn = strlen(p);
+    if (pos + pn + 1 > sizeof buf) return p;   /* too long, give up */
+    memcpy(buf + pos, p, pn + 1);
+    return buf;
+}
+
 /* ============================================================================
  * Per-runtime fd table.
  * ============================================================================ */
@@ -316,8 +358,9 @@ static int oflags_lx_to_fb(int f);
 
 int32_t yos_open(struct yos_exec_ctx *ctx, uint32_t path, int32_t flags, int32_t mode)
 {
-    const char *s = wstr(ctx, path);
-    if (!s) return yos_errno_neg(ctx, EFAULT);
+    const char *raw = wstr(ctx, path);
+    if (!raw) return yos_errno_neg(ctx, EFAULT);
+    const char *s = yos_path_resolve(ctx, raw);
 
     /* Check if path is in a virtual filesystem */
     struct yos_mount_table *mt = (struct yos_mount_table *)ctx->rt->mount_table;
@@ -394,8 +437,9 @@ int32_t yos_link(struct yos_exec_ctx *ctx, uint32_t oldname, uint32_t newname)
 
 int32_t yos_unlink(struct yos_exec_ctx *ctx, uint32_t pathname)
 {
-    const char *s = wstr(ctx, pathname);
-    if (!s) return yos_errno_neg(ctx, EFAULT);
+    const char *raw = wstr(ctx, pathname);
+    if (!raw) return yos_errno_neg(ctx, EFAULT);
+    const char *s = yos_path_resolve(ctx, raw);
     return yos_errno_check(ctx, unlink(s));
 }
 
@@ -404,37 +448,49 @@ int32_t yos_chdir(struct yos_exec_ctx *ctx, uint32_t filename)
     const char *s = wstr(ctx, filename);
     if (!s) return yos_errno_neg(ctx, EFAULT);
 
-    if (chdir(s) < 0)
+    /* DO NOT call host chdir. yos's pthread-per-process model shares
+     * host cwd across every guest, so a real chdir here would let
+     * one guest's chdir silently move every other guest's relative
+     * paths. Instead, resolve the target against the current ctx->cwd
+     * + verify it exists + update ctx->cwd. Every subsequent path-
+     * taking bridge will route its path through yos_path_resolve()
+     * which prepends ctx->cwd for relative paths. */
+    const char *resolved = yos_path_resolve(ctx, s);
+    struct stat st;
+    if (stat(resolved, &st) < 0)
         return yos_errno_neg(ctx, errno);
+    if (!S_ISDIR(st.st_mode))
+        return yos_errno_neg(ctx, ENOTDIR);
 
-    /* Track cwd - resolve to absolute path */
+    /* Update ctx->cwd. If `s` is already absolute, use it as-is.
+     * Else compose ctx->cwd + '/' + s. TODO: canonicalize . / .. */
     if (s[0] == '/') {
-        /* Absolute path */
         strncpy(ctx->cwd, s, PATH_MAX - 1);
         ctx->cwd[PATH_MAX - 1] = '\0';
     } else {
-        /* Relative path - append to current cwd */
         size_t cwdlen = strlen(ctx->cwd);
         if (cwdlen > 0 && ctx->cwd[cwdlen - 1] != '/')
             strncat(ctx->cwd, "/", PATH_MAX - cwdlen - 1);
         strncat(ctx->cwd, s, PATH_MAX - strlen(ctx->cwd) - 1);
     }
-    /* TODO: canonicalize path (resolve . and ..) */
+    ydebug("chdir(\"%s\") → ctx->cwd=\"%s\"\n", s, ctx->cwd);
 
     return 0;
 }
 
 int32_t yos_chmod(struct yos_exec_ctx *ctx, uint32_t filename, int32_t mode)
 {
-    const char *s = wstr(ctx, filename);
-    if (!s) return yos_errno_neg(ctx, EFAULT);
+    const char *raw = wstr(ctx, filename);
+    if (!raw) return yos_errno_neg(ctx, EFAULT);
+    const char *s = yos_path_resolve(ctx, raw);
     return yos_errno_check(ctx, chmod(s, mode));
 }
 
 int32_t yos_lchown(struct yos_exec_ctx *ctx, uint32_t filename, int32_t user, int32_t group)
 {
-    const char *s = wstr(ctx, filename);
-    if (!s) return yos_errno_neg(ctx, EFAULT);
+    const char *raw = wstr(ctx, filename);
+    if (!raw) return yos_errno_neg(ctx, EFAULT);
+    const char *s = yos_path_resolve(ctx, raw);
     return yos_errno_check(ctx, lchown(s, user, group));
 }
 
@@ -464,8 +520,9 @@ int32_t yos_vfs__llseek(struct yos_exec_ctx *ctx, int32_t fd, uint32_t offset_hi
 
 int32_t yos_access(struct yos_exec_ctx *ctx, uint32_t filename, int32_t mode)
 {
-    const char *s = wstr(ctx, filename);
-    if (!s) return yos_errno_neg(ctx, EFAULT);
+    const char *raw = wstr(ctx, filename);
+    if (!raw) return yos_errno_neg(ctx, EFAULT);
+    const char *s = yos_path_resolve(ctx, raw);
     return yos_errno_check(ctx, access(s, mode));
 }
 
@@ -474,20 +531,29 @@ int32_t yos_rename(struct yos_exec_ctx *ctx, uint32_t oldname, uint32_t newname)
     const char *o = wstr(ctx, oldname);
     const char *n = wstr(ctx, newname);
     if (!o || !n) return yos_errno_neg(ctx, EFAULT);
-    return yos_errno_check(ctx, rename(o, n));
+    /* Each path needs its own resolved copy — yos_path_resolve uses
+     * a single TLS buffer, so the second call would clobber the first. */
+    char abs_o[PATH_MAX]; char abs_n[PATH_MAX];
+    const char *ro = yos_path_resolve(ctx, o);
+    strncpy(abs_o, ro, sizeof abs_o - 1); abs_o[sizeof abs_o - 1] = 0;
+    const char *rn = yos_path_resolve(ctx, n);
+    strncpy(abs_n, rn, sizeof abs_n - 1); abs_n[sizeof abs_n - 1] = 0;
+    return yos_errno_check(ctx, rename(abs_o, abs_n));
 }
 
 int32_t yos_mkdir(struct yos_exec_ctx *ctx, uint32_t pathname, int32_t mode)
 {
-    const char *s = wstr(ctx, pathname);
-    if (!s) return yos_errno_neg(ctx, EFAULT);
+    const char *raw = wstr(ctx, pathname);
+    if (!raw) return yos_errno_neg(ctx, EFAULT);
+    const char *s = yos_path_resolve(ctx, raw);
     return yos_errno_check(ctx, mkdir(s, mode));
 }
 
 int32_t yos_rmdir(struct yos_exec_ctx *ctx, uint32_t pathname)
 {
-    const char *s = wstr(ctx, pathname);
-    if (!s) return yos_errno_neg(ctx, EFAULT);
+    const char *raw = wstr(ctx, pathname);
+    if (!raw) return yos_errno_neg(ctx, EFAULT);
+    const char *s = yos_path_resolve(ctx, raw);
     return yos_errno_check(ctx, rmdir(s));
 }
 
@@ -1007,8 +1073,9 @@ int32_t yos_vfs_pwrite64(struct yos_exec_ctx *ctx, int32_t fd, uint32_t buf, uin
 
 int32_t yos_chown(struct yos_exec_ctx *ctx, uint32_t filename, int32_t user, int32_t group)
 {
-    const char *s = wstr(ctx, filename);
-    if (!s) return yos_errno_neg(ctx, EFAULT);
+    const char *raw = wstr(ctx, filename);
+    if (!raw) return yos_errno_neg(ctx, EFAULT);
+    const char *s = yos_path_resolve(ctx, raw);
     return yos_errno_check(ctx, chown(s, user, group));
 }
 

@@ -1,19 +1,20 @@
-#!/bin/sh
-# example service: heartbeat printer.
+#!/libexec/zsh -f
+# example service: TCP server giving wasm zsh per connection.
 #
-# runsv spawns this script and pipes its stdout into log/run's stdin.
-# Anything we write to stdout/stderr lands in svlogd's rotating file
-# at $LOG_DIR/example/current.
+# Listens on port 12323; each TCP connection forks a fresh wasm zsh
+# under yos and pipes the socket to its stdio. Connect from anywhere
+# reachable:
 #
-# Replace with a real long-lived service (telnetd, sshd, …) when you
-# have one wired up. The contract:
-#   - exec() the program (no fork) so runsv tracks its PID directly.
-#   - run in the foreground; runsv treats exit as crash and restarts.
+#     telnet -E HOST 12323
+#     nc HOST 12323
 #
-# This stub uses /bin/sh's date+sleep loop so first-time users see
-# something in $LOG_DIR/example/ on a fresh ./tools/yos.sh --server.
+# This IS the real goal — runit keeps the listener alive across crashes
+# and yos-tcpserver gives multi-session. Known limitation: second
+# concurrent session crashes the listener (yos fork-after-fork race);
+# runsv will restart it on crash, so single-session-at-a-time works
+# robustly.
+#
+# yos.sh exports PATH=$ALL/libexec so the bare names resolve via
+# yos_execvp's PATH walk.
 exec 2>&1
-while :; do
-    date +'example heartbeat %Y-%m-%dT%H:%M:%S'
-    sleep 5
-done
+exec yos-tcpserver 12323 zsh
