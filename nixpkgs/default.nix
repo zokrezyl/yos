@@ -150,6 +150,14 @@ let
     src = perf-stress-src;
   };
 
+  # Gerrit Pape's runit, wasm32 port: runsv / runsvdir / sv / svlogd /
+  # runsvchdir. Foundation for the "real multi-process test rig with
+  # telnet sessions" workflow — drop a service dir under /tmp/run/<svc>
+  # inside the yos sandbox, point `runsvdir /tmp/run` at it from the
+  # zsh prompt, and let the supervisor restart-on-exit / signal-route
+  # / log-fd-setup any wasm program you point its run script at.
+  runit = pkgs.callPackage ./pkgs/runit { inherit toolchain sysroot; };
+
   # Umbrella package: every user-facing yos artefact merged into one
   # tree via symlinkJoin. Lets users do
   #   nix run .#                    # drops into wasm zsh under yos (sandbox)
@@ -166,7 +174,7 @@ let
   # sandbox boundary.
   all = pkgs.symlinkJoin {
     name = "yos-all";
-    paths = [ yos zsh nvim freebsd-tools openssh perf-stress ];  # cpython disabled — see above
+    paths = [ yos zsh nvim freebsd-tools openssh perf-stress runit ];  # cpython disabled — see above
     postBuild = ''
       cat > $out/bin/yos-shell <<RUNNER_EOF
       #!/usr/bin/env bash
@@ -205,5 +213,6 @@ in {
           zsh  # cpython disabled — see above
           zlib openssl openssh
           perf-stress
+          runit
           all;
 }
