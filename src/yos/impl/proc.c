@@ -10,6 +10,7 @@
 #include <fcntl.h>
 #include <signal.h>
 #include <sys/wait.h>
+#include <sys/stat.h>  /* execvp_path_search: stat() the PATH candidates */
 #include <sys/syscall.h>
 /* CLEARTID exit-wake done via pthread_cond_broadcast on the proc's
  * wait_cond (see below). No Linux futex syscall needed on the host;
@@ -1470,14 +1471,88 @@ int32_t yos_execv(struct yos_exec_ctx *ctx, uint32_t path, uint32_t argv_ptr)
  * implement PATH search yet; if the caller passes an absolute or
  * relative path with a slash (which is what libuv / nvim does for the
  * self-respawn path), it works. Bare file names return -ENOENT. */
+/* PATH-search helper for execvp / execvpe. POSIX says:
+ *   - If `file` contains a '/', execve(file) directly.
+ *   - Else walk $PATH (colon-separated); for each prefix `p` try
+ *     execve("p/file"). Empty prefix means cwd.
+ *   - If $PATH is unset, use a system default (we use "" → cwd).
+ *
+ * Writes the resolved path into `out` (caller-owned, must be
+ * PATH_MAX). Returns 1 on hit (out filled), 0 if every candidate
+ * stat'd to ENOENT (caller surfaces ENOENT), -1 on error.
+ *
+ * We resolve via host stat (against the GUEST's $PATH from
+ * ctx->envp). The path we hand to yos_execve is absolute, so
+ * even though we don't have per-process cwd today, the exec
+ * arg works regardless of host cwd state. */
+static int execvp_path_search(struct yos_exec_ctx *ctx,
+                              const char *file, char *out)
+{
+    /* Pull PATH from the guest env. ctx->envp is the parent's env
+     * array as host char**; each entry is a host string the guest
+     * set via setenv. Easier than the wasm-side env walk. */
+    const char *path = NULL;
+    if (ctx->envp) {
+        for (int i = 0; ctx->envp[i]; i++) {
+            if (strncmp(ctx->envp[i], "PATH=", 5) == 0) {
+                path = ctx->envp[i] + 5;
+                break;
+            }
+        }
+    }
+    if (!path || !*path) path = "";  /* empty PATH → cwd only */
+
+    const char *p = path;
+    while (*p || p == path) {
+        const char *colon = strchr(p, ':');
+        size_t plen = colon ? (size_t)(colon - p) : strlen(p);
+        size_t flen = strlen(file);
+        if (plen + 1 + flen + 1 > 4096) {
+            if (!colon) break;
+            p = colon + 1;
+            continue;
+        }
+        if (plen == 0) {
+            /* empty component → cwd */
+            memcpy(out, file, flen + 1);
+        } else {
+            memcpy(out, p, plen);
+            out[plen] = '/';
+            memcpy(out + plen + 1, file, flen + 1);
+        }
+        struct stat st;
+        if (stat(out, &st) == 0 && (st.st_mode & S_IFREG)) {
+            ydebug("execvp_path: %s → %s\n", file, out);
+            return 1;
+        }
+        if (!colon) break;
+        p = colon + 1;
+    }
+    return 0;
+}
+
 int32_t yos_execvp(struct yos_exec_ctx *ctx, uint32_t file, uint32_t argv_ptr)
 {
     const char *fn = (const char *)(ctx->memory + file);
-    if (!strchr(fn, '/')) {
-        ydebug("execvp(%s): PATH search not implemented; ENOENT\n", fn);
+    if (strchr(fn, '/')) {
+        return yos_execve(ctx, file, argv_ptr, 0);
+    }
+    char resolved[4096];
+    if (!execvp_path_search(ctx, fn, resolved)) {
+        ydebug("execvp(%s): no match in PATH\n", fn);
         return -ENOENT;
     }
-    return yos_execve(ctx, file, argv_ptr, 0);
+    /* Stash the resolved absolute path in the guest's wasm memory
+     * so yos_execve sees it via the same (wasm-offset → host-string)
+     * convention as everything else. Pin it to the parent's stack-
+     * top scratch — we're about to fork+exec anyway so the parent's
+     * memory state is leaving. ctx->heap_end is a stable cursor; the
+     * 4 KiB headroom is plenty for a PATH-resolved entry. */
+    uint32_t off = ctx->heap_end + 1024;
+    if (off + 4096 > ctx->memory_size) return -ENOMEM;
+    size_t n = strlen(resolved);
+    memcpy(ctx->memory + off, resolved, n + 1);
+    return yos_execve(ctx, off, argv_ptr, 0);
 }
 
 /* execvpe(file, argv, envp) — same as execvp but with explicit envp. */
@@ -1485,11 +1560,19 @@ int32_t yos_execvpe(struct yos_exec_ctx *ctx, uint32_t file,
                     uint32_t argv_ptr, uint32_t envp)
 {
     const char *fn = (const char *)(ctx->memory + file);
-    if (!strchr(fn, '/')) {
-        ydebug("execvpe(%s): PATH search not implemented; ENOENT\n", fn);
+    if (strchr(fn, '/')) {
+        return yos_execve(ctx, file, argv_ptr, envp);
+    }
+    char resolved[4096];
+    if (!execvp_path_search(ctx, fn, resolved)) {
+        ydebug("execvpe(%s): no match in PATH\n", fn);
         return -ENOENT;
     }
-    return yos_execve(ctx, file, argv_ptr, envp);
+    uint32_t off = ctx->heap_end + 1024;
+    if (off + 4096 > ctx->memory_size) return -ENOMEM;
+    size_t n = strlen(resolved);
+    memcpy(ctx->memory + off, resolved, n + 1);
+    return yos_execve(ctx, off, argv_ptr, envp);
 }
 
 /* deliver_to_proc: send `sig` to one guest proc via pthread_kill on its

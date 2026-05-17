@@ -163,6 +163,13 @@ let
   # telnet client into a wasm program (e.g. zsh) under runit.
   telnetd = pkgs.callPackage ./pkgs/telnetd { inherit toolchain sysroot; };
 
+  # Minimal TCP super-server. Each accept forks a wasm child + execve's
+  # the configured program with the connection on stdin/stdout/stderr.
+  # Pair with /libexec/zsh for "telnet → fresh shell per session"; pair
+  # with /libexec/telnetd for the real telnet protocol (telnetd handles
+  # PTY, IAC, login, etc.). Bypasses runit's cwd-race blocker entirely.
+  yos-tcpserver = pkgs.callPackage ./pkgs/yos-tcpserver { inherit toolchain sysroot; };
+
   # Umbrella package: every user-facing yos artefact merged into one
   # tree via symlinkJoin. Lets users do
   #   nix run .#                    # drops into wasm zsh under yos (sandbox)
@@ -179,7 +186,7 @@ let
   # sandbox boundary.
   all = pkgs.symlinkJoin {
     name = "yos-all";
-    paths = [ yos zsh nvim freebsd-tools openssh perf-stress runit telnetd ];  # cpython disabled — see above
+    paths = [ yos zsh nvim freebsd-tools openssh perf-stress runit telnetd yos-tcpserver ];  # cpython disabled — see above
     postBuild = ''
       cat > $out/bin/yos-shell <<RUNNER_EOF
       #!/usr/bin/env bash
@@ -220,5 +227,6 @@ in {
           perf-stress
           runit
           telnetd
+          yos-tcpserver
           all;
 }
