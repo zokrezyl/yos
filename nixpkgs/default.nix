@@ -130,6 +130,26 @@ let
   openssl = pkgs.callPackage ./pkgs/openssl { inherit toolchain sysroot zlib; };
   openssh = pkgs.callPackage ./pkgs/openssh { inherit toolchain sysroot zlib openssl; };
 
+  # In-tree stress test compiled to wasm and shipped as a runnable
+  # tool inside the umbrella ($out/libexec/perf-stress). Lets users
+  # invoke it from within `./tools/yos.sh`:
+  #
+  #     nixem% perf-stress &           # background
+  #     nixem% wait                    # observe stdout/stderr
+  #
+  # The source narrows to just tests/ut/libc/test_perf_stress.c +
+  # whatever the wasm toolchain needs; edits elsewhere in src/yos/
+  # don't invalidate this derivation's cache.
+  perf-stress-src = scopeSrc {
+    inherit src;
+    name = "yos-perf-stress-src";
+    keep = [ "tests/ut/libc/test_perf_stress.c" ];
+  };
+  perf-stress = pkgs.callPackage ./pkgs/perf-stress {
+    inherit toolchain sysroot;
+    src = perf-stress-src;
+  };
+
   # Umbrella package: every user-facing yos artefact merged into one
   # tree via symlinkJoin. Lets users do
   #   nix run .#                    # drops into wasm zsh under yos (sandbox)
@@ -146,7 +166,7 @@ let
   # sandbox boundary.
   all = pkgs.symlinkJoin {
     name = "yos-all";
-    paths = [ yos zsh nvim freebsd-tools openssh ];  # cpython disabled — see above
+    paths = [ yos zsh nvim freebsd-tools openssh perf-stress ];  # cpython disabled — see above
     postBuild = ''
       cat > $out/bin/yos-shell <<RUNNER_EOF
       #!/usr/bin/env bash
@@ -184,5 +204,6 @@ in {
           freebsd-tools
           zsh  # cpython disabled — see above
           zlib openssl openssh
+          perf-stress
           all;
 }

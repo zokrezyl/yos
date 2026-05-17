@@ -332,7 +332,14 @@ int main(int argc, char **argv)
              FORK_N, t1 - t0, (t1 - t0) / FORK_N);
     emit(line);
 
-    /* ---- 2. RECURSIVE fork tree → ~100 processes -------------- */
+    /* ---- 2. RECURSIVE fork tree → ~100 processes --------------
+     * Scale knobs: branches={A,B} means root → A children → A*B
+     * grandchildren = A + A*B total non-root processes (= log lines).
+     * Default {10,10} = 110 lines, ~111 processes. yos may abort
+     * under the host glibc allocator at high concurrency (host-side
+     * mimalloc-over-linear-memory bookkeeping); knock it down here
+     * when isolating the trap. */
+    emit("phase 2: recursive fork tree starting...\n");
     {
         const int branches[] = {10, 10};  /* root → 10 → 100 leaves */
         const int depth = (int)(sizeof(branches) / sizeof(branches[0]));
