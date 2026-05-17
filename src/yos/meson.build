@@ -99,6 +99,10 @@ yos_runtime_sources = files(
   'impl/tz.c',      # per-ctx timezone — closes tzname/timezone/daylight leaks
   'impl/libc_globals_link.c',  # binds env.getopt / env.tzset to the above
   'impl/libpython.c',
+  # syslog (openlog/closelog/syslog) + FreeBSD libutil (login_tty,
+  # realhostname_sa). Hand-bridged because the headers aren't in the
+  # codegen extractor's api_top_headers list.
+  'impl/syslog_extras.c',
   # ytrace + yplatform — switchable trace-point machinery imported
   # verbatim from yetty (with yetty_yplatform → yos_yplatform).
   # ytrace.h defines ydebug/yinfo/ywarn/yerror/ytrace and the

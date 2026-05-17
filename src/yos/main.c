@@ -1503,6 +1503,16 @@ void yos_link_imports(IM3Module module, struct yos_exec_ctx *ctx)
                         "stub\n", brg_rc);
     }
 
+    /* syslog (openlog/closelog/syslog) + FreeBSD libutil (login_tty,
+     * realhostname_sa). Not in the codegen surface because <syslog.h>
+     * / <libutil.h> aren't in api_top_headers (those drag in
+     * machine-specific decls that break wasm32 extraction). Bridges
+     * are hand-written in impl/syslog_extras.c; bind them AFTER the
+     * codegen link pass so the m3 unresolved-import check sees them
+     * resolved at load time. telnetd needs all five to load. */
+    extern void yos_syslog_extras_link_imports (IM3Module mod);
+    yos_syslog_extras_link_imports (module);
+
     /* FreeBSD-internal libc-private aliases. The public POSIX name
      * (mktemp) gets bridged via yos_brg_link_imports; the underscored
      * variant (_mktemp) is what FreeBSD libc's *.c source calls when
