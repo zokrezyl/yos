@@ -1,0 +1,19 @@
+#!/bin/sh
+# example service: heartbeat printer.
+#
+# runsv spawns this script and pipes its stdout into log/run's stdin.
+# Anything we write to stdout/stderr lands in svlogd's rotating file
+# at $LOG_DIR/example/current.
+#
+# Replace with a real long-lived service (telnetd, sshd, …) when you
+# have one wired up. The contract:
+#   - exec() the program (no fork) so runsv tracks its PID directly.
+#   - run in the foreground; runsv treats exit as crash and restarts.
+#
+# This stub uses /bin/sh's date+sleep loop so first-time users see
+# something in $LOG_DIR/example/ on a fresh ./tools/yos.sh --server.
+exec 2>&1
+while :; do
+    date +'example heartbeat %Y-%m-%dT%H:%M:%S'
+    sleep 5
+done

@@ -1758,10 +1758,122 @@ extern char **environ;
 
 int main(int argc, char **argv)
 {
+    /* ── server-mode flags ───────────────────────────────────────────
+     *
+     * Strip yos-host options from the front of argv BEFORE the wasm
+     * path is consumed at argv[1]. We accept exactly three:
+     *
+     *   --server              cosmetic / future-hook (sets g_server)
+     *                         — runit is the loaded wasm; tools/yos.sh
+     *                         is what actually picks `runsvdir <dir>`.
+     *   --daemon              fork+setsid+fork+chdir(/)+stdio→log file.
+     *                         Requires --log-dir so we know where to
+     *                         redirect.
+     *   --log-dir <abs-path>  parent dir for the catch-all server log
+     *                         AND for per-service svlogd output (the
+     *                         path is also exported as LOG_DIR in the
+     *                         child env so svlogd run scripts pick it
+     *                         up). Created if missing.
+     *
+     * Implemented as a tiny hand parser (not getopt) so we don't drag
+     * libc state into yos main. Unknown flags fall through to the
+     * wasm guest unchanged. */
+    int   g_server  = 0;
+    int   g_daemon  = 0;
+    char *g_log_dir = NULL;
+    {
+        int w = 1;
+        for (int i = 1; i < argc; i++) {
+            if (strcmp(argv[i], "--server") == 0) {
+                g_server = 1; continue;
+            }
+            if (strcmp(argv[i], "--daemon") == 0) {
+                g_daemon = 1; continue;
+            }
+            if (strcmp(argv[i], "--log-dir") == 0 && i + 1 < argc) {
+                g_log_dir = argv[++i]; continue;
+            }
+            argv[w++] = argv[i];
+        }
+        argc = w;
+    }
+
     if (argc < 2) {
-        fprintf(stderr, "usage: yos <program.wasm>\n");
+        fprintf(stderr,
+                "usage: yos [--server] [--daemon] [--log-dir DIR] "
+                "<program.wasm> [args...]\n");
         return 1;
     }
+    if (g_daemon && !g_log_dir) {
+        fprintf(stderr,
+                "yos: --daemon requires --log-dir DIR (stdio is "
+                "closed; no other place for log output)\n");
+        return 1;
+    }
+    if (g_log_dir && mkdir(g_log_dir, 0755) < 0 && errno != EEXIST) {
+        fprintf(stderr, "yos: mkdir(%s): %s\n",
+                g_log_dir, strerror(errno));
+        return 1;
+    }
+    /* Export LOG_DIR so service `log/run` scripts under runsvdir can
+     * point svlogd at $LOG_DIR/<svc>/ without each one hard-coding
+     * the path. Set even when --daemon isn't given — the dir exists
+     * and per-service logs can still land there with the catch-all
+     * going to the terminal. */
+    if (g_log_dir) setenv("LOG_DIR", g_log_dir, 1);
+
+    if (g_daemon) {
+        /* Classic double-fork. Detach from the controlling tty, lose
+         * session leadership, redirect stdio to <log-dir>/yos-server.log,
+         * write the second-fork PID to <log-dir>/yos-server.pid so
+         * the user can `kill $(cat …)`. chdir("/") so the daemon
+         * doesn't pin the cwd (else the running binary's tmpdir, repo
+         * checkout, etc. can't be unmounted). */
+        char logpath[4096];
+        char pidpath[4096];
+        snprintf(logpath, sizeof logpath, "%s/yos-server.log", g_log_dir);
+        snprintf(pidpath, sizeof pidpath, "%s/yos-server.pid", g_log_dir);
+
+        pid_t p = fork();
+        if (p < 0) { perror("yos: --daemon: fork#1"); return 1; }
+        if (p > 0) { /* original parent — exit, let init reap. */
+            _exit(0);
+        }
+        if (setsid() < 0) { perror("yos: setsid"); return 1; }
+        p = fork();
+        if (p < 0) { perror("yos: --daemon: fork#2"); return 1; }
+        if (p > 0) { /* session leader exits; grandchild keeps going. */
+            _exit(0);
+        }
+        /* Grandchild: the daemon process. */
+        if (chdir("/") < 0) { /* tolerate */ }
+        int lfd = open(logpath, O_WRONLY | O_CREAT | O_APPEND, 0644);
+        if (lfd < 0) {
+            /* Can't go to log; bail loudly while we still have a
+             * stderr to bail through. */
+            int saved = errno;
+            dprintf(2, "yos: --daemon: open(%s): %s\n",
+                    logpath, strerror(saved));
+            _exit(1);
+        }
+        int nfd = open("/dev/null", O_RDONLY);
+        if (nfd >= 0) { dup2(nfd, 0); close(nfd); }
+        dup2(lfd, 1);
+        dup2(lfd, 2);
+        if (lfd > 2) close(lfd);
+
+        /* Write our PID after the redirects so any failure above
+         * surfaces on stderr-before-redirect rather than into a
+         * half-set-up log. */
+        int pfd = open(pidpath, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (pfd >= 0) {
+            char buf[32];
+            int n = snprintf(buf, sizeof buf, "%ld\n", (long)getpid());
+            (void)!write(pfd, buf, (size_t)n);
+            close(pfd);
+        }
+    }
+    (void)g_server;  /* reserved — future runit-aware behaviour */
 
     /* YOS_BRG_TRACE=1 makes every generated bridge log its name. Lets us
      * see exactly what libc function the wasm guest called last when it

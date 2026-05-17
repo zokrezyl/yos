@@ -30,3 +30,13 @@ __pycache__/
 # Editor / OS noise.
 .DS_Store
 *.swp
+
+# runit server-mode state. The service scripts under runtime/runit/<svc>/
+# are tracked (run, log/run). Everything else is generated at runtime:
+#   - supervise/         runsv's per-service control sockets + status
+#   - log/main           svlogd's rotating buffer dir
+#   - logs/              the --log-dir catch-all + per-service spool
+runtime/runit/*/supervise/
+runtime/runit/*/log/supervise/
+runtime/runit/*/log/main/
+runtime/logs/

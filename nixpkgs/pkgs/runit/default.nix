@@ -1,4 +1,4 @@
-{ stdenv, lib, fetchurl, toolchain, sysroot
+{ stdenv, lib, fetchurl, binaryen, python3, toolchain, sysroot
 , yos ? null   # optional — when null, the bin/ runner falls back to
               # `yos` on PATH instead of hardcoding a store path.
 }:
@@ -49,7 +49,7 @@ stdenv.mkDerivation rec {
     sha256 = "sha256-b9AWDLDPEgfeTmZ1S205dQz/FLsKpmq0lJCZLAxHuhg=";
   };
 
-  nativeBuildInputs = [ toolchain ];
+  nativeBuildInputs = [ toolchain binaryen python3 ];
 
   dontStrip    = true;
   dontPatchELF = true;
@@ -90,6 +90,44 @@ stdenv.mkDerivation rec {
     done
     # systype — auxiliary info string. runit's `system` tag.
     echo 'yos-wasm32-freebsd' > systype
+
+    # yos-specific patch: runsvdir spawns `runsv <basename>` and
+    # relies on the child inheriting the parent's cwd (svdir) so
+    # runsv's `chdir(basename)` resolves correctly. Under yos every
+    # forked process is a pthread of the same host process, which
+    # means the HOST cwd is shared — the parent's `fchdir(curdir)`
+    # right after spawn races the child's `chdir(basename)` and
+    # the latter ends up at REPO_ROOT/basename instead of
+    # svdir/basename, fatally exiting with "unable to change to
+    # directory: file does not exist".
+    #
+    # Workaround: hand runsv an absolute path so its `chdir` is
+    # cwd-independent. Patch the spawn site to prepend `svdir + "/"`
+    # to the basename before exec'ing runsv. Keeps the rest of
+    # runit's machinery untouched.
+    python3 - runsvdir.c <<'PY'
+    import sys, pathlib, re
+    p = pathlib.Path(sys.argv[1])
+    text = p.read_text()
+    marker = "/* yos: pass absolute service path */"
+    if marker in text: sys.exit(0)
+    old = '    prog[0] ="runsv";\n    prog[1] =name;\n'
+    new = ('    char absbuf[1024];\n'
+           '    int n1 = 0, n2 = 0;\n'
+           '    while (svdir[n1]) absbuf[n1] = svdir[n1], n1++;\n'
+           '    if (n1 > 0 && absbuf[n1-1] != \'/\') absbuf[n1++] = \'/\';\n'
+           '    while (name[n2] && n1 + n2 < (int)sizeof(absbuf) - 1)\n'
+           '      absbuf[n1+n2] = name[n2], n2++;\n'
+           '    absbuf[n1+n2] = 0;\n'
+           '    ' + marker + '\n'
+           '    prog[0] ="runsv";\n'
+           '    prog[1] =absbuf;\n')
+    if old not in text:
+      sys.stderr.write("yos patch: spawn site already moved — re-check\n")
+      sys.exit(1)
+    p.write_text(text.replace(old, new))
+    PY
+
     cd ..
   '';
 
@@ -203,7 +241,25 @@ stdenv.mkDerivation rec {
         "${sysroot}/usr/lib/crt1.o" \
         "$t.o" $LIB_OBJS \
         -lc -lyos_stubs \
+        -o "../out/libexec/$t.raw"
+    done
+
+    # Asyncify pass — runsv, runsvdir and sv ALL fork/exec under
+    # yos. Without --asyncify the wasm guest's call stack can't be
+    # snapshotted/restored across fork, and the first fork bridge
+    # logs "asyncify not available - WASM must be compiled with
+    # asyncify" and silently no-ops. runsvdir then sits there
+    # without ever spawning a runsv per service dir.
+    #
+    # We pass --asyncify across every tool — the control clients
+    # (sv / runsvctrl / runsvstat / runsvchdir) don't fork but the
+    # extra instrumentation is harmless, and uniform builds make
+    # the recipe simpler.
+    for t in $RUNIT_TOOLS; do
+      wasm-opt --asyncify -O2 \
+        "../out/libexec/$t.raw" \
         -o "../out/libexec/$t"
+      rm "../out/libexec/$t.raw"
     done
 
     cd ..
