@@ -70,6 +70,7 @@ extern uint32_t yos_malloc(struct yos_exec_ctx *ctx, uint32_t size);
 #define PWD_BUF_SZ      512u
 #define GRP_BUF_SZ      1024u
 #define LOGIN_BUF_SZ    64u
+#define UGNAME_BUF_SZ   64u   /* user_from_uid / group_from_gid scratch */
 
 /* Per-process static storage anchors. We keep one wasm-side buffer
  * per kind, reused across calls — same lifetime contract as libc's
@@ -78,6 +79,7 @@ extern uint32_t yos_malloc(struct yos_exec_ctx *ctx, uint32_t size);
 static uint32_t pwd_buf_off;        /* wasm offset of passwd buffer (struct+strs) */
 static uint32_t grp_buf_off;        /* wasm offset of group buffer */
 static uint32_t login_buf_off;      /* wasm offset of login-name buffer */
+static uint32_t ugname_buf_off;     /* user_from_uid / group_from_gid result */
 
 static uint32_t ensure_buf(struct yos_exec_ctx *ctx,
                            uint32_t *anchor, uint32_t want)
@@ -985,4 +987,48 @@ uint32_t yos_getprotobynumber(struct yos_exec_ctx *ctx, int32_t number)
             return emit_protoent(ctx, &yos_proto_table[i]);
     }
     return 0;
+}
+
+/* user_from_uid / group_from_gid — FreeBSD libutil helpers ls(1) uses
+ * to render the owner/group columns. Glibc has no equivalent, so they
+ * land in the codegen ENOSYS stub by default; that returns NULL and
+ * ls treats NULL as a fatal OOM ("err(1, \"user_from_uid\")").
+ *
+ * Both return a pointer to a static buffer holding the name. On lookup
+ * failure: with nouser/nogroup == 0 they return the numeric form
+ * (printed as decimal); with !=0 they return NULL. We share one wasm
+ * scratch buffer per kind (one user, one group) — same lifetime
+ * contract as FreeBSD's own static, and matches how ls/find use the
+ * call (one-at-a-time per entry, no nested results held). */
+static uint32_t emit_ugname(struct yos_exec_ctx *ctx, const char *s)
+{
+    uint32_t buf = ensure_buf(ctx, &ugname_buf_off, UGNAME_BUF_SZ);
+    if (!buf) return 0;
+    size_t n = strlen(s);
+    if (n >= UGNAME_BUF_SZ) n = UGNAME_BUF_SZ - 1;
+    memcpy(ctx->memory + buf, s, n);
+    ctx->memory[buf + n] = '\0';
+    return buf;
+}
+
+uint32_t yos_user_from_uid(struct yos_exec_ctx *ctx, uint32_t uid, int32_t nouser)
+{
+    struct passwd *pw = getpwuid((uid_t)uid);
+    if (pw && pw->pw_name && pw->pw_name[0])
+        return emit_ugname(ctx, pw->pw_name);
+    if (nouser) return 0;
+    char num[16];
+    snprintf(num, sizeof num, "%u", uid);
+    return emit_ugname(ctx, num);
+}
+
+uint32_t yos_group_from_gid(struct yos_exec_ctx *ctx, uint32_t gid, int32_t nogroup)
+{
+    struct group *gr = getgrgid((gid_t)gid);
+    if (gr && gr->gr_name && gr->gr_name[0])
+        return emit_ugname(ctx, gr->gr_name);
+    if (nogroup) return 0;
+    char num[16];
+    snprintf(num, sizeof num, "%u", gid);
+    return emit_ugname(ctx, num);
 }

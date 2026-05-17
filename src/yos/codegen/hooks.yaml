@@ -147,6 +147,11 @@ custom_proc:
   - endgrent
   - getlogin
   - getlogin_r
+  # FreeBSD libutil helpers ls(1) calls per entry to render the
+  # owner/group columns. Glibc has no equivalent; without these the
+  # codegen ENOSYS stub returns NULL, which ls treats as fatal OOM.
+  - user_from_uid
+  - group_from_gid
   # impl/pwd.c — same static-buffer pattern for the time-string
   # family. Returns wasm offset to a per-ctx slot containing the
   # struct tm / time string.

@@ -15,9 +15,23 @@
  *      is how ps(1) and any /proc reader gets yos's process table
  *      instead of the host's.
  *
- * Wasm-side `DIR *` is a small int (1..YOS_DIR_MAX-1); slot 0 is the
- * canonical NULL so `if ((dirp = opendir(...)) == NULL)` keeps
- * working.
+ * Wasm-side `DIR *` is a wasm offset to an 8-byte struct in linear
+ * memory:
+ *     +0 : int32_t  dd_fd     — wasm fd; FreeBSD libc's `_dirfd(dirp)`
+ *                               macro (from gen-private.h) is
+ *                               `((dirp)->dd_fd)` — i.e. a load of the
+ *                               first int. fts/find/ls all rely on
+ *                               that path returning a usable fd.
+ *     +4 : uint32_t slot_idx  — index back into g_dirs[]. Bridges
+ *                               look the slot up here so we can keep
+ *                               the per-stream state host-side without
+ *                               teaching the guest about it.
+ *
+ * Returning a real wasm pointer (not a 1..63 slot index) is what makes
+ * `_dirfd` work — fts_safe_changedir uses `_fstat(_dirfd(dirp))` to
+ * verify it's still pointing at the directory it expected, and an
+ * arbitrary garbage read at offset slot_index would compare against
+ * stack data or random heap.
  *
  * Forks share the table (same global). Same compromise as
  * impl/file.c's FILE* table — directory streams rarely outlive a fork
@@ -82,6 +96,12 @@ struct yos_dir_slot {
     const struct yos_file_operations *vfs_ops;
 
     uint32_t scratch_off;          /* wasm offset of FreeBSD dirent buffer */
+    uint32_t dd_off;               /* wasm offset of the _dirdesc-shaped
+                                      header (the value we return to the
+                                      guest as DIR*). 0 when unset. */
+    int32_t  wasm_fd;              /* wasm fd written into dd_off+0. -1
+                                      for vfs-backed dirs with no host
+                                      fd to surface. */
 
     /* virtual-fs read-ahead buffer (host-side) */
     uint8_t  vfs_buf[YOS_VFS_DIRBUF_SIZE];
@@ -90,14 +110,35 @@ struct yos_dir_slot {
     int      vfs_exhausted;        /* getdents64 returned 0 */
 };
 
+/* Header laid into wasm linear memory at slot->dd_off. */
+#define YOS_DD_SIZE         8
+#define YOS_DD_FD_OFF       0
+#define YOS_DD_SLOTIDX_OFF  4
+
 static struct yos_dir_slot g_dirs[YOS_DIR_MAX];
 static pthread_mutex_t     g_dirs_lock = PTHREAD_MUTEX_INITIALIZER;
 
+/* Look up a slot by its yos-internal index (used only when we already
+ * know the slot — see slot_from_dd for the guest-pointer path). */
 static struct yos_dir_slot *slot_get(uint32_t handle)
 {
     if (handle == 0 || handle >= YOS_DIR_MAX) return NULL;
     if (!g_dirs[handle].in_use) return NULL;
     return &g_dirs[handle];
+}
+
+/* Translate a guest DIR* (wasm offset of the header struct) to its
+ * yos slot. Returns NULL on any inconsistency — bridges then surface
+ * EBADF, matching what libc would do for a stale DIR pointer. */
+static struct yos_dir_slot *slot_from_dd(struct yos_exec_ctx *ctx,
+                                         uint32_t dd_off)
+{
+    if (dd_off == 0) return NULL;
+    if ((uint64_t)dd_off + YOS_DD_SIZE > ctx->memory_size) return NULL;
+    uint32_t idx = *(uint32_t *)(ctx->memory + dd_off + YOS_DD_SLOTIDX_OFF);
+    struct yos_dir_slot *slot = slot_get(idx);
+    if (!slot || slot->dd_off != dd_off) return NULL;
+    return slot;
 }
 
 /* Reserve a slot; caller fills host_dir / vfs_file then commits with
@@ -109,6 +150,7 @@ static uint32_t slot_reserve(void)
         if (!g_dirs[i].in_use) {
             memset(&g_dirs[i], 0, sizeof(g_dirs[i]));
             g_dirs[i].in_use = 1;
+            g_dirs[i].wasm_fd = -1;
             pthread_mutex_unlock(&g_dirs_lock);
             return i;
         }
@@ -117,16 +159,30 @@ static uint32_t slot_reserve(void)
     return 0;
 }
 
+/* Allocate the per-slot wasm scratch (FreeBSD dirent buffer) AND the
+ * 8-byte header struct the guest will see as DIR*. The header carries
+ * dd_fd at +0 (so libc's `_dirfd(dirp)` macro returns a usable wasm
+ * fd) and our slot index at +4 (so the bridges can find the slot
+ * again from just the guest pointer). */
 static int slot_finalise(struct yos_exec_ctx *ctx, uint32_t handle)
 {
-    g_dirs[handle].scratch_off = yos_malloc(ctx, YOS_FBSD_DIRENT_SIZE);
-    if (g_dirs[handle].scratch_off == 0) {
-        pthread_mutex_lock(&g_dirs_lock);
-        g_dirs[handle].in_use = 0;
-        pthread_mutex_unlock(&g_dirs_lock);
-        return -1;
+    struct yos_dir_slot *slot = &g_dirs[handle];
+    slot->scratch_off = yos_malloc(ctx, YOS_FBSD_DIRENT_SIZE);
+    if (slot->scratch_off == 0) goto fail;
+    slot->dd_off = yos_malloc(ctx, YOS_DD_SIZE);
+    if (slot->dd_off == 0) {
+        yos_free(ctx, slot->scratch_off);
+        slot->scratch_off = 0;
+        goto fail;
     }
+    *(int32_t  *)(ctx->memory + slot->dd_off + YOS_DD_FD_OFF) = slot->wasm_fd;
+    *(uint32_t *)(ctx->memory + slot->dd_off + YOS_DD_SLOTIDX_OFF) = handle;
     return 0;
+fail:
+    pthread_mutex_lock(&g_dirs_lock);
+    slot->in_use = 0;
+    pthread_mutex_unlock(&g_dirs_lock);
+    return -1;
 }
 
 /* Procfs file table is per-ctx (procfs_fds). Look up the table and
@@ -136,6 +192,23 @@ static struct yos_file *vfs_file_from_fd(struct yos_exec_ctx *ctx, int32_t fd)
     struct yos_file_table *ft = (struct yos_file_table *)ctx->procfs_fds;
     if (!ft) return NULL;
     return yos_file_get(ft, fd);
+}
+
+/* Assign a wasm fd that resolves to the host fd backing a freshly-
+ * opened DIR*. dup()'d so closedir() and yos_close(wasm_fd) can each
+ * release their half independently (closedir owns the original, the
+ * wasm fd owns the dup). Returns -1 on failure (caller must close the
+ * DIR* itself in that case). */
+static int alloc_wasm_fd_for_host_dir(struct yos_exec_ctx *ctx, DIR *d)
+{
+    extern int yos_fd_alloc(struct yos_exec_ctx *, int);
+    int orig = dirfd(d);
+    if (orig < 0) return -1;
+    int duped = dup(orig);
+    if (duped < 0) return -1;
+    int wfd = yos_fd_alloc(ctx, duped);
+    if (wfd < 0) { close(duped); return -1; }
+    return wfd;
 }
 
 uint32_t yos_opendir(struct yos_exec_ctx *ctx, uint32_t path_off)
@@ -172,13 +245,15 @@ uint32_t yos_opendir(struct yos_exec_ctx *ctx, uint32_t path_off)
         }
         g_dirs[h].vfs_file = vfile;
         g_dirs[h].vfs_ops  = ops;
+        g_dirs[h].wasm_fd  = vfd; /* virtual fd; usable for fstat etc. */
         if (slot_finalise(ctx, h) < 0) {
             if (ops->close) ops->close(ctx, vfile);
             return yos_errno_null(ctx, ENOMEM);
         }
         if (ydebug_enabled())
-            ydebug("opendir(\"%s\") = handle %u (vfs)\n", path, h);
-        return h;
+            ydebug("opendir(\"%s\") = dd_off 0x%x slot %u wasm_fd %d (vfs)\n",
+                   path, g_dirs[h].dd_off, h, g_dirs[h].wasm_fd);
+        return g_dirs[h].dd_off;
     }
 
     /* Host-backed path. */
@@ -191,11 +266,12 @@ uint32_t yos_opendir(struct yos_exec_ctx *ctx, uint32_t path_off)
     uint32_t h = slot_reserve();
     if (h == 0) { closedir(d); return yos_errno_null(ctx, EMFILE); }
     g_dirs[h].host_dir = d;
+    g_dirs[h].wasm_fd  = alloc_wasm_fd_for_host_dir(ctx, d);
     if (slot_finalise(ctx, h) < 0) {
         closedir(d);
         return yos_errno_null(ctx, ENOMEM);
     }
-    return h;
+    return g_dirs[h].dd_off;
 }
 
 uint32_t yos_fdopendir(struct yos_exec_ctx *ctx, int32_t wasm_fd)
@@ -209,11 +285,16 @@ uint32_t yos_fdopendir(struct yos_exec_ctx *ctx, int32_t wasm_fd)
     uint32_t h = slot_reserve();
     if (h == 0) { closedir(d); return yos_errno_null(ctx, EMFILE); }
     g_dirs[h].host_dir = d;
+    /* fdopendir transfers ownership of the host fd to the DIR — the
+     * caller's wasm fd still refers to the same host fd, which is what
+     * we want surfaced via _dirfd. No dup needed; the wasm fd already
+     * points at it. */
+    g_dirs[h].wasm_fd = wasm_fd;
     if (slot_finalise(ctx, h) < 0) {
         closedir(d);
         return yos_errno_null(ctx, ENOMEM);
     }
-    return h;
+    return g_dirs[h].dd_off;
 }
 
 /* Lay one FreeBSD-i386 dirent into the slot's wasm scratch and return
@@ -239,9 +320,9 @@ static uint32_t emit_fbsd_dirent(struct yos_exec_ctx *ctx,
     return slot->scratch_off;
 }
 
-uint32_t yos_readdir(struct yos_exec_ctx *ctx, uint32_t handle)
+uint32_t yos_readdir(struct yos_exec_ctx *ctx, uint32_t dd_off)
 {
-    struct yos_dir_slot *slot = slot_get(handle);
+    struct yos_dir_slot *slot = slot_from_dd(ctx, dd_off);
     if (!slot) return yos_errno_null(ctx, EBADF);
 
     if (slot->vfs_file) {
@@ -297,9 +378,9 @@ uint32_t yos_readdir(struct yos_exec_ctx *ctx, uint32_t handle)
                             (uint8_t)e->d_type, e->d_name, namlen);
 }
 
-int32_t yos_closedir(struct yos_exec_ctx *ctx, uint32_t handle)
+int32_t yos_closedir(struct yos_exec_ctx *ctx, uint32_t dd_off)
 {
-    struct yos_dir_slot *slot = slot_get(handle);
+    struct yos_dir_slot *slot = slot_from_dd(ctx, dd_off);
     if (!slot) return yos_errno_neg(ctx, EBADF);
 
     int rc = 0;
@@ -309,42 +390,33 @@ int32_t yos_closedir(struct yos_exec_ctx *ctx, uint32_t handle)
         int32_t r = slot->vfs_ops->close(ctx, slot->vfs_file);
         if (r < 0) rc = r;
     }
-    uint32_t scratch = slot->scratch_off;
+    uint32_t scratch  = slot->scratch_off;
+    uint32_t hdr_off  = slot->dd_off;
     pthread_mutex_lock(&g_dirs_lock);
     memset(slot, 0, sizeof(*slot));
+    slot->wasm_fd = -1;
     pthread_mutex_unlock(&g_dirs_lock);
     if (scratch) yos_free(ctx, scratch);
+    if (hdr_off) yos_free(ctx, hdr_off);
     if (rc < 0) return yos_errno_neg(ctx, -rc);
     return 0;
 }
 
-int32_t yos_dirfd(struct yos_exec_ctx *ctx, uint32_t handle)
+int32_t yos_dirfd(struct yos_exec_ctx *ctx, uint32_t dd_off)
 {
-    extern int yos_fd_alloc(struct yos_exec_ctx *, int);
-    extern int yos_fd_get  (struct yos_exec_ctx *, int);
-
-    struct yos_dir_slot *slot = slot_get(handle);
+    /* Now trivial: the wasm fd already lives at dd_off+0 so the libc
+     * macro `_dirfd(dirp)` returns it without an env import. Bridges
+     * are still called by anything that uses `dirfd(dirp)` as an
+     * actual function — give them the same answer. */
+    struct yos_dir_slot *slot = slot_from_dd(ctx, dd_off);
     if (!slot) return yos_errno_neg(ctx, EBADF);
-
-    /* Virtual DIRs have no host fd to hand out — yos_file is opaque.
-     * Returning -EBADF tells the caller (fts.c, find, …) it can't
-     * fchdir into it; they fall back to chdir(path). */
-    if (!slot->host_dir) return yos_errno_neg(ctx, EBADF);
-
-    int hfd = dirfd(slot->host_dir);
-    if (hfd < 0) return yos_errno_neg(ctx, errno);
-    for (int wfd = 0; wfd < 256; wfd++) {
-        if (yos_fd_get(ctx, wfd) == hfd) return wfd;
-    }
-    int wfd = yos_fd_alloc(ctx, hfd);
-    if (wfd < 0) return yos_errno_neg(ctx, EMFILE);
-    return wfd;
+    if (slot->wasm_fd < 0) return yos_errno_neg(ctx, EBADF);
+    return slot->wasm_fd;
 }
 
-void yos_rewinddir(struct yos_exec_ctx *ctx, uint32_t handle)
+void yos_rewinddir(struct yos_exec_ctx *ctx, uint32_t dd_off)
 {
-    (void)ctx;
-    struct yos_dir_slot *slot = slot_get(handle);
+    struct yos_dir_slot *slot = slot_from_dd(ctx, dd_off);
     if (!slot) return;
     if (slot->host_dir) {
         rewinddir(slot->host_dir);
