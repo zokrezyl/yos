@@ -156,6 +156,14 @@ custom_proc:
   # 11-char "drwxr-xr-x " column ls -l prints. Pure / stateless; no
   # glibc equivalent. Without it ls -l silently drops the mode column.
   - strmode
+  # impl/pty.c — pseudo-terminal allocation chain telnetd needs to
+  # set up a session. Codegen leaves these as ENOSYS stubs which
+  # makes telnetd write "All network ports in use" and exit.
+  - posix_openpt
+  - grantpt
+  - unlockpt
+  - ptsname
+  - ptsname_r
   # impl/mbwc.c — host scratch mbstate_t per call. FreeBSD's
   # mbstate_t is 128 bytes (union with __mbstate8[128]); glibc's is
   # 8 bytes — passing the guest pointer straight through trips

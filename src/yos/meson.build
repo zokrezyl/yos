@@ -103,6 +103,8 @@ yos_runtime_sources = files(
   # realhostname_sa). Hand-bridged because the headers aren't in the
   # codegen extractor's api_top_headers list.
   'impl/syslog_extras.c',
+  'impl/pty.c',                   # posix_openpt + grantpt + unlockpt + ptsname
+                                  # for telnetd PTY allocation
   # ytrace + yplatform — switchable trace-point machinery imported
   # verbatim from yetty (with yetty_yplatform → yos_yplatform).
   # ytrace.h defines ydebug/yinfo/ywarn/yerror/ytrace and the
