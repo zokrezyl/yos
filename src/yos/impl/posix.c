@@ -1604,3 +1604,98 @@ int32_t yos_fstatfs(struct yos_exec_ctx *ctx, int32_t wfd, uint32_t buf_off)
     *(uint64_t *)(w + FB_STATFS_F_FFREE_OFF)   = (uint64_t)h.f_ffree;
     return 0;
 }
+
+/* strmode(mode_t mode, char *p) — FreeBSD libc helper that renders a
+ * `mode_t` as the 11-char "drwxrwxrwx " column ls -l prints in the
+ * leftmost slot. Stubbed by codegen (no glibc equivalent), so without
+ * this every ls -l line started at the link-count column and looked
+ * misaligned and missing the mode/perm info.
+ *
+ * Layout (writes exactly 11 chars, no NUL):
+ *   [0]    file type:  - (regular) d (dir) l (symlink) c (char dev)
+ *                       b (block dev) p (fifo) s (socket) w (whiteout)
+ *   [1-3]  owner perms with setuid encoding (S/s)
+ *   [4-6]  group perms with setgid encoding (S/s)
+ *   [7-9]  other perms with sticky encoding (T/t)
+ *   [10]   ' ' — placeholder for the "extended attribute" column
+ *                FreeBSD uses ('+' when ACL present). We don't track
+ *                ACLs, so always a space — same convention glibc's
+ *                non-existent strmode would have used.
+ *
+ * Pure / stateless — no host call needed; the host's mode_t bits are
+ * defined by POSIX and match the FreeBSD values we'd be matching
+ * against. (Specifically: S_IRUSR..S_IXOTH = 0700..0001, S_ISUID=04000,
+ * S_ISGID=02000, S_ISVTX=01000 — identical on Linux, darwin, FreeBSD.)
+ * S_IFMT values differ between hosts but we receive the FreeBSD-shape
+ * mode_t from the wasm guest, so test against FreeBSD's S_IF* macros
+ * spelled inline (the host header's may not match). */
+#define FB_S_IFMT   0170000
+#define FB_S_IFIFO  0010000
+#define FB_S_IFCHR  0020000
+#define FB_S_IFDIR  0040000
+#define FB_S_IFBLK  0060000
+#define FB_S_IFREG  0100000
+#define FB_S_IFLNK  0120000
+#define FB_S_IFSOCK 0140000
+#define FB_S_IFWHT  0160000
+#define FB_S_ISUID  0004000
+#define FB_S_ISGID  0002000
+#define FB_S_ISVTX  0001000
+#define FB_S_IRUSR  0000400
+#define FB_S_IWUSR  0000200
+#define FB_S_IXUSR  0000100
+#define FB_S_IRGRP  0000040
+#define FB_S_IWGRP  0000020
+#define FB_S_IXGRP  0000010
+#define FB_S_IROTH  0000004
+#define FB_S_IWOTH  0000002
+#define FB_S_IXOTH  0000001
+
+void yos_strmode(struct yos_exec_ctx *ctx, uint32_t mode_in, uint32_t p_off)
+{
+    if (!p_off || p_off + 12 > ctx->memory_size) return;
+    char *p = (char *)(ctx->memory + p_off);
+    unsigned mode = (unsigned)mode_in;
+
+    switch (mode & FB_S_IFMT) {
+    case FB_S_IFDIR:  p[0] = 'd'; break;
+    case FB_S_IFCHR:  p[0] = 'c'; break;
+    case FB_S_IFBLK:  p[0] = 'b'; break;
+    case FB_S_IFREG:  p[0] = '-'; break;
+    case FB_S_IFLNK:  p[0] = 'l'; break;
+    case FB_S_IFSOCK: p[0] = 's'; break;
+    case FB_S_IFIFO:  p[0] = 'p'; break;
+    case FB_S_IFWHT:  p[0] = 'w'; break;
+    default:          p[0] = '?'; break;
+    }
+
+    p[1] = (mode & FB_S_IRUSR) ? 'r' : '-';
+    p[2] = (mode & FB_S_IWUSR) ? 'w' : '-';
+    switch (mode & (FB_S_IXUSR | FB_S_ISUID)) {
+    case 0:                         p[3] = '-'; break;
+    case FB_S_IXUSR:                p[3] = 'x'; break;
+    case FB_S_ISUID:                p[3] = 'S'; break;
+    case FB_S_IXUSR | FB_S_ISUID:   p[3] = 's'; break;
+    }
+
+    p[4] = (mode & FB_S_IRGRP) ? 'r' : '-';
+    p[5] = (mode & FB_S_IWGRP) ? 'w' : '-';
+    switch (mode & (FB_S_IXGRP | FB_S_ISGID)) {
+    case 0:                         p[6] = '-'; break;
+    case FB_S_IXGRP:                p[6] = 'x'; break;
+    case FB_S_ISGID:                p[6] = 'S'; break;
+    case FB_S_IXGRP | FB_S_ISGID:   p[6] = 's'; break;
+    }
+
+    p[7] = (mode & FB_S_IROTH) ? 'r' : '-';
+    p[8] = (mode & FB_S_IWOTH) ? 'w' : '-';
+    switch (mode & (FB_S_IXOTH | FB_S_ISVTX)) {
+    case 0:                         p[9] = '-'; break;
+    case FB_S_IXOTH:                p[9] = 'x'; break;
+    case FB_S_ISVTX:                p[9] = 'T'; break;
+    case FB_S_IXOTH | FB_S_ISVTX:   p[9] = 't'; break;
+    }
+
+    p[10] = ' ';
+    p[11] = '\0';
+}

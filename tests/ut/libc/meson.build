@@ -85,6 +85,11 @@ libc_tests = [
   # child via fputc on stderr — under yos that output disappears
   # because the child exits without an stdio flush.
   'test_fork_fprintf_stderr',
+  # FreeBSD libc strmode(3): mode_t → "drwxr-xr-x " column ls -l
+  # prints. Pure / stateless; hand-bridged in impl/posix.c because
+  # glibc has no equivalent and the codegen ENOSYS stub left every
+  # ls -l line with a blank mode column.
+  'test_strmode',
 ]
 
 # Path to the generator's output dir, exposed by src/yos/codegen.

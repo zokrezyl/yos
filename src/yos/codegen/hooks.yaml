@@ -152,6 +152,10 @@ custom_proc:
   # codegen ENOSYS stub returns NULL, which ls treats as fatal OOM.
   - user_from_uid
   - group_from_gid
+  # impl/posix.c — FreeBSD libc helper that renders mode bits as the
+  # 11-char "drwxr-xr-x " column ls -l prints. Pure / stateless; no
+  # glibc equivalent. Without it ls -l silently drops the mode column.
+  - strmode
   # impl/mbwc.c — host scratch mbstate_t per call. FreeBSD's
   # mbstate_t is 128 bytes (union with __mbstate8[128]); glibc's is
   # 8 bytes — passing the guest pointer straight through trips
