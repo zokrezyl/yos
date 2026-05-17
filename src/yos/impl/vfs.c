@@ -784,6 +784,15 @@ int oflags_fb_to_lx_fwd(int f) { return oflags_fb_to_lx(f); }
 #ifndef AT_NO_AUTOMOUNT
 #define AT_NO_AUTOMOUNT 0x800
 #endif
+/* AT_EMPTY_PATH is a Linux extension (kernel 5.8+; glibc exposes it
+ * via fcntl.h). darwin/BSD have no equivalent — when the guest sets
+ * the FreeBSD-shape bit, we silently drop it on those hosts. Guests
+ * that depend on AT_EMPTY_PATH semantics (rare; mostly fstatat with
+ * an empty path to mean "stat the fd itself") get the wrong answer,
+ * but no host crash. */
+#ifndef AT_EMPTY_PATH
+#  define AT_EMPTY_PATH 0
+#endif
 
 #define FB_AT_EACCESS          0x0100
 #define FB_AT_SYMLINK_NOFOLLOW 0x0200

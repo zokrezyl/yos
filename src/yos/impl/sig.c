@@ -567,8 +567,19 @@ int32_t yos_sigwaitinfo(struct yos_exec_ctx *ctx,
     sigset_t host;
     fbsd_sigset_to_host(ctx->memory + set_off, &host);
 
-    int rc = sigwaitinfo(&host, NULL);
+    int rc;
+#if defined(__linux__) || defined(__FreeBSD__)
+    rc = sigwaitinfo(&host, NULL);
     if (rc < 0) return yos_errno_neg(ctx, errno);
+#else
+    /* darwin has no sigwaitinfo (POSIX-2008 left it Linux-OBy). Emulate
+     * via sigwait — same blocking semantics, just no siginfo_t fill-out.
+     * Our siginfo zeroing below makes that gap explicit to callers. */
+    int sig = 0;
+    int e = sigwait(&host, &sig);
+    if (e != 0) return yos_errno_neg(ctx, e);
+    rc = sig;
+#endif
 
     /* Zero the wasm siginfo_t if provided so callers don't read stale
      * memory. FreeBSD-i386 siginfo_t is 64 bytes. */
