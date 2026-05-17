@@ -168,13 +168,12 @@ def walk_headers(headers: list[str], cflags: list[str]) -> dict[str, dict]:
 # ─── Binary-format dispatch (ELF vs Mach-O) ───────────────────────────
 
 def _detect_format(path: str) -> str:
-    """Read the magic to decide ELF vs Mach-O. Returns 'elf', 'macho',
-    or '?' (caller errors out). Mach-O has several flavours
-    (32/64-bit, fat universal); we treat all of them as 'macho' since
-    llvm-nm handles the slicing for us."""
+    """Read the magic to decide ELF vs Mach-O vs TBD. Returns 'elf',
+    'macho', 'tbd', or '?' (caller errors out)."""
     with open(path, 'rb') as f:
-        m = f.read(4)
-    if m[:4] == b'\x7fELF':
+        head = f.read(64)
+    m = head[:4]
+    if m == b'\x7fELF':
         return 'elf'
     if m in (b'\xfe\xed\xfa\xce',  # MH_MAGIC (32-bit BE)
              b'\xce\xfa\xed\xfe',  # MH_CIGAM
@@ -183,7 +182,85 @@ def _detect_format(path: str) -> str:
              b'\xca\xfe\xba\xbe',  # FAT_MAGIC (universal)
              b'\xbe\xba\xfe\xca'): # FAT_CIGAM
         return 'macho'
+    # `.tbd` (Text-based Dynamic library stubs Apple ships in SDKs to
+    # describe system dylibs that live only inside dyld_shared_cache).
+    # YAML doc starting with `--- !tapi-tbd`.
+    if head.lstrip().startswith(b'--- !tapi-tbd'):
+        return 'tbd'
     return '?'
+
+
+# ─── TBD reader (Apple SDK stub for cache-only dylibs) ────────────────
+#
+# Modern macOS/iOS keep every system dylib (libSystem, libobjc, …)
+# only inside `dyld_shared_cache`; no individual .dylib files exist
+# on disk. The SDK ships `.tbd` (Text-based Dynamic library) YAML
+# files describing each dylib's exported symbol list. We can't read
+# sections or sizes from a TBD (the actual binary isn't there) but
+# the symbol NAMES are authoritative for what's externally visible
+# from libSystem on darwin/iOS/tvOS, which is what the policy file
+# needs to enumerate.
+#
+# For a full audit (sections, sizes), extract individual dylibs from
+# the shared cache via Apple's dsc_extractor.bundle. The tooling
+# isn't a one-liner — for now, .tbd gives us the symbol coverage and
+# the policy author classifies based on the symbol's POSIX name +
+# any libclang-extracted type info from the SDK headers.
+
+def _tbd_symbols(path: str) -> dict[str, dict]:
+    """Parse a tapi-tbd YAML file. Returns {name: {bind, stt, ...}}.
+    Sections/sizes are zero (the .tbd doesn't carry them); the policy
+    diff still works because it keys on symbol name."""
+    out: dict[str, dict] = {}
+    text = Path(path).read_text()
+    # The TBD file may have multiple `--- !tapi-tbd` documents (one per
+    # re-exported sub-dylib in the install-name graph).
+    # `!tapi-tbd` is Apple's custom YAML tag; teach PyYAML to treat it
+    # as a plain mapping so safe_load_all doesn't bail.
+    class _TbdLoader(yaml.SafeLoader): pass
+    def _tbd_ctor(loader, node):
+        if isinstance(node, yaml.MappingNode):
+            return loader.construct_mapping(node, deep=True)
+        return loader.construct_scalar(node)
+    for tag in ('!tapi-tbd', '!tapi-tbd-v3', '!tapi-tbd-v4', '!tapi-tbd-v5'):
+        _TbdLoader.add_constructor(tag, _tbd_ctor)
+    docs = yaml.load_all(text, Loader=_TbdLoader)
+    for doc in docs:
+        if not isinstance(doc, dict):
+            continue
+        for export in (doc.get('exports') or []):
+            for key, stt, is_tls in (
+                ('symbols',              'OBJECT', False),
+                ('weak-symbols',         'OBJECT', False),
+                ('thread-local-symbols', 'TLS',    True),
+                ('objc-classes',         'OBJECT', False),
+                ('objc-eh-types',        'OBJECT', False),
+                ('objc-ivars',           'OBJECT', False),
+            ):
+                for sym in (export.get(key) or []):
+                    name = sym
+                    # Mach-O exports start with `_`; strip for parity
+                    # with the ELF-side names. ObjC classes use $-prefixes
+                    # we keep as-is.
+                    if name.startswith('_') and not name.startswith('__'):
+                        name = name[1:]
+                    elif name.startswith('__') and not name.startswith('___'):
+                        # `_foo` → `foo`, `__foo` → `__foo` (the latter
+                        # are internal __libc-ish names that exist on
+                        # both sides identically); leave alone.
+                        pass
+                    if not name:
+                        continue
+                    out.setdefault(name, {
+                        'bind':         'WEAK' if key == 'weak-symbols' else 'GLOBAL',
+                        'stt':          stt,
+                        'size':         0,
+                        'section_name': '(tbd:no-section-info)',
+                        'section_type': stt,
+                        'section_flags': '' if is_tls else 'W',
+                        'is_tls':       is_tls,
+                    })
+    return out
 
 
 # ─── ELF readers (Linux / FreeBSD glibc-class) ────────────────────────
@@ -348,20 +425,27 @@ def _macho_sections(so: str) -> dict[str, dict]:
 
 def _macho_kind_to_class(secname: str, kind: str) -> tuple[str, bool]:
     """Map a Mach-O '__SEGMENT,__section' string + nm kind-char to
-    (hazard_class, is_tls). Mirrors the ELF logic in classify()."""
+    (hazard_class, is_tls). Mirrors the ELF logic in classify().
+
+    Segments first — Mach-O loads __TEXT pages read-only and __DATA
+    pages writable regardless of sub-section name. __DATA_CONST is a
+    separate read-only data segment (introduced in 10.13). TLS lives
+    in __DATA,__thread_data / __thread_bss / __thread_vars.
+    """
     sec = secname.lower()
     is_tls = ('__thread' in sec)
     if is_tls:
         return 'threadlocal', True
-    # read-only?
-    if ('__const' in sec
-            or '__cstring' in sec
+    # Segment-level read-only classification.
+    if sec.startswith('__text,') or sec.startswith('__data_const,'):
+        return 'shared_const', False
+    # Section-level overrides (within __DATA segment).
+    if ('__const' in sec or '__cstring' in sec
             or kind in ('R', 'r', 's')):
         return 'shared_const', False
     if ('__data' in sec or '__bss' in sec or '__common' in sec
             or kind in ('D', 'd', 'B', 'b')):
         return 'shared', False
-    # Fallback: unknown — treat as shared (worst-case for safety).
     return 'shared', False
 
 
@@ -382,13 +466,24 @@ def _macho_symbols(so: str) -> dict[str, dict]:
     # a header line ":arch x86_64" etc. — we don't care which arch
     # (the policy is per ABI but most globals are universal).
     import re
+    # llvm-nm -m line shape, two known forms:
+    #   <vmaddr> (__SEG,__sect) <binding> <name>
+    #   <vmaddr> (__SEG,__sect) <binding> (was a private external) <name>
+    # The optional `(was ...)` annotation is emitted for symbols that
+    # used to be private-extern but were exported by a `.private_extern`
+    # directive removal. We tolerate any number of parenthesised
+    # annotations between binding and name.
     pat = re.compile(
         r'^\s*([0-9a-fA-F]+)\s+'        # vmaddr
         r'\(([^,]+),([^)]+)\)\s+'        # (segment,section)
-        r'(\S+)\s+'                       # binding ("external" / "non-external" / "weak external" / ...)
-        r'(\S+)'                          # name
+        r'(\S+(?:\s+\S+)*?)\s+'           # binding ('external' / 'non-external' / 'weak external')
+        r'(?:\([^)]+\)\s+)*'              # any number of (annotation) blocks
+        r'(\S+)\s*$'                      # name (last token)
     )
     for line in p.stdout.splitlines():
+        # Skip llvm-nm's section-header / file-banner lines.
+        if not line or line.endswith(':') or line.startswith(('Archive', ':')):
+            continue
         m = pat.match(line)
         if not m:
             continue
@@ -600,6 +695,11 @@ def main():
         # section-level summary independently.
         _ = _macho_sections(so)   # validates llvm-objdump is installed
         so_syms = _macho_symbols(so)
+    elif fmt == 'tbd':
+        # Apple SDK text-stub. Symbol names only — no section/size.
+        # Sufficient for policy coverage diffs on iOS/tvOS where the
+        # actual dylib is locked inside dyld_shared_cache.
+        so_syms = _tbd_symbols(so)
     else:
         sys.exit(f'extract_globals: {so}: unknown binary format '
                  f'(not ELF or Mach-O magic)')
