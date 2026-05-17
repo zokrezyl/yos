@@ -1408,6 +1408,161 @@ def emit_bridge(analyse: dict, guest_api: dict, host_api: dict,
             sigs[name] = wsig
             continue
 
+        # ── Auto save/restore wrapper: bridge.py emits the entire
+        # per-ctx safety dance around a host libc call. No human
+        # input needed beyond declaring the global in the policy. ─────
+        if category == 'auto_save_restore':
+            wargs, ok = _wargs_decl(gf)
+            if not ok:
+                counts['skipped'] += 1
+                continue
+            wret = _wasm_type(g_types.get(gf['ret']), g_types) or 'int32_t'
+            hret = _host_type(h_types.get((hf or {}).get('ret', '')), h_types) \
+                   if hf else None
+            host_call_args = []  # we don't translate args here — that
+            # IS the work the regular bridge does. For auto_save_restore
+            # we forward args POSITIONALLY using their wasm-side names
+            # because the legacy hand bridges that touch _res etc. take
+            # only scalars + char* args; the few pointer args are
+            # already wasm offsets, and the wrapped fn here is what the
+            # WASM GUEST already calls (so its host-libc signature
+            # accepts wasm-shaped args too via auto-bridge). In other
+            # words: this category is for fns whose normal passthrough
+            # body would be the right thing IF the global isolation
+            # were honoured — we wrap the passthrough body in a save/
+            # restore frame keyed by per-ctx state.
+            sig = (f'{wret} yos_{name}(struct yos_exec_ctx *ctx'
+                   f'{(", " + ", ".join(wargs)) if wargs else ""})')
+            decls.append(sig + ';')
+            auto_g = (sc_meta.get('__auto_fns__') or {}).get(name, [])
+            auto_meta_all = sc_meta.get('__auto_globals__') or {}
+            # Build save/restore lines per touched global.
+            saves, applies, writebacks, restores = [], [], [], []
+            lock_names = []
+            for gname in auto_g:
+                gmeta = auto_meta_all.get(gname)
+                if not gmeta:
+                    continue
+                # `extern T G;` to reach the host global.
+                # For struct types, the size may be large — memcpy via
+                # local snapshot rather than scalar copy.
+                t = gmeta['type']
+                saves.append(f'        {t} __saved_{gname} = {gname};')
+                applies.append(f'        {gname} = ctx->autoglobals.{gname};')
+                writebacks.append(f'        ctx->autoglobals.{gname} = {gname};')
+                restores.append(f'        {gname} = __saved_{gname};')
+                lock_names.append(gname)
+            # One mutex shared by ALL autoglobals — keeps total lock
+            # count fixed at 1 across yos's lifetime regardless of how
+            # many globals the policy auto-isolates. Contention is
+            # acceptable: these fns are low-frequency.
+            wargs_callthrough = ', '.join(a.split()[-1] for a in wargs) if wargs else ''
+            host_arg_casts = ''
+            if hf:
+                # Same cast logic as the passthrough path; reuse
+                # _arg_translation_full to get scalar widen/narrow
+                # right.
+                tr_setups = []
+                tr_calls = []
+                for i, (ga, ha) in enumerate(zip(gf.get('args', []),
+                                                 hf.get('args', []))):
+                    gt = g_types.get(ga['type_uid'])
+                    ht = h_types.get(ha['type_uid'])
+                    tr = _arg_translation_full(ga.get('name'), i,
+                                               gt, ht, g_types, h_types)
+                    if tr is None:
+                        tr = ('', f'a{i}', '')
+                    if tr[0]:
+                        tr_setups.append(tr[0])
+                    tr_calls.append(tr[1])
+                host_arg_casts = ', '.join(tr_calls)
+                tr_setups_block = '\n'.join(tr_setups)
+            else:
+                tr_setups_block = ''
+                host_arg_casts = wargs_callthrough
+            ret_decl = '' if wret == 'void' else f'        {wret} _rc;'
+            ret_assign = '' if wret == 'void' else '_rc = '
+            ret_return = '' if wret == 'void' else '        return _rc;'
+            host_call = f'{name}({host_arg_casts})'
+            body = (
+                f'{sig} {{\n'
+                f'    /* AUTO save/restore wrapper. Touches: {", ".join(lock_names)}.\n'
+                f'     * Emitted by bridge.py from policies/libc.yaml\n'
+                f'     * `leaks.*.auto_save_restore`. */\n'
+                f'    extern pthread_mutex_t yos_autoglobals_lock;\n'
+                f'    (void)ctx;\n'
+                + ''.join(f'    (void){a.split()[-1]};\n' for a in wargs)
+                + (tr_setups_block + '\n' if tr_setups_block else '')
+                + f'    pthread_mutex_lock(&yos_autoglobals_lock);\n'
+                f'    {{\n'
+                + '\n'.join(saves) + '\n'
+                + '\n'.join(applies) + '\n'
+                + (f'{ret_decl}\n' if ret_decl else '')
+                + f'        {ret_assign}{host_call};\n'
+                + '\n'.join(writebacks) + '\n'
+                + '\n'.join(restores) + '\n'
+                + f'    pthread_mutex_unlock(&yos_autoglobals_lock);\n'
+                + (f'{ret_return}\n' if ret_return else '')
+                + '    }\n'
+                + '}\n'
+            )
+            defs.append(body)
+            counts['custom_routed'] += 1  # accounting bucket
+            sigs[name] = wsig
+            continue
+
+        # ── Policy refusal: a loud ENOSYS body naming the leak. ──────
+        # Triggered when the policy file's `leaks.*.unbridge:` lists this
+        # function. We use the same body shape as `stub` but write a
+        # comment naming the global(s) the function would corrupt, and
+        # emit a one-line stderr message at runtime so a guest's first
+        # call surfaces the refusal instead of returning -1 silently.
+        if category == 'policy_refused':
+            wargs, ok = _wargs_decl(gf)
+            if not ok:
+                counts['skipped'] += 1
+                continue
+            wret = _wasm_type(g_types.get(gf['ret']), g_types) or 'int32_t'
+            g_ret_resolved2 = _resolve(g_types.get(gf['ret']), g_types)
+            is_ptr = (g_ret_resolved2 and
+                      g_ret_resolved2.get('kind') == 'pointer')
+            refused_globals = (sc_meta.get('__refused_globals__') or {}).get(name, [])
+            globals_str = ', '.join(refused_globals) if refused_globals else '?'
+            sig = (f'{wret} yos_{name}(struct yos_exec_ctx *ctx'
+                   f'{(", " + ", ".join(wargs)) if wargs else ""})')
+            decls.append(sig + ';')
+            if wret == 'void':
+                body_extra = ''
+            elif is_ptr:
+                body_extra = f'    return ({wret})0;\n'
+            else:
+                body_extra = (
+                    '    extern int yos_remap_errno_h2g(int);\n'
+                    '    if (ctx && ctx->memory && ctx->errno_off)\n'
+                    '        *(int *)(ctx->memory + ctx->errno_off) =\n'
+                    '            yos_remap_errno_h2g(38 /* ENOSYS */);\n'
+                    f'    return ({wret})-1;\n'
+                )
+            defs.append(
+                f'{sig} {{\n'
+                f'    /* {name}: refused by globals policy. Touches: '
+                f'{globals_str}.\n'
+                f'     * See build-tools/libbridge/policies/libc.yaml. To unblock,\n'
+                f'     * promote the global(s) to bridged_per_ctx + write the\n'
+                f'     * per-ctx impl. */\n'
+                f'    (void)ctx;\n'
+                + ''.join(f'    (void){a.split()[-1]};\n' for a in wargs)
+                + f'    static int _warned = 0;\n'
+                  f'    if (!_warned) {{ _warned = 1; '
+                  f'fprintf(stderr, "yos: {name} refused by globals policy '
+                  f'(touches {globals_str})\\n"); }}\n'
+                + body_extra
+                + f'}}'
+            )
+            counts['enosys_stub'] += 1
+            sigs[name] = wsig
+            continue
+
         # ── Hand-marked stub: -ENOSYS body. ───────────────────────────
         if category == 'stub':
             wargs, ok = _wargs_decl(gf)
@@ -1527,14 +1682,37 @@ def emit_bridge(analyse: dict, guest_api: dict, host_api: dict,
            '#endif /* YOS_BRIDGE_H */\n')
 
     include_block = '\n'.join(f'#include <{p}>' for p in host_includes)
+    # Headers declared by auto_save_restore globals (resolv.h for _res, …)
+    auto_globals_meta = sc_meta.get('__auto_globals__') or {}
+    auto_includes = sorted({g.get('include')
+                            for g in auto_globals_meta.values()
+                            if g.get('include')})
+    auto_include_block = '\n'.join(f'#include {p}' for p in auto_includes)
+    # Macro forms of the global names (e.g. resolv.h `#define _res
+    # (*__res_state())`) would expand at every use site below and the
+    # save/restore wrapper would assign to a function-call rvalue.
+    # Undef the macro, then re-extern the storage so we still reach the
+    # actual host symbol.
+    auto_undefs = '\n'.join(f'#undef {g}' for g in sorted(auto_globals_meta))
+    auto_externs = '\n'.join(
+        f'extern {gm["type"]} {g};'
+        for g, gm in sorted(auto_globals_meta.items()))
     c = (_BRIDGE_PROLOGUE
          + '#include "yos_bridge.h"\n'
          + '#include "yos/types.h"  /* full struct yos_exec_ctx for ctx->memory */\n'
          + '#include "wasm3.h"     /* m3ApiRawFunction, m3_LinkRawFunction, ... */\n'
          + '#include "yos_struct_convert.h" /* cv_<name>_h2w / w2h */\n'
+         + '#include <pthread.h> /* yos_autoglobals_lock for auto_save_restore */\n'
          + include_block + '\n'
+         + (auto_include_block + '\n' if auto_include_block else '')
+         + (('/* Auto-globals: disarm macro forms, re-extern raw storage. */\n'
+             + auto_undefs + '\n' + auto_externs + '\n\n')
+            if auto_globals_meta else '')
          + 'extern int yos_remap_errno_h2g(int);\n'
-         + 'extern int yos_xlate_dfd(struct yos_exec_ctx *, int32_t);\n\n'
+         + 'extern int yos_xlate_dfd(struct yos_exec_ctx *, int32_t);\n'
+         + '/* Single mutex protecting every auto_save_restore wrapper.\n'
+         + ' * Low-frequency fns (getopt/tzset/dns/locale); one lock fine. */\n'
+         + 'pthread_mutex_t yos_autoglobals_lock = PTHREAD_MUTEX_INITIALIZER;\n\n'
          + '/* ---- bridge bodies (call host libc) ---- */\n\n'
          + '\n\n'.join(defs)
          + '\n\n/* ---- wasm3 raw-function wrappers ---- */\n\n'
@@ -1571,12 +1749,76 @@ def _load_hooks(path: Path | None) -> tuple[dict[str, str], dict[str, dict]]:
     return cat_map, sc_meta
 
 
+def _load_globals_policy(path: Path | None) -> dict:
+    """Read build-tools/libbridge/policies/<lib>.yaml.
+
+    Returns a dict shaped:
+      {
+        'fn_to_globals': {fn_name: [global_name, ...]},
+            # for the refusal mechanism — every fn touching a leak
+            # global gets refused unless an auto_save_restore (below)
+            # or hand impl handles it.
+
+        'auto_globals': {global_name: {type, init, include?, fns: [...]}},
+            # leak entries that opt into auto save/restore. bridge.py
+            # emits the per-ctx struct field AND the wrapper for each
+            # listed fn — those fns get category 'auto_save_restore'
+            # instead of 'policy_refused'.
+
+        'auto_fns': {fn_name: [global_name, ...]},
+            # inverse: fn → list of auto-isolated globals it touches.
+            # A fn may touch multiple auto globals; the wrapper saves/
+            # restores all of them.
+      }
+
+    Returns empty structure when path is None.
+    """
+    empty = {'fn_to_globals': {}, 'auto_globals': {}, 'auto_fns': {}}
+    if path is None or not path.exists():
+        return empty
+    raw = yaml.safe_load(path.read_text()) or {}
+    classes = raw.get('classes') or {}
+    leaks_entries = classes.get('leaks') or []
+    fn_to_globals: dict[str, list[str]] = {}
+    auto_globals: dict[str, dict] = {}
+    auto_fns: dict[str, list[str]] = {}
+    for entry in leaks_entries:
+        if not isinstance(entry, dict):
+            continue
+        global_name = entry.get('name')
+        if not global_name:
+            continue
+        unbridge = entry.get('unbridge') or []
+        for fn in unbridge:
+            fn_to_globals.setdefault(fn, []).append(global_name)
+        # auto_save_restore opts the global out of plain refusal:
+        # bridge.py will emit per-ctx storage + wrapper for each fn.
+        auto = entry.get('auto_save_restore')
+        if auto and isinstance(auto, dict):
+            auto_globals[global_name] = {
+                'type':    auto.get('type', 'int'),
+                'init':    auto.get('init', '0'),
+                'include': auto.get('include'),  # optional header
+                'fns':     list(unbridge),
+            }
+            for fn in unbridge:
+                auto_fns.setdefault(fn, []).append(global_name)
+    return {
+        'fn_to_globals': fn_to_globals,
+        'auto_globals':  auto_globals,
+        'auto_fns':      auto_fns,
+    }
+
+
 def main() -> int:
     p = argparse.ArgumentParser(description='Emit yos_bridge.{h,c} from analyse-report.yaml.')
     p.add_argument('--analyse',   required=True, type=Path)
     p.add_argument('--guest-api', required=True, type=Path)
     p.add_argument('--host-api',  required=True, type=Path)
     p.add_argument('--hooks',     required=False, type=Path)
+    p.add_argument('--globals-policy', required=False, type=Path,
+                   help='build-tools/libbridge/policies/<lib>.yaml — '
+                        'functions in `leaks.*.unbridge:` get policy_refused')
     p.add_argument('--out-dir',   required=True, type=Path)
     args = p.parse_args()
 
@@ -1584,6 +1826,114 @@ def main() -> int:
     with args.guest_api.open() as f: guest_api = yaml.safe_load(f)
     with args.host_api.open()  as f: host_api  = yaml.safe_load(f)
     hooks, sc_meta = _load_hooks(args.hooks)
+
+    # Merge in the globals-policy: refusals override `passthrough` and
+    # `stub` (those would silently leak) to `policy_refused`. Auto-
+    # save/restore fns override to `auto_save_restore` (handled at the
+    # emit_bridge layer below). Do NOT override `runtime_owned` /
+    # `custom_*` / `variadic` / `struct_convert` — those mean "hand-
+    # bound elsewhere by the human, who has presumably already
+    # arranged for per-ctx safety." Re-routing those would duplicate
+    # symbols.
+    policy = _load_globals_policy(args.globals_policy)
+    refused      = policy['fn_to_globals']
+    auto_globals = policy['auto_globals']
+    auto_fns     = policy['auto_fns']
+    if refused or auto_globals:
+        skipped_handled, refused_count, auto_count = 0, 0, 0
+        for fn, globals_touched in refused.items():
+            prior = hooks.get(fn, 'passthrough')
+            if prior in ('runtime_owned', 'variadic', 'struct_convert') \
+                    or prior.startswith('custom_'):
+                skipped_handled += 1
+                continue
+            if fn in auto_fns:
+                hooks[fn] = 'auto_save_restore'
+                auto_count += 1
+            else:
+                hooks[fn] = 'policy_refused'
+                refused_count += 1
+            if prior not in ('policy_refused', 'auto_save_restore', 'passthrough'):
+                print(f'[bridge] policy override: {fn}: {prior} → '
+                      f'{hooks[fn]} (touches: {", ".join(globals_touched)})',
+                      file=sys.stderr)
+        # Stash globals-touched table so emit_bridge can write it into
+        # the refusal stub comment.
+        for fn, gs in refused.items():
+            sc_meta.setdefault('__refused_globals__', {})[fn] = gs
+        # Stash auto-globals + per-fn refused-globals for emit_bridge.
+        sc_meta.setdefault('__refused_globals__', {}).update(refused)
+        sc_meta['__auto_globals__'] = auto_globals
+        sc_meta['__auto_fns__']     = auto_fns
+
+        report_path = args.out_dir / 'blocked-by-policy.txt'
+        args.out_dir.mkdir(parents=True, exist_ok=True)
+        with report_path.open('w') as rf:
+            rf.write('# Functions named in build-tools/libbridge/policies/libc.yaml\n'
+                     '# `leaks.*.unbridge:`. To unblock: add an auto_save_restore\n'
+                     '# block to the global, or write a per-ctx impl and promote\n'
+                     '# to bridged_per_ctx.\n\n')
+            rf.write('# === REFUSED at codegen (was passthrough/stub) ===\n')
+            for fn in sorted(refused):
+                if hooks.get(fn) == 'policy_refused':
+                    rf.write(f'{fn}\ttouches: {", ".join(refused[fn])}\n')
+            rf.write('\n# === AUTO save/restore wrappers emitted ===\n')
+            for fn in sorted(refused):
+                if hooks.get(fn) == 'auto_save_restore':
+                    rf.write(f'{fn}\tauto_touches: {", ".join(refused[fn])}\n')
+            rf.write('\n# === ALREADY hand-handled (runtime_owned/custom_*) ===\n')
+            for fn in sorted(refused):
+                if hooks.get(fn) not in ('policy_refused', 'auto_save_restore'):
+                    rf.write(f'{fn}\thandled_via: {hooks.get(fn, "?")}\n')
+        print(f'[bridge] {refused_count} fns refused, {auto_count} fns auto-wrapped, '
+              f'{skipped_handled} already hand-handled → {report_path}',
+              file=sys.stderr)
+
+        # Generate the autoglobals header: per-ctx field declarations
+        # for each auto global. Sourced into the host build via a
+        # top-level #include in types.h, exposing ctx->autoglobals.<G>.
+        ah = '/* AUTOGENERATED by src/yos/codegen/bridge.py — DO NOT EDIT.\n'
+        ah += ' * Per-ctx storage for libc globals classified leaks+auto_save_restore\n'
+        ah += ' * in build-tools/libbridge/policies/libc.yaml. */\n'
+        ah += '#ifndef YOS_AUTOGLOBALS_H\n#define YOS_AUTOGLOBALS_H\n\n'
+        includes = sorted({g['include'] for g in auto_globals.values()
+                           if g.get('include')})
+        for inc in includes:
+            ah += f'#include {inc}\n'
+        # Many libc globals are exposed via macros that resolve to
+        # something other than the bare name (e.g. resolv.h's
+        # `_res` is `(*__res_state)`). Undef each macro before we
+        # declare the field — the macro form is irrelevant to us
+        # because we explicitly extern the underlying storage in the
+        # generated wrapper.
+        ah += '\n/* Disarm macro forms of the global names that would\n'
+        ah += ' * collide with our field declarations below. */\n'
+        for gname in sorted(auto_globals):
+            ah += f'#undef {gname}\n'
+        ah += '\nstruct yos_autoglobals {\n'
+        for gname, gmeta in sorted(auto_globals.items()):
+            ah += f'    /* {gname}: {gmeta["type"]} */\n'
+            ah += f'    {gmeta["type"]} {gname};\n'
+        ah += '};\n\n'
+        # Default initialiser snippet, callable from libc-init.c.
+        # memset for struct types (initialiser-list to a struct via cast
+        # isn't C99-legal for all clang configurations); init expr is
+        # treated as a scalar literal for scalar types and ignored for
+        # struct types (we zero-init structs).
+        ah += '#include <string.h>\n'
+        ah += 'static inline void yos_autoglobals_init(struct yos_autoglobals *a) {\n'
+        for gname, gmeta in sorted(auto_globals.items()):
+            t = gmeta['type'].strip()
+            if t.startswith('struct ') or t.startswith('union '):
+                ah += f'    memset(&a->{gname}, 0, sizeof(a->{gname}));\n'
+            else:
+                ah += f'    a->{gname} = ({t}){gmeta["init"]};\n'
+        ah += '}\n\n'
+        ah += '#endif\n'
+        (args.out_dir / 'yos_autoglobals.h').write_text(ah)
+        print(f'[bridge] generated yos_autoglobals.h '
+              f'({len(auto_globals)} globals, {len(auto_fns)} wrapped fns)',
+              file=sys.stderr)
 
     h, c, counts, guest_h = emit_bridge(analyse, guest_api, host_api, hooks, sc_meta)
     args.out_dir.mkdir(parents=True, exist_ok=True)

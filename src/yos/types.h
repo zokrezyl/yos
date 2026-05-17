@@ -5,6 +5,7 @@
 #include <stddef.h>
 #include <pthread.h>
 #include <limits.h>      /* PATH_MAX from POSIX libc, not Linux UAPI */
+#include "yos_autoglobals.h"   /* generated: struct yos_autoglobals */
 
 /* Asyncify states (from Binaryen's asyncify transformation) */
 #define ASYNCIFY_NORMAL    0
@@ -116,6 +117,76 @@ struct yos_exec_ctx {
     int fork_pending;
     int32_t fork_return;
     int is_child;
+
+    /* AUTO-isolated libc globals — bridge.py emits the per-ctx
+     * field definitions for everything marked auto_save_restore in
+     * the policy file. yos_autoglobals.h is generated; if you don't
+     * see your global here at runtime, check whether it's listed.
+     * The header path resolves through codegen's include dir. */
+    struct yos_autoglobals autoglobals;
+
+    /* Per-ctx libc-globals isolation (build-tools/libbridge/policies/libc.yaml).
+     *
+     * Each field below replaces a SHARED host-libc global that, left
+     * unguarded, would let guest A's call corrupt guest B's view.
+     * The bridges (impl/getopt.c, impl/tz.c, …) read+write these
+     * ctx fields instead of touching the host global directly.
+     *
+     * Adding a new entry here = corresponding policy.yaml entry MUST
+     * be promoted from `leaks` to `bridged_per_ctx` with `via:` =
+     * the impl file. The extractor's --fail-on-leak catches gaps. */
+
+    /* getopt state (optind/optarg/optopt/opterr). impl/getopt.c
+     * implements the parser itself (FreeBSD-derived) and never calls
+     * host getopt — eliminates the host-libc-global write entirely.
+     * `optind = 1` is the POSIX initial value; opterr defaults to 1
+     * (print error messages). */
+    struct {
+        int   optind;       /* next argv index to inspect; init 1 */
+        int   opterr;       /* if non-zero, print errors; init 1   */
+        int   optopt;       /* the unrecognized opt char            */
+        uint32_t optarg_off;/* wasm-memory offset of current optarg */
+    } getopt_state;
+
+    /* Timezone state. tzset() with $TZ set mutates host tzname/
+     * timezone/daylight. impl/tz.c swaps them in from this ctx slot
+     * before any timezone-sensitive call (localtime/mktime/strftime),
+     * swaps host's previous state out after.
+     * Initialised lazily: `initialized=0` until first tzset/localtime. */
+    struct {
+        int   initialized;
+        char  tzname0[64];      /* tzname[0] copy (e.g. "CET")     */
+        char  tzname1[64];      /* tzname[1] copy (e.g. "CEST")    */
+        long  timezone;         /* seconds west of UTC             */
+        int   daylight;         /* 1 if DST observed in this zone  */
+    } tz_state;
+
+    /* Resolver state — deferred. Adding requires bridging
+     * gethostbyname/getaddrinfo via res_n* reentrant variants.
+     * Until then env.gethostbyname is stubbed in the auto-bridge. */
+    void *resolver_state;       /* future: struct __res_state * */
+
+    /* Locale state — current `setlocale` argument per-ctx. impl/pwd.c
+     * currently calls host setlocale directly (leak); to be fixed by
+     * holding the locale string here and re-applying via uselocale
+     * (per-thread, glibc) on each bridge entry. */
+    char locale_name[64];       /* "" = host default */
+
+    /* Per-guest bridged-library state.
+     *
+     * yos hosts arbitrary native libraries (libpython3.12, future:
+     * libsqlite, libssl, ...) and exposes their C APIs to wasm guests
+     * via env.* bridges (impl/libpython.c et al). Each guest gets its
+     * own slice of every library's state — held here, owned by the
+     * library bridge, opaque to the rest of yos. NULL until the guest
+     * calls the library's init bridge.
+     *
+     * py_tstate: PyThreadState * of this guest's CPython subinterpreter.
+     *   Subinterpreters give each guest its own sys.modules / builtins /
+     *   (3.12+) GIL — without them two guests sharing one libpython
+     *   would see each other's monkey-patches and global mutation.
+     *   See impl/libpython.c. */
+    void *py_tstate;
 
     /* "Did this ctx write to stderr (wfd=2) since the last failed exec?"
      * Used by yos_exit to detect a forked child that died after exec

@@ -23,6 +23,7 @@
         # Wasm ports:
         #   .#nvim         neovim 0.10.4 wasm (with all 9 deps)
         #   .#zsh          zsh 5.9 wasm
+        #   .#cpython      DISABLED — see nixpkgs/default.nix
         #   .#freebsd-tools FreeBSD-base userland (cat/echo/ls/…)
         # nvim's libraries (each is its own derivation, also exposed):
         #   .#lua .#libuv .#msgpack-c .#unibilium .#libvterm

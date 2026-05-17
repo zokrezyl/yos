@@ -841,3 +841,12 @@ runtime_owned:
   - pthread_attr_getstacksize
   - pthread_attr_setstackaddr
   - pthread_attr_getstackaddr
+
+  # ── Per-ctx libc-globals isolation (impl/libc_globals_link.c). ──
+  # These functions touch host libc globals that the policy file
+  # (build-tools/libbridge/policies/libc.yaml) lists as `leaks`.
+  # Routing them runtime_owned makes bridge.py emit NOTHING; main.c
+  # binds env.<name> to a hand-written per-ctx implementation
+  # (impl/getopt.c, impl/tz.c) that never touches the host global.
+  - getopt
+  - tzset

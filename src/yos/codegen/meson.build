@@ -200,13 +200,23 @@ api_generate_outputs = custom_target(
 api_bridge_outputs = custom_target(
   'api-bridge-outputs',
   input            : [api_analyse_report, guest_api_yaml, host_api_yaml],
-  output           : ['yos_bridge.h', 'yos_bridge.c', 'yos_imports.h'],
+  output           : ['yos_bridge.h', 'yos_bridge.c', 'yos_imports.h',
+                      # Auto-isolation outputs (driven by
+                      # build-tools/libbridge/policies/libc.yaml):
+                      'yos_autoglobals.h',
+                      'blocked-by-policy.txt'],
   command          : [
     py, files('bridge.py'),
     '--analyse',   '@INPUT0@',
     '--guest-api', '@INPUT1@',
     '--host-api',  '@INPUT2@',
     '--hooks',     files('hooks.yaml'),
+    # libc globals policy — forces refusal stubs for fns whose
+    # `unbridge:` entries name them. See build-tools/libbridge/
+    # README.md and policies/libc.yaml.
+    '--globals-policy',
+        files(meson.project_source_root() /
+              'build-tools' / 'libbridge' / 'policies' / 'libc.yaml'),
     '--out-dir',   '@OUTDIR@',
   ],
   build_by_default : false,
@@ -278,5 +288,16 @@ api_bridge_dep = declare_dependency(
     include_directories('.'),
     yos_types_inc,
     yos_inc,
+  ],
+  # Force codegen to RUN before any consumer compiles. yos's types.h
+  # #includes yos_autoglobals.h which doesn't exist until bridge.py
+  # has run; without this `sources:` entry, the impl/*.c files start
+  # compiling before the header is generated and fail with "not found".
+  # The three .h outputs are the headers consumers can include; .c
+  # outputs are already gated via link_whole on api_bridge_lib.
+  sources             : [
+    api_bridge_outputs[0],   # yos_bridge.h
+    api_bridge_outputs[2],   # yos_imports.h
+    api_bridge_outputs[3],   # yos_autoglobals.h
   ],
 )

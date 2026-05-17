@@ -33,6 +33,11 @@
 threads_dep = dependency('threads')
 cc = meson.get_compiler('c')
 m_dep = cc.find_library('m', required: true)
+# libpython 3.12 (embedded) — links the real CPython interpreter into
+# the yos host so wasm guests can drive it through env.Py_* bridges
+# (impl/libpython.c). Optional: if libpython isn't installed, the
+# bridges still compile but every Py_* call traps with unresolved-symbol.
+python_embed_dep = dependency('python3-embed', required: false)
 # iconv: glibc folds it into libc; darwin/BSD ship a separate libiconv
 # whose symbols start with `iconv_*` (and `__iconv_*` for the GNU
 # extras). yos's bridge calls those names, so we need explicit linkage
@@ -89,6 +94,10 @@ yos_runtime_sources = files(
   'impl/sysctl.c',
   'impl/printf.c',
   'impl/dir.c',
+  'impl/getopt.c',  # per-ctx getopt — closes optind/optarg/optopt/opterr leaks
+  'impl/tz.c',      # per-ctx timezone — closes tzname/timezone/daylight leaks
+  'impl/libc_globals_link.c',  # binds env.getopt / env.tzset to the above
+  'impl/libpython.c',
   # ytrace + yplatform — switchable trace-point machinery imported
   # verbatim from yetty (with yetty_yplatform → yos_yplatform).
   # ytrace.h defines ydebug/yinfo/ywarn/yerror/ytrace and the
@@ -119,6 +128,7 @@ yos_exe = executable(
     threads_dep,
     m_dep,
     iconv_dep,           # darwin/BSD: separate libiconv
+    python_embed_dep,    # libpython3.12.so for env.Py_* bridges
   ],
   c_args : [
     '-D_GNU_SOURCE',

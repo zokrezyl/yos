@@ -1456,6 +1456,15 @@ void yos_link_imports(IM3Module module, struct yos_exec_ctx *ctx)
     m3_LinkRawFunction(module, "env", "vsprintf",  "i(iii)",  m3_vsprintf);
     m3_LinkRawFunction(module, "env", "vsnprintf", "i(iiii)", m3_vsnprintf);
 
+    /* Per-ctx libc-globals isolation (build-tools/libbridge/policies/libc.yaml).
+     *
+     * These bind BEFORE yos_brg_link_imports so the per-ctx versions
+     * win over auto-bridges that would otherwise call host libc and
+     * mutate the cross-guest shared globals. Each is documented in
+     * the policy as `bridged_per_ctx via: impl/<file>.c`. */
+    extern void yos_libc_globals_link(IM3Module mod);
+    yos_libc_globals_link(module);
+
     /* exec family — must bind BEFORE yos_brg_link_imports so our trapping
      * versions win over the auto-generated non-trapping ones. */
     m3_LinkRawFunction(module, "env", "execvp",  "i(ii)",  m3_execvp);
@@ -1472,6 +1481,12 @@ void yos_link_imports(IM3Module module, struct yos_exec_ctx *ctx)
      * its NULL-returning auto-stub. */
     extern void yos_freebsd_userland_link(IM3Module mod);
     yos_freebsd_userland_link(module);
+
+    /* libpython 3.12 — env.Py_Initialize / Py_Finalize / PyRun_SimpleString.
+     * The yos host links against libpython3.12.so; the wasm guest is a
+     * tiny driver that imports these names. See impl/libpython.c. */
+    extern void yos_libpython_link(IM3Module mod);
+    yos_libpython_link(module);
 
     /* Auto-generated bridges for the FreeBSD-libc-name import surface.
      * For guests that import each libc fn by name (env.write, env.read,

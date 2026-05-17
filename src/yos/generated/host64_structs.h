@@ -13,8 +13,13 @@
  * collide with the literal field names in our Linux-shape mirror structs.
  * Push them out of the way for the duration of this header and pop at
  * the bottom so callers that hold a real `struct stat` / `struct sigaction`
- * keep working. */
-#ifdef __APPLE__
+ * keep working.
+ *
+ * Same on Linux when something pulls in <signal.h> (or transitively
+ * <resolv.h>) before this header — glibc defines sa_handler as a macro
+ * expanding to a __sigaction_handler.sa_handler field access, which
+ * then collides with our struct's literal sa_handler member. Shield
+ * unconditionally so include order doesn't matter. */
 #  pragma push_macro("st_atime")
 #  pragma push_macro("st_mtime")
 #  pragma push_macro("st_ctime")
@@ -29,7 +34,6 @@
 #  undef sa_handler
 #  undef sa_sigaction
 #  undef __unused
-#endif
 
 /* COFF_AOUTHDR: 28 bytes, align 1 */
 struct host64_COFF_AOUTHDR {
@@ -23164,7 +23168,6 @@ struct host64_sockaddr_pppol2tpv3 {
     struct host64_pppol2tpv3_addr pppol2tp;
 };
 
-#ifdef __APPLE__
 #  pragma pop_macro("__unused")
 #  pragma pop_macro("sa_sigaction")
 #  pragma pop_macro("sa_handler")
@@ -23172,6 +23175,5 @@ struct host64_sockaddr_pppol2tpv3 {
 #  pragma pop_macro("st_ctime")
 #  pragma pop_macro("st_mtime")
 #  pragma pop_macro("st_atime")
-#endif
 
 #endif // YOS_HOST64_STRUCTS_H

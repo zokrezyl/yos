@@ -110,6 +110,16 @@ let
   # build-tools/wasm-pkg/configs/<name>/build.sh recipe.
   zsh = pkgs.callPackage ./pkgs/zsh { inherit buildRecipe; };
 
+  # CPython 3.12 wasm — DISABLED. The compile-to-wasm path has expat
+  # FASTCALL collisions vs our -D__i386__=1 (build-tools/wasm-pkg/
+  # configs/cpython/build.sh) that we never finished smashing. We
+  # abandoned this route in favour of linking host libpython into the
+  # yos binary and bridging Py_* (impl/libpython.c) — much smaller,
+  # native speed, no cross-compile pain, no per-platform yos surprises.
+  # Re-enable here when the libpython-in-host approach is proven to
+  # NOT need the standalone wasm interpreter as a fallback.
+  # cpython = pkgs.callPackage ./pkgs/cpython { inherit buildRecipe; };
+
   # Network stack: zlib → openssl → openssh. Static-linked,
   # cross-compiled to wasm32 against the FreeBSD sysroot. Built as
   # plain stdenv.mkDerivation recipes (no shared shell script): each
@@ -136,7 +146,7 @@ let
   # sandbox boundary.
   all = pkgs.symlinkJoin {
     name = "yos-all";
-    paths = [ yos zsh nvim freebsd-tools openssh ];
+    paths = [ yos zsh nvim freebsd-tools openssh ];  # cpython disabled — see above
     postBuild = ''
       cat > $out/bin/yos-shell <<RUNNER_EOF
       #!/usr/bin/env bash
@@ -172,7 +182,7 @@ in {
           lua libuv msgpack-c unibilium tree-sitter libvterm
           lpeg lua-mpack luv nvim
           freebsd-tools
-          zsh
+          zsh  # cpython disabled — see above
           zlib openssl openssh
           all;
 }
