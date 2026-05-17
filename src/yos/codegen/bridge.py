@@ -1170,6 +1170,7 @@ def _emit_struct_convert_body(name: str, gf: dict, hf: dict,
     extra_setups: list[str] = []
     extra_posts: list[str] = []
     is_at_family = name in _AT_FAMILY
+    at_flag_idx = _AT_FLAG_ARG.get(name)
     for i, ga in enumerate(gf.get('args', [])):
         wname = wargs[i].split()[-1]
         if i == struct_arg_idx:
@@ -1218,6 +1219,11 @@ def _emit_struct_convert_body(name: str, gf: dict, hf: dict,
                 # _AT_FAMILY comment near the top of this file.
                 call_args.append(
                     f'yos_xlate_dfd(ctx, (int32_t)({host_t}){wname})')
+            elif at_flag_idx is not None and i == at_flag_idx:
+                # *at family: translate FreeBSD-shape AT_* flag bits to
+                # the host's. See _AT_FLAG_ARG comment.
+                call_args.append(
+                    f'({host_t})yos_at_flags_fb_to_lx((int)({host_t}){wname})')
             else:
                 call_args.append(f'({host_t}){wname}')
         else:
