@@ -110,6 +110,16 @@ zsh_int_tests = {
   # libexec so the bug actually fires if it regresses.
   'interactive-ssh-clean' : {'src' : files('test_interactive_ssh_clean.py'),
                              'xfail' : false},
+  # End-to-end `zsh -fc 'cd <tmp>; ls -alrt'` against a scratch dir
+  # we built ourselves. Asserts every long-format column (mode +
+  # owner + group + size + -t ordering) on lines we know the exact
+  # value for — catches strmode / user_from_uid / group_from_gid /
+  # struct stat layout regressions before they look like "ls output
+  # is mangled" to the user. Also pins the absence of the
+  # 'yos-tool: ./X: Success' fts info-leak warning that's still
+  # surfacing on the first entry of large directories.
+  'ls-output'           : {'src' : files('test_ls_output.py'),
+                           'xfail' : true},
 }
 
 # Pty-driven tests with hard-coded timing windows; run serially so
