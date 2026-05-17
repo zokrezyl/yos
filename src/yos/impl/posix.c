@@ -1546,7 +1546,23 @@ int32_t yos___swbuf(struct yos_exec_ctx *ctx, int32_t c, uint32_t fp)
  * the wasm fd through fd_map, fstatfs the host, and copy the numeric
  * fields into the FreeBSD layout. Mount-path strings stay zero
  * (callers that need them open /proc/mounts directly anyway). */
-#include <sys/vfs.h>
+/* `struct statfs` header location differs: Linux glibc puts it in
+ * <sys/vfs.h>; macOS / FreeBSD / OpenBSD put it in <sys/mount.h>
+ * (which on those platforms is the canonical home).
+ *
+ * The field set we read below — f_bsize, f_blocks, f_bfree, f_bavail,
+ * f_files, f_ffree, f_type — is the intersection that exists on both
+ * (with darwin's f_type meaning a darwin-specific fs-type enum rather
+ * than Linux's __SWORD_TYPE; the guest treats f_type opaquely so
+ * either is fine). */
+#if defined(__linux__)
+#  include <sys/vfs.h>
+#elif defined(__APPLE__) || defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__)
+#  include <sys/param.h>
+#  include <sys/mount.h>
+#else
+#  include <sys/statfs.h>   /* POSIX-2024 fallback */
+#endif
 
 /* FreeBSD statfs field offsets (from yaml extraction). All u64 on
  * wasm32 except f_version/f_type (u32) at the head. */
