@@ -152,6 +152,17 @@ custom_proc:
   # codegen ENOSYS stub returns NULL, which ls treats as fatal OOM.
   - user_from_uid
   - group_from_gid
+  # impl/mbwc.c — host scratch mbstate_t per call. FreeBSD's
+  # mbstate_t is 128 bytes (union with __mbstate8[128]); glibc's is
+  # 8 bytes — passing the guest pointer straight through trips
+  # glibc's __mbsinit assertion and aborts the process.
+  - mbrtowc
+  - mbsinit
+  - mbsrtowcs
+  - mbtowc
+  - mblen
+  - wcrtomb
+  - wctomb
   # impl/pwd.c — same static-buffer pattern for the time-string
   # family. Returns wasm offset to a per-ctx slot containing the
   # struct tm / time string.

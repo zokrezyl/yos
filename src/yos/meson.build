@@ -94,6 +94,7 @@ yos_runtime_sources = files(
   'impl/sysctl.c',
   'impl/printf.c',
   'impl/dir.c',
+  'impl/mbwc.c',    # mbrtowc / wcrtomb / mbsrtowcs — host scratch state
   'impl/getopt.c',  # per-ctx getopt — closes optind/optarg/optopt/opterr leaks
   'impl/tz.c',      # per-ctx timezone — closes tzname/timezone/daylight leaks
   'impl/libc_globals_link.c',  # binds env.getopt / env.tzset to the above
