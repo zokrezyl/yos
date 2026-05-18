@@ -282,6 +282,185 @@ static void *rw_writer(void *p)
     return NULL;
 }
 
+/* ── randomness: deterministic xorshift32, seeded from PID ─────────
+ *
+ * Used by the chaos-churn phases below. We want REPRODUCIBLE chaos:
+ * if the test trips a yos bug, re-running the same wasm under the
+ * same root PID should hit the same path, so we don't seed from
+ * clock_gettime(). PID alone biases slightly across runs because the
+ * runtime allocates PID 1, 2, 3, …; that's fine — the inner workers
+ * mix in round/iter indices. */
+static unsigned int g_rng = 1;
+static unsigned int chaos_rand(void)
+{
+    g_rng ^= g_rng << 13;
+    g_rng ^= g_rng >> 17;
+    g_rng ^= g_rng << 5;
+    return g_rng;
+}
+static unsigned int chaos_rand_mod(unsigned int n)
+{
+    return n ? chaos_rand() % n : 0;
+}
+
+/* ── chaos child SIGTERM handler ───────────────────────────────────
+ *
+ * yos's waitpid currently only encodes the WIFEXITED branch — a
+ * guest that's signal-killed via kill() still appears to the parent
+ * as a clean exit, which makes "did the kill actually land?"
+ * impossible to assert by inspecting the wait status.
+ *
+ * Workaround: install a SIGTERM handler in each chaos child that
+ * exits with a distinctive code (77). The parent then counts
+ *   kill_landed = # of children that exited with code 77
+ * and that's a real proof-of-kill, independent of whether yos ever
+ * grows WIFSIGNALED support. SIGKILL is uncatchable so children
+ * that get SIGKILL exit with whatever yos's signal-kill path
+ * produces (typically 0); the kill_calls counter still tracks the
+ * attempt. */
+#define CHAOS_SIGTERM_EXIT 77
+static void chaos_sigterm(int sig) {
+    (void)sig;
+    _exit(CHAOS_SIGTERM_EXIT);
+}
+
+/* ── chaos child body — pick one of several workloads ──────────────
+ *
+ * Each chaos child picks a workload by hashing (round, idx) so the
+ * mix across N kids in a round is varied. Workloads exercise
+ * different subsystems: allocator, vfs, signals, nested fork — the
+ * point is to keep yos's internal state churning so we catch races
+ * the single-fork test can't (concurrent fd_alloc, concurrent
+ * mmap2 bumps, concurrent procfs writes, …).
+ *
+ * Workloads:
+ *   0 — allocator churn (malloc/free in random sizes, exit clean)
+ *   1 — file IO (write+close+unlink a unique /tmp file)
+ *   2 — tight CPU loop (a long-running spin so the kill path has
+ *       something live to interrupt)
+ *   3 — nested fork (this child forks a grandchild and reaps it,
+ *       so the parent's reap sees the child's exit AFTER the
+ *       grandchild lifecycle has run)
+ *   4 — open/close many fds (stress yos's per-ctx fd_map slots)
+ */
+static void chaos_child_body(int round, int idx)
+{
+    unsigned int seed = (unsigned int)round * 31u + (unsigned int)idx;
+    unsigned int r = seed * 2654435761u;
+    int work_type = (int)(r % 5);
+    switch (work_type) {
+    case 0: {
+        void *bufs[16];
+        int n = 4 + (int)((r >> 4) % 12);
+        for (int i = 0; i < n; i++)
+            bufs[i] = malloc(64 + ((r >> (i & 7)) % 4096));
+        for (int i = 0; i < n; i++) free(bufs[i]);
+        break;
+    }
+    case 1: {
+        char path[64];
+        snprintf(path, sizeof path, "/tmp/yos-chaos-%d.dat", (int)getpid());
+        int fd = open(path, O_CREAT | O_WRONLY | O_TRUNC, 0600);
+        if (fd >= 0) {
+            char buf[512];
+            memset(buf, 'z' + (int)(r % 3), sizeof buf);
+            (void)write(fd, buf, sizeof buf);
+            close(fd);
+            unlink(path);
+        }
+        break;
+    }
+    case 2: {
+        /* Long-ish workload with periodic I/O. The I/O is what gives
+         * yos's signal pump a chance to deliver SIGTERM to the wasm
+         * handler (yos_signal_pump fires from yos_read). Pure CPU
+         * spin never pumps → kill() never lands → kill_landed count
+         * stays at 0 even though the parent issued the call. Mix
+         * keeps the workload long enough for kill races to be real
+         * (tens of ms on a release-build wasm3) while still allowing
+         * the guest to observe a pending signal. */
+        for (int round = 0; round < 4; round++) {
+            volatile long acc = 0;
+            long iters = 50000L + (long)((r >> round) % 200000L);
+            for (long i = 0; i < iters; i++) acc += i ^ (i << 3);
+            /* Cheap I/O to drive yos's signal pump. read 0 bytes
+             * from /dev/null — non-blocking, no allocation, and
+             * (crucially) goes through yos_read which is where
+             * pending-signal delivery happens. Without an I/O hook
+             * inside the spin, a SIGTERM from the parent's kill()
+             * never reaches the wasm handler. */
+            int fd = open("/dev/null", O_RDONLY);
+            if (fd >= 0) { char b; (void)read(fd, &b, 0); close(fd); }
+        }
+        break;
+    }
+    case 3: {
+        pid_t gp = fork();
+        if (gp == 0) {
+            volatile long acc = 0;
+            for (long i = 0; i < 20000; i++) acc += i;
+            _exit(0);
+        }
+        if (gp > 0) {
+            int st = 0;
+            (void)waitpid(gp, &st, 0);
+        }
+        break;
+    }
+    case 4: {
+        int fds[16];
+        int n = 4 + (int)((r >> 5) % 12);
+        if (n > 16) n = 16;
+        for (int i = 0; i < n; i++) fds[i] = open("/dev/null", O_RDONLY);
+        for (int i = 0; i < n; i++) if (fds[i] >= 0) close(fds[i]);
+        break;
+    }
+    }
+}
+
+/* ── chaos thread body — same idea, signal-free ───────────────────
+ *
+ * Threads share the host process so signals to "kill a thread" would
+ * take down the whole process. Instead each thread polls a stop_flag
+ * and exits cleanly. The shared mutex/counter pair lets us verify
+ * the post-condition: total bumps == sum of per-thread bumps,
+ * regardless of which threads finished naturally vs were told to
+ * stop early. Catches lost-update / cancellation-leakage bugs in
+ * yos's pthread bridge. */
+struct chaos_thread_ctx {
+    pthread_mutex_t  lock;
+    volatile int     stop;            /* set by churn loop to ask threads to wind down */
+    long             total_bumps;     /* sum of every thread's local bumps */
+    int              thread_id;       /* round-robin seed for workload pick */
+};
+static void *chaos_thread_body(void *p)
+{
+    struct chaos_thread_ctx *c = (struct chaos_thread_ctx *)p;
+    pthread_mutex_lock(&c->lock);
+    int my_id = c->thread_id++;
+    pthread_mutex_unlock(&c->lock);
+
+    unsigned int r = (unsigned int)my_id * 2654435761u + 0xa5a5a5a5u;
+    long local = 0;
+    /* Each iteration does a small CPU burst + a mutex bump. Bail when
+     * stop is set so the round can wind down deterministically. */
+    while (!c->stop) {
+        volatile long acc = 0;
+        int spin = 200 + (int)(r % 800);
+        r = r * 1103515245u + 12345u;
+        for (int i = 0; i < spin; i++) acc += i;
+        pthread_mutex_lock(&c->lock);
+        c->total_bumps++;
+        local++;
+        pthread_mutex_unlock(&c->lock);
+        /* cap so a stuck stop-flag can't run us forever — but a high
+         * cap so saturation under contention is what limits us, not
+         * this safety net. */
+        if (local > 200000) break;
+    }
+    return (void *)(long)local;
+}
+
 int main(int argc, char **argv)
 {
     /* Re-exec stub. The execve phase below calls back into this same
@@ -439,9 +618,17 @@ int main(int argc, char **argv)
             pid_t pid = fork();
             if (pid < 0) { emit_err("procfs fork failed\n"); fail++; break; }
             if (pid == 0) {
-                /* Child: close write end, block reading the read end.
-                 * Parent closes its write end when ready for child to exit. */
-                close(pipes[i][1]);
+                /* Child: close write-ends of EVERY pipe (this child's
+                 * own write-end AND every prior sibling's write-end
+                 * that we inherited at fork time). Without this, when
+                 * the parent later closes its copy of pipes[k][1] for
+                 * sibling k, child k's read still doesn't see EOF —
+                 * siblings k+1..N-1 are still holding write-ends and
+                 * the pipe's reader-count stays > 0. yos's fork now
+                 * correctly duplicates the full parent fd table, so
+                 * the bug bites; on a host that did partial fd-dup
+                 * the test happened to pass anyway. */
+                for (int j = 0; j <= i; j++) close(pipes[j][1]);
                 char b;
                 (void)read(pipes[i][0], &b, 1);
                 _exit(0);
@@ -531,6 +718,120 @@ int main(int argc, char **argv)
              "fork+execve  x%-3d : %8lld us total, %6lld us/op\n",
              EXEC_N, t5 - t4, (t5 - t4) / EXEC_N);
     emit(line);
+
+    /* ---- 4b. CHAOS CHURN (processes) --------------------------
+     *
+     * Multi-round randomized fork+kill+reap loop. Each round spawns
+     * 4..CHAOS_MAX_KIDS concurrent children running varied workloads
+     * (allocator churn, file IO, CPU spin, nested fork, fd burst).
+     * After spawn, ~30% of children get a SIGTERM or (1-in-7) SIGKILL
+     * mid-flight; the rest are left to exit cleanly. All are then
+     * reaped and the round verifies:
+     *   - waitpid found every spawned PID (no leaks)
+     *   - signaled+exited counts add up
+     *   - a follow-up waitpid(-1, …, WNOHANG) returns 0 (no zombies)
+     *
+     * This is the test that exercises CONCURRENT live forks in yos —
+     * the only existing fork-stress phase (recursive tree) is strictly
+     * serial (one live grandchild at a time). Concurrent forks shake
+     * out races in the proc-table allocator, the fd-map snapshot, and
+     * the asyncify rewind / linear-memory restore that the serial
+     * tree can't reach. Caps at 10 concurrent kids so a 10-core host
+     * can actually run them in parallel; raise CHAOS_MAX_KIDS to push
+     * the host scheduler harder. */
+    {
+        enum { CHAOS_ROUNDS = 4, CHAOS_MAX_KIDS = 10 };
+        g_rng = (unsigned int)getpid() * 2654435761u + 0xdeadu;
+        long long ta = now_us();
+        int total_spawned = 0;
+        int total_signaled = 0;     /* WIFSIGNALED — yos doesn't set this today */
+        int total_exited = 0;       /* WIFEXITED (any code) */
+        int total_kill_landed = 0;  /* WIFEXITED + WEXITSTATUS == 77 — handler ran */
+        int total_kill_calls = 0;   /* how many kill() succeeded (returned 0) */
+        int total_zombies_left = 0;
+        for (int rnd = 0; rnd < CHAOS_ROUNDS; rnd++) {
+            int n_kids = 4 + (int)chaos_rand_mod(CHAOS_MAX_KIDS - 3);
+            pid_t kids[CHAOS_MAX_KIDS];
+            int spawned = 0;
+            for (int i = 0; i < n_kids; i++) {
+                pid_t pid = fork();
+                if (pid < 0) {
+                    emit_err("chaos: fork failed\n");
+                    fail++;
+                    break;
+                }
+                if (pid == 0) {
+                    /* Install SIGTERM handler so the parent can
+                     * detect kill landings via exit code 77 — see
+                     * CHAOS_SIGTERM_EXIT comment above. */
+                    signal(SIGTERM, chaos_sigterm);
+                    chaos_child_body(rnd, i);
+                    _exit(0);
+                }
+                kids[spawned++] = pid;
+            }
+            /* Random kill of a fraction of the live children. The
+             * killed ones may have already exited naturally — kill
+             * returns ESRCH in that case, which is fine. */
+            int kill_calls = 0;
+            for (int i = 0; i < spawned; i++) {
+                unsigned int r = chaos_rand();
+                if (r % 100 < 50) {
+                    int sig = (r % 7 == 0) ? SIGKILL : SIGTERM;
+                    if (kill(kids[i], sig) == 0) kill_calls++;
+                }
+            }
+            total_kill_calls += kill_calls;
+            /* Reap everyone we spawned. waitpid blocks until done. */
+            for (int i = 0; i < spawned; i++) {
+                int st = 0;
+                if (waitpid(kids[i], &st, 0) != kids[i]) {
+                    snprintf(line, sizeof line,
+                      "chaos: waitpid(%d) failed (round %d)\n",
+                      (int)kids[i], rnd);
+                    emit_err(line);
+                    fail++;
+                    continue;
+                }
+                if (WIFSIGNALED(st)) total_signaled++;
+                else if (WIFEXITED(st)) {
+                    total_exited++;
+                    if (WEXITSTATUS(st) == CHAOS_SIGTERM_EXIT)
+                        total_kill_landed++;
+                }
+            }
+            /* No zombies must remain after we've reaped every kid we
+             * tracked. A non-tracked child here would mean a runaway
+             * fork inside chaos_child_body — workload 3 forks one
+             * grandchild but reaps it locally before _exit. */
+            pid_t z;
+            while ((z = waitpid(-1, NULL, WNOHANG)) > 0)
+                total_zombies_left++;
+            total_spawned += spawned;
+        }
+        long long tb = now_us();
+        snprintf(line, sizeof line,
+          "chaos proc   x%-3d : %8lld us total, %3d exited "
+          "(%3d via SIGTERM handler), %3d signaled, "
+          "%d kill-calls, %d zombies-left\n",
+          total_spawned, tb - ta, total_exited, total_kill_landed,
+          total_signaled, total_kill_calls, total_zombies_left);
+        emit(line);
+        if (total_exited + total_signaled != total_spawned) {
+            snprintf(line, sizeof line,
+              "chaos proc: spawn=%d exit+sig=%d (mismatch)\n",
+              total_spawned, total_exited + total_signaled);
+            emit_err(line);
+            fail++;
+        }
+        if (total_zombies_left != 0) {
+            snprintf(line, sizeof line,
+              "chaos proc: %d untracked zombies left over\n",
+              total_zombies_left);
+            emit_err(line);
+            fail++;
+        }
+    }
 
     /* ---- 3. pthread_create + per-thread I/O + pthread_join -----
      * KEEP THIS LAST. See the file header — running fork() after
@@ -703,6 +1004,86 @@ int main(int argc, char **argv)
           "writes=%d, viol=%d\n",
           RW_READERS, tb - ta, RW_WRITES, rc.reader_violations);
         emit(line);
+    }
+
+    /* ---- 5e. CHAOS CHURN (threads) ----------------------------
+     *
+     * Randomized create+stop+join loop. Each round spins up
+     * 4..CHAOS_T_MAX threads, all bumping a shared mutex-protected
+     * counter for varied durations. After a tiny "let them run"
+     * burst, the round flips the stop flag and joins every thread,
+     * collecting the per-thread bump count. Post-conditions:
+     *   - every thread joined (no leaked tids)
+     *   - sum of per-thread return values == ctx.total_bumps
+     *     (mutex consistency under contention)
+     * Catches lost-update bugs and the "thread didn't notice the
+     * stop flag" hang that surfaces when yos's pthread bridge
+     * mispairs a cond/mutex during fork-snapshot restore. */
+    {
+        enum { CHAOS_T_ROUNDS = 3, CHAOS_T_MAX = 10 };
+        long long ta = now_us();
+        long total_bumps_sum = 0;
+        int total_threads = 0;
+        int mismatches = 0;
+        for (int rnd = 0; rnd < CHAOS_T_ROUNDS; rnd++) {
+            int n = 4 + (int)chaos_rand_mod(CHAOS_T_MAX - 3);
+            struct chaos_thread_ctx cctx;
+            pthread_mutex_init(&cctx.lock, NULL);
+            cctx.stop = 0;
+            cctx.total_bumps = 0;
+            cctx.thread_id = 0;
+            pthread_t tids[CHAOS_T_MAX];
+            int started = 0;
+            for (int i = 0; i < n; i++) {
+                if (pthread_create(&tids[i], NULL,
+                                   chaos_thread_body, &cctx) != 0) {
+                    emit_err("chaos thread: create failed\n");
+                    fail++;
+                    break;
+                }
+                started++;
+            }
+            /* Let them run for a varied bit before asking to stop.
+             * No usleep — yos's sleep round-trip is uneven in this
+             * stress path. Burn CPU on main for a randomized count.
+             * Has to be LARGE so the worker threads actually rack up
+             * a meaningful bump count before the stop flag flips —
+             * previous 200K..1M burn finished in well under a ms on
+             * release-build wasm3, threads got ~5 iters each, the
+             * "lots of contended mutex acquires" property never
+             * exercised. */
+            long burn = 1000000L + (long)chaos_rand_mod(3000000L);
+            volatile long s = 0;
+            for (long b = 0; b < burn; b++) s += b;
+            cctx.stop = 1;
+            long round_sum = 0;
+            for (int i = 0; i < started; i++) {
+                void *rv = NULL;
+                if (pthread_join(tids[i], &rv) != 0) {
+                    emit_err("chaos thread: join failed\n");
+                    fail++;
+                    continue;
+                }
+                round_sum += (long)rv;
+            }
+            if (round_sum != cctx.total_bumps) {
+                snprintf(line, sizeof line,
+                  "chaos thr rnd %d: sum-of-rv=%ld != ctx.total_bumps=%ld\n",
+                  rnd, round_sum, cctx.total_bumps);
+                emit_err(line);
+                mismatches++;
+            }
+            total_bumps_sum += cctx.total_bumps;
+            total_threads += started;
+            pthread_mutex_destroy(&cctx.lock);
+        }
+        long long tb = now_us();
+        snprintf(line, sizeof line,
+          "chaos thr    x%-3d : %8lld us total, "
+          "%ld bumps, %d mismatches\n",
+          total_threads, tb - ta, total_bumps_sum, mismatches);
+        emit(line);
+        if (mismatches) fail++;
     }
 
     /* ---- 6. file I/O throughput -------------------------------- */

@@ -6,6 +6,10 @@
 #include <stdatomic.h>
 #include <sys/syscall.h>
 #include <sys/mman.h>
+#include <sys/stat.h>          /* mkdir — explicit because Apple SDK
+                                  doesn't pull it via the other sys
+                                  headers above (Linux glibc happens to,
+                                  which is why this only bites on macOS). */
 #include <unistd.h>
 #include <signal.h>
 #include <fcntl.h>

@@ -129,7 +129,14 @@ perf_stress_wasm = custom_target(
   'test_perf_stress.wasm',
   input            : perf_stress_raw,
   output           : 'test_perf_stress.wasm',
-  command          : [wasm_opt, '--asyncify', '-o', '@OUTPUT@', '@INPUT@'],
+  # -O2 is REQUIRED here. Without it, wasm-opt's asyncify pass emits
+  # a `_start` whose locals overflow wasm3's compile-time function
+  # stack-height limit, and the host bails out with "compiling
+  # function overran its stack height limit" before even calling
+  # main. -O2 shrinks the asyncify-instrumented frame enough that
+  # _start fits. The other (smaller) libc tests get away without
+  # -O2 because their _start frame is already compact.
+  command          : [wasm_opt, '--asyncify', '-O2', '-o', '@OUTPUT@', '@INPUT@'],
   build_by_default : true,
 )
 test('test_perf_stress',
