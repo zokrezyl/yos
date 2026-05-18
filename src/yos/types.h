@@ -16,7 +16,14 @@
 #define ASYNCIFY_BUF_SIZE  16384
 
 /* Max processes in table */
-#define YOS_MAX_PROCS      64
+/* yos's proc-table slot count. Each forked guest, including the
+ * always-alive supervisor chain (runsvdir → runsv → yos-tcpserver
+ * → telnetd → its PTY child → the user shell) consumes one slot;
+ * with the legacy cap of 64 a perf-stress chaos round of `-k 64`
+ * concurrent kids tipped the table over and the next fork(2)
+ * returned -1 mid-burst. 256 is enough headroom for a few hundred
+ * concurrent guests and costs about 100 KiB of host memory total. */
+#define YOS_MAX_PROCS      256
 
 /* Max free regions for mmap reuse */
 #define YOS_MAX_FREE_REGIONS 64
