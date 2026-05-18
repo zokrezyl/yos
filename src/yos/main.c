@@ -1411,14 +1411,21 @@ void yos_link_imports(IM3Module module, struct yos_exec_ctx *ctx)
      * allocate the host on first use; main/proc subsystems share it via
      * g_runtime->pthread_host. */
     if (ctx && ctx->rt) {
-        struct yos_pthread_host *ph = (struct yos_pthread_host *)ctx->rt->pthread_host;
+        struct yos_pthread_host *ph = (struct yos_pthread_host *)ctx->pthread_host;
         if (!ph) {
             /* Pass the master runtime + the wasm bytes so worker_main
              * can m3_NewSiblingRuntime + re-parse the same module on
              * each thread. Without these, clone() spawns a thread
              * that immediately fails to ParseModule(NULL) and bails
              * silently. The wasm-bytes pointer must outlive every
-             * thread; ctx->wasm_bytes is kept around for fork too. */
+             * thread; ctx->wasm_bytes is kept around for fork too.
+             *
+             * Stored on the per-CTX field (NOT ctx->rt->...) — every
+             * fork+exec'd guest needs its OWN pthread_host because
+             * the host pins the master runtime and wasm-bytes pointer
+             * at construction. Sharing across ctxs makes threads
+             * spawned from a non-first guest run the first guest's
+             * code on the wrong memory. */
             IM3Runtime master = (IM3Runtime)ctx->runtime;
             IM3Environment env = master ? master->environment : NULL;
             ph = yos_pthread_host_create (env, master,
@@ -1427,7 +1434,7 @@ void yos_link_imports(IM3Module module, struct yos_exec_ctx *ctx)
                                           /*per_thread_stack=*/64 * 1024,
                                           /*tls_pool_base=*/0,
                                           /*tls_arena_size=*/0);
-            ctx->rt->pthread_host = ph;
+            ctx->pthread_host = ph;
         }
         if (ph) {
             M3Result lerr = yos_pthread_host_link (ph, module);
@@ -2077,6 +2084,22 @@ int main(int argc, char **argv)
 
         /* Handle exec - load new module */
         ydebug("exec: loading %s\n", ctx.exec_path);
+
+        /* Same reasoning as fork_thread_func's exec path: the
+         * pthread_host pins the OLD runtime + wasm bytes. Drop it
+         * BEFORE m3_FreeRuntime invalidates them. The next
+         * yos_link_imports (inside load_wasm_module) will lazy-create
+         * a fresh host bound to the new master/wasm. Without this,
+         * pthread_create in the exec'd program runs a sibling on top
+         * of the FREED runtime — m3_NewSiblingRuntime returns NULL,
+         * every thread exits without running its body, mutex/condvar/
+         * rwlock all report "lost updates" / "missed wakeups". */
+        if (ctx.pthread_host) {
+            extern void yos_pthread_host_destroy(struct yos_pthread_host *);
+            yos_pthread_host_destroy(
+                (struct yos_pthread_host *)ctx.pthread_host);
+            ctx.pthread_host = NULL;
+        }
 
         m3_FreeRuntime(ctx.runtime);
         free(wasm_bytes);

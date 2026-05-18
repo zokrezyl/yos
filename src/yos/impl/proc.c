@@ -168,10 +168,21 @@ int32_t yos_exit(struct yos_exec_ctx *ctx, int32_t code)
             __atomic_store_n(tid_word, 0u, __ATOMIC_SEQ_CST);
         }
 
+        /* Only transition to ZOMBIE from a live state. SIGKILL's
+         * deliver_to_proc path marks the proc ZOMBIE up front and
+         * the parent's waitpid may have already reaped (state ==
+         * FREE) before this host thread reached its _exit. Re-marking
+         * a FREE slot as ZOMBIE resurrects a stale (pid, ppid) tuple
+         * in the proc table — a subsequent waitpid(-1, WNOHANG)
+         * "finds" the same already-reaped child as a phantom zombie
+         * and chaos churn flags it as a leak. */
         pthread_mutex_lock(&ctx->proc->lock);
-        ctx->proc->state = YOS_PROC_ZOMBIE;
-        ctx->proc->exit_code = code;
-        ctx->proc->exited = 1;
+        if (ctx->proc->state == YOS_PROC_READY ||
+            ctx->proc->state == YOS_PROC_RUNNING) {
+            ctx->proc->state = YOS_PROC_ZOMBIE;
+            ctx->proc->exit_code = code;
+            ctx->proc->exited = 1;
+        }
         pthread_cond_broadcast(&ctx->proc->wait_cond);
         pthread_mutex_unlock(&ctx->proc->lock);
 
@@ -626,6 +637,19 @@ static void *fork_thread_func(void *arg)
         /* Handle exec - load new module */
         ydebug("child exec: loading %s\n", child_ctx->exec_path);
 
+        /* Drop the pre-exec pthread_host BEFORE freeing the old
+         * runtime — the host pins the old IM3Runtime as its master
+         * and the old wasm-bytes pointer. Once m3_FreeRuntime fires
+         * those become dangling, and a later pthread_create would
+         * dereference them. Lazy-create happens further down when
+         * yos_link_imports runs against the new module. */
+        if (child_ctx->pthread_host) {
+            extern void yos_pthread_host_destroy(struct yos_pthread_host *);
+            yos_pthread_host_destroy(
+                (struct yos_pthread_host *)child_ctx->pthread_host);
+            child_ctx->pthread_host = NULL;
+        }
+
         /* The guest-facing allocator (impl/alloc.c) keeps all its
          * state INSIDE ctx->memory now — no host-side registry to
          * dangle when m3_FreeRuntime frees the linear memory. Safe
@@ -776,6 +800,8 @@ static void *fork_thread_func(void *arg)
         child_ctx->longjmp_value   = 0;
         child_ctx->sj_discard_ptr  = 0;
         child_ctx->asyncify_ptr    = 0;
+        /* (pthread_host was already destroyed earlier, BEFORE the
+         * m3_FreeRuntime that invalidated its master pointer.) */
 
         uint32_t *thread_ptr = (uint32_t *)(child_ctx->memory + 0);
         *thread_ptr = 0x100;
@@ -825,13 +851,22 @@ static void *fork_thread_func(void *arg)
         ydebug("child exec: loaded %s, argc=%d\n", child_ctx->exec_path, child_ctx->argc);
     }
 
-    /* Child finished - mark as zombie */
-    if (child_ctx->proc->state != YOS_PROC_ZOMBIE) {
+    /* Child finished - mark as zombie ONLY if still alive. The
+     * SIGKILL path (deliver_to_proc) already marks the proc ZOMBIE
+     * and the parent's waitpid may have already reaped it AND set
+     * the slot back to FREE before pthread_cancel finishes here.
+     * Re-marking a FREE slot as ZOMBIE resurrects a stale (pid,
+     * ppid) tuple in the proc table — subsequent waitpid(-1,
+     * WNOHANG) "finds" the same kid again as a phantom zombie. */
+    pthread_mutex_lock(&child_ctx->rt->proc_lock);
+    if (child_ctx->proc->state == YOS_PROC_READY ||
+        child_ctx->proc->state == YOS_PROC_RUNNING) {
         child_ctx->proc->state = YOS_PROC_ZOMBIE;
         child_ctx->proc->exit_code = 0;
         child_ctx->proc->exited = 1;
     }
     pthread_cond_broadcast(&child_ctx->proc->wait_cond);
+    pthread_mutex_unlock(&child_ctx->rt->proc_lock);
 
     /* Runtime-wide "something exited" event for main.c's shutdown
      * wait. Covers every break-out-of-loop path above (trap, exec
@@ -1661,6 +1696,24 @@ static int deliver_to_proc(struct yos_proc *p, int sig)
         case 22: /* SIGTTOU  */
             return 0;
     }
+    /* SIGKILL is uncatchable by definition. pthread_kill(thread, 9)
+     * on Linux/FreeBSD doesn't kill the THREAD — it kills the whole
+     * HOST PROCESS (every yos guest dies, including yos itself). The
+     * symptom is "[1] killed ./tools/yos.sh ..." in the user's
+     * terminal: kill(guest_pid, SIGKILL) from any guest takes the
+     * supervisor down with it. Translate SIGKILL to a thread-local
+     * teardown: pthread_cancel the worker, mark its yos_proc as a
+     * zombie with the conventional SIGKILL exit code, and wake any
+     * waiter. The wasm guest's atexit / asyncify cleanup doesn't
+     * run, which matches real SIGKILL semantics. */
+    if (sig == 9 /* SIGKILL — same number on Linux & FreeBSD */) {
+        (void)pthread_cancel(p->thread);
+        p->state     = YOS_PROC_ZOMBIE;
+        p->exit_code = 9;
+        p->exited    = 1;
+        pthread_cond_broadcast(&p->wait_cond);
+        return 0;
+    }
     int rc = pthread_kill(p->thread, sig);
     return rc == 0 ? 0 : -rc;
 }
@@ -1873,7 +1926,7 @@ int32_t yos_proc_clone(struct yos_exec_ctx *ctx,
                                 uint32_t ctid_addr, uint32_t tls,
                                 uint8_t *memory_base, uint32_t *out_tid);
     uint32_t spawned_tid = 0;
-    int rc = yos_clone_thread(ctx->rt->pthread_host,
+    int rc = yos_clone_thread((struct yos_pthread_host *)ctx->pthread_host,
                               fn, arg,
                               (flags & CLONE_CHILD_CLEARTID) ? ctid_addr : 0,
                               (flags & CLONE_SETTLS) ? tls : 0,

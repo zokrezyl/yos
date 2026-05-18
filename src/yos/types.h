@@ -103,6 +103,16 @@ struct yos_exec_ctx {
     int free_count;
     pthread_mutex_t mem_lock;
 
+    /* Per-ctx host-side pthread implementation. MUST be per-ctx (not
+     * per-runtime) because yos_pthread_host pins the master IM3Runtime
+     * and the wasm-bytes pointer at first thread creation. With one
+     * runtime-wide host, every guest's pthread_create would clone the
+     * FIRST guest that ever spawned a thread — fork+exec of a different
+     * wasm produces "threads run pid=1's code on pid=2's memory" and
+     * mutex/condvar/rwlock all silently no-op. Lazy-init from main.c's
+     * pthread_host_link path. */
+    void *pthread_host;
+
     /* Command line */
     int argc;
     char **argv;
