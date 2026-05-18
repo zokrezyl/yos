@@ -12,4 +12,4 @@
 # child) so stdin/stdout/stderr are the PTY slave; zsh sees a real
 # terminal and runs in interactive mode. PATH was exported by ../run
 # so the wasm tools (ls, ps, cat, …) resolve.
-exec zsh
+exec zsh -f

@@ -347,6 +347,19 @@ typedef struct {
     int64_t *wasm_globals;
     uint32_t wasm_globals_count;
     uint32_t heap_end;
+    /* Allocator bookmarks (impl/alloc.c). These live in the host-side
+     * yos_exec_ctx but reference wasm-memory offsets. The free-list
+     * body is IN the wasm linear memory, so it's carried across by the
+     * memory snapshot — but the bookmark fields must be transferred
+     * explicitly, otherwise the child sees alloc_hi=0 and runs
+     * alloc_init_locked on top of the parent's already-carved heap.
+     * Worse: the parent's alloc_init pushed heap_end to memory_size/2,
+     * so the child's re-init computes hi==lo and returns -1 → every
+     * malloc in the child returns 0 → "failure allocating argument
+     * space" out of telnetd's first addarg. */
+    uint32_t alloc_lo;
+    uint32_t alloc_hi;
+    uint32_t alloc_free_head;
     int argc;
     char **argv;
     int envc;
@@ -414,6 +427,12 @@ static void *fork_thread_func(void *arg)
     if (child_ctx->proc) child_ctx->proc->thread = pthread_self();
     child_ctx->runtime = rt;
     child_ctx->heap_end = fork_thread_arg->heap_end;
+    /* Inherit allocator bookmarks so the child reuses the parent's
+     * carved heap instead of re-running alloc_init_locked on top of
+     * it. See header comment on fork_thread_arg_t::alloc_lo. */
+    child_ctx->alloc_lo        = fork_thread_arg->alloc_lo;
+    child_ctx->alloc_hi        = fork_thread_arg->alloc_hi;
+    child_ctx->alloc_free_head = fork_thread_arg->alloc_free_head;
     child_ctx->asyncify_ptr = fork_thread_arg->asyncify_ptr;
     child_ctx->sj_discard_ptr  = fork_thread_arg->sj_discard_ptr;
     /* TODO(setjmp-refactor): copy parent's sj_slots[] into child. */
@@ -1050,6 +1069,9 @@ void yos_fork_pump(struct yos_exec_ctx *ctx)
         fork_thread_arg->wasm_globals = wasm_globals_copy;
         fork_thread_arg->wasm_globals_count = num_globals;
         fork_thread_arg->heap_end = ctx->heap_end;
+        fork_thread_arg->alloc_lo        = ctx->alloc_lo;
+        fork_thread_arg->alloc_hi        = ctx->alloc_hi;
+        fork_thread_arg->alloc_free_head = ctx->alloc_free_head;
         fork_thread_arg->argc = ctx->argc;
         fork_thread_arg->argv = ctx->argv;
         fork_thread_arg->envc = ctx->envc;
@@ -2057,6 +2079,9 @@ void yos_vfork_pump(struct yos_exec_ctx *ctx)
         fork_thread_arg->wasm_globals = wasm_globals_copy;
         fork_thread_arg->wasm_globals_count = num_globals;
         fork_thread_arg->heap_end = ctx->heap_end;
+        fork_thread_arg->alloc_lo        = ctx->alloc_lo;
+        fork_thread_arg->alloc_hi        = ctx->alloc_hi;
+        fork_thread_arg->alloc_free_head = ctx->alloc_free_head;
         fork_thread_arg->argc = ctx->argc;
         fork_thread_arg->argv = ctx->argv;
         fork_thread_arg->envc = ctx->envc;

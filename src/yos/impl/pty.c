@@ -63,7 +63,9 @@ int32_t yos_grantpt(struct yos_exec_ctx *ctx, int32_t wfd)
 {
     int hfd = yos_fd_get(ctx, wfd);
     if (hfd < 0) return yos_errno_neg(ctx, EBADF);
-    if (grantpt(hfd) < 0) return yos_errno_neg(ctx, errno);
+    int rc = grantpt(hfd);
+    ydebug("grantpt(wfd=%d hfd=%d) = %d errno=%d\n", wfd, hfd, rc, rc < 0 ? errno : 0);
+    if (rc < 0) return yos_errno_neg(ctx, errno);
     return 0;
 }
 
@@ -71,7 +73,9 @@ int32_t yos_unlockpt(struct yos_exec_ctx *ctx, int32_t wfd)
 {
     int hfd = yos_fd_get(ctx, wfd);
     if (hfd < 0) return yos_errno_neg(ctx, EBADF);
-    if (unlockpt(hfd) < 0) return yos_errno_neg(ctx, errno);
+    int rc = unlockpt(hfd);
+    ydebug("unlockpt(wfd=%d hfd=%d) = %d errno=%d\n", wfd, hfd, rc, rc < 0 ? errno : 0);
+    if (rc < 0) return yos_errno_neg(ctx, errno);
     return 0;
 }
 
@@ -98,6 +102,8 @@ uint32_t yos_ptsname(struct yos_exec_ctx *ctx, int32_t wfd)
     if (n >= YOS_PTSNAME_BUF) n = YOS_PTSNAME_BUF - 1;
     memcpy(ctx->memory + buf_off, hs, n);
     ctx->memory[buf_off + n] = 0;
+    ydebug("ptsname(wfd=%d hfd=%d) = wasm_off=0x%x \"%s\"\n",
+           wfd, hfd, buf_off, hs);
     return buf_off;
 }
 

@@ -57,6 +57,12 @@ custom_proc:
   - recvfrom
   - shutdown
   - getpeername
+  # impl/posix.c — fd_set bitmap is indexed by raw fd number; auto-
+  # bridge passes wasm fds straight through, host select then looks
+  # at the wrong fds and never blocks (busy-spin in telnetd's PTY/
+  # socket proxy loop). Hand bridge translates wasm fds ↔ host fds
+  # on both sides of the host select call.
+  - select
   # impl/posix.c — fd-taking, also need wfd→hfd translation.
   - posix_fadvise
   - posix_fallocate

@@ -259,11 +259,17 @@ int32_t yos_read(struct yos_exec_ctx *ctx, int32_t fd, uint32_t buf, uint32_t co
     }
     if (ydebug_enabled()) {
         pid_t tid = yos_plat_gettid();
-        ydebug("read(tid=%d wfd=%d hfd=%d count=%u) = %zd%s%.*s%s\n",
+        char hex[3 * 16 + 1] = {0};
+        if (r > 0) {
+            const uint8_t *bp = (const uint8_t *)p;
+            int n = r > 16 ? 16 : (int)r;
+            for (int i = 0; i < n; i++)
+                snprintf(hex + i * 3, 4, "%02x ", bp[i]);
+        }
+        ydebug("read(tid=%d wfd=%d hfd=%d count=%u) = %zd%s%s\n",
                (int)tid, fd, hfd, count, r,
-               r > 0 ? " head=\"" : "",
-               (int)(r > 0 ? (r > 16 ? 16 : r) : 0), (const char *)p,
-               r > 0 ? "\"" : "");
+               r > 0 ? " hex=" : "",
+               r > 0 ? hex : "");
     }
     return yos_errno_check(ctx, (int32_t)r);
 }
@@ -340,13 +346,19 @@ int32_t yos_write(struct yos_exec_ctx *ctx, int32_t fd, uint32_t buf, uint32_t c
     int saved_errno = (r < 0) ? errno : 0;
     if (ydebug_enabled() && fd != 4 && fd != 5) {
         pid_t tid = yos_plat_gettid();
-        ydebug("write(tid=%d wfd=%d hfd=%d count=%u) = %zd%s%s%s%.*s%s\n",
+        char hex[3 * 32 + 1] = {0};
+        if (r > 0) {
+            const uint8_t *bp = (const uint8_t *)p;
+            int n = r > 32 ? 32 : (int)r;
+            for (int i = 0; i < n; i++)
+                snprintf(hex + i * 3, 4, "%02x ", bp[i]);
+        }
+        ydebug("write(tid=%d wfd=%d hfd=%d count=%u) = %zd%s%s%s%s\n",
                (int)tid, fd, hfd, count, r,
                r < 0 ? " errno=" : "",
                r < 0 ? strerror(saved_errno) : "",
-               r > 0 ? " head=\"" : "",
-               (int)(r > 0 ? (r > 32 ? 32 : r) : 0), (const char *)p,
-               r > 0 ? "\"" : "");
+               r > 0 ? " hex=" : "",
+               r > 0 ? hex : "");
     }
     return r < 0 ? -saved_errno : (int32_t)r;
 }
@@ -593,6 +605,16 @@ int32_t yos_pipe(struct yos_exec_ctx *ctx, uint32_t fildes)
 #define FB_FIOCLEX      0x20006601u
 #define FB_FIONCLEX     0x20006602u
 #define FB_FIOASYNC     0x8004667du
+/* TIOCPKT: PTY-master packet mode. telnetd enables this so each
+ * read returns a leading status byte (TIOCPKT_FLUSHWRITE etc.) plus
+ * the data — used to interleave terminal-state changes with the data
+ * stream. The "(void) ioctl(p, TIOCPKT, &on)" call ignores failure;
+ * if the host returns ENOTTY, telnetd still goes on to strip byte[0]
+ * of every read as "the status byte", eating the leading ESC of every
+ * escape sequence — visible as zsh's prompt repaint showing `[K` /
+ * `[?2004h` literal in the client (no ESC byte → terminal doesn't
+ * interpret) and ZLE behaving as if Enter fired after each char. */
+#define FB_TIOCPKT      0x80047470u   /* _IOW('t', 112, int) */
 
 #define LX_TIOCGWINSZ   0x5413u
 #define LX_TIOCSWINSZ   0x5414u
@@ -605,6 +627,7 @@ int32_t yos_pipe(struct yos_exec_ctx *ctx, uint32_t fildes)
 #define LX_FIOCLEX      0x5451u
 #define LX_FIONCLEX     0x5450u
 #define LX_FIOASYNC     0x5452u
+#define LX_TIOCPKT      0x5420u
 
 static uint32_t ioctl_cmd_fb_to_lx(uint32_t cmd)
 {
@@ -630,6 +653,7 @@ static uint32_t ioctl_cmd_fb_to_lx(uint32_t cmd)
     case FB_FIOCLEX:    return LX_FIOCLEX;
     case FB_FIONCLEX:   return LX_FIONCLEX;
     case FB_FIOASYNC:   return LX_FIOASYNC;
+    case FB_TIOCPKT:    return LX_TIOCPKT;
     default:            return cmd;  /* pass through, may still fail */
     }
 #endif

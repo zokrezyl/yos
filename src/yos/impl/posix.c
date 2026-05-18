@@ -348,6 +348,74 @@ int32_t yos_shutdown(struct yos_exec_ctx *ctx, int32_t fd, int32_t how)
     return yos_errno_check(ctx, shutdown(hfd, how));
 }
 
+/* yos_select — fd_set translation across the wasm/host fd boundary.
+ *
+ * Auto-bridge passes fd_set bitmaps straight through. The bitmap is
+ * indexed by FD NUMBER; the wasm guest's fd numbers (its fd_map slots
+ * 0..YOS_FD_MAX) are NOT the host fd numbers (host kernel pipe / pty
+ * / socket fds). Without translation, host select() looks for the
+ * wrong fds, returns 0 or -1 immediately, and any program that uses
+ * select to block (telnetd's I/O proxy, runsv's iopause, openssh's
+ * channel loop) busy-spins eating CPU + getting no data.
+ *
+ * Translate by walking each wasm fd in [0, nfds), looking up its host
+ * fd via yos_fd_get, and rebuilding the fd_set on the host side. After
+ * host select returns, walk the host fd_set and translate back to wasm
+ * fds for the guest. */
+int32_t yos_select(struct yos_exec_ctx *ctx, int32_t nfds,
+                   uint32_t r_off, uint32_t w_off, uint32_t e_off,
+                   uint32_t to_off)
+{
+    if (nfds < 0 || nfds > YOS_FD_MAX) return yos_errno_neg(ctx, EINVAL);
+
+    fd_set hr, hw, he;
+    FD_ZERO(&hr); FD_ZERO(&hw); FD_ZERO(&he);
+    int max_hfd = -1;
+
+    /* Map: wasm-fd → host-fd, AND host-fd → wasm-fd. Indexed by
+     * the LARGER of the two table sizes so we cover both directions. */
+    int w2h[YOS_FD_MAX];
+    int h2w[FD_SETSIZE];
+    for (int i = 0; i < YOS_FD_MAX; i++) w2h[i] = -1;
+    for (int i = 0; i < FD_SETSIZE; i++) h2w[i] = -1;
+
+    fd_set *guest_r = r_off ? (fd_set *)(ctx->memory + r_off) : NULL;
+    fd_set *guest_w = w_off ? (fd_set *)(ctx->memory + w_off) : NULL;
+    fd_set *guest_e = e_off ? (fd_set *)(ctx->memory + e_off) : NULL;
+
+    for (int wfd = 0; wfd < nfds; wfd++) {
+        int in_r = guest_r && FD_ISSET(wfd, guest_r);
+        int in_w = guest_w && FD_ISSET(wfd, guest_w);
+        int in_e = guest_e && FD_ISSET(wfd, guest_e);
+        if (!(in_r || in_w || in_e)) continue;
+        int hfd = yos_fd_get(ctx, wfd);
+        if (hfd < 0 || hfd >= FD_SETSIZE) continue;
+        w2h[wfd] = hfd;
+        h2w[hfd] = wfd;
+        if (in_r) FD_SET(hfd, &hr);
+        if (in_w) FD_SET(hfd, &hw);
+        if (in_e) FD_SET(hfd, &he);
+        if (hfd > max_hfd) max_hfd = hfd;
+    }
+
+    struct timeval *tv = to_off ? (struct timeval *)(ctx->memory + to_off) : NULL;
+    int rc = select(max_hfd + 1, &hr, &hw, &he, tv);
+    if (rc < 0) return yos_errno_neg(ctx, errno);
+
+    /* Rebuild the guest fd_sets with only the wasm-fd bits set. */
+    if (guest_r) FD_ZERO(guest_r);
+    if (guest_w) FD_ZERO(guest_w);
+    if (guest_e) FD_ZERO(guest_e);
+    for (int hfd = 0; hfd <= max_hfd; hfd++) {
+        int wfd = h2w[hfd];
+        if (wfd < 0) continue;
+        if (guest_r && FD_ISSET(hfd, &hr)) FD_SET(wfd, guest_r);
+        if (guest_w && FD_ISSET(hfd, &hw)) FD_SET(wfd, guest_w);
+        if (guest_e && FD_ISSET(hfd, &he)) FD_SET(wfd, guest_e);
+    }
+    return rc;
+}
+
 int32_t yos_getpeername(struct yos_exec_ctx *ctx, int32_t fd,
                         uint32_t addr_off, uint32_t addrlen_off)
 {

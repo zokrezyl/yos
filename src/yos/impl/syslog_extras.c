@@ -99,14 +99,26 @@ static m3ApiRawFunction(m3_syslog)
 
 /* ── env.login_tty(int fd) ────────────────────────────────────────
  *
- * Acquire controlling TTY on the given wasm fd. Forwards to the
- * host login_tty which does the classic:
- *   setsid();
- *   ioctl(fd, TIOCSCTTY, 0);
- *   dup2(fd, 0); dup2(fd, 1); dup2(fd, 2);
- *   if (fd > 2) close(fd);
- * We translate the wasm fd to its host fd via yos_fd_get; on
- * failure return -1 with EBADF in the guest errno slot. */
+ * Hand-roll the four-step BSD recipe. Calling host login_tty is
+ * NOT safe under yos's pthread-per-process model:
+ *   - setsid() is per-HOST-process, not per-host-thread; the
+ *     first guest "process" already put the host into some
+ *     session, and a second thread's setsid() either fails or
+ *     yanks the controlling tty out from under unrelated guest
+ *     threads.
+ *   - ioctl(fd, TIOCSCTTY, 0) needs the calling process to be
+ *     session leader without a controlling tty; the host process
+ *     usually already has one (the terminal we were launched
+ *     from), so this returns EPERM and telnetd's getptyslave
+ *     prints "telnetd: : Operation not permitted." and exits.
+ *
+ * The pieces that DO need to happen for telnetd to read/write
+ * its PTY are the dup2-to-0/1/2 + close, since those redirect
+ * the wasm guest's stdio table (the per-ctx fd_map). The
+ * controlling-tty bit is meaningful only at the kernel level
+ * for job control / signal delivery; the wasm guest doesn't
+ * observe it directly. So: skip setsid + TIOCSCTTY, do the
+ * fd swap, return 0. */
 static m3ApiRawFunction(m3_login_tty)
 {
     m3ApiReturnType (int32_t);
@@ -118,11 +130,36 @@ static m3ApiRawFunction(m3_login_tty)
     if (hfd < 0) {
         m3ApiReturn(yos_errno_neg(ctx, EBADF));
     }
-    int r = login_tty(hfd);
-    if (r < 0) {
-        m3ApiReturn(yos_errno_neg(ctx, errno));
+    /* Repoint guest fds 0/1/2 at the slave PTY's host fd. Each
+     * slot in ctx->fd_map[] is INDEPENDENT host fd ownership;
+     * dup2 host-side and assign. */
+    extern int yos_fd_alloc(struct yos_exec_ctx *, int);
+    extern void yos_fd_close(struct yos_exec_ctx *, int);
+    for (int slot = 0; slot < 3; slot++) {
+        int dup_fd = dup(hfd);
+        if (dup_fd < 0) {
+            ydebug("login_tty(wfd=%d hfd=%d) dup failed slot=%d errno=%d\n",
+                   wfd, hfd, slot, errno);
+            m3ApiReturn(yos_errno_neg(ctx, errno));
+        }
+        /* Close the old host fd held by ctx->fd_map[slot], if any,
+         * then install the new dup. yos_fd_close handles the
+         * host-side close + slot clear. */
+        if (ctx->fd_map[slot] >= 0) {
+            close(ctx->fd_map[slot]);
+        }
+        ctx->fd_map[slot] = dup_fd;
     }
-    m3ApiReturn(r);
+    /* Release the original PTY slave slot — guest no longer needs
+     * the high-numbered fd once 0/1/2 point at the same kernel
+     * object via dup. */
+    if (wfd > 2) {
+        close(hfd);
+        ctx->fd_map[wfd] = -1;
+    }
+    ydebug("login_tty(wfd=%d hfd=%d) -> dup2'd to fd_map[0..2]\n",
+           wfd, hfd);
+    m3ApiReturn(0);
     m3ApiSuccess();
 }
 

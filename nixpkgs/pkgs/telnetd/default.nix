@@ -1,4 +1,4 @@
-{ stdenv, lib, fetchFromGitHub, toolchain, sysroot
+{ stdenv, lib, fetchFromGitHub, binaryen, toolchain, sysroot
 , yos ? null   # optional — when null, the bin/ runner falls back to
               # `yos` on PATH instead of hardcoding a store path.
 }:
@@ -50,7 +50,7 @@ stdenv.mkDerivation rec {
     sparseCheckout = [ "contrib/telnet" ];
   };
 
-  nativeBuildInputs = [ toolchain ];
+  nativeBuildInputs = [ toolchain binaryen ];
 
   dontStrip     = true;
   dontPatchELF  = true;
@@ -106,7 +106,56 @@ stdenv.mkDerivation rec {
   buildPhase = ''
     runHook preBuild
     CC=${toolchain}/bin/wasm-clang
-    OBJS=()
+
+    # getopt-compat shim: telnetd's wasm has NO body for the four
+    # getopt(3) globals (optarg/optind/optopt/opterr). Our yos
+    # sysroot has an empty libc.a (.empty.o only — every symbol
+    # comes through env.* imports). Without a definition,
+    # wasm-ld with --allow-undefined silently resolves `extern
+    # char *optarg` to address 0 of linear memory — which yos
+    # uses to store the wasm32 thread-self pointer (= 0x100 after
+    # exec). Telnetd's `case 'p': altlogin = optarg;` then loads
+    # 0x100, ships that as the execv() path, and the child errors
+    # out with "telnetd: : Operation not permitted." because
+    # execve resolves to a nonsense path inside the runit cwd.
+    #
+    # Provide REAL .bss storage here, plus a getopt() wrapper that
+    # calls into yos's env.getopt then updates the locals from the
+    # per-ctx accessors. The wrapper hides env.getopt — telnetd's
+    # call to getopt() resolves to this body, not the bare import.
+    cat > getopt_compat.c <<'GOPT'
+    /* Provide real storage + an updating wrapper around env.getopt. */
+    char *optarg  = (void *)0;
+    int   optind  = 1;
+    int   optopt  = 0;
+    int   opterr  = 1;
+
+    /* env.getopt is yos's per-ctx getopt; rename via attribute. */
+    extern int __real_getopt(int argc, char *const argv[], const char *opts)
+        __attribute__((import_module("env"), import_name("getopt")));
+
+    /* Per-ctx accessors yos provides for the four global slots. */
+    extern unsigned __yos_getopt_optarg_get(void)
+        __attribute__((import_module("env"), import_name("__yos_getopt_optarg_get")));
+    extern int      __yos_getopt_optind_get(void)
+        __attribute__((import_module("env"), import_name("__yos_getopt_optind_get")));
+    extern int      __yos_getopt_optopt_get(void)
+        __attribute__((import_module("env"), import_name("__yos_getopt_optopt_get")));
+
+    int getopt(int argc, char *const argv[], const char *opts)
+    {
+        int r = __real_getopt(argc, argv, opts);
+        /* yos returns optarg as a wasm-memory offset (uint32). The
+         * guest's view of char* is a 32-bit offset too, so just store. */
+        optarg = (char *)(unsigned long)__yos_getopt_optarg_get();
+        optind = __yos_getopt_optind_get();
+        optopt = __yos_getopt_optopt_get();
+        return r;
+    }
+GOPT
+    $CC $CFLAGS -c getopt_compat.c -o getopt_compat.o
+
+    OBJS=( getopt_compat.o )
     for s in $TELNETD_SRCS $LIBTELNET_SRCS; do
       if [ ! -f "$s" ]; then
         echo "telnetd: missing src $s" >&2
@@ -127,7 +176,15 @@ stdenv.mkDerivation rec {
       "${sysroot}/usr/lib/crt1.o" \
       "''${OBJS[@]}" \
       -lc -lyos_stubs \
-      -o telnetd.wasm
+      -o telnetd.raw.wasm
+
+    # Asyncify pass — telnetd forks AT LEAST twice per connection
+    # (once for inetd-style handoff, once more for the PTY slave
+    # session). Without --asyncify yos's fork bridge silently
+    # no-ops, leaks stale errno into the wasm guest, and telnetd
+    # bails with 'fork: Inappropriate ioctl for device' (whatever
+    # the prior tcgetattr/ioctl left in errno).
+    wasm-opt --asyncify -O2 telnetd.raw.wasm -o telnetd.wasm
     runHook postBuild
   '';
 
