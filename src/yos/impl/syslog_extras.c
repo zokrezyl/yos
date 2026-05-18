@@ -34,6 +34,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <errno.h>
+#include <unistd.h>     /* dup, close — darwin's <util.h> doesn't pull these in */
 #include <sys/types.h>
 #include <sys/socket.h>
 

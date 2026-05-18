@@ -21,6 +21,12 @@
 
 #define _XOPEN_SOURCE 600    /* posix_openpt + friends */
 #define _GNU_SOURCE
+#if defined(__APPLE__)
+/* darwin's <stdlib.h> gates ptsname_r behind
+ * (!_POSIX_C_SOURCE || _DARWIN_C_SOURCE); _XOPEN_SOURCE above
+ * sets _POSIX_C_SOURCE so we have to re-open the door. */
+#  define _DARWIN_C_SOURCE
+#endif
 #include <stdint.h>
 #include <stddef.h>
 #include <string.h>
