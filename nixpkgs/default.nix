@@ -170,6 +170,12 @@ let
   # PTY, IAC, login, etc.). Bypasses runit's cwd-race blocker entirely.
   yos-tcpserver = pkgs.callPackage ./pkgs/yos-tcpserver { inherit toolchain sysroot; };
 
+  # ytrace — guest-side strace-style libc-surface tracer. Tiny wasm
+  # program that sets YTRACE_DEFAULT_ON=yes in the env and execvps the
+  # rest of argv. Installed as $out/libexec/ytrace so the umbrella's
+  # PATH (the yos-shell sandbox) picks it up.
+  ytrace-wasm = pkgs.callPackage ./pkgs/ytrace-wasm { inherit toolchain sysroot; };
+
   # Umbrella package: every user-facing yos artefact merged into one
   # tree via symlinkJoin. Lets users do
   #   nix run .#                    # drops into wasm zsh under yos (sandbox)
@@ -186,7 +192,7 @@ let
   # sandbox boundary.
   all = pkgs.symlinkJoin {
     name = "yos-all";
-    paths = [ yos zsh nvim freebsd-tools openssh perf-stress runit telnetd yos-tcpserver ];  # cpython disabled — see above
+    paths = [ yos zsh nvim freebsd-tools openssh perf-stress runit telnetd yos-tcpserver ytrace-wasm ];  # cpython disabled — see above
     postBuild = ''
       cat > $out/bin/yos-shell <<RUNNER_EOF
       #!/usr/bin/env bash
@@ -211,6 +217,50 @@ let
           "$out/bin/yos" "$out/libexec/zsh" "\$@"
       RUNNER_EOF
       chmod +x $out/bin/yos-shell
+
+      # ytrace — strace-style libc-surface tracer.
+      # Front for the per-call ytrace points emitted by every m3w_<name>
+      # bridge wrapper. Flips YTRACE_DEFAULT_ON=yes so every trace point
+      # fires from the first instruction; optionally redirects to a
+      # file (-o) using the ytrace per-thread file-prefix routing.
+      #
+      # Usage mirrors strace:
+      #   ytrace <wasm-prog> [args...]
+      #   ytrace -o /tmp/trace <wasm-prog>     # writes /tmp/trace-<comm>-<tid>
+      #   ytrace -e zsh                         # shorthand: trace a libexec/<name>
+      #
+      # Bare names (no leading /) are looked up in $out/libexec, so
+      # \`ytrace zsh -c true\` runs the umbrella's wasm zsh under trace.
+      cat > $out/bin/ytrace <<RUNNER_EOF
+      #!/usr/bin/env bash
+      out_prefix=""
+      while [ "\$#" -gt 0 ]; do
+        case "\$1" in
+          -o) out_prefix="\$2"; shift 2 ;;
+          -h|--help)
+            echo "ytrace — strace-style libc-surface trace for wasm under yos."
+            echo "Usage: ytrace [-o file] <wasm-prog|libexec-name> [args...]"
+            echo "  -o file   write per-thread trace to <file>-<comm>-<tid>"
+            echo "  bare name resolves under $out/libexec/"
+            exit 0 ;;
+          --) shift; break ;;
+          -*) echo "ytrace: unknown flag \$1" >&2; exit 2 ;;
+          *)  break ;;
+        esac
+      done
+      if [ "\$#" -eq 0 ]; then
+        echo "ytrace: missing program" >&2; exit 2
+      fi
+      prog="\$1"; shift
+      case "\$prog" in
+        /*|./*|../*) ;;                                  # absolute / relative — pass through
+        *) [ -f "$out/libexec/\$prog" ] && prog="$out/libexec/\$prog" ;;
+      esac
+      env_args=( YTRACE_DEFAULT_ON=yes )
+      [ -n "\$out_prefix" ] && env_args+=( YTRACE_FILE_PREFIX="\$out_prefix" )
+      exec env "\''${env_args[@]}" "$out/bin/yos" "\$prog" "\$@"
+      RUNNER_EOF
+      chmod +x $out/bin/ytrace
     '';
     meta = with pkgs.lib; {
       description = "yos host runtime + every wasm32 port (zsh, nvim, freebsd-tools) merged into one bin/libexec tree, plus yos-shell sandbox wrapper";
@@ -228,5 +278,6 @@ in {
           runit
           telnetd
           yos-tcpserver
+          ytrace-wasm
           all;
 }

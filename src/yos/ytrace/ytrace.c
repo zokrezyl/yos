@@ -166,6 +166,12 @@ void ytrace_shutdown(void)
     YTRACE_UNLOCK();
 }
 
+bool ytrace_default_enabled(void)
+{
+    if (!g_initialized) ytrace_init();
+    return g_default_enabled;
+}
+
 bool ytrace_register(bool *enabled, const char *file, int line, const char *func, const char *level,
                      const char *message)
 {
@@ -246,6 +252,13 @@ void ytrace_output(const char *level, const char *file, int line, const char *fu
 void ytrace_set_all_enabled(bool enabled)
 {
     YTRACE_LOCK();
+    /* Update the default too so trace points that REGISTER later
+     * (lazy first-touch from new code paths, or new wasm modules
+     * loaded after exec) start out enabled rather than picking up
+     * the stale startup-time default. Without this, ytrace_set_all_enabled
+     * only affects already-registered points and any subsequent
+     * first-hit registration silently re-disables itself. */
+    g_default_enabled = enabled;
     for (size_t i = 0; i < g_point_count; i++) {
         *g_points[i].enabled = enabled;
     }

@@ -49,7 +49,7 @@
 #include <unistd.h>
 
 #include "yos/types.h"
-#include "yos/ydebug.h"
+#include <yos/ytrace/ytrace.h>
 #include "impl/alloc.h"
 #include "impl/errno_helpers.h"
 #include "vfs/mount.h"
@@ -254,7 +254,7 @@ uint32_t yos_opendir(struct yos_exec_ctx *ctx, uint32_t path_off)
             if (ops->close) ops->close(ctx, vfile);
             return yos_errno_null(ctx, ENOMEM);
         }
-        if (ydebug_enabled())
+        if (ytrace_default_enabled())
             ydebug("opendir(\"%s\") = dd_off 0x%x slot %u wasm_fd %d (vfs)\n",
                    path, g_dirs[h].dd_off, h, g_dirs[h].wasm_fd);
         return g_dirs[h].dd_off;
@@ -263,7 +263,7 @@ uint32_t yos_opendir(struct yos_exec_ctx *ctx, uint32_t path_off)
     /* Host-backed path. */
     errno = 0;
     DIR *d = opendir(path);
-    if (ydebug_enabled())
+    if (ytrace_default_enabled())
         ydebug("opendir(\"%s\") = %p%s\n", path, (void *)d,
                d ? "" : strerror(errno));
     if (!d) return yos_errno_null(ctx, errno);

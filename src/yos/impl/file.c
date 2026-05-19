@@ -29,7 +29,7 @@
 #include <pthread.h>
 
 #include "yos/types.h"
-#include "yos/ydebug.h"
+#include <yos/ytrace/ytrace.h>
 #include "impl/errno_helpers.h"
 
 #define YOS_FILE_MAX 256

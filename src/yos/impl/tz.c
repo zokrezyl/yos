@@ -29,7 +29,7 @@
 #include <pthread.h>
 
 #include "yos/types.h"
-#include "yos/ydebug.h"
+#include <yos/ytrace/ytrace.h>
 
 /* Host's tzname/timezone/daylight access via the libc-provided
  * declarations in <time.h>. */

@@ -2,7 +2,7 @@
 #include "procfs.h"
 #include "file.h"
 #include "../types.h"
-#include "../ydebug.h"
+#include <yos/ytrace/ytrace.h>
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>

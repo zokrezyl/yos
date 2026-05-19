@@ -35,7 +35,7 @@
 #include <stdint.h>
 
 #include "yos/types.h"
-#include "yos/ydebug.h"
+#include <yos/ytrace/ytrace.h>
 #include <unistd.h>     /* write() for stream-handle fd_map routing */
 
 /* Read one slot from the guest's va_list region.

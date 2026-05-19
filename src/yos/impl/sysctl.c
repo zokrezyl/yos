@@ -21,7 +21,7 @@
 #include "wasm3.h"
 #include "m3_env.h"
 #include "yos/types.h"
-#include "yos/ydebug.h"
+#include <yos/ytrace/ytrace.h>
 
 /* FreeBSD sysctl MIB constants (from sys/sysctl.h, sys/proc.h). */
 #define CTL_KERN              1

@@ -37,7 +37,7 @@
 #include <sys/types.h>
 
 #include "yos/types.h"
-#include "yos/ydebug.h"
+#include <yos/ytrace/ytrace.h>
 #include "impl/errno_helpers.h"
 
 extern int yos_fd_alloc(struct yos_exec_ctx *, int);

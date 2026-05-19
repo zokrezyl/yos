@@ -33,7 +33,7 @@
 #include "wasm3.h"
 #include "m3_env.h"
 #include "yos/types.h"
-#include "yos/ydebug.h"
+#include <yos/ytrace/ytrace.h>
 
 extern uint32_t yos_malloc(struct yos_exec_ctx *ctx, uint32_t size);
 extern int yos_remap_errno_h2g(int);

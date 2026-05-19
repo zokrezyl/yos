@@ -1,7 +1,7 @@
 #define _GNU_SOURCE
 #define _GNU_SOURCE   /* for the syscall() prototype in <unistd.h> */
 #include "yos/types.h"
-#include "yos/ydebug.h"
+#include <yos/ytrace/ytrace.h>
 #include "impl/clone-abi.h"
 #include "errno_helpers.h"   /* yos_errno_neg — exec failure POSIX errno */
 #include <stdint.h>
@@ -395,6 +395,13 @@ typedef struct {
      * decouples relative-path lookup from the host process cwd, which
      * is shared across forks (they're all pthreads of one host pid). */
     char parent_cwd[PATH_MAX];
+    /* Parent's per-process signal state — child inherits everything
+     * on fork per POSIX. handlers stay valid because they're wasm
+     * function-table indices, and the child runs the same wasm
+     * binary post-fork (asyncify rewind) so the table is identical. */
+    uint32_t parent_sig_handlers[32];
+    uint32_t parent_sig_mask;
+    uint32_t parent_sig_pending;
 } fork_thread_arg_t;
 
 static void *fork_thread_func(void *arg)
@@ -435,7 +442,10 @@ static void *fork_thread_func(void *arg)
     /* Record this thread on the child proc so kill(child_pid)/tkill in
      * the guest namespace can resolve the guest pid back to a real
      * pthread via deliver_to_proc(). */
-    if (child_ctx->proc) child_ctx->proc->thread = pthread_self();
+    if (child_ctx->proc) {
+        child_ctx->proc->thread     = pthread_self();
+        child_ctx->proc->ctx_handle = child_ctx;
+    }
     child_ctx->runtime = rt;
     child_ctx->heap_end = fork_thread_arg->heap_end;
     /* Inherit allocator bookmarks so the child reuses the parent's
@@ -484,6 +494,11 @@ static void *fork_thread_func(void *arg)
     child_ctx->wasm_bytes = fork_thread_arg->wasm_bytes;
     child_ctx->wasm_bytes_size = fork_thread_arg->wasm_bytes_size;
     memcpy(child_ctx->cwd, fork_thread_arg->parent_cwd, sizeof(child_ctx->cwd));
+    /* POSIX fork: child inherits parent's full signal state. */
+    memcpy(child_ctx->sig_handlers, fork_thread_arg->parent_sig_handlers,
+           sizeof(child_ctx->sig_handlers));
+    child_ctx->sig_mask    = fork_thread_arg->parent_sig_mask;
+    child_ctx->sig_pending = fork_thread_arg->parent_sig_pending;
     pthread_mutex_init(&child_ctx->mem_lock, NULL);
 
     rt->userdata = child_ctx;
@@ -1148,6 +1163,10 @@ void yos_fork_pump(struct yos_exec_ctx *ctx)
         }
         memcpy(fork_thread_arg->parent_cwd, ctx->cwd,
                sizeof(fork_thread_arg->parent_cwd));
+        memcpy(fork_thread_arg->parent_sig_handlers, ctx->sig_handlers,
+               sizeof(fork_thread_arg->parent_sig_handlers));
+        fork_thread_arg->parent_sig_mask    = ctx->sig_mask;
+        fork_thread_arg->parent_sig_pending = ctx->sig_pending;
 
         /* Spawn child thread detached so the parent resumes concurrently.
          * Child lifetime is tracked via yos_proc state (RUNNING/ZOMBIE);
@@ -1520,6 +1539,18 @@ int32_t yos_execve(struct yos_exec_ctx *ctx, uint32_t filename, uint32_t argv_pt
         host_envp[env_count] = NULL;
     }
 
+    /* POSIX execve: signal mask is preserved; pending signals are
+     * cleared; handlers reset to SIG_DFL unless they were SIG_IGN
+     * (those carry across). The wasm function-table indices recorded
+     * in sig_handlers are also no longer valid against the new
+     * module's table — only SIG_DFL(0)/SIG_IGN(1) are portable. */
+    for (int i = 0; i < 32; i++) {
+        if (ctx->sig_handlers[i] != 1u /* SIG_IGN */)
+            ctx->sig_handlers[i] = 0u /* SIG_DFL */;
+    }
+    ctx->sig_pending = 0;
+    /* ctx->sig_mask intentionally preserved. */
+
     /* Store exec info */
     strcpy(ctx->exec_path, exec_path);
     ctx->exec_pending = 1;
@@ -1713,6 +1744,16 @@ static int deliver_to_proc(struct yos_proc *p, int sig)
         p->exited    = 1;
         pthread_cond_broadcast(&p->wait_cond);
         return 0;
+    }
+    /* Set the target's per-process pending bit atomically. This is the
+     * authoritative yos-side signal delivery: the target's
+     * yos_signal_pump will fire the registered handler at the next
+     * yield point (provided the signal isn't blocked in sig_mask).
+     * The pthread_kill below is a side-channel wake-up so a target
+     * blocked in read()/usleep() returns EINTR and runs its pump. */
+    if (p->ctx_handle && sig > 0 && sig < 32) {
+        struct yos_exec_ctx *target = (struct yos_exec_ctx *)p->ctx_handle;
+        __atomic_or_fetch(&target->sig_pending, 1u << sig, __ATOMIC_RELEASE);
     }
     int rc = pthread_kill(p->thread, sig);
     return rc == 0 ? 0 : -rc;
@@ -2158,6 +2199,10 @@ void yos_vfork_pump(struct yos_exec_ctx *ctx)
         }
         memcpy(fork_thread_arg->parent_cwd, ctx->cwd,
                sizeof(fork_thread_arg->parent_cwd));
+        memcpy(fork_thread_arg->parent_sig_handlers, ctx->sig_handlers,
+               sizeof(fork_thread_arg->parent_sig_handlers));
+        fork_thread_arg->parent_sig_mask    = ctx->sig_mask;
+        fork_thread_arg->parent_sig_pending = ctx->sig_pending;
 
         /* Spawn child thread */
         child_proc->state = YOS_PROC_RUNNING;

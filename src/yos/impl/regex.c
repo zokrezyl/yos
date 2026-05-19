@@ -35,7 +35,7 @@
 #include <pthread.h>
 
 #include "yos/types.h"
-#include "yos/ydebug.h"
+#include <yos/ytrace/ytrace.h>
 #include "errno_helpers.h"
 
 #define YOS_REGEX_MAX 64

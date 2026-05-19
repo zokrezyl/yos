@@ -66,28 +66,29 @@
 #include "m3_env.h"
 #include "platform.h"
 #include "yos/types.h"
-#include "yos/ydebug.h"
+#include <yos/ytrace/ytrace.h>
 
 extern int yos_remap_errno_h2g(int);
 extern int yos_fd_alloc(struct yos_exec_ctx *ctx, int host_fd);
 extern int yos_fd_get  (struct yos_exec_ctx *ctx, int wasm_fd);
 
 /* Hand-rolled m3ApiRawFunction wrappers don't go through the
- * codegen-emitted m3w_<name> trampolines, so YOS_BRG_TRACE never sees
- * them. Record them ourselves so the trace is honest. */
+ * codegen-emitted m3w_<name> trampolines, so we feed the crash-dump
+ * ring buffer ourselves and emit a ytrace line per call. */
 extern const char *yos_brg_last_call;
-extern int  yos_brg_trace;
 extern void yos_brg_record(const char *name);
 extern void yos_brg_record_args(uint64_t,uint64_t,uint64_t,uint64_t);
 #define KQ_TRACE(name) do {                                          \
     yos_brg_last_call = (name); yos_brg_record(name);                \
-    if (yos_brg_trace) fprintf(stderr, "yos_brg: %s\n", (name));     \
+    ytrace("%s(...)", (name));                                       \
 } while (0)
 #define KQ_TRACE4(name, a, b, c, d) do {                             \
     yos_brg_last_call = (name); yos_brg_record(name);                \
     yos_brg_record_args((uint64_t)(a),(uint64_t)(b),                 \
                         (uint64_t)(c),(uint64_t)(d));                \
-    if (yos_brg_trace) fprintf(stderr, "yos_brg: %s\n", (name));     \
+    ytrace("%s(0x%llx, 0x%llx, 0x%llx, 0x%llx)", (name),             \
+           (unsigned long long)(a), (unsigned long long)(b),         \
+           (unsigned long long)(c), (unsigned long long)(d));        \
 } while (0)
 
 /* Guest (FreeBSD-flavored) kevent constants. Same numeric values on
@@ -153,7 +154,7 @@ static void *tty_select_thread(void *arg)
     struct tty_watcher *w = (struct tty_watcher *)arg;
     int loops = 0;
     /* On entry, dump fd info so we can confirm tty_fd is the pty slave. */
-    if (ydebug_enabled()) {
+    if (ytrace_default_enabled()) {
         struct stat sb;
         if (fstat(w->tty_fd, &sb) == 0) {
             const char *kind = "?";
@@ -177,7 +178,7 @@ static void *tty_select_thread(void *arg)
         struct timeval tv = { .tv_sec = 1, .tv_usec = 0 };
         int r = select(max_fd + 1, &rfds, NULL, NULL, &tv);
         loops++;
-        if (ydebug_enabled() && (loops <= 5 || r > 0)) {
+        if (ytrace_default_enabled() && (loops <= 5 || r > 0)) {
             ydebug("tty_select_thread: loop=%d select tty_fd=%d r=%d "
                    "isset=%d errno=%d isatty=%d\n",
                    loops, w->tty_fd, r,
@@ -193,7 +194,7 @@ static void *tty_select_thread(void *arg)
         if (r == 0) {
             /* Diagnostic: if select timed out but bytes are sitting
              * on the fd, something is wrong with select(). */
-            if (ydebug_enabled() && loops <= 5) {
+            if (ytrace_default_enabled() && loops <= 5) {
                 int avail = -1;
                 ioctl(w->tty_fd, FIONREAD, &avail);
                 ydebug("tty_select_thread: TIMEOUT FIONREAD=%d\n", avail);
@@ -524,7 +525,7 @@ static m3ApiRawFunction(m3_yos_kevent)
     ctx->memory_size = mem_size;
     static int kevent_call_n = 0;
     int my_call = ++kevent_call_n;
-    if (ydebug_enabled() && my_call < 30) {
+    if (ytrace_default_enabled() && my_call < 30) {
         ydebug("kevent#%d(kq=%d nchanges=%d nevents=%d timeout=%s)\n",
                my_call, kq_wfd, nchanges, nevents,
                timeout_off ? "ts" : "BLOCK");
@@ -549,7 +550,7 @@ static m3ApiRawFunction(m3_yos_kevent)
         uint16_t flags  = ke_flags(ke);
         uint32_t fflags = ke_fflags(ke);
         uint32_t udata  = ke_udata(ke);
-        if (ydebug_enabled()) {
+        if (ytrace_default_enabled()) {
             ydebug("kevent change[%d]: ident=%u filter=%d flags=0x%x "
                    "fflags=0x%x udata=0x%x\n",
                    i, ident, filter, flags, fflags, udata);
@@ -636,7 +637,7 @@ static m3ApiRawFunction(m3_yos_kevent)
     ydebug("kevent#%d returned %d events errno=%d\n",
            my_call, n, n < 0 ? errno : 0);
     if (n < 0) { write_errno(ctx, errno); m3ApiReturn(-1); }
-    if (ydebug_enabled()) {
+    if (ytrace_default_enabled()) {
         for (int i = 0; i < n && i < 8; i++) {
             ydebug("  event[%d]: ident=%lu filter=%d flags=0x%x "
                    "fflags=0x%x data=%lld udata=%p\n",
@@ -764,7 +765,7 @@ void yos_proc_watches_init(void)
 #include "m3_env.h"
 #include "platform.h"
 #include "yos/types.h"
-#include "yos/ydebug.h"
+#include <yos/ytrace/ytrace.h>
 
 extern int yos_remap_errno_h2g(int);
 extern int yos_fd_alloc(struct yos_exec_ctx *ctx, int host_fd);
@@ -978,7 +979,7 @@ static m3ApiRawFunction(m3_yos_kevent)
     ctx->memory_size = mem_size;
     static int kevent_call_n = 0;
     int my_call = ++kevent_call_n;
-    if (ydebug_enabled() && my_call < 30) {
+    if (ytrace_default_enabled() && my_call < 30) {
         pid_t tid = yos_plat_gettid();
         ydebug("kevent#%d(tid=%d kq=%d nchanges=%d nevents=%d timeout=%s)\n",
                my_call, (int)tid, kq_wfd, nchanges, nevents,
@@ -1094,7 +1095,7 @@ static m3ApiRawFunction(m3_yos_kevent)
     struct epoll_event eevs[256];
     int n = epoll_wait(kq, eevs, nevents, timeout_ms);
     if (n < 0) { write_errno(ctx, errno); m3ApiReturn(-1); }
-    if (ydebug_enabled() && my_call < 30) {
+    if (ytrace_default_enabled() && my_call < 30) {
         for (int i = 0; i < n && i < 4; i++) {
             ydebug("  epoll_event[%d]: events=0x%x udata=%016lx\n",
                    i, eevs[i].events, (unsigned long)eevs[i].data.u64);

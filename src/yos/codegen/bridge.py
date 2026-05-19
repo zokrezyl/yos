@@ -1027,10 +1027,44 @@ def _wasm_sig(name: str, gf: dict, gtypes: dict) -> tuple[str, list[str]] | None
     return rchar, arg_chars
 
 
-def _emit_m3_wrapper(name: str, ret_char: str, arg_chars: list[str]) -> str:
+def _strace_arg_fmt(t: dict, types: dict) -> tuple[str, str]:
+    """For a guest arg type, return (printf_fmt, arg_expr_template).
+    The expr template has a single `{var}` placeholder that the caller
+    fills with the popped wasm arg name (a0, a1, ...). Output mirrors
+    strace defaults: strings dereffed and quoted, pointers as 0x..,
+    signed/unsigned ints as decimal, floats as %g."""
+    t = _resolve(t, types)
+    if t is None:
+        return ('0x%x', '(unsigned){var}')
+    k = t.get('kind')
+    if k == 'pointer':
+        pointee = _resolve(types.get(t.get('pointee_uid')), types)
+        is_const = bool(t.get('pointee_is_const')) or (pointee and bool(pointee.get('is_const')))
+        if pointee and pointee.get('kind') == 'builtin' and is_const:
+            pname = (pointee.get('name') or '').lower()
+            if 'char' in pname and pointee.get('size') == 1:
+                return ('%s', 'yos_brg_strarg(ctx, {var})')
+        return ('0x%x', '(unsigned){var}')
+    if k == 'builtin':
+        size = t.get('size')
+        nm = (t.get('name') or '').lower()
+        if 'float' in nm or 'double' in nm:
+            return ('%g', '(double){var}')
+        is_unsigned = 'unsigned' in nm or 'uint' in nm
+        if size == 8:
+            return ('%llu', '(unsigned long long){var}') if is_unsigned \
+                else ('%lld', '(long long){var}')
+        return ('%u', '(unsigned){var}') if is_unsigned else ('%d', '(int){var}')
+    if k == 'enum':
+        return ('%d', '(int){var}')
+    return ('0x%x', '(unsigned){var}')
+
+
+def _emit_m3_wrapper(name: str, ret_char: str, arg_chars: list[str],
+                     gf: dict | None = None, gtypes: dict | None = None) -> str:
     """Emit the wasm3 raw-function wrapper that pops args off the m3
-    stack, calls yos_<name>, and pushes the return."""
-    # Map sig char -> the C type we use to pop the arg.
+    stack, calls yos_<name>, pushes the return, and traces the call
+    in a single strace-style ytrace line."""
     pop_type = {'i': 'uint32_t', 'I': 'uint64_t', 'f': 'float', 'F': 'double'}
 
     lines = [
@@ -1042,13 +1076,9 @@ def _emit_m3_wrapper(name: str, ret_char: str, arg_chars: list[str]) -> str:
         '    struct yos_exec_ctx *ctx = '
         '(struct yos_exec_ctx *)m3_GetUserData(runtime);',
         '    extern const char *yos_brg_last_call;',
-        '    extern int yos_brg_trace;',
         '    extern void yos_brg_record(const char *);',
         f'    yos_brg_last_call = "{name}";',
         f'    yos_brg_record("{name}");',
-        '    if (yos_brg_trace) {',
-        f'        fprintf(stderr, "yos_brg: {name}\\n");',
-        '    }',
     ]
     if ret_char != 'v':
         lines.append(f'    {pop_type[ret_char]} *raw_return = '
@@ -1060,9 +1090,6 @@ def _emit_m3_wrapper(name: str, ret_char: str, arg_chars: list[str]) -> str:
         lines.append(f'    {pop_type[c]} {an} = '
                      f'*({pop_type[c]}*)(_sp++);')
         arg_names.append(an)
-    # Stash up to 4 raw arg values into the ring slot so the trap
-    # handler can show what each call was actually doing. Cast to
-    # uint64_t so any of i32/i64/f32/f64 lands in a uniform field.
     lines.append('    extern void yos_brg_record_args(uint64_t,uint64_t,uint64_t,uint64_t);')
     a_arr = []
     for i in range(4):
@@ -1072,12 +1099,69 @@ def _emit_m3_wrapper(name: str, ret_char: str, arg_chars: list[str]) -> str:
             a_arr.append('0')
     lines.append('    yos_brg_record_args(' + ', '.join(a_arr) + ');')
 
+    # Reset host errno before the call so the post-call value cleanly
+    # signals whether the host libc routine touched it. The bridge body
+    # itself does NOT reset (POSIX-conformant: success doesn't clobber
+    # a previously-set errno from the *guest's* point of view, which
+    # reads the per-ctx slot, not host errno). The m3w trace, however,
+    # wants the per-call signal — so we wrap the body in a clean
+    # host-errno window here. Doesn't affect guest-visible errno
+    # because the guest never reads host errno directly.
+    lines.append('    errno = 0;')
+
     call = f'yos_{name}(ctx{("," if arg_names else "")} '
     call += ', '.join(arg_names) + ')'
     if ret_char == 'v':
         lines.append(f'    {call};')
     else:
         lines.append(f'    *raw_return = ({pop_type[ret_char]}){call};')
+    lines.append('    int _trace_errno = errno;  /* captured for the ytrace line below */')
+
+    # ── strace-style trace line — one ytrace point per bridge ────────
+    # Build the format string and the arg-expression list from the
+    # guest signature. The variadic-tail va_list pointer (added to
+    # arg_chars when gf->variadic) has no guest-side type entry, so
+    # we render it as a bare "..." placeholder in the format and skip
+    # any expression for it.
+    g_args = (gf or {}).get('args', []) if gf else []
+    arg_fmt_parts: list[str] = []
+    arg_exprs: list[str] = []
+    for i, an in enumerate(arg_names):
+        if gf and gtypes is not None and i < len(g_args):
+            ga = g_args[i]
+            gt = gtypes.get(ga.get('type_uid'))
+            fmt, expr_tpl = _strace_arg_fmt(gt, gtypes)
+            arg_fmt_parts.append(fmt)
+            arg_exprs.append(expr_tpl.format(var=an))
+        else:
+            # Variadic-tail va_list, or no guest info available.
+            arg_fmt_parts.append('...')
+    if ret_char == 'v':
+        fmt_str = f'{name}({", ".join(arg_fmt_parts)})'
+        if arg_exprs:
+            lines.append(f'    ytrace("{fmt_str}", {", ".join(arg_exprs)});')
+        else:
+            lines.append(f'    ytrace("{fmt_str}");')
+    else:
+        # Return-value formatting. Pointer-returning bridges (wret
+        # uint32_t for fns like getenv/strdup) render as 0x%x; integer
+        # returns go through yos_brg_retstr which adds the ENNN suffix
+        # on negative-with-errno.
+        if ret_char == 'i':
+            ret_expr = (
+                'yos_brg_retstr((long long)(int32_t)*raw_return, _trace_errno)')
+            ret_fmt = '%s'
+        elif ret_char == 'I':
+            ret_expr = (
+                'yos_brg_retstr((long long)*raw_return, _trace_errno)')
+            ret_fmt = '%s'
+        else:  # float / double — no errno semantics
+            ret_expr = '(double)*raw_return'
+            ret_fmt = '%g'
+        fmt_str = f'{name}({", ".join(arg_fmt_parts)}) = {ret_fmt}'
+        arg_exprs.append(ret_expr)
+        lines.append(f'    ytrace("{fmt_str}", {", ".join(arg_exprs)});')
+
     lines.append('    return 0;  /* m3Err_none */')
     lines.append('}')
     return '\n'.join(lines)
@@ -1762,7 +1846,8 @@ def emit_bridge(analyse: dict, guest_api: dict, host_api: dict,
     host_includes.sort()
 
     # Per-function wasm3 raw wrappers + the linker.
-    wrappers = [_emit_m3_wrapper(name, rchar, args)
+    wrappers = [_emit_m3_wrapper(name, rchar, args,
+                                 gf=g_fns.get(name), gtypes=g_types)
                 for name, (rchar, args) in sorted(sigs.items())]
     linker = _emit_link_imports(sigs)
 
@@ -1807,6 +1892,7 @@ def emit_bridge(analyse: dict, guest_api: dict, host_api: dict,
          + '#include "yos/types.h"  /* full struct yos_exec_ctx for ctx->memory */\n'
          + '#include "wasm3.h"     /* m3ApiRawFunction, m3_LinkRawFunction, ... */\n'
          + '#include "yos_struct_convert.h" /* cv_<name>_h2w / w2h */\n'
+         + '#include <yos/ytrace/ytrace.h>  /* ytrace() — strace-style per-call line */\n'
          + '#include <pthread.h> /* yos_autoglobals_lock for auto_save_restore */\n'
          + include_block + '\n'
          + (auto_include_block + '\n' if auto_include_block else '')
@@ -1817,6 +1903,8 @@ def emit_bridge(analyse: dict, guest_api: dict, host_api: dict,
          + 'extern int yos_xlate_dfd(struct yos_exec_ctx *, int32_t);\n'
          + 'extern int yos_at_flags_fb_to_lx(int);\n'
          + 'extern const char *yos_path_resolve(struct yos_exec_ctx *, const char *);\n'
+         + 'extern const char *yos_brg_strarg(struct yos_exec_ctx *, uint32_t);\n'
+         + 'extern const char *yos_brg_retstr(long long ret, int host_errno);\n'
          + '/* Single mutex protecting every auto_save_restore wrapper.\n'
          + ' * Low-frequency fns (getopt/tzset/dns/locale); one lock fine. */\n'
          + 'pthread_mutex_t yos_autoglobals_lock = PTHREAD_MUTEX_INITIALIZER;\n\n'

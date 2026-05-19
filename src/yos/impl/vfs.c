@@ -1,7 +1,7 @@
 #define _GNU_SOURCE
 #define _DARWIN_C_SOURCE  /* darwin libc gates mknodat/etc. behind this */
 #include "yos/types.h"
-#include "yos/ydebug.h"
+#include <yos/ytrace/ytrace.h>
 #include "platform.h"
 #include "impl/errno_helpers.h"
 #include "vfs/mount.h"
@@ -257,7 +257,7 @@ int32_t yos_read(struct yos_exec_ctx *ctx, int32_t fd, uint32_t buf, uint32_t co
          * second-stage return from its wasm handler. */
         yos_signal_pump(ctx);
     }
-    if (ydebug_enabled()) {
+    if (ytrace_default_enabled()) {
         pid_t tid = yos_plat_gettid();
         char hex[3 * 16 + 1] = {0};
         if (r > 0) {
@@ -344,7 +344,7 @@ int32_t yos_write(struct yos_exec_ctx *ctx, int32_t fd, uint32_t buf, uint32_t c
     }
     ssize_t r = write(hfd, p, count);
     int saved_errno = (r < 0) ? errno : 0;
-    if (ydebug_enabled() && fd != 4 && fd != 5) {
+    if (ytrace_default_enabled() && fd != 4 && fd != 5) {
         pid_t tid = yos_plat_gettid();
         char hex[3 * 32 + 1] = {0};
         if (r > 0) {
@@ -404,7 +404,7 @@ int32_t yos_open(struct yos_exec_ctx *ctx, uint32_t path, int32_t flags, int32_t
         real_mode = 0;
     }
     int r = open(s, hflags, real_mode);
-    if (ydebug_enabled())
+    if (ytrace_default_enabled())
         ydebug("open(\"%s\" flags=0x%x->0x%x mode_off=%d real_mode=0%o) = %d%s\n",
                s, flags, hflags, mode, real_mode, r,
                r < 0 ? strerror(errno) : "");
@@ -943,7 +943,7 @@ int32_t yos_fcntl(struct yos_exec_ctx *ctx, int32_t fd, int32_t cmd, int32_t arg
         if (arg && (uint32_t)arg + 4 <= ctx->memory_size)
             real_arg = *(int32_t *)(ctx->memory + (uint32_t)arg);
     }
-    if (ydebug_enabled())
+    if (ytrace_default_enabled())
         ydebug("fcntl(wfd=%d hfd=%d cmd=%d->%d va_off=%d arg=%d)\n",
                fd, hfd, cmd, hcmd, arg, real_arg);
     /* F_DUPFD / F_DUPFD_CLOEXEC return a fresh host fd that needs a
@@ -1068,7 +1068,7 @@ int32_t yos_writev(struct yos_exec_ctx *ctx, int32_t fd, uint32_t vec, int32_t v
     if (r) return r;
     int hfd = host_fd(ctx, fd);
     ssize_t n = writev(hfd, host_iov, vlen);
-    if (ydebug_enabled()) {
+    if (ytrace_default_enabled()) {
         size_t total = 0;
         for (int i = 0; i < vlen; i++) total += host_iov[i].iov_len;
         pid_t tid = yos_plat_gettid();
@@ -1176,7 +1176,7 @@ int32_t yos_openat(struct yos_exec_ctx *ctx, int32_t dfd, uint32_t filename, int
         real_mode = 0;
     }
     int r = openat(host_dfd, path, hflags, real_mode);
-    if (ydebug_enabled())
+    if (ytrace_default_enabled())
         ydebug("openat(dfd=%d \"%s\" flags=0x%x->0x%x mode_off=%d real_mode=0%o) = %d%s\n",
                host_dfd, path, flags, hflags, mode, real_mode, r,
                r < 0 ? strerror(errno) : "");

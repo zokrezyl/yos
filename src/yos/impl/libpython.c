@@ -30,7 +30,7 @@
 #include "wasm3.h"
 #include "m3_env.h"
 #include "yos/types.h"
-#include "yos/ydebug.h"
+#include <yos/ytrace/ytrace.h>
 
 /* libpython 3.12 forward decls. We deliberately don't #include
  * <Python.h> here — it pulls in the whole Python C API plus a pile of

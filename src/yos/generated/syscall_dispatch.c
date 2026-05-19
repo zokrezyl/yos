@@ -3,7 +3,7 @@
 
 
 #include "yos/types.h"
-#include "yos/ydebug.h"
+#include <yos/ytrace/ytrace.h>
 #include "syscall_numbers.h"
 #include "syscall_handlers.c"  // Include handlers
 

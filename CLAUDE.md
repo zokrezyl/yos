@@ -206,7 +206,8 @@ list, pthread TLS pool, asyncify fork mechanics) and lives in
 - `yos-f128.c` — __float128 helpers.
 - `yos-procfs.h` + `vfs/procfs.c` — synthetic /proc.
 - `vfs/mount.{c,h}`, `vfs/file.{c,h}` — mount table, virtual fd.
-- `ydebug.h` — `ydebug()` macro (only fires when `YTRACE_DEFAULT_ON=yes`).
+- `include/yos/ytrace/ytrace.h` — switchable trace-point macros
+  (`ydebug`/`yinfo`/`ywarn`/`yerror`/`ytrace`); gated by `YTRACE_DEFAULT_ON=yes`.
 
 Auto-generated bridges live in `build-tools/api-generate/`:
 
@@ -469,10 +470,11 @@ Bridges return wasm offsets, not host pointers.
   (`./yos some.wasm`) must print *only* the wasm guest's own
   output and yos's actual user-visible errors (a wasm trap, a
   failed file open, an unresolved import). No diagnostic chatter.
-- **All trace / informational prints go through `ydebug()`** from
-  `yos/ydebug.h`. They are gated at runtime by the project-wide
-  `YTRACE_DEFAULT_ON=yes` env var (matches the convention used
-  across the rest of the toolchain).
+- **All trace / informational prints go through `ydebug()`** (or
+  the matching level macros `yinfo`/`ywarn`/`yerror`/`ytrace`) from
+  `<yos/ytrace/ytrace.h>`. They are gated at runtime by the
+  project-wide `YTRACE_DEFAULT_ON=yes` env var (matches the
+  convention used across the rest of the toolchain).
 - **Never write `fprintf(stderr, "yos: ...")` directly** for
   anything that isn't a fatal user-facing error. Even helpful
   things like "argv_setup: ptr=0x…" go through `ydebug()` —

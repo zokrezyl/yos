@@ -25,7 +25,7 @@
 #include <stdio.h>
 
 #include "yos/types.h"
-#include "yos/ydebug.h"
+#include <yos/ytrace/ytrace.h>
 
 /* The wasm guest's char *const argv[] is a flat list of wasm-memory
  * offsets: each argv[i] is a uint32 offset to the C string in linear

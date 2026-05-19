@@ -1,6 +1,6 @@
 #define _GNU_SOURCE
 #include "yos/types.h"
-#include "yos/ydebug.h"
+#include <yos/ytrace/ytrace.h>
 #include <stdint.h>
 #include <errno.h>
 #include <stdio.h>

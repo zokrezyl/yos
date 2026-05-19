@@ -73,6 +73,17 @@ struct yos_proc {
 
     pthread_t thread;
 
+    /* Back-pointer to the running ctx for cross-thread access (kill →
+     * sig_pending, /proc/[pid] introspection from another guest, …).
+     * void* because struct yos_exec_ctx is defined below this struct
+     * and we don't want to reorder the file. Set by fork_thread_func
+     * and the initial main.c thread when each first enters wasm.
+     * NULL when the proc is zombie/freed.
+     *
+     * Cross-thread reads of fields THROUGH this pointer must use atomics
+     * where applicable (sig_pending is the obvious one). */
+    void *ctx_handle;
+
     /* Process info for /proc/[pid] (stored per-process, not per-ctx) */
     char comm[16];           /* command name (basename of exe) */
     char exe[PATH_MAX];      /* path to executable */
@@ -326,6 +337,28 @@ struct yos_exec_ctx {
     uint32_t alloc_lo;
     uint32_t alloc_hi;
     uint32_t alloc_free_head;
+
+    /* Per-process signal state (impl/sig.c).
+     *
+     *   sig_handlers[signum]  — wasm-side function-table index of the
+     *                           registered handler (FreeBSD signums 1..31;
+     *                           [0] unused). Values 0/1/0xffffffff carry
+     *                           the SIG_DFL/SIG_IGN/SIG_ERR semantics.
+     *   sig_mask              — bitmask of blocked FreeBSD signals
+     *                           (bit (signo-1)). Read/written by
+     *                           sigprocmask, consulted by signal_pump
+     *                           before invoking each handler.
+     *   sig_pending           — bits set when a signal arrives while
+     *                           that signal is blocked, OR when kill()
+     *                           targets this process. Cleared by
+     *                           signal_pump as each is delivered.
+     *
+     * Inheritance: fork copies all three from parent. Execve preserves
+     * sig_mask, resets handlers (custom → SIG_DFL; SIG_IGN preserved),
+     * and clears sig_pending. */
+    uint32_t sig_handlers[32];
+    uint32_t sig_mask;
+    uint32_t sig_pending;
 };
 
 /* Global runtime state */

@@ -39,7 +39,7 @@
 #include <errno.h>
 
 #include "yos/types.h"
-#include "yos/ydebug.h"
+#include <yos/ytrace/ytrace.h>
 #include "platform.h"
 #include "impl/errno_helpers.h"
 
@@ -789,7 +789,7 @@ int32_t yos_fstat(struct yos_exec_ctx *ctx, int32_t wfd, uint32_t statbuf_off)
     struct stat h;
     memset(&h, 0, sizeof h);
     if (fstat(hfd, &h) < 0) return yos_errno_neg(ctx, errno);
-    if (ydebug_enabled()) {
+    if (ytrace_default_enabled()) {
         const char *kind = "?";
         if (S_ISREG(h.st_mode))  kind = "REG";
         else if (S_ISDIR(h.st_mode)) kind = "DIR";

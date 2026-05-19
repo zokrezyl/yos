@@ -35,7 +35,7 @@
 #include <wchar.h>
 
 #include "yos/types.h"
-#include "yos/ydebug.h"
+#include <yos/ytrace/ytrace.h>
 #include "impl/errno_helpers.h"
 
 /* Helper: translate a wasm offset (or 0) to a host pointer (or NULL). */

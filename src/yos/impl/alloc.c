@@ -38,7 +38,7 @@
 #include <errno.h>
 
 #include "yos/types.h"
-#include "yos/ydebug.h"
+#include <yos/ytrace/ytrace.h>
 #include "alloc.h"
 
 #define HDR_SIZE   8u

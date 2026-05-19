@@ -1,5 +1,5 @@
 #include "yos/types.h"
-#include "yos/ydebug.h"
+#include <yos/ytrace/ytrace.h>
 #include <stdint.h>
 #include <string.h>     /* memset for sigemptyset/sigfillset */
 #include <errno.h>
@@ -12,23 +12,26 @@
 #include "m3_env.h"
 #include "errno_helpers.h"  /* yos_remap_errno_h2g for pthread_sigmask */
 
-/* Signal handling stubs - we can't actually deliver signals in WASM,
- * but we return success so programs think they registered handlers. */
-
-/* Recorded signal-handler function-table indices. zsh installs SIGCHLD
- * via sigaction during job-control init; sigsuspend then blocks
- * waiting for the handler to fire and update STAT_DONE. yos doesn't
- * have async signal delivery, so we record the handler here and
- * synthesise a synchronous call from sigsuspend whenever a child of
- * the calling proc has reached ZOMBIE state. SIGCHLD is by far the
- * most common case; track up to 32 entries to cover SIGINT etc. too. */
+/* Signal handling. State lives on struct yos_exec_ctx: handler table,
+ * blocked mask, and pending mask are all per-process. fork() inherits
+ * everything from the parent; execve() preserves the mask and resets
+ * the handler table (custom → SIG_DFL, SIG_IGN preserved per POSIX). */
 #define YOS_NSIG 32
-static uint32_t g_signal_handlers[YOS_NSIG];
+/* FreeBSD sigset_t is `uint32_t __bits[4]` — 16 bytes total. yos
+ * only tracks signums 1..31, so all the relevant bits live in
+ * __bits[0]; the other 12 bytes get zeroed on every write. */
+#define YOS_FBSD_SIGSET_BYTES 16
 
-static void record_handler(int signum, uint32_t handler_idx)
+static void record_handler(struct yos_exec_ctx *ctx, int signum,
+                           uint32_t handler_idx)
 {
-    if (signum > 0 && signum < YOS_NSIG)
-        g_signal_handlers[signum] = handler_idx;
+    if (ctx && signum > 0 && signum < YOS_NSIG)
+        ctx->sig_handlers[signum] = handler_idx;
+}
+
+static inline uint32_t signum_bit(int signum)
+{
+    return (signum > 0 && signum < YOS_NSIG) ? (1u << signum) : 0u;
 }
 
 /* Async signal forwarding from the host.
@@ -72,8 +75,8 @@ void yos_signal_set_pending(int fbsd_signum)
 
 static void invoke_signal_handler(struct yos_exec_ctx *ctx, int signum)
 {
-    if (signum <= 0 || signum >= YOS_NSIG) return;
-    uint32_t idx = g_signal_handlers[signum];
+    if (!ctx || signum <= 0 || signum >= YOS_NSIG) return;
+    uint32_t idx = ctx->sig_handlers[signum];
     ydebug("invoke_signal_handler: sig=%d idx=%u\n", signum, idx);
     /* SIG_DFL (0): no handler installed — default kernel disposition,
      * which for SIGCHLD is "ignore" — we just return.
@@ -114,74 +117,124 @@ static void invoke_signal_handler(struct yos_exec_ctx *ctx, int signum)
 void yos_signal_pump(struct yos_exec_ctx *ctx)
 {
     if (!ctx) return;
-    uint32_t pending = __atomic_exchange_n(&g_host_pending_signals, 0,
-                                            __ATOMIC_ACQ_REL);
-    if (!pending) return;
-    for (int s = 0; s < YOS_NSIG; s++) {
-        if (pending & (1u << s))
-            invoke_signal_handler(ctx, s);
+    /* Pull anything the host handler latched into the process-wide
+     * incoming queue and merge into this ctx's per-process pending
+     * set. The host has no easy way to identify a destination ctx —
+     * whichever proc pumps first wins, which matches the tty model
+     * (foreground proc reads first → it sees Ctrl-C). */
+    uint32_t fresh = __atomic_exchange_n(&g_host_pending_signals, 0,
+                                          __ATOMIC_ACQ_REL);
+    if (fresh) __atomic_or_fetch(&ctx->sig_pending, fresh, __ATOMIC_ACQ_REL);
+
+    /* Deliver every pending signal that isn't blocked. Each delivery
+     * clears the pending bit atomically (kill() from another thread
+     * may set bits concurrently); blocked bits stay set and get
+     * picked up the next time sigprocmask unblocks them or sigsuspend
+     * runs with the right mask. */
+    for (;;) {
+        uint32_t cur = __atomic_load_n(&ctx->sig_pending, __ATOMIC_ACQUIRE);
+        uint32_t deliverable = cur & ~ctx->sig_mask;
+        if (!deliverable) break;
+        int s = __builtin_ctz(deliverable);
+        uint32_t bit = 1u << s;
+        __atomic_and_fetch(&ctx->sig_pending, ~bit, __ATOMIC_ACQ_REL);
+        invoke_signal_handler(ctx, s);
     }
 }
 
 int32_t yos_sig_rt_sigaction(struct yos_exec_ctx *ctx, int32_t signum,
                               uint32_t act, uint32_t oldact, uint32_t sigsetsize)
 {
-    (void)ctx;
-    ydebug("rt_sigaction(sig=%d, act=0x%x, oldact=0x%x, size=%u) -> 0 (stub)\n",
-           signum, act, oldact, sigsetsize);
-    /* Record the wasm-side handler so sigsuspend can invoke it
-     * synchronously when the corresponding proc-table event fires
-     * (child zombie → SIGCHLD). FreeBSD i386 struct sigaction has
-     * sa_handler (or sa_sigaction in the union) at offset 0; the
-     * value is a function-table index, NOT a host pointer. */
-    if (act && ctx && ctx->memory && act + 4 <= ctx->memory_size) {
+    (void)sigsetsize;
+    if (!ctx || signum <= 0 || signum >= YOS_NSIG)
+        return yos_errno_neg(ctx, EINVAL);
+    uint32_t prev = ctx->sig_handlers[signum];
+    if (act && ctx->memory && act + 4 <= ctx->memory_size) {
+        /* FreeBSD i386 struct sigaction: sa_handler/sa_sigaction is at
+         * offset 0; the value is a wasm function-table index, NOT a
+         * host pointer. */
         uint32_t handler = *(uint32_t *)(ctx->memory + act);
-        record_handler(signum, handler);
+        record_handler(ctx, signum, handler);
     }
-    /* If oldact is provided, we should write the old action there.
-     * For now, just zero it out if provided. */
-    if (oldact && ctx) {
-        /* Zero out the old sigaction struct (32 bytes on i386) */
+    if (oldact && ctx->memory && oldact + 32 <= ctx->memory_size) {
         uint8_t *p = ctx->memory + oldact;
-        if (oldact + 32 <= ctx->memory_size) {
-            for (int i = 0; i < 32; i++) p[i] = 0;
+        memset(p, 0, 32);
+        *(uint32_t *)p = prev;       /* sa_handler */
+    }
+    return 0;
+}
+
+/* Read the FreeBSD-shape sigset_t at `off` into a uint32 holding bits
+ * for signums 1..31. Returns 0 if off is 0 / out of bounds.
+ *
+ * Layout: FreeBSD sigset_t is `uint32_t __bits[4]` — 16 bytes total,
+ * little-endian; signum N (1..128) is bit (N-1) of __bits[(N-1)/32].
+ * yos only tracks 1..31, so we just read __bits[0] and ignore the
+ * upper signums (POSIX realtime sigs aren't delivered anyway). */
+static uint32_t read_fbsd_sigset_lo(struct yos_exec_ctx *ctx, uint32_t off)
+{
+    if (!off || !ctx || off + YOS_FBSD_SIGSET_BYTES > ctx->memory_size)
+        return 0;
+    return *(uint32_t *)(ctx->memory + off);
+}
+
+/* Write a uint32 mask back into a FreeBSD-shape sigset_t at `off`.
+ * Zeros the upper signum slots so a sigset_t round-tripped through
+ * yos doesn't carry stale bits there. */
+static void write_fbsd_sigset_lo(struct yos_exec_ctx *ctx, uint32_t off,
+                                 uint32_t lo)
+{
+    if (!off || !ctx || off + YOS_FBSD_SIGSET_BYTES > ctx->memory_size)
+        return;
+    uint8_t *p = ctx->memory + off;
+    *(uint32_t *)p = lo;
+    memset(p + 4, 0, YOS_FBSD_SIGSET_BYTES - 4);
+}
+
+/* Apply a FreeBSD-shape sigprocmask op to ctx->sig_mask. After the
+ * op, runs the pump so anything that just got unblocked fires.
+ *   how = SIG_BLOCK(1)/SIG_UNBLOCK(2)/SIG_SETMASK(3) — FreeBSD numbering.
+ * SIGKILL and SIGSTOP can never be blocked (POSIX) — strip those bits
+ * silently from any incoming mask. */
+#define YOS_FBSD_SIG_BLOCK    1
+#define YOS_FBSD_SIG_UNBLOCK  2
+#define YOS_FBSD_SIG_SETMASK  3
+#define YOS_FBSD_SIGKILL      9
+#define YOS_FBSD_SIGSTOP      17
+
+static int32_t sigmask_apply(struct yos_exec_ctx *ctx, int32_t how,
+                             uint32_t set_off, uint32_t oset_off)
+{
+    if (!ctx) return yos_errno_neg(ctx, EINVAL);
+    uint32_t prev = ctx->sig_mask;
+    if (set_off) {
+        uint32_t s = read_fbsd_sigset_lo(ctx, set_off);
+        s &= ~((1u << YOS_FBSD_SIGKILL) | (1u << YOS_FBSD_SIGSTOP));
+        switch (how) {
+        case YOS_FBSD_SIG_BLOCK:   ctx->sig_mask = prev | s;  break;
+        case YOS_FBSD_SIG_UNBLOCK: ctx->sig_mask = prev & ~s; break;
+        case YOS_FBSD_SIG_SETMASK: ctx->sig_mask = s;         break;
+        default:                   return yos_errno_neg(ctx, EINVAL);
         }
     }
+    if (oset_off) write_fbsd_sigset_lo(ctx, oset_off, prev);
+    /* Anything we just unblocked may already be pending — fire it now. */
+    if (ctx->sig_pending & ~ctx->sig_mask)
+        yos_signal_pump(ctx);
     return 0;
 }
 
 int32_t yos_sig_rt_sigprocmask(struct yos_exec_ctx *ctx, int32_t how,
                                 uint32_t set, uint32_t oset, uint32_t sigsetsize)
 {
-    (void)ctx; (void)how; (void)set; (void)sigsetsize;
-    ydebug("rt_sigprocmask(how=%d) -> 0 (stub)\n", how);
-    /* If oset is provided, zero it out */
-    if (oset && ctx) {
-        uint8_t *p = ctx->memory + oset;
-        if (oset + 8 <= ctx->memory_size) {
-            for (int i = 0; i < 8; i++) p[i] = 0;
-        }
-    }
-    return 0;
+    (void)sigsetsize;
+    return sigmask_apply(ctx, how, set, oset);
 }
 
 int32_t yos_sigaction(struct yos_exec_ctx *ctx, int32_t signum,
                            uint32_t act, uint32_t oldact)
 {
-    (void)ctx;
-    ydebug("sigaction(sig=%d) -> 0\n", signum);
-    /* Record the wasm-side handler — see yos_sig_rt_sigaction. */
-    if (act && ctx && ctx->memory && act + 4 <= ctx->memory_size) {
-        uint32_t handler = *(uint32_t *)(ctx->memory + act);
-        record_handler(signum, handler);
-    }
-    if (oldact && ctx) {
-        uint8_t *p = ctx->memory + oldact;
-        if (oldact + 32 <= ctx->memory_size) {
-            for (int i = 0; i < 32; i++) p[i] = 0;
-        }
-    }
-    return 0;
+    return yos_sig_rt_sigaction(ctx, signum, act, oldact, 0);
 }
 
 /* ── signal(int, void (*)(int)) → void (*)(int) ──────────────────────
@@ -201,26 +254,16 @@ int32_t yos_sigaction(struct yos_exec_ctx *ctx, int32_t signum,
  * expect for an EINVAL response. */
 uint32_t yos_signal(struct yos_exec_ctx *ctx, int32_t signum, uint32_t handler)
 {
-    (void)ctx;
-    if (signum <= 0 || signum >= YOS_NSIG) return YOS_SIG_ERR;
-    uint32_t old = g_signal_handlers[signum];
-    record_handler(signum, handler);
-    ydebug("signal(sig=%d) old=%u new=%u\n", signum, old, handler);
+    if (!ctx || signum <= 0 || signum >= YOS_NSIG) return YOS_SIG_ERR;
+    uint32_t old = ctx->sig_handlers[signum];
+    record_handler(ctx, signum, handler);
     return old;
 }
 
 int32_t yos_sigprocmask(struct yos_exec_ctx *ctx, int32_t how,
                              uint32_t set, uint32_t oset)
 {
-    (void)ctx; (void)how; (void)set;
-    ydebug("sigprocmask(how=%d) -> 0 (stub)\n", how);
-    if (oset && ctx) {
-        uint8_t *p = ctx->memory + oset;
-        if (oset + 8 <= ctx->memory_size) {
-            for (int i = 0; i < 8; i++) p[i] = 0;
-        }
-    }
-    return 0;
+    return sigmask_apply(ctx, how, set, oset);
 }
 
 /* sigsuspend — block "until a signal arrives". yos doesn't actually
@@ -242,47 +285,62 @@ int32_t yos_sigprocmask(struct yos_exec_ctx *ctx, int32_t how,
  * loop falls through to waitpid. This is the same poll-with-usleep
  * shape yos_waitpid already uses (see impl/proc.c) — staying
  * consistent with existing yos process-table mechanics. */
+/* sigsuspend — atomically install temp mask, wait for an unblocked
+ * signal, restore mask, return -1 + EINTR. We poll the proc table for
+ * ZOMBIE children of this proc and synthesise SIGCHLD when one
+ * appears (yos's only signal-delivery driver besides host-forwarded
+ * SIGINT/SIGWINCH which already enter via signal_pump). The temp
+ * mask is enforced via signal_pump's blocked-bit filter; any
+ * unblocked pending bit set during the wait (from kill() or the
+ * host signal handler) gets delivered. */
 int32_t yos_sigsuspend(struct yos_exec_ctx *ctx, uint32_t mask_off)
 {
-    (void)mask_off;  /* mask is irrelevant: yos doesn't deliver async signals */
-    if (!ctx || !ctx->proc || !ctx->rt) {
-        if (ctx && ctx->memory && ctx->errno_off)
-            *(int *)(ctx->memory + ctx->errno_off) = EINVAL;
-        return -1;
+    if (!ctx || !ctx->proc || !ctx->rt)
+        return yos_errno_neg(ctx, EINVAL);
+
+    uint32_t saved_mask = ctx->sig_mask;
+    if (mask_off) {
+        uint32_t m = read_fbsd_sigset_lo(ctx, mask_off);
+        m &= ~((1u << YOS_FBSD_SIGKILL) | (1u << YOS_FBSD_SIGSTOP));
+        ctx->sig_mask = m;
     }
 
-    /* yos doesn't have async signal delivery (no kernel signals to
-     * the wasm guest from outside). Instead we synthesise the most
-     * important case synchronously here: if a child of the calling
-     * proc has reached ZOMBIE state and the guest registered a
-     * SIGCHLD handler, invoke it. zsh's wait loop predicate is
-     * `jn->stat & STAT_DONE`, which gets set inside the SIGCHLD
-     * handler's wait_for_processes() → waitpid(WNOHANG) reap path;
-     * without this synchronous dispatch the loop spins on
-     * sigsuspend/sigprocmask forever. */
+    /* Drain anything already pending under the new mask before we
+     * start waiting; matches the POSIX "deliver one immediately if
+     * one was pending" semantic. */
+    yos_signal_pump(ctx);
+
+    /* Poll for SIGCHLD-worthy events. Each iteration also runs the
+     * pump in case kill()/host signal landed something pending. We
+     * bail as soon as we either delivered a signal (pending cleared)
+     * or saw a zombie child. */
     struct yos_runtime *rt = ctx->rt;
     int32_t my_pid = ctx->proc->pid;
-
-    pthread_mutex_lock(&rt->proc_lock);
-    int has_zombie = 0;
-    for (int i = 0; i < YOS_MAX_PROCS; i++) {
-        struct yos_proc *p = &rt->procs[i];
-        if (p->state == YOS_PROC_ZOMBIE && p->ppid == my_pid) {
-            has_zombie = 1; break;
+    for (int iter = 0; iter < 200; iter++) {
+        pthread_mutex_lock(&rt->proc_lock);
+        int has_zombie = 0;
+        for (int i = 0; i < YOS_MAX_PROCS; i++) {
+            struct yos_proc *p = &rt->procs[i];
+            if (p->state == YOS_PROC_ZOMBIE && p->ppid == my_pid) {
+                has_zombie = 1; break;
+            }
         }
+        pthread_mutex_unlock(&rt->proc_lock);
+        if (has_zombie) {
+            ctx->sig_pending |= (1u << 20);   /* FreeBSD SIGCHLD */
+            yos_signal_pump(ctx);
+            break;
+        }
+        if (ctx->sig_pending & ~ctx->sig_mask) break;
+        usleep(5000);
     }
-    pthread_mutex_unlock(&rt->proc_lock);
 
-    if (has_zombie) {
-        /* SIGCHLD = 17 on Linux but 20 on FreeBSD — zsh's wasm sees
-         * the FreeBSD signal numbers (we built it against FreeBSD
-         * headers). Use 20. */
-        invoke_signal_handler(ctx, 20 /* SIGCHLD on FreeBSD */);
-    }
-
-    if (ctx->memory && ctx->errno_off)
-        *(int *)(ctx->memory + ctx->errno_off) = EINTR;
-    return -1;
+    /* POSIX: restore the original mask, regardless of whether a
+     * signal fired. Any signal that arrived during the suspend that
+     * we couldn't deliver (blocked under the original mask too) stays
+     * in sig_pending for later. */
+    ctx->sig_mask = saved_mask;
+    return yos_errno_neg(ctx, EINTR);
 }
 
 /* ── sigemptyset / sigfillset / sigaddset / sigdelset / sigismember
@@ -299,8 +357,6 @@ int32_t yos_sigsuspend(struct yos_exec_ctx *ctx, uint32_t mask_off)
  * declaration level the bridge generator can't tell that the
  * intended manipulation is purely on the FreeBSD layout.
  */
-
-#define YOS_FBSD_SIGSET_BYTES 16
 
 static inline int yos_sigset_bound(struct yos_exec_ctx *ctx, uint32_t off)
 {

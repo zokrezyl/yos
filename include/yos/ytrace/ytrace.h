@@ -81,6 +81,11 @@ void ytrace_init(void);
 /* Shutdown and cleanup */
 void ytrace_shutdown(void);
 
+/* True when YTRACE_DEFAULT_ON is set to yes/1/true. Cheap query used
+ * by hot paths (vfs read/write) to short-circuit expensive arg
+ * evaluation before the per-callsite enable bit is consulted. */
+bool ytrace_default_enabled(void);
+
 /* Label the calling host thread so per-thread trace files (when
  * YTRACE_FILE_PREFIX is set) include a human-readable name in
  * their filenames. yos sets this from main.c (initial proc) and

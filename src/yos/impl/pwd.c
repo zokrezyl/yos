@@ -52,7 +52,7 @@
 #include <libgen.h>          /* dirname (POSIX), basename */
 
 #include "yos/types.h"
-#include "yos/ydebug.h"
+#include <yos/ytrace/ytrace.h>
 
 /* Forward decls for the auto-generated struct converter we use here.
  * Defined in build/<host>/src/yos/codegen/yos_struct_convert.c via

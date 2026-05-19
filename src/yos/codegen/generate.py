@@ -161,6 +161,44 @@ def _emit_remap_function(name: str, pairs: list[tuple[str, int, int]],
     return '\n'.join(lines), notes
 
 
+def _emit_name_function(name: str, pairs: list[tuple[str, int, int]]) -> str:
+    """Emit `const char *yos_name_<group>(int guest_v)` — symbolic name
+    lookup, used by the strace-style bridge trace to render errno
+    numbers, signal numbers, etc. as their constant names. Same data
+    as the g2h/h2g switches; different orientation.
+
+    Collision policy: when two constants share an integer value (e.g.
+    FreeBSD's `EAI_AGAIN`=2 and `ENOENT`=2 — they live in different
+    POSIX name domains but the prefix grouper threw both into 'errno'),
+    we prefer the plain-prefix name over a known sub-prefix alias.
+    Sub-prefix sets to deprioritise per group are listed in
+    `_NAME_DEMOTE`. Unknown names sort alphabetically as before."""
+    _NAME_DEMOTE = {
+        'errno':  ('EAI_', 'EHOST', 'ERPC'),    # getaddrinfo & RPC aliases
+        'signal': ('SIG_',),                     # SIG_DFL/SIG_IGN/SIG_ERR (action ptrs)
+    }
+    demote_prefixes = _NAME_DEMOTE.get(name, ())
+    def _sort_key(p):
+        cname = p[0]
+        return (any(cname.startswith(pfx) for pfx in demote_prefixes), cname)
+    lines = [f'const char *yos_name_{name}(int v)', '{']
+    seen: set[int] = set()
+    if pairs:
+        lines.append('    switch (v) {')
+        for cname, gv, _hv in sorted(pairs, key=_sort_key):
+            if gv is None or gv in seen:
+                continue
+            seen.add(gv)
+            lines.append(f'    case {gv}: return "{cname}";')
+        lines.append('    default:  return (const char *)0;')
+        lines.append('    }')
+    else:
+        lines.append('    (void)v;')
+        lines.append('    return (const char *)0;')
+    lines.append('}')
+    return '\n'.join(lines)
+
+
 def _emittable_groups(groups: dict) -> list[str]:
     """The 'misc' group is a junk drawer of unrelated namespaces (IGMP
     flags + ELF constants + sysctl numbers + …) that collide on
@@ -183,6 +221,7 @@ def emit_remap_h(groups: dict) -> str:
     for g in _emittable_groups(groups):
         out.append(f'int yos_remap_{g}_g2h(int v);')
         out.append(f'int yos_remap_{g}_h2g(int v);')
+        out.append(f'const char *yos_name_{g}(int v);')
     out += ['',
             '#ifdef __cplusplus',
             '}',
@@ -205,6 +244,7 @@ def emit_remap_c(groups: dict) -> tuple[str, list[str]]:
         out.append(c); all_notes.extend(notes); out.append('')
         c, notes = _emit_remap_function(g, pairs, 'h2g')
         out.append(c); all_notes.extend(notes); out.append('')
+        out.append(_emit_name_function(g, pairs)); out.append('')
     return '\n'.join(out), all_notes
 
 

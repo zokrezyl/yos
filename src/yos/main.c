@@ -18,7 +18,7 @@
 #include "m3_env.h"
 #include "platform.h"
 #include "yos/types.h"
-#include "yos/ydebug.h"
+#include <yos/ytrace/ytrace.h>
 #include "yos/vfs/mount.h"
 #include "yos/vfs/procfs.h"
 #include "impl/pthread.h"
@@ -74,14 +74,13 @@ static inline void pfx_refresh(IM3Runtime rt, struct yos_exec_ctx *ctx) {
 }
 
 /* Forward decls — definitions further down. The variadic trampolines need
- * to feed the bridge ring buffer too so YOS_BRG_TRACE / crash dumps see
- * printf-family activity. */
+ * to feed the bridge ring buffer too so crash dumps see printf-family
+ * activity. Per-call strace-style tracing goes through ytrace() below. */
 extern const char *yos_brg_last_call;
-extern int yos_brg_trace;
 extern void yos_brg_record(const char *name);
 #define PFX_TRACE(name) do {                                       \
     yos_brg_last_call = (name); yos_brg_record(name);              \
-    if (yos_brg_trace) fprintf(stderr, "yos_brg: %s\n", (name));   \
+    ytrace("%s(...)", (name));                                     \
 } while (0)
 
 static m3ApiRawFunction(m3_printf) {
@@ -222,7 +221,7 @@ static m3ApiRawFunction(m3_main_argc_argv)
     /* Diagnostic: trace the argv nvim is receiving. Only printed when
      * the project-wide trace switch (YTRACE_DEFAULT_ON=yes) is on —
      * normal runs stay quiet. */
-    if (ydebug_enabled()) {
+    if (ytrace_default_enabled()) {
         struct yos_exec_ctx *ctx = (struct yos_exec_ctx *)m3_GetUserData(runtime);
         uint32_t ms = 0;
         ctx->memory = m3_GetMemory(runtime, &ms, 0);
@@ -303,10 +302,10 @@ static m3ApiRawFunction(m3_yos_error)
  * libc function nvim called immediately before bailing out. */
 const char *yos_brg_last_call = "<none>";
 
-/* Set to 1 to log every bridge call. Pulled from YOS_BRG_TRACE env var
- * in main(). Useful for debugging "what did the wasm just try to call"
- * crashes. Very noisy — disable for normal runs. */
-int yos_brg_trace = 0;
+/* Per-bridge-call trace lines now go through ytrace (one switchable
+ * point per `m3w_<name>` wrapper, format strace-style). The legacy
+ * YOS_BRG_TRACE int + env-var path is gone — use YTRACE_DEFAULT_ON=yes
+ * (or per-callsite ytrace_set_*) to enable. */
 
 /* Ring buffer of the last N bridge calls per host thread. Each m3w_*
  * wrapper calls yos_brg_record(name); on a __stack_chk_fail trap we
@@ -351,8 +350,89 @@ void yos_brg_record_args(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3)
     r->args[0] = a0; r->args[1] = a1; r->args[2] = a2; r->args[3] = a3;
 }
 
-/* Dump a host-side string buffer at a wasm offset, escaping non-print
- * chars; used to interpret pointer-shaped bridge args. */
+/* Render a guest-side `const char *` arg as a strace-style quoted
+ * string into a per-thread round-robin scratch slot. Each call
+ * advances the slot index, so a single ytrace() with several string
+ * args gets distinct buffers (8 slots; libc fns have far fewer
+ * string args than that). Non-printable bytes are escaped as `\xNN`,
+ * common escapes (\n \t \r \\ \") use their familiar forms. The
+ * payload is truncated at 64 bytes with "..." appended, matching
+ * strace's default -s64 look. NULL → `NULL`, out-of-bounds → `<oob:0xNNN>`.
+ *
+ * Returns a pointer into thread-local storage valid until the 8th
+ * subsequent call on the same thread overwrites the slot. */
+const char *yos_brg_strarg(struct yos_exec_ctx *ctx, uint32_t off)
+{
+    enum { POOL_N = 8, BUF_N = 256, MAX_CHARS = 64 };
+    static __thread char bufs[POOL_N][BUF_N];
+    static __thread int  pool_idx = 0;
+    char *buf = bufs[pool_idx++ & (POOL_N - 1)];
+
+    if (off == 0) { strcpy(buf, "NULL"); return buf; }
+    if (!ctx || !ctx->memory || off >= ctx->memory_size) {
+        snprintf(buf, BUF_N, "<oob:0x%x>", off);
+        return buf;
+    }
+
+    const char *p = (const char *)(ctx->memory + off);
+    int o = 0;
+    buf[o++] = '"';
+    int i;
+    for (i = 0; i < MAX_CHARS && p[i]; i++) {
+        unsigned c = (unsigned char)p[i];
+        if (o + 8 >= BUF_N) break;
+        if      (c == '"')  { buf[o++] = '\\'; buf[o++] = '"'; }
+        else if (c == '\\') { buf[o++] = '\\'; buf[o++] = '\\'; }
+        else if (c == '\n') { buf[o++] = '\\'; buf[o++] = 'n'; }
+        else if (c == '\t') { buf[o++] = '\\'; buf[o++] = 't'; }
+        else if (c == '\r') { buf[o++] = '\\'; buf[o++] = 'r'; }
+        else if (c >= 32 && c < 127) { buf[o++] = (char)c; }
+        else { o += snprintf(buf + o, BUF_N - o, "\\x%02x", c); }
+    }
+    buf[o++] = '"';
+    if (p[i] != 0 && o + 3 < BUF_N) { /* truncation marker */
+        buf[o++] = '.'; buf[o++] = '.'; buf[o++] = '.';
+    }
+    buf[o] = 0;
+    return buf;
+}
+
+/* Render a strace-style return string. The caller passes the
+ * *host* errno captured immediately after the bridge body returned
+ * (the m3w wrapper resets host errno to 0 before each call so any
+ * non-zero value here means the host libc call signalled an error).
+ * For negative returns with a real errno, appends ` ENNN (description)`. */
+const char *yos_brg_retstr(long long ret, int host_errno)
+{
+    static __thread char buf[128];
+    if (ret < 0 && host_errno) {
+        const char *nm = NULL;
+#if defined(__GLIBC__) && (__GLIBC__ > 2 || (__GLIBC__ == 2 && __GLIBC_MINOR__ >= 32))
+        /* glibc 2.32+ has the canonical name table — covers every
+         * POSIX errno including the common ones (ENOENT, EACCES, ...)
+         * that our auto-generated yos_name_errno misses because their
+         * value is identical on host and guest. */
+        nm = strerrorname_np(host_errno);
+#endif
+        if (!nm) {
+            /* Fallback: ask the generator-emitted table for the FreeBSD
+             * name corresponding to the guest-side errno (used on hosts
+             * without strerrorname_np, and for FreeBSD-only constants
+             * like ENEEDAUTH/EPROCLIM that have no Linux peer). */
+            extern const char *yos_name_errno(int);
+            extern int yos_remap_errno_h2g(int);
+            nm = yos_name_errno(yos_remap_errno_h2g(host_errno));
+        }
+        snprintf(buf, sizeof buf, "%lld %s (%s)",
+                 ret, nm ? nm : "?", strerror(host_errno));
+    } else {
+        snprintf(buf, sizeof buf, "%lld", ret);
+    }
+    return buf;
+}
+
+/* Crash-dump variant — same escaping but writes directly to a FILE.
+ * Used by the host-crash handler so it doesn't depend on ytrace. */
 static void yos_brg_dump_strarg(FILE *out, struct yos_exec_ctx *ctx,
                                 uint64_t off, int max)
 {
@@ -1886,11 +1966,6 @@ int main(int argc, char **argv)
     }
     (void)g_server;  /* reserved — future runit-aware behaviour */
 
-    /* YOS_BRG_TRACE=1 makes every generated bridge log its name. Lets us
-     * see exactly what libc function the wasm guest called last when it
-     * crashes without a useful host-visible error. */
-    if (getenv("YOS_BRG_TRACE")) yos_brg_trace = 1;
-
     /* Crash diagnostics. The crashing thread on darwin can have a
      * corrupted stack (e.g. wasm3 jumped into garbage) — install a
      * sigaltstack so the handler has somewhere safe to run. Use
@@ -2003,6 +2078,7 @@ int main(int argc, char **argv)
      * thread via pthread_kill(). Forked procs get this filled in by
      * the fork-thread spawn path. */
     proc->thread = pthread_self();
+    /* proc->ctx_handle set just after ctx is declared below. */
 
     /* Initialize process info */
     if (!getcwd(proc->cwd, sizeof(proc->cwd)))
@@ -2020,6 +2096,7 @@ int main(int argc, char **argv)
     ctx.rt = &g_runtime;
     yos_brg_dump_ctx = &ctx;
     ctx.proc = proc;
+    proc->ctx_handle = &ctx;
     ctx.argc = argc - 1;
     ctx.argv = argv + 1;
     ctx.envc = g_runtime.envc;

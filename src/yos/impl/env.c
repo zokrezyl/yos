@@ -30,7 +30,7 @@
 #include <errno.h>
 
 #include "yos/types.h"
-#include "yos/ydebug.h"
+#include <yos/ytrace/ytrace.h>
 #include "impl/errno_helpers.h"
 
 extern uint32_t yos_malloc(struct yos_exec_ctx *ctx, uint32_t size);
@@ -155,6 +155,26 @@ int32_t yos_setenv(struct yos_exec_ctx *ctx, uint32_t name_off,
     const char *value = (const char *)(ctx->memory + value_off);
     if (!*name || strchr(name, '=') != NULL)
         return yos_errno_neg(ctx, EINVAL);
+
+    /* YTRACE_* env vars take effect immediately on the host trace
+     * system, so the guest-side `ytrace` wrapper (a tiny setenv +
+     * execvp wasm program) can flip tracing on for the child it's
+     * about to exec. Without this, setenv() only updates the
+     * per-process g_env store and the next exec'd child inherits
+     * it for its own getenv() lookups — but the HOST'S ytrace
+     * registry (process-wide, not per-ctx) never learns about the
+     * change because that lives outside the guest's env model. */
+    if (strcmp(name, "YTRACE_DEFAULT_ON") == 0) {
+        extern void ytrace_set_all_enabled(bool);
+        bool on = (strcmp(value, "yes") == 0 || strcmp(value, "1") == 0 ||
+                   strcmp(value, "true") == 0);
+        ytrace_set_all_enabled(on);
+    } else if (strcmp(name, "YTRACE_FILE_PREFIX") == 0) {
+        /* Propagate to host setenv so ytrace.c's per-thread file
+         * re-open (driven by yos_ytrace_set_comm on each new comm)
+         * picks up the new prefix. */
+        setenv("YTRACE_FILE_PREFIX", value, 1);
+    }
 
     int idx = find_entry(&g_env, ctx, name);
     if (idx >= 0) {

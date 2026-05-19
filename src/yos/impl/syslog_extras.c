@@ -50,7 +50,7 @@
 #include "m3_env.h"
 
 #include "yos/types.h"
-#include "yos/ydebug.h"
+#include <yos/ytrace/ytrace.h>
 #include "impl/errno_helpers.h"
 
 extern int yos_fd_get(struct yos_exec_ctx *, int);

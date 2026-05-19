@@ -1,6 +1,8 @@
 # yos host runtime.
 #
-#   types.h, ydebug.h    runtime struct + debug macros (top-level)
+#   types.h              runtime struct (top-level). Trace/debug macros
+#                        (ydebug/yinfo/ywarn/yerror/ytrace) come from
+#                        include/yos/ytrace/ytrace.h.
 #   main.c               entry: load wasm, link imports, run _start
 #
 #   impl/proc.c          yos_fork / yos_getpid / yos_kill / yos_waitpid / ...
