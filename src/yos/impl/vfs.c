@@ -11,6 +11,7 @@
 #include "host64_structs.h"
 #include "struct_convert.h"
 #include <stdint.h>
+#include <stdlib.h>             /* getenv */
 #include <unistd.h>
 #include <fcntl.h>
 #include <errno.h>
