@@ -844,6 +844,20 @@ d_m3Op  (Entry)
     IM3Function function = immediate (IM3Function);
     IM3Memory memory = m3MemInfo (_mem);
 
+    /* yperf hot path: enter every wasm function. The actual logging
+     * is gated on g_yperf_enabled inline so the disabled-cost is one
+     * relaxed atomic load + one predictable branch. yperf_enter
+     * takes the function name for lazy symbol-table registration —
+     * it survives proc-reap, which the dumper's proc walker can't.
+     * Externs declared at file scope so wasm3 stays standalone; the
+     * symbols come from libyos at link. */
+    extern _Atomic _Bool g_yperf_enabled;
+    extern void yperf_enter(const void *, const char *);
+    extern void yperf_exit(void);
+    bool _yp_on = __atomic_load_n((bool *)&g_yperf_enabled, __ATOMIC_RELAXED);
+    if (_yp_on) yperf_enter((const void *)function,
+                            m3_GetFunctionName(function));
+
 #if d_m3SkipStackCheck
     if (true)
 #else
@@ -875,6 +889,8 @@ d_m3Op  (Entry)
 #endif
 
         m3ret_t r = nextOpImpl ();
+
+        if (_yp_on) yperf_exit();
 
 #if d_m3EnableStrace >= 2
         trace_rt->callDepth--;

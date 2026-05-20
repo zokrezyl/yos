@@ -174,6 +174,36 @@ int32_t yos_setenv(struct yos_exec_ctx *ctx, uint32_t name_off,
          * re-open (driven by yos_ytrace_set_comm on each new comm)
          * picks up the new prefix. */
         setenv("YTRACE_FILE_PREFIX", value, 1);
+    } else if (strcmp(name, "YPERF") == 0) {
+        extern void yperf_set_enabled(bool);
+        extern void yperf_dump_and_reset(void);
+        if (strcmp(value, "stop") == 0) {
+            /* "stop" → flush captured profile to YPERF_FILE and
+             * disable recording. Used by the guest-side `yperf`
+             * wrapper after wait()-ing for the child it was
+             * profiling, so the dump is bounded to that child's
+             * lifetime. The next setenv("YPERF","yes") begins a
+             * fresh capture. */
+            yperf_dump_and_reset();
+        } else {
+            bool on = (strcmp(value, "yes") == 0 || strcmp(value, "1") == 0 ||
+                       strcmp(value, "true") == 0);
+            yperf_set_enabled(on);
+        }
+    } else if (strcmp(name, "YPERF_FILE") == 0) {
+        /* yperf reads YPERF_FILE at dump time via getenv, so push
+         * to the host env so the eventual atexit-driven dump finds
+         * it. Mirrors the YTRACE_FILE_PREFIX path above. */
+        setenv("YPERF_FILE", value, 1);
+    } else if (strcmp(name, "YPERF_RING_SIZE") == 0) {
+        /* Read by yperf_init when each host thread allocates its
+         * per-thread ring. Push to host env so the alloc picks the
+         * caller's chosen capacity. Threads that have already
+         * allocated keep their existing size — only NEW threads
+         * (e.g. the fork'd child the wrapper is about to exec)
+         * see the new value, which is exactly the per-app scope
+         * we want. */
+        setenv("YPERF_RING_SIZE", value, 1);
     }
 
     int idx = find_entry(&g_env, ctx, name);

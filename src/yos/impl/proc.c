@@ -1822,6 +1822,17 @@ int32_t yos_kill(struct yos_exec_ctx *ctx, int32_t pid, int32_t sig)
     return 0;
 }
 
+/* yos_proc_kill_by_pid — deliver `sig` to guest `pid` without a calling
+ * ctx. Used by the yctl daemon (a host-only pthread that has no
+ * struct yos_exec_ctx of its own) to drive proc.kill from RPC. Returns
+ * 0 on success, -errno on failure (ESRCH, etc.). */
+int yos_proc_kill_by_pid(struct yos_runtime *rt, int32_t pid, int32_t sig)
+{
+    struct yos_proc *p = yos_proc_find(rt, pid);
+    if (!p) return -ESRCH;
+    return deliver_to_proc(p, sig);
+}
+
 /* wait3(status, options, rusage) — equivalent to waitpid(-1, status,
  * options) with rusage data. zsh's `wait_for_processes` uses wait3
  * with WNOHANG to drain zombies after a SIGCHLD. The bridge previously

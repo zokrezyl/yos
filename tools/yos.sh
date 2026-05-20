@@ -1,31 +1,22 @@
 #!/usr/bin/env bash
-# yos.sh — launch yos with sensible defaults.
+# yos.sh — thin wrapper that execs the umbrella's yos with libexec on PATH.
 #
-#   ./tools/yos.sh                       interactive wasm zsh
-#   ./tools/yos.sh -c 'echo hi'          one-shot zsh
-#   ./tools/yos.sh nvim FILE             run a libexec tool directly
+# Everything you pass is forwarded to yos. Any leading `--*` flags are
+# host flags consumed by yos itself; the first non-flag is the wasm
+# program (bare libexec names like `zsh`/`nvim` are auto-expanded to
+# their absolute umbrella path).
 #
-# Server mode (runit-driven supervisor):
-#
+#   ./tools/yos.sh --help                            forwarded to yos
+#   ./tools/yos.sh zsh                               interactive wasm zsh
+#   ./tools/yos.sh zsh -c 'echo hi'                  one-shot zsh
+#   ./tools/yos.sh nvim FILE                         libexec tool
+#   ./tools/yos.sh --yctl-socket /tmp/yos.sock zsh   yctl daemon + zsh
 #   ./tools/yos.sh --server [--log-dir DIR] [--daemon]
+#                                                    runit supervisor mode
 #
-#   --server      Skip zsh and exec runsvdir on the service dir
-#                 under <repo>/runtime/runit/. Each subdir is a
-#                 runit service; runsvdir spawns one runsv per.
-#                 Pass --server to the yos host too — reserved for
-#                 future server-aware behaviour (today it's a
-#                 no-op other than flag presence).
-#   --daemon      Daemonize the yos host: fork+setsid+fork, chdir
-#                 to /, redirect stdio to <log-dir>/yos-server.log,
-#                 write PID to <log-dir>/yos-server.pid. Implies
-#                 --server. Requires --log-dir.
-#   --log-dir DIR
-#                 Catch-all log directory. Default = <repo>/runtime/logs.
-#                 The yos host writes its stderr there when --daemon
-#                 is set; LOG_DIR=<dir> is exported into runsvdir's
-#                 env so each service's log/run script can
-#                 `exec svlogd $LOG_DIR/<svc>` for per-service
-#                 rotating files.
+# There is no zsh-by-default — pass `zsh` explicitly if that's what
+# you want. A bare `./tools/yos.sh` execs `yos` with no args, which
+# prints yos's own usage line.
 #
 # Builds .#all on first run (nix path-info is read-only — won't build).
 set -euo pipefail
@@ -39,23 +30,51 @@ if [ -z "$ALL" ] || [ ! -e "$ALL" ]; then
     ALL="$(nix path-info .#all)"
 fi
 
-# ── parse server-mode flags from the FRONT of argv ───────────────────
+# ── collect every leading `--*` flag and pass through to yos ─────────
+# We also notice --server / --daemon / --log-dir so the script can pick
+# the runit default program when no explicit one is given. Everything
+# else (--yctl-socket, anything added later) is passed through verbatim
+# without the script needing to know about it.
+HOST_FLAGS=()
 SERVER=0
 DAEMON=0
 LOG_DIR=""
 while [ "$#" -gt 0 ]; do
     case "$1" in
-        --server)  SERVER=1; shift ;;
-        --daemon)  DAEMON=1; SERVER=1; shift ;;
-        --log-dir) LOG_DIR="$2"; shift 2 ;;
-        --log-dir=*) LOG_DIR="${1#--log-dir=}"; shift ;;
-        *) break ;;
+        --server)
+            SERVER=1; HOST_FLAGS+=("$1"); shift ;;
+        --daemon)
+            DAEMON=1; SERVER=1; HOST_FLAGS+=("$1"); shift ;;
+        --log-dir)
+            LOG_DIR="$2"; HOST_FLAGS+=("$1" "$2"); shift 2 ;;
+        --log-dir=*)
+            LOG_DIR="${1#--log-dir=}"; HOST_FLAGS+=("$1"); shift ;;
+        --)
+            shift; break ;;
+        --*=*)
+            HOST_FLAGS+=("$1"); shift ;;
+        --*)
+            # Two-arg form like `--yctl-socket PATH`. We don't enforce
+            # which flags do/don't take a value — yos's own parser is
+            # authoritative. If the next token is also a `--*` flag,
+            # treat the current one as a bare flag.
+            if [ "$#" -ge 2 ] && [ "${2#-}" = "$2" ]; then
+                HOST_FLAGS+=("$1" "$2"); shift 2
+            else
+                HOST_FLAGS+=("$1"); shift
+            fi ;;
+        *)
+            break ;;
     esac
 done
 
 if [ "$SERVER" = 1 ]; then
-    # Default log dir → repo/runtime/logs.
-    [ -n "$LOG_DIR" ] || LOG_DIR="$REPO/runtime/logs"
+    # Default log dir → repo/runtime/logs. Make sure the flag is in
+    # HOST_FLAGS so the yos binary sees it — append if not already.
+    [ -n "$LOG_DIR" ] || {
+        LOG_DIR="$REPO/runtime/logs"
+        HOST_FLAGS+=("--log-dir" "$LOG_DIR")
+    }
     mkdir -p "$LOG_DIR"
 
     SVCDIR="$REPO/runtime/runit"
@@ -64,36 +83,31 @@ if [ "$SERVER" = 1 ]; then
         exit 1
     fi
 
-    # exec yos → runsvdir on the service dir. Pass --server / --daemon /
-    # --log-dir to the yos binary so the daemonize dance happens HOST-
-    # side (before wasm load) and so the LOG_DIR env var is set for
-    # every forked service. PATH is the umbrella libexec/ so each
-    # service's `run` can exec wasm tools by bare name.
-    set -- "$ALL/bin/yos" \
-           --server \
-           $([ "$DAEMON" = 1 ] && echo --daemon) \
-           --log-dir "$LOG_DIR" \
-           "$ALL/libexec/runsvdir" -P "$SVCDIR"
-    # YOS_LIBEXEC is the umbrella's libexec/ on the HOST filesystem
-    # (a real /nix/store path). Service `run` scripts that need to
-    # set PATH explicitly (because something upstream wiped it, or
-    # because a sub-spawned shell needs an absolute fallback) can
-    # use `export PATH=$YOS_LIBEXEC`. yos's wasm guest sees these
-    # absolute store paths verbatim — there's no separate vfs root.
+    # Default program in server mode is runsvdir on the repo's runit
+    # service dir, unless the user supplied an explicit one.
+    if [ "$#" -eq 0 ]; then
+        set -- "$ALL/libexec/runsvdir" -P "$SVCDIR"
+    fi
     exec env PATH="$ALL/libexec" \
              LOG_DIR="$LOG_DIR" \
              YOS_LIBEXEC="$ALL/libexec" \
-             "$@"
+             "$ALL/bin/yos" "${HOST_FLAGS[@]}" "$@"
 fi
 
-# ── non-server mode (interactive / one-shot) ────────────────────────
-# Three invocation shapes:
-#   ./tools/yos.sh                   → interactive zsh
-#   ./tools/yos.sh -c 'echo hi'      → forwarded to zsh -c
-#   ./tools/yos.sh -<flag>           → forwarded to zsh
-#   ./tools/yos.sh nvim file.txt     → exec libexec/nvim directly under yos
-if [ "$#" -gt 0 ] && [ -e "$ALL/libexec/$1" ] && [ "${1#-}" = "$1" ]; then
+# ── non-server mode ──────────────────────────────────────────────────
+# A bare libexec name (zsh, nvim, …) is rewritten to its absolute
+# umbrella path so the wasm loader can find it. Anything starting with
+# `/` or `.` passes through. With no program at all we still exec yos —
+# yos's own argument parser then handles `--help`, prints usage for a
+# bare invocation, etc. The script is a thin pass-through.
+if [ "$#" -gt 0 ]; then
     PROG="$1"; shift
-    exec env PATH="$ALL/libexec" "$ALL/bin/yos" "$ALL/libexec/$PROG" "$@"
+    case "$PROG" in
+        /*|./*|../*) ;;
+        *) [ -e "$ALL/libexec/$PROG" ] && PROG="$ALL/libexec/$PROG" ;;
+    esac
+    set -- "$PROG" "$@"
 fi
-exec env PATH="$ALL/libexec" "$ALL/bin/yos" "$ALL/libexec/zsh" "$@"
+
+exec env PATH="$ALL/libexec" \
+         "$ALL/bin/yos" "${HOST_FLAGS[@]}" "$@"

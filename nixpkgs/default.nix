@@ -176,6 +176,24 @@ let
   # PATH (the yos-shell sandbox) picks it up.
   ytrace-wasm = pkgs.callPackage ./pkgs/ytrace-wasm { inherit toolchain sysroot; };
 
+  # yperf — guest-side per-app wrapper around the host's wasm-function
+  # profile recorder. fork+exec+wait+stop pattern; needs asyncify
+  # (see yos-tcpserver for the same rationale).
+  yperf-wasm = pkgs.callPackage ./pkgs/yperf-wasm { inherit toolchain sysroot; };
+
+  # yctl — client for the runtime introspection + control daemon. Same
+  # .c builds twice: wasm32 guest binary in libexec/ (yctl-wasm) and a
+  # host binary in bin/ (yctl-host). Both connect to the AF_UNIX socket
+  # the yos host opens when launched with `--yctl-socket PATH`.
+  yctl-wasm = pkgs.callPackage ./pkgs/yctl {
+    inherit toolchain sysroot;
+    msgpack-c = msgpack-c;   # wasm32 msgpack-c built by our buildRecipe
+  };
+  yctl-host = pkgs.callPackage ./pkgs/yctl-host {
+    msgpack-c = pkgs.msgpack-c;
+    yctlSrc   = ./pkgs/yctl;
+  };
+
   # Umbrella package: every user-facing yos artefact merged into one
   # tree via symlinkJoin. Lets users do
   #   nix run .#                    # drops into wasm zsh under yos (sandbox)
@@ -192,7 +210,7 @@ let
   # sandbox boundary.
   all = pkgs.symlinkJoin {
     name = "yos-all";
-    paths = [ yos zsh nvim freebsd-tools openssh perf-stress runit telnetd yos-tcpserver ytrace-wasm ];  # cpython disabled — see above
+    paths = [ yos zsh nvim freebsd-tools openssh perf-stress runit telnetd yos-tcpserver ytrace-wasm yperf-wasm yctl-wasm yctl-host ];  # cpython disabled — see above
     postBuild = ''
       cat > $out/bin/yos-shell <<RUNNER_EOF
       #!/usr/bin/env bash
@@ -279,5 +297,8 @@ in {
           telnetd
           yos-tcpserver
           ytrace-wasm
+          yperf-wasm
+          yctl-wasm
+          yctl-host
           all;
 }

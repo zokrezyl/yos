@@ -1,6 +1,7 @@
 { stdenv, lib, fetchurl, fetchFromGitHub
 , meson, ninja, pkg-config, python3, llvmPackages_18, binaryen
 , libffi, libiconv, apple-sdk_13 ? null
+, msgpack-c
 , src
 }:
 
@@ -80,6 +81,10 @@ in stdenv.mkDerivation {
 
   buildInputs = [
     libffi
+    # Host msgpack-c — yctl daemon's RPC encoder/decoder
+    # (src/yos/yctl/yctl.c). pkg-config picks the `msgpack-c` (or older
+    # `msgpack`) module up from this input.
+    msgpack-c
   ] ++ lib.optionals stdenv.isDarwin [
     libiconv
     # Without this, nix's stdenv on darwin gates libSystem at the 10.12

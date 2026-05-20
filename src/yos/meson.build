@@ -45,6 +45,14 @@ python_embed_dep = dependency('python3-embed', required: false)
 # extras). yos's bridge calls those names, so we need explicit linkage
 # wherever it isn't already in libc.
 iconv_dep = cc.find_library('iconv', required: false)
+# msgpack-c — host-side library, used by yctl/yctl.c for the
+# msgpack-RPC introspection daemon (--yctl-socket PATH).
+# Upstream pkg-config name flipped between '-c' and bare 'msgpack'
+# across versions; accept either.
+msgpack_dep = dependency('msgpack-c', required: false)
+if not msgpack_dep.found()
+  msgpack_dep = dependency('msgpack', required: true)
+endif
 
 subdir('codegen')        # api_bridge_dep, yos_imports.h
 
@@ -113,6 +121,14 @@ yos_runtime_sources = files(
   # ytime_start/ytime_report timer macros; ytrace.c provides the
   # registry, output formatting and runtime enable/disable.
   'ytrace/ytrace.c',
+  # yperf — per-call profile recorder. See include/yos/yperf/yperf.h.
+  # Hot path lives in vendored wasm3's op_Entry; this file owns
+  # state, dumping and the symbol-walker callback wiring.
+  'yperf/yperf.c',
+  # yctl — msgpack-RPC introspection + control daemon. Listens on a
+  # unix socket when yos is launched with `--yctl-socket PATH`.
+  # See include/yos/yctl/yctl.h.
+  'yctl/yctl.c',
   'yplatform/time/default.c',
   'yplatform/thread/default.c',
   'yplatform/term/default.c',
@@ -138,6 +154,7 @@ yos_exe = executable(
     m_dep,
     iconv_dep,           # darwin/BSD: separate libiconv
     python_embed_dep,    # libpython3.12.so for env.Py_* bridges
+    msgpack_dep,         # host msgpack-c for yctl daemon
   ],
   c_args : [
     '-D_GNU_SOURCE',

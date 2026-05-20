@@ -37,4 +37,7 @@ int32_t yos_gettid(struct yos_exec_ctx *ctx);
 int32_t yos_setpgid(struct yos_exec_ctx *ctx, int32_t pid, int32_t pgid);
 int32_t yos_setsid(struct yos_exec_ctx *ctx);
 
+/* Public kill-by-pid for ctx-less callers (yctl daemon). */
+int yos_proc_kill_by_pid(struct yos_runtime *rt, int32_t pid, int32_t sig);
+
 #endif /* YOS_PROC_H */

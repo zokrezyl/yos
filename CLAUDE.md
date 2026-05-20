@@ -487,6 +487,27 @@ Bridges return wasm offsets, not host pointers.
 
 ## Common mistakes I have made and must not repeat
 
+- **Forgetting that the primary deployment target is iOS / tvOS
+  and treating "performance" as if any JIT is on the table.**
+  Apple's app sandbox forbids `mmap(PROT_EXEC)` / `MAP_JIT` in
+  shipping apps. Wasmtime, wasmer, LuaJIT, V8 — every native
+  code-generating runtime is OFF the table. wasm3 is in the tree
+  *because* it's an interpreter; that's the whole reason. When
+  the user asks how to speed something up, do NOT suggest:
+  swapping wasm3 for a JITting wasm runtime, using LuaJIT,
+  using LLVM-backed JIT'd Lua (Ravi etc.), anything that emits
+  host machine code at runtime, or anything that says "Cranelift"
+  / "Liftoff" / "Baseline JIT". The legitimate speedup paths
+  are: (a) generate WASM BYTECODE at runtime and load via
+  `m3_LoadModule` — wasm-interpreter sees more wasm, no native
+  code escapes the sandbox; (b) synthesise `M3Function->compiled`
+  op streams directly (we own wasm3), skipping the bytecode
+  parse — still pure data + statically-compiled op handlers,
+  Apple-store-safe; (c) AOT compile slow guests (e.g. lua-to-wasm)
+  so the inner interpreter goes away. All three live entirely
+  inside wasm bytecode / wasm3 op-pointer data; none ever calls
+  `mprotect(PROT_EXEC)`. Internalise this — the user has had to
+  re-explain it more than once.
 - **Reading from yos-sandbox.** That tree is older and the
   layout (no mmap_top anchor, no TLS pool, no procfs, no real
   fork) is wrong. Always read from yos-private.

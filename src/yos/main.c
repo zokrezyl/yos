@@ -19,6 +19,8 @@
 #include "platform.h"
 #include "yos/types.h"
 #include <yos/ytrace/ytrace.h>
+#include <yos/yperf/yperf.h>
+#include <yos/yctl/yctl.h>
 #include "yos/vfs/mount.h"
 #include "yos/vfs/procfs.h"
 #include "impl/pthread.h"
@@ -1647,6 +1649,33 @@ static uint8_t *load_file(const char *path, size_t *out_size)
 /* Global runtime - process table shared across all processes */
 static struct yos_runtime g_runtime;
 
+/* yperf symbol walker — called on dump to resolve recorded
+ * M3Function* handles back to readable names. Iterates every
+ * proc's runtime modules. yos_proc.ctx_handle gives the back-link
+ * to the running ctx, ctx->runtime is the M3Runtime, and
+ * runtime->modules is a linked list of M3Module each with a
+ * functions[] array. Skips reaped procs (ctx_handle NULL). */
+static void yperf_walk_procs(yperf_emit_fn emit)
+{
+    pthread_mutex_lock(&g_runtime.proc_lock);
+    for (int i = 0; i < YOS_MAX_PROCS; i++) {
+        struct yos_proc *p = &g_runtime.procs[i];
+        if (p->state == YOS_PROC_FREE) continue;
+        struct yos_exec_ctx *ctx = (struct yos_exec_ctx *)p->ctx_handle;
+        if (!ctx || !ctx->runtime) continue;
+        IM3Runtime rt = (IM3Runtime)ctx->runtime;
+        for (IM3Module mod = rt->modules; mod; mod = mod->next) {
+            for (u32 fi = 0; fi < mod->numFunctions; fi++) {
+                IM3Function fn = &mod->functions[fi];
+                if (!fn->compiled) continue;
+                const char *name = m3_GetFunctionName(fn);
+                emit((const void *)fn, name ? name : "<anon>");
+            }
+        }
+    }
+    pthread_mutex_unlock(&g_runtime.proc_lock);
+}
+
 /* Forward declarations */
 extern struct yos_proc *yos_proc_alloc(struct yos_runtime *rt, int32_t ppid);
 extern void yos_fork_pump(struct yos_exec_ctx *ctx);
@@ -1872,9 +1901,14 @@ int main(int argc, char **argv)
     int   g_server  = 0;
     int   g_daemon  = 0;
     char *g_log_dir = NULL;
+    char *g_yctl_sock = NULL;
+    int   g_show_help = 0;
     {
         int w = 1;
         for (int i = 1; i < argc; i++) {
+            if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
+                g_show_help = 1; continue;
+            }
             if (strcmp(argv[i], "--server") == 0) {
                 g_server = 1; continue;
             }
@@ -1884,17 +1918,47 @@ int main(int argc, char **argv)
             if (strcmp(argv[i], "--log-dir") == 0 && i + 1 < argc) {
                 g_log_dir = argv[++i]; continue;
             }
+            /* --yctl-socket PATH: enable the msgpack-RPC introspection
+             * + control daemon on a unix socket. See
+             * include/yos/yctl/yctl.h. Off when the flag is absent. */
+            if (strcmp(argv[i], "--yctl-socket") == 0 && i + 1 < argc) {
+                g_yctl_sock = argv[++i]; continue;
+            }
             argv[w++] = argv[i];
         }
         argc = w;
     }
 
-    if (argc < 2) {
+    if (g_show_help) {
+        printf(
+"usage: yos [HOST FLAGS] <program.wasm> [args...]\n"
+"\n"
+"Host flags (consumed by yos itself, before the wasm program):\n"
+"  -h, --help              show this help and exit\n"
+"  --server                runit supervisor mode marker (cosmetic)\n"
+"  --daemon                fork+setsid+fork; redirect stdio to <log-dir>\n"
+"                          (requires --log-dir)\n"
+"  --log-dir DIR           catch-all log directory; also exported as\n"
+"                          LOG_DIR for forked services\n"
+"  --yctl-socket PATH      bind the introspection + control daemon\n"
+"                          on a unix socket — see yctl(1)\n"
+"\n"
+"Everything after the first non-flag is the wasm program + its argv.\n");
+        return 0;
+    }
+
+    /* argc < 2 means no wasm program. That's only OK if --yctl-socket
+     * was given — in which case we run as an idle introspection server:
+     * bind the socket, init the (empty) runtime, then sit on pause(2)
+     * until SIGINT/SIGTERM. Useful for testing the RPC surface and as
+     * the natural home for a future spawn-via-RPC verb. */
+    if (argc < 2 && !g_yctl_sock) {
         fprintf(stderr,
                 "usage: yos [--server] [--daemon] [--log-dir DIR] "
-                "<program.wasm> [args...]\n");
+                "[--yctl-socket PATH] <program.wasm> [args...]\n");
         return 1;
     }
+    int g_idle = (argc < 2);
     if (g_daemon && !g_log_dir) {
         fprintf(stderr,
                 "yos: --daemon requires --log-dir DIR (stdio is "
@@ -2038,6 +2102,13 @@ int main(int argc, char **argv)
      * FreeBSD=20) when pushing to the pending bitmask. */
     yos_install_host_signal_handlers();
 
+    /* Initialise yperf early so YPERF env at startup is honoured.
+     * The symbol-resolution walker is registered now too so an
+     * early-exit dump (e.g. immediate trap) still gets readable
+     * function names rather than bare pointer addresses. */
+    yperf_init();
+    yperf_set_walker(yperf_walk_procs);
+
     /* Initialize global runtime */
     memset(&g_runtime, 0, sizeof(g_runtime));
     pthread_mutex_init(&g_runtime.proc_lock, NULL);
@@ -2063,6 +2134,29 @@ int main(int argc, char **argv)
     yos_mount_table_init(&mount_table);
     yos_mount_add(&mount_table, "/proc", &yos_procfs_ops);
     g_runtime.mount_table = &mount_table;
+
+    /* yctl: spin up the introspection/control daemon if --yctl-socket
+     * was given. The accept loop runs on a detached host pthread; failure
+     * to bind is loud but non-fatal — yos itself still runs the guest. */
+    if (g_yctl_sock) {
+        if (yctl_start(&g_runtime, g_yctl_sock) != 0) {
+            fprintf(stderr, "yos: yctl: bind %s failed: %s\n",
+                    g_yctl_sock, strerror(errno));
+        }
+    }
+
+    /* Idle mode: --yctl-socket given but no wasm program. Daemon is
+     * already running on the host pthread; just block here until
+     * SIGINT/SIGTERM kills the process. The proc table stays empty so
+     * yctl `proc.list` returns []. */
+    if (g_idle) {
+        fprintf(stderr,
+                "yos: idle, yctl listening on %s (Ctrl-C to exit)\n",
+                g_yctl_sock);
+        for (;;) pause();
+        /* unreachable */
+        return 0;
+    }
 
     IM3Environment env = m3_NewEnvironment();
 
