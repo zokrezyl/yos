@@ -602,6 +602,24 @@ variadic:
 stub:
   - process_vm_readv
   - process_vm_writev
+  # cget* — FreeBSD libc termcap-style database lookup. Auto-bridge
+  # generates `(char **)(ctx->memory + a)` for the `char **db_array`
+  # argument and passes that straight to host cgetent. Host libc then
+  # dereferences entries that hold wasm offsets, not host pointers,
+  # and segfaults inside _platform_strlen. Stubbing returns -1
+  # (entry not found), which makes telnetd / login / similar callers
+  # fall back to defaults. Real fix is a hand-written bridge that
+  # translates the inner array; until then this keeps the host alive.
+  - cgetent
+  - cgetcap
+  - cgetfirst
+  - cgetnext
+  - cgetstr
+  - cgetustr
+  - cgetnum
+  - cgetmatch
+  - cgetclose
+  - cgetset
   - epoll_create
   - epoll_create1
   - epoll_ctl

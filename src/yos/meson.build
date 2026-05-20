@@ -39,7 +39,14 @@ m_dep = cc.find_library('m', required: true)
 # the yos host so wasm guests can drive it through env.Py_* bridges
 # (impl/libpython.c). Optional: if libpython isn't installed, the
 # bridges still compile but every Py_* call traps with unresolved-symbol.
-python_embed_dep = dependency('python3-embed', required: false)
+with_libpython_opt = get_option('with_libpython')
+if with_libpython_opt.disabled()
+  python_embed_dep = dependency('', required: false)
+  have_libpython = false
+else
+  python_embed_dep = dependency('python3-embed', required: with_libpython_opt)
+  have_libpython = python_embed_dep.found()
+endif
 # iconv: glibc folds it into libc; darwin/BSD ship a separate libiconv
 # whose symbols start with `iconv_*` (and `__iconv_*` for the GNU
 # extras). yos's bridge calls those names, so we need explicit linkage
@@ -49,9 +56,16 @@ iconv_dep = cc.find_library('iconv', required: false)
 # msgpack-RPC introspection daemon (--yctl-socket PATH).
 # Upstream pkg-config name flipped between '-c' and bare 'msgpack'
 # across versions; accept either.
-msgpack_dep = dependency('msgpack-c', required: false)
-if not msgpack_dep.found()
-  msgpack_dep = dependency('msgpack', required: true)
+with_yctl_opt = get_option('with_yctl')
+if with_yctl_opt.disabled()
+  msgpack_dep = dependency('', required: false)
+  have_yctl = false
+else
+  msgpack_dep = dependency('msgpack-c', required: false)
+  if not msgpack_dep.found()
+    msgpack_dep = dependency('msgpack', required: with_yctl_opt)
+  endif
+  have_yctl = msgpack_dep.found()
 endif
 
 subdir('codegen')        # api_bridge_dep, yos_imports.h
@@ -108,7 +122,6 @@ yos_runtime_sources = files(
   'impl/getopt.c',  # per-ctx getopt — closes optind/optarg/optopt/opterr leaks
   'impl/tz.c',      # per-ctx timezone — closes tzname/timezone/daylight leaks
   'impl/libc_globals_link.c',  # binds env.getopt / env.tzset to the above
-  'impl/libpython.c',
   # syslog (openlog/closelog/syslog) + FreeBSD libutil (login_tty,
   # realhostname_sa). Hand-bridged because the headers aren't in the
   # codegen extractor's api_top_headers list.
@@ -125,10 +138,6 @@ yos_runtime_sources = files(
   # Hot path lives in vendored wasm3's op_Entry; this file owns
   # state, dumping and the symbol-walker callback wiring.
   'yperf/yperf.c',
-  # yctl — msgpack-RPC introspection + control daemon. Listens on a
-  # unix socket when yos is launched with `--yctl-socket PATH`.
-  # See include/yos/yctl/yctl.h.
-  'yctl/yctl.c',
   'yplatform/time/default.c',
   'yplatform/thread/default.c',
   'yplatform/term/default.c',
@@ -142,28 +151,66 @@ yos_runtime_sources = files(
   'generated/struct_convert.c',
 )
 
+# Optional sources, gated by feature switches. Each is paired with a
+# preprocessor flag so main.c can compile out the wiring (#ifdef
+# YOS_HAVE_YCTL / YOS_HAVE_LIBPYTHON).
+optional_sources = []
+optional_args    = []
+optional_deps    = []
+if have_yctl
+  optional_sources += files('yctl/yctl.c')
+  optional_args    += '-DYOS_HAVE_YCTL=1'
+  optional_deps    += msgpack_dep
+endif
+if have_libpython
+  optional_sources += files('impl/libpython.c')
+  optional_args    += '-DYOS_HAVE_LIBPYTHON=1'
+  optional_deps    += python_embed_dep
+endif
+
+yos_common_c_args = [
+  '-D_GNU_SOURCE',
+  '-Wno-unused-parameter',
+  '-Wno-unused-but-set-variable',
+  '-Wno-unused-variable',
+  '-Wno-unused-function',
+  '-Wno-implicit-fallthrough',
+  '-Wno-format-overflow',
+] + optional_args
+
+yos_common_deps = [
+  wasm3_dep,
+  api_bridge_dep,      # m3w_<fn> wrappers + yos_brg_link_imports()
+  threads_dep,
+  m_dep,
+  iconv_dep,           # darwin/BSD: separate libiconv
+] + optional_deps
+
 yos_exe = executable(
   'yos',
   yos_runtime_sources,
   platform_sources,
+  optional_sources,
   include_directories : yos_inc,
-  dependencies : [
-    wasm3_dep,
-    api_bridge_dep,      # m3w_<fn> wrappers + yos_brg_link_imports()
-    threads_dep,
-    m_dep,
-    iconv_dep,           # darwin/BSD: separate libiconv
-    python_embed_dep,    # libpython3.12.so for env.Py_* bridges
-    msgpack_dep,         # host msgpack-c for yctl daemon
-  ],
-  c_args : [
-    '-D_GNU_SOURCE',
-    '-Wno-unused-parameter',
-    '-Wno-unused-but-set-variable',
-    '-Wno-unused-variable',
-    '-Wno-unused-function',
-    '-Wno-implicit-fallthrough',
-    '-Wno-format-overflow',
-  ],
+  dependencies : yos_common_deps,
+  c_args : yos_common_c_args,
   install : false,
 )
+
+# tvOS / iOS app bundles need a static library: the bundle's launcher
+# (build-tools/tvos/launcher.m) provides main() + UIApplicationMain and
+# pthread_create's a worker that jumps to yos_main(). Same sources as
+# the executable, just compiled with -DYOS_AS_LIBRARY so main.c emits
+# `yos_main` instead of `main`. See -Dbuild_static_lib=true.
+if get_option('build_static_lib')
+  yos_static = static_library(
+    'yos',
+    yos_runtime_sources,
+    platform_sources,
+    optional_sources,
+    include_directories : yos_inc,
+    dependencies : yos_common_deps,
+    c_args : yos_common_c_args + ['-DYOS_AS_LIBRARY=1'],
+    install : false,
+  )
+endif

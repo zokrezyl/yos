@@ -20,7 +20,9 @@
 #include "yos/types.h"
 #include <yos/ytrace/ytrace.h>
 #include <yos/yperf/yperf.h>
+#ifdef YOS_HAVE_YCTL
 #include <yos/yctl/yctl.h>
+#endif
 #include "yos/vfs/mount.h"
 #include "yos/vfs/procfs.h"
 #include "impl/pthread.h"
@@ -1577,9 +1579,14 @@ void yos_link_imports(IM3Module module, struct yos_exec_ctx *ctx)
 
     /* libpython 3.12 — env.Py_Initialize / Py_Finalize / PyRun_SimpleString.
      * The yos host links against libpython3.12.so; the wasm guest is a
-     * tiny driver that imports these names. See impl/libpython.c. */
+     * tiny driver that imports these names. See impl/libpython.c.
+     * When the build is configured with -Dwith_libpython=disabled (e.g.
+     * iOS sim where libpython3.12 isn't in the SDK), the symbol isn't
+     * compiled in; guests calling Py_* see unresolved-import traps. */
+#ifdef YOS_HAVE_LIBPYTHON
     extern void yos_libpython_link(IM3Module mod);
     yos_libpython_link(module);
+#endif
 
     /* Auto-generated bridges for the FreeBSD-libc-name import surface.
      * For guests that import each libc fn by name (env.write, env.read,
@@ -1876,8 +1883,32 @@ static void free_exec_argv(struct yos_exec_ctx *ctx)
 
 extern char **environ;
 
+/* When YOS_AS_LIBRARY is set (tvOS / iOS app-bundle builds), the
+ * binary's actual main() is provided by build-tools/tvos/launcher.m
+ * (or similar) — it spins up the app shell on the system thread and
+ * pthread_create's a worker that calls into here. We expose this
+ * entry as yos_main() in that mode. CLI builds keep the standard
+ * `main()` symbol. */
+#ifdef YOS_AS_LIBRARY
+int yos_main(int argc, char **argv)
+#else
 int main(int argc, char **argv)
+#endif
 {
+    /* ── early env override ──────────────────────────────────────────
+     * Some launchers (notably `xcrun simctl spawn` on iOS simulators)
+     * overwrite PATH with their own runtime sysroot before our binary
+     * ever sees the caller's value, and there is no flag to opt out.
+     * Honour a YOS_PATH escape hatch: if set, treat it as the
+     * authoritative PATH for the rest of this process (and so for the
+     * wasm guests we exec). Cheap, contained, no-op when unset. */
+    {
+        const char *forced_path = getenv("YOS_PATH");
+        if (forced_path && *forced_path) {
+            setenv("PATH", forced_path, 1);
+        }
+    }
+
     /* ── server-mode flags ───────────────────────────────────────────
      *
      * Strip yos-host options from the front of argv BEFORE the wasm
@@ -2139,10 +2170,16 @@ int main(int argc, char **argv)
      * was given. The accept loop runs on a detached host pthread; failure
      * to bind is loud but non-fatal — yos itself still runs the guest. */
     if (g_yctl_sock) {
+#ifdef YOS_HAVE_YCTL
         if (yctl_start(&g_runtime, g_yctl_sock) != 0) {
             fprintf(stderr, "yos: yctl: bind %s failed: %s\n",
                     g_yctl_sock, strerror(errno));
         }
+#else
+        fprintf(stderr,
+                "yos: yctl support not compiled in (with_yctl=disabled); "
+                "ignoring --yctl-socket %s\n", g_yctl_sock);
+#endif
     }
 
     /* Idle mode: --yctl-socket given but no wasm program. Daemon is

@@ -12,7 +12,13 @@
 #include <unistd.h>
 #include <errno.h>
 #if defined(__APPLE__)
-#  include <sys/random.h>  /* getentropy lives here, not <unistd.h>, on darwin */
+#  if defined(__has_include) && __has_include(<sys/random.h>)
+#    include <sys/random.h>  /* getentropy lives here on macOS */
+#  else
+/* iPhoneSimulator SDK doesn't ship <sys/random.h>, but libSystem still
+ * exports getentropy. Forward-declare so the call links. */
+extern int getentropy(void *, size_t);
+#  endif
 #endif
 
 #include "yos/types.h"
