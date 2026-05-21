@@ -2,8 +2,8 @@
 #define _GNU_SOURCE   /* for the syscall() prototype in <unistd.h> */
 #include "yos/types.h"
 #include <yos/ytrace/ytrace.h>
-#include "impl/clone-abi.h"
-#include "errno_helpers.h"   /* yos_errno_neg — exec failure POSIX errno */
+#include "impl/proc/clone-abi.h"
+#include "impl/errno_helpers.h"   /* yos_errno_neg — exec failure POSIX errno */
 #include <stdint.h>
 #include <time.h>
 #include <unistd.h>

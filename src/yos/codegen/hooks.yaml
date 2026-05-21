@@ -12,7 +12,7 @@
 # name on `env.<name>`).
 #
 # Routing destinations:
-#   custom_vfs       -> yos_<name>(ctx, ...)  defined in src/yos/impl/vfs.c
+#   custom_vfs       -> yos_<name>(ctx, ...)  defined in src/yos/impl/io/io.c
 #   custom_proc      -> yos_<name>(ctx, ...)              src/yos/impl/proc.c
 #   custom_pthread   -> yos_<name>(ctx, ...)              src/yos/impl/pthread.c
 #   custom_mem       -> yos_<name>(ctx, ...)              src/yos/impl/mem.c
@@ -487,7 +487,7 @@ custom_vfs:
   # this bridge, every interactive zsh session traps with `env.poll
   # unresolved` the moment you press an arrow key (or any key zsh's
   # multi-byte sequence reader peeks ahead for). Hand-written in
-  # impl/vfs.c: translate per-pollfd fd through fd_map, leave events/
+  # impl/io/io.c: translate per-pollfd fd through fd_map, leave events/
   # revents unchanged (POLL* bit values match between FreeBSD and Linux).
   - poll
 
@@ -670,7 +670,7 @@ stub:
   # copy_file_range moved to custom_vfs — cp(1) probes it first and
   # falls back to read/write only on EINVAL, so the generic
   # -ENOSYS stub leaves cp emitting "Remote address changed" and
-  # producing a zero-byte destination. impl/vfs.c returns -EINVAL
+  # producing a zero-byte destination. impl/io/io.c returns -EINVAL
   # to keep cp on the portable fallback path until a real bridge
   # to host copy_file_range / sendfile lands.
   - recvmmsg

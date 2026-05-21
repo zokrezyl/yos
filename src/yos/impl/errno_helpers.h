@@ -2,7 +2,7 @@
  * error reporting from custom_<area> impls.
  *
  * The auto-generated bridges already do this dance after every host
- * libc call. Hand-written subsystem impls (impl/vfs.c, impl/proc.c,
+ * libc call. Hand-written subsystem impls (impl/io/io.c, impl/proc.c,
  * impl/mem.c, …) used to return `-errno` directly, which broke
  * caller checks like `if (rc == -1) ...` (every POSIX wrapper does
  * this) and meant the FreeBSD `errno` macro never reflected the

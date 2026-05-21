@@ -44,7 +44,7 @@ import yaml
 #  - **AT_FDCWD value mismatch.** FreeBSD/Linux use AT_FDCWD = -100;
 #    darwin uses -2. The wasm guest is FreeBSD-shaped so it always
 #    passes -100; if we forward that straight to a darwin host fstatat
-#    it reads -100 as "fd #-100" → EBADF. yos_xlate_dfd (impl/vfs.c)
+#    it reads -100 as "fd #-100" → EBADF. yos_xlate_dfd (impl/io/io.c)
 #    swaps -100 → host AT_FDCWD.
 #  - **fd_map translation.** Regular wasm fds are slot numbers into
 #    ctx->fd_map and must be looked up to get the host fd. Happens to
@@ -431,7 +431,7 @@ def _emit_bridge(name: str, gf: dict, hf: dict, gtypes: dict, htypes: dict,
                   tr[2] if len(tr) > 2 else '')
         # PATH args: route relative paths through yos_path_resolve so
         # they resolve against ctx->cwd (yos's faked per-process cwd —
-        # see comment on _PATH_ARG_FNS and impl/vfs.c::yos_path_resolve).
+        # see comment on _PATH_ARG_FNS and impl/io/io.c::yos_path_resolve).
         # The existing translation builds e.g. `(const char *)(ctx->memory
         # + a0)`; we wrap that in yos_path_resolve.
         if (i in path_arg_idxs and tr is not None

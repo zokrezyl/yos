@@ -31,7 +31,7 @@
 #include <msgpack.h>
 
 #include "yos/types.h"
-#include "impl/proc.h"
+#include "impl/proc/proc.h"
 #include "yos/ytrace/ytrace.h"
 #include "yos/yperf/yperf.h"
 

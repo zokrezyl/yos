@@ -10,7 +10,7 @@
 
 #include "wasm3.h"
 #include "m3_env.h"
-#include "errno_helpers.h"  /* yos_remap_errno_h2g for pthread_sigmask */
+#include "impl/errno_helpers.h"  /* yos_remap_errno_h2g for pthread_sigmask */
 
 /* Signal handling. State lives on struct yos_exec_ctx: handler table,
  * blocked mask, and pending mask are all per-process. fork() inherits
@@ -358,7 +358,8 @@ int32_t yos_sigsuspend(struct yos_exec_ctx *ctx, uint32_t mask_off)
  * intended manipulation is purely on the FreeBSD layout.
  */
 
-static inline int yos_sigset_bound(struct yos_exec_ctx *ctx, uint32_t off)
+/* sig-linux.c / sig-darwin.c use this; declared in sig-internal.h. */
+int yos_sigset_bound(struct yos_exec_ctx *ctx, uint32_t off)
 {
     return off && off + YOS_FBSD_SIGSET_BYTES <= ctx->memory_size;
 }
@@ -444,7 +445,7 @@ int32_t yos_sigismember(struct yos_exec_ctx *ctx, uint32_t set_off, int32_t sign
  * does the same in the other direction. Signals without a host
  * equivalent are silently dropped — caller still gets EINVAL from
  * sigaddset/sigaction etc. if it tries to actually use them. */
-static int fbsd_to_host_signo(int fb)
+int fbsd_to_host_signo(int fb)
 {
     /* Indexed 1..32; out-of-range returns 0 (no host equivalent). */
     static const int tbl[33] = {
@@ -460,14 +461,14 @@ static int fbsd_to_host_signo(int fb)
     return (fb >= 1 && fb <= 32) ? tbl[fb] : 0;
 }
 
-static int host_to_fbsd_signo(int h)
+int host_to_fbsd_signo(int h)
 {
     for (int fb = 1; fb <= 32; fb++)
         if (fbsd_to_host_signo(fb) == h) return fb;
     return 0;
 }
 
-static void fbsd_sigset_to_host(const uint8_t *fb, sigset_t *host)
+void fbsd_sigset_to_host(const uint8_t *fb, sigset_t *host)
 {
     sigemptyset(host);
     for (int fbsig = 1; fbsig <= 32; fbsig++) {
@@ -479,7 +480,7 @@ static void fbsd_sigset_to_host(const uint8_t *fb, sigset_t *host)
     }
 }
 
-static void host_sigset_to_fbsd(const sigset_t *host, uint8_t *fb)
+void host_sigset_to_fbsd(const sigset_t *host, uint8_t *fb)
 {
     memset(fb, 0, YOS_FBSD_SIGSET_BYTES);
     for (int h = 1; h < NSIG; h++) {
@@ -606,90 +607,13 @@ int32_t yos_sigwait(struct yos_exec_ctx *ctx,
     return 0;
 }
 
-/* ── sigwaitinfo(const sigset_t *set, siginfo_t *info) ───────────────
+/* ── sigwaitinfo / sigtimedwait ─────────────────────────────────────
  *
- * Same as sigwait but returns the signum directly (or -1+errno). The
- * `info` out-buffer carries siginfo_t which has very different layouts
- * between FreeBSD and Linux (host: 128 bytes; FreeBSD-i386: 64). We
- * don't convert it yet — guests that need siginfo fields will see all
- * zeros. Most callers only consume the return value, so this works for
- * the common path; flag siginfo as TODO when a real consumer surfaces.
+ * Bodies live in sig-linux.c (native sigwaitinfo + sigtimedwait) and
+ * sig-darwin.c (sigwait-based emulation; sigtimedwait ENOSYS — darwin
+ * has neither). Both reach into this file for the bound check + sigset
+ * layout converter + fbsd<->host signo mapping via sig-internal.h.
  */
-int32_t yos_sigwaitinfo(struct yos_exec_ctx *ctx,
-                        uint32_t set_off, uint32_t info_off)
-{
-    if (!yos_sigset_bound(ctx, set_off)) return yos_errno_neg(ctx, EFAULT);
-
-    sigset_t host;
-    fbsd_sigset_to_host(ctx->memory + set_off, &host);
-
-    int rc;
-#if defined(__linux__) || defined(__FreeBSD__)
-    rc = sigwaitinfo(&host, NULL);
-    if (rc < 0) return yos_errno_neg(ctx, errno);
-#else
-    /* darwin has no sigwaitinfo (POSIX-2008 left it Linux-OBy). Emulate
-     * via sigwait — same blocking semantics, just no siginfo_t fill-out.
-     * Our siginfo zeroing below makes that gap explicit to callers. */
-    int sig = 0;
-    int e = sigwait(&host, &sig);
-    if (e != 0) return yos_errno_neg(ctx, e);
-    rc = sig;
-#endif
-
-    /* Zero the wasm siginfo_t if provided so callers don't read stale
-     * memory. FreeBSD-i386 siginfo_t is 64 bytes. */
-    if (info_off && info_off + 64 <= ctx->memory_size)
-        memset(ctx->memory + info_off, 0, 64);
-
-    int fbsig = host_to_fbsd_signo(rc);
-    return (fbsig > 0) ? fbsig : rc;
-}
-
-/* ── sigtimedwait(set, info, timeout) ────────────────────────────────
- *
- * Like sigwaitinfo but bounded. FreeBSD-i386 timespec is 8 bytes
- * (4-byte time_t + 4-byte long); host glibc x86_64 timespec is 16
- * bytes. Read the 8-byte wasm form and build a host struct.
- *
- * Linux-only: sigtimedwait() doesn't exist on darwin/iOS. Guard the
- * body so the host build still links; the bridge returns -ENOSYS
- * everywhere else. */
-int32_t yos_sigtimedwait(struct yos_exec_ctx *ctx,
-                         uint32_t set_off, uint32_t info_off,
-                         uint32_t timeout_off)
-{
-#if defined(__linux__)
-    if (!yos_sigset_bound(ctx, set_off)) return yos_errno_neg(ctx, EFAULT);
-
-    sigset_t host;
-    fbsd_sigset_to_host(ctx->memory + set_off, &host);
-
-    struct timespec ts, *tsp = NULL;
-    if (timeout_off) {
-        if (timeout_off + 8 > ctx->memory_size)
-            return yos_errno_neg(ctx, EFAULT);
-        uint32_t s, n;
-        memcpy(&s, ctx->memory + timeout_off,     4);
-        memcpy(&n, ctx->memory + timeout_off + 4, 4);
-        ts.tv_sec  = (time_t)(int32_t)s;
-        ts.tv_nsec = (long)(int32_t)n;
-        tsp = &ts;
-    }
-
-    int rc = sigtimedwait(&host, NULL, tsp);
-    if (rc < 0) return yos_errno_neg(ctx, errno);
-
-    if (info_off && info_off + 64 <= ctx->memory_size)
-        memset(ctx->memory + info_off, 0, 64);
-
-    int fbsig = host_to_fbsd_signo(rc);
-    return (fbsig > 0) ? fbsig : rc;
-#else
-    (void)set_off; (void)info_off; (void)timeout_off;
-    return yos_errno_neg(ctx, ENOSYS);
-#endif
-}
 
 /* ── sigpending(sigset_t *set) ─────────────────────────────────────────
  *

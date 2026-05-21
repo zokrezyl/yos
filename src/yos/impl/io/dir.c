@@ -50,7 +50,7 @@
 
 #include "yos/types.h"
 #include <yos/ytrace/ytrace.h>
-#include "impl/alloc.h"
+#include "impl/mem/alloc.h"
 #include "impl/errno_helpers.h"
 #include "vfs/mount.h"
 #include "vfs/file.h"

@@ -17,7 +17,7 @@
  *   stream_init asserts on UV_NAMED_PIPE/UV_TTY, and the embedded
  *   server crashes in <200 ms — the whole class of failures described
  *   in tmp/nvim-runtime-issues.md. This test pins the
- *   FB_F_DUPFD_CLOEXEC=17 mapping in src/yos/impl/vfs.c:fcntl_cmd_fb_to_lx.
+ *   FB_F_DUPFD_CLOEXEC=17 mapping in src/yos/impl/io/io.c:fcntl_cmd_fb_to_lx.
  *
  * Expected: exit 0, stdout contains "dup ok", stdout contains "cloexec ok".
  */

@@ -5,12 +5,19 @@
 #                        include/yos/ytrace/ytrace.h.
 #   main.c               entry: load wasm, link imports, run _start
 #
-#   impl/proc.c          yos_fork / yos_getpid / yos_kill / yos_waitpid / ...
-#   impl/pthread.c       yos_pthread_create / _mutex_* / _cond_* / TLS pool
-#   impl/vfs.c           yos_open / yos_read / yos_write / yos_close / ...
-#   impl/mem.c           yos_brk / yos_mmap / yos_mprotect / ...
-#   impl/sig.c           yos_sigaction / yos_sigprocmask
-#   impl/f128.c          __float128 soft-float helpers
+#   impl/proc/   process subsystem: fork+exec+wait+kill, pthread+TLS pool,
+#                signals. Owns the proc table + asyncify fork mechanics.
+#   impl/io/     POSIX I/O bridges: open/read/write/close + fd_map,
+#                opendir/readdir DIR table, host FILE* table, FIFO
+#                emulation (mkfifo-forbidding sandboxes), PTY emulation
+#                (posix_openpt-forbidding sandboxes). NOT the same as
+#                src/yos/vfs/ — that's the custom virtual filesystem
+#                layer (mount table, procfs, file_operations vtable);
+#                impl/io/io.c dispatches to it for /proc lookups.
+#   impl/mem/    brk + mmap inside guest linear memory, malloc/free.
+#   impl/libc/   pure / near-pure libc surface — printf, posix passthroughs,
+#                env, regex, kqueue, sysctl, syslog, mbwc, etc.
+#   impl/errno_helpers.h  shared by everything in impl/.
 #
 #   vfs/                 mount table, file glue, procfs synth
 #   generated/           struct_convert.{c,h} (wasm32<->host64 shape converter,
@@ -92,46 +99,104 @@ else
   error('yos: unsupported host OS: ' + host_os)
 endif
 
+# ── per-platform impl/ slice selection ────────────────────────────────
+#
+# Most libc bridges in impl/ are platform-neutral and built everywhere.
+# Where a bridge has platform-specific behaviour (Linux-only syscalls,
+# darwin Mach ports, sandbox restrictions on iOS/tvOS), the divergent
+# code is sliced into `<area>-<platform>.c` files and the platform-
+# neutral file `<area>.c` only carries the shared helpers (or is empty
+# when nothing is shared). NO #ifdef inside any of those files — meson
+# picks the right slice based on host.
+#
+# Slice categories (extend with -freebsd.c, -windows.c as needed):
+#   <area>-linux.c       linux hosts
+#   <area>-darwin.c      every libSystem host (macos + ios + tvos + ios-sim)
+#   <area>-darwin-app.c  sandboxed Apple-app hosts (ios + tvos) — no
+#                        Mach-exception ports, no posix_openpt /dev/ptmx,
+#                        no host mkfifo(2), no audio-session pause when
+#                        backgrounded. macOS is NOT in this set.
+#   <area>-macos.c       macOS only — Mach ports available, full sandbox
+#                        privileges of a user binary
+#   <area>-ios.c         iOS device only
+#   <area>-tvos.c        tvOS device only
+#   <area>-ios-sim.c     iOS Simulator only (libSystem but no sandbox)
+#
+# Per-file rule (per user request): if a function name shows up across
+# multiple slices and the *bodies* diverge, the function declaration
+# lives in `<area>.c` as a helper that the slices call differently.
+# Library entry points (`yos_<libc-name>`) implementations live in the
+# slice when the body diverges; in `<area>.c` when it does not.
+is_ios_app  = get_option('ios_unblock')
+is_tvos_app = get_option('tvos_unblock')
+is_darwin_app = is_ios_app or is_tvos_app
+is_macos      = (host_os == 'darwin') and (not is_darwin_app)
+
+impl_platform_sources = []
+if host_os == 'linux'
+  impl_platform_sources += files(
+    'impl/proc/sig-linux.c',
+    'impl/libc/kqueue-linux.c',
+    'impl/main-linux.c',
+  )
+elif host_os == 'darwin'
+  impl_platform_sources += files(
+    'impl/proc/sig-darwin.c',
+    'impl/libc/kqueue-darwin.c',
+  )
+  if is_darwin_app
+    # iOS / tvOS app bundle: Mach exception ports + sigaltstack are
+    # both unavailable. main-darwin-app.c provides no-op stubs.
+    impl_platform_sources += files('impl/main-darwin-app.c')
+  else
+    # macOS: full host privileges — Mach exception handler + real
+    # sigaltstack.
+    impl_platform_sources += files('impl/main-macos.c')
+  endif
+endif
+
 yos_runtime_sources = files(
   'main.c',
-  'impl/proc.c',
-  'impl/pthread.c',
-  'impl/vfs.c',
-  'impl/mem.c',
-  'impl/sig.c',
-  'impl/f128.c',
-  'impl/aliases.c',
-  'impl/alloc.c',
-  'impl/callback.c',
-  'impl/cv_trace.c',
-  'impl/env.c',
-  'impl/file.c',
-  'impl/kqueue.c',
-  'impl/posix.c',
-  'impl/pwd.c',
-  'impl/regex.c',
-  'impl/fmtcheck_freebsd.c',
-  'impl/random.c',
-  'impl/signal.c',
-  'impl/strto.c',
-  'impl/freebsd_userland.c',
-  'impl/sysctl.c',
-  'impl/printf.c',
-  'impl/dir.c',
-  'impl/mbwc.c',    # mbrtowc / wcrtomb / mbsrtowcs — host scratch state
-  'impl/getopt.c',  # per-ctx getopt — closes optind/optarg/optopt/opterr leaks
-  'impl/tz.c',      # per-ctx timezone — closes tzname/timezone/daylight leaks
-  'impl/libc_globals_link.c',  # binds env.getopt / env.tzset to the above
-  # syslog (openlog/closelog/syslog) + FreeBSD libutil (login_tty,
-  # realhostname_sa). Hand-bridged because the headers aren't in the
-  # codegen extractor's api_top_headers list.
-  'impl/syslog_extras.c',
-  'impl/pty.c',                   # posix_openpt + grantpt + unlockpt + ptsname
-                                  # for telnetd PTY allocation
-  'impl/fifo.c',                  # mkfifo emulation for sandboxes that
-                                  # forbid host mkfifo (tvOS / iOS); routes
-                                  # open(path) → dup of a pre-registered
-                                  # host pipe pair
+  # ── proc/ ── fork / exec / wait / kill, pthread + TLS pool, signals.
+  'impl/proc/proc.c',
+  'impl/proc/pthread.c',
+  'impl/proc/sig.c',
+  'impl/proc/signal.c',
+  # ── vfs/ ── open/read/write/close + fd_map; opendir/readdir DIR
+  # table; FILE* table; FIFO emulation (mkfifo-forbidding sandboxes);
+  # PTY emulation (posix_openpt-forbidding sandboxes).
+  'impl/io/io.c',
+  'impl/io/dir.c',
+  'impl/io/file.c',
+  'impl/io/fifo.c',
+  'impl/io/pty.c',
+  # ── mem/ ── brk + mmap inside guest linear memory, malloc/free.
+  'impl/mem/mem.c',
+  'impl/mem/alloc.c',
+  # ── libc/ ── pure / near-pure libc surface (no per-ctx state
+  # beyond what the auto-bridge can derive). Posix passthroughs,
+  # printf family, multibyte/widechar, regex, kqueue, sysctl,
+  # syslog, env, getopt, timezone, password DB, etc.
+  'impl/libc/posix.c',
+  'impl/libc/printf.c',
+  'impl/libc/env.c',
+  'impl/libc/getopt.c',
+  'impl/libc/tz.c',
+  'impl/libc/libc_globals_link.c',
+  'impl/libc/aliases.c',
+  'impl/libc/callback.c',
+  'impl/libc/cv_trace.c',
+  'impl/libc/f128.c',
+  'impl/libc/freebsd_userland.c',
+  'impl/libc/fmtcheck_freebsd.c',
+  'impl/libc/kqueue.c',
+  'impl/libc/mbwc.c',
+  'impl/libc/pwd.c',
+  'impl/libc/random.c',
+  'impl/libc/regex.c',
+  'impl/libc/strto.c',
+  'impl/libc/sysctl.c',
+  'impl/libc/syslog_extras.c',
   # ytrace + yplatform — switchable trace-point machinery imported
   # verbatim from yetty (with yetty_yplatform → yos_yplatform).
   # ytrace.h defines ydebug/yinfo/ywarn/yerror/ytrace and the
@@ -167,7 +232,7 @@ if have_yctl
   optional_deps    += msgpack_dep
 endif
 if have_libpython
-  optional_sources += files('impl/libpython.c')
+  optional_sources += files('impl/libc/libpython.c')
   optional_args    += '-DYOS_HAVE_LIBPYTHON=1'
   optional_deps    += python_embed_dep
 endif
@@ -206,6 +271,7 @@ if get_option('build_static_lib')
     'yos',
     yos_runtime_sources,
     platform_sources,
+    impl_platform_sources,
     optional_sources,
     include_directories : yos_inc,
     dependencies : yos_common_deps,
@@ -217,6 +283,7 @@ else
     'yos',
     yos_runtime_sources,
     platform_sources,
+    impl_platform_sources,
     optional_sources,
     include_directories : yos_inc,
     dependencies : yos_common_deps,

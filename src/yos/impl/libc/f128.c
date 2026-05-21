@@ -20,7 +20,7 @@
 #include "wasm3.h"
 #include "m3_env.h"
 #include "m3_api_defs.h"
-#include "impl/pthread.h"  /* not actually needed but keeps the link surface tidy */
+#include "impl/proc/pthread.h"  /* not actually needed but keeps the link surface tidy */
 
 #if !defined(__SIZEOF_FLOAT128__)
 /* Hosts that lack __float128 (darwin x86_64 clang, windows MSVC):

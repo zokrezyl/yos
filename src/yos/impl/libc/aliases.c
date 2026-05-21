@@ -6,7 +6,7 @@
  * decision, not an accident of subsystem layout). */
 
 #include "yos/types.h"
-#include "impl/proc.h"
+#include "impl/proc/proc.h"
 
 /* _exit and _Exit are POSIX synonyms for exit (no atexit handlers,
  * no stdio flush). yos's process model treats all three identically:

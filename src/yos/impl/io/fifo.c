@@ -188,30 +188,29 @@ int32_t yos_mkfifoat(struct yos_exec_ctx *ctx, int32_t dfd,
     /* Absolute path → ignore dfd, defer to plain mkfifo. */
     if (raw[0] == '/') return yos_mkfifo(ctx, path_off, mode);
 
-    /* Relative: same trick the auto-bridge uses for *at fns —
-     * resolve dfd to a real host dir fd and use openat(O_CREAT)
-     * for the marker, then build the absolute path via /proc/self
-     * style readlink or the host fchdir+getcwd round-trip. The
-     * pipe registry stores absolute paths so subsequent open()
-     * lookups match regardless of the caller's cwd. */
+    /* Relative: build an absolute path so the registry stores
+     * something consistent. For AT_FDCWD, getcwd() directly. For a
+     * real dir fd, fchdir-getcwd-restore. NB: fchdir(AT_FDCWD) is
+     * EBADF — never call it. */
     int hdfd = yos_xlate_dfd(ctx, dfd);
     char abs[4096];
-    /* Try linkat/readlink trick: on linux /proc/self/fd/<n> gives a path
-     * for the dir fd, but tvOS has no /proc. fchdir into the dir then
-     * getcwd to read its absolute path; restore previous cwd after. */
-    int saved_cwd = open(".", O_RDONLY | O_CLOEXEC);
-    if (fchdir(hdfd) < 0) {
-        if (saved_cwd >= 0) close(saved_cwd);
-        return yos_errno_neg(ctx, errno);
-    }
     char dir[4096];
-    if (!getcwd(dir, sizeof dir)) {
-        int saved = errno;
+    if (hdfd == AT_FDCWD) {
+        if (!getcwd(dir, sizeof dir))
+            return yos_errno_neg(ctx, errno);
+    } else {
+        int saved_cwd = open(".", O_RDONLY | O_CLOEXEC);
+        if (fchdir(hdfd) < 0) {
+            if (saved_cwd >= 0) close(saved_cwd);
+            return yos_errno_neg(ctx, errno);
+        }
+        if (!getcwd(dir, sizeof dir)) {
+            int saved = errno;
+            if (saved_cwd >= 0) { (void)fchdir(saved_cwd); close(saved_cwd); }
+            return yos_errno_neg(ctx, saved);
+        }
         if (saved_cwd >= 0) { (void)fchdir(saved_cwd); close(saved_cwd); }
-        return yos_errno_neg(ctx, saved);
     }
-    if (saved_cwd >= 0) { (void)fchdir(saved_cwd); close(saved_cwd); }
-
     snprintf(abs, sizeof abs, "%s/%s", dir, raw);
 
     /* Re-enter yos_mkfifo with an absolute path that lands directly
@@ -383,36 +382,21 @@ int32_t yos_fstatat(struct yos_exec_ctx *ctx, int32_t dfd,
                       ? (const char *)(ctx->memory + path_off) : NULL;
     if (!raw) return yos_errno_neg(ctx, EFAULT);
 
-    /* Build the absolute path so the registry lookup matches. For
-     * absolute paths we skip dfd; for relative, fchdir-getcwd-fchdir
-     * gives us the dir fd's absolute path. */
-    char abs[4096];
-    if (raw[0] == '/') {
-        snprintf(abs, sizeof abs, "%s", raw);
-    } else {
-        int hdfd = yos_xlate_dfd(ctx, dfd);
-        int saved = open(".", O_RDONLY | O_CLOEXEC);
-        if (fchdir(hdfd) < 0) {
-            if (saved >= 0) close(saved);
-            return yos_errno_neg(ctx, errno);
-        }
-        char dir[4096];
-        if (!getcwd(dir, sizeof dir)) {
-            int s = errno;
-            if (saved >= 0) { (void)fchdir(saved); close(saved); }
-            return yos_errno_neg(ctx, s);
-        }
-        if (saved >= 0) { (void)fchdir(saved); close(saved); }
-        snprintf(abs, sizeof abs, "%s/%s", dir, raw);
-    }
-    const char *path = yos_path_resolve(ctx, abs);
+    int hdfd = yos_xlate_dfd(ctx, dfd);
+    const char *path = yos_path_resolve(ctx, raw);
 
     struct stat host_st;
     memset(&host_st, 0, sizeof host_st);
     errno = 0;
-    int rc = fstatat(AT_FDCWD, path, &host_st, flags);
+    int rc = fstatat(hdfd, path, &host_st, flags);
     if (rc < 0) return yos_errno_neg(ctx, errno);
 
+    /* FIFO registry overlay. The registry stores absolute paths, so a
+     * dfd-relative call only hits if the caller happened to pass an
+     * already-absolute path. That's the runsv case; for other relative
+     * lookups the regular stat result stands, which is correct on hosts
+     * where mkfifo(2) works natively (the placeholder file isn't there
+     * — the real FIFO is). */
     (void)yos_fifo_stat_fixup(path, &host_st.st_mode);
 
     if (statbuf_off && statbuf_off < ctx->memory_size)

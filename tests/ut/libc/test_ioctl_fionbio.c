@@ -18,7 +18,7 @@
  *   unrecognised request number → ENOTTY, which broke libuv's
  *   uv_pipe_open(stdin) and prevented the TUI from ever registering its
  *   read watcher. This test pins the platform-aware translation in
- *   src/yos/impl/vfs.c:ioctl_cmd_fb_to_lx.
+ *   src/yos/impl/io/io.c:ioctl_cmd_fb_to_lx.
  *
  * Expected: exit 0, stdout contains "ioctl ok", stdout contains "nonblock ok".
  */

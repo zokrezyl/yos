@@ -30,7 +30,7 @@
  * implicitly. */
 #define _GNU_SOURCE
 
-#include "impl/pthread.h"
+#include "impl/proc/pthread.h"
 #include <yos/yos_pthread.h>
 #include "yos/types.h"   /* struct yos_exec_ctx — needed for the
                           * yos_link_imports call in worker_main */
