@@ -48,7 +48,19 @@ let
   };
 
   freebsd-src = pkgs.callPackage ./freebsd-src { };
-  yos         = pkgs.callPackage ./yos        { inherit src; };
+  # Force the yos host build to use clang on every platform. nix's
+  # default stdenv on linux is gcc-based, which (a) emits a different
+  # diagnostic surface than the darwin/iOS/tvOS slices the same code
+  # has to compile under, so a change that builds clean on macOS keeps
+  # tripping on linux for trivia clang accepts; (b) makes the auto-
+  # generated bridge's pointer-to-int casts a hard error on newer gcc.
+  # Pinning clang means every host uses the same compiler frontend.
+  yos = pkgs.callPackage ./yos {
+    inherit src;
+    stdenv = if pkgs.stdenv.isLinux
+             then pkgs.llvmPackages_18.stdenv
+             else pkgs.stdenv;
+  };
   sysroot     = pkgs.callPackage ./sysroot    { inherit freebsd-src; src = sysrootSrc; };
   toolchain   = pkgs.callPackage ./toolchain  { src = toolchainSrc; };
 

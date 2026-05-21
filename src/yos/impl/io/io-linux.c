@@ -29,6 +29,7 @@
 
 #include <stdint.h>
 #include <stddef.h>
+#include <stdio.h>     /* snprintf */
 #include <string.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -267,23 +268,6 @@ int32_t yos_vfs_getdents64(struct yos_exec_ctx *ctx, int32_t fd, uint32_t dirent
     long r = syscall(SYS_getdents64, hfd, p, count);
     return yos_errno_check(ctx, (int32_t)r);
 }
-#else /* !__linux__ */
-int32_t yos_vfs_preadv2(struct yos_exec_ctx *ctx, int32_t fd, uint32_t vec, int32_t vlen, uint32_t pos_l, uint32_t pos_h, int32_t flags)
-{ (void)ctx;(void)fd;(void)vec;(void)vlen;(void)pos_l;(void)pos_h;(void)flags; return -ENOSYS; }
-int32_t yos_vfs_pwritev2(struct yos_exec_ctx *ctx, int32_t fd, uint32_t vec, int32_t vlen, uint32_t pos_l, uint32_t pos_h, int32_t flags)
-{ (void)ctx;(void)fd;(void)vec;(void)vlen;(void)pos_l;(void)pos_h;(void)flags; return -ENOSYS; }
-int32_t yos_vfs_vmsplice(struct yos_exec_ctx *ctx, int32_t fd, uint32_t vec, uint32_t vlen, uint32_t flags)
-{ (void)ctx;(void)fd;(void)vec;(void)vlen;(void)flags; return -ENOSYS; }
-int32_t yos_vfs_process_madvise(struct yos_exec_ctx *ctx, int32_t pidfd, uint32_t vec, uint32_t vlen, int32_t behavior, uint32_t flags)
-{ (void)ctx;(void)pidfd;(void)vec;(void)vlen;(void)behavior;(void)flags; return -ENOSYS; }
-int32_t yos_vfs_process_vm_readv(struct yos_exec_ctx *ctx, int32_t pid, uint32_t lvec, uint32_t liovcnt, uint32_t rvec, uint32_t riovcnt, uint32_t flags)
-{ (void)ctx;(void)pid;(void)lvec;(void)liovcnt;(void)rvec;(void)riovcnt;(void)flags; return -ENOSYS; }
-int32_t yos_vfs_process_vm_writev(struct yos_exec_ctx *ctx, int32_t pid, uint32_t lvec, uint32_t liovcnt, uint32_t rvec, uint32_t riovcnt, uint32_t flags)
-{ (void)ctx;(void)pid;(void)lvec;(void)liovcnt;(void)rvec;(void)riovcnt;(void)flags; return -ENOSYS; }
-int32_t yos_vfs_getdents(struct yos_exec_ctx *ctx, int32_t fd, uint32_t dirent, uint32_t count)
-{ (void)ctx;(void)fd;(void)dirent;(void)count; return -ENOSYS; }
-int32_t yos_vfs_getdents64(struct yos_exec_ctx *ctx, int32_t fd, uint32_t dirent, uint32_t count)
-{ (void)ctx;(void)fd;(void)dirent;(void)count; return -ENOSYS; }
 /*
  * statx - extended stat with mount table support
  * Kernel ABI constants for mode bits
