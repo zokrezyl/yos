@@ -329,7 +329,7 @@ int yos_fifo_drop(const char *path)
  * yos_stat body and routes the m3w_stat raw wrapper to ours.
  */
 
-extern void cv_stat_h2w(uint8_t *wasm, const struct stat *host);
+#include "impl/io/cv_stat.h"
 extern int  yos_xlate_dfd(struct yos_exec_ctx *ctx, int32_t dfd);
 
 int32_t yos_stat(struct yos_exec_ctx *ctx, uint32_t path_off,
@@ -349,7 +349,7 @@ int32_t yos_stat(struct yos_exec_ctx *ctx, uint32_t path_off,
     (void)yos_fifo_stat_fixup(path, &host_st.st_mode);
 
     if (statbuf_off && statbuf_off < ctx->memory_size)
-        cv_stat_h2w((uint8_t *)(ctx->memory + statbuf_off), &host_st);
+        yos_cv_stat_fbi((uint8_t *)(ctx->memory + statbuf_off), &host_st);
     return 0;
 }
 
@@ -370,7 +370,7 @@ int32_t yos_lstat(struct yos_exec_ctx *ctx, uint32_t path_off,
     (void)yos_fifo_stat_fixup(path, &host_st.st_mode);
 
     if (statbuf_off && statbuf_off < ctx->memory_size)
-        cv_stat_h2w((uint8_t *)(ctx->memory + statbuf_off), &host_st);
+        yos_cv_stat_fbi((uint8_t *)(ctx->memory + statbuf_off), &host_st);
     return 0;
 }
 
@@ -385,10 +385,19 @@ int32_t yos_fstatat(struct yos_exec_ctx *ctx, int32_t dfd,
     int hdfd = yos_xlate_dfd(ctx, dfd);
     const char *path = yos_path_resolve(ctx, raw);
 
+    /* AT_SYMLINK_NOFOLLOW (and AT_EMPTY_PATH etc.) have DIFFERENT
+     * numeric values on FreeBSD vs the host. fstatat(host, flags)
+     * silently does the wrong thing — `lstat` semantics collapse to
+     * `stat` if AT_SYMLINK_NOFOLLOW=0x200 isn't translated to the
+     * host's bit. Run flags through the translator before the host
+     * syscall. */
+    extern int yos_at_flags_fb_to_lx(int f);
+    int hflags = yos_at_flags_fb_to_lx(flags);
+
     struct stat host_st;
     memset(&host_st, 0, sizeof host_st);
     errno = 0;
-    int rc = fstatat(hdfd, path, &host_st, flags);
+    int rc = fstatat(hdfd, path, &host_st, hflags);
     if (rc < 0) return yos_errno_neg(ctx, errno);
 
     /* FIFO registry overlay. The registry stores absolute paths, so a
@@ -400,6 +409,6 @@ int32_t yos_fstatat(struct yos_exec_ctx *ctx, int32_t dfd,
     (void)yos_fifo_stat_fixup(path, &host_st.st_mode);
 
     if (statbuf_off && statbuf_off < ctx->memory_size)
-        cv_stat_h2w((uint8_t *)(ctx->memory + statbuf_off), &host_st);
+        yos_cv_stat_fbi((uint8_t *)(ctx->memory + statbuf_off), &host_st);
     return 0;
 }

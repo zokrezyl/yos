@@ -174,6 +174,7 @@ yos_runtime_sources = files(
   'impl/io/file.c',
   'impl/io/fifo.c',
   'impl/io/pty.c',
+  'impl/io/cv_stat.c',
   # ── mem/ ── brk + mmap inside guest linear memory, malloc/free.
   'impl/mem/mem.c',
   'impl/mem/alloc.c',

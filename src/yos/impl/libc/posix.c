@@ -734,44 +734,11 @@ int32_t yos_mkostemps(struct yos_exec_ctx *ctx, uint32_t template_off,
     return wfd;
 }
 
-#if defined(__APPLE__)
-/* Hand-rolled cv_stat_h2w for darwin: matches the FreeBSD i386
- * sysroot's struct stat layout that nvim/libuv was compiled against
- * (see build-darwin/sysroot/usr/include/sys/stat.h). The previous
- * version mirrored a stale 72-byte wasm32_stat (st_mode at offset 8),
- * which silently broke uv_guess_handle on every SOCK fd in the
- * embedded nvim server: libuv read st_mode=0 (the byte at the WRONG
- * offset), S_ISSOCK was false, and the IPC stdin was misclassified
- * as UV_FILE → never registered on kqueue → the embedded server hit
- * the "ch 1 was closed by the client" path within ~200 ms. The
- * auto-generated cv_stat_h2w on Linux already uses the layout below;
- * keeping the two in sync. */
 #include <sys/stat.h>
-static inline void cv_stat_h2w(uint8_t *w, const struct stat *h)
-{
-    /* FreeBSD i386 struct stat (192 bytes used; size with __spare is
-     * 224, but the auto-gen layout stops at 192). */
-    memset(w, 0, 192);
-    *(int64_t *)(w +  0) = (int64_t)h->st_dev;
-    *(int64_t *)(w +  8) = (int64_t)h->st_ino;
-    *(int64_t *)(w + 16) = (int64_t)h->st_nlink;
-    *(int16_t *)(w + 24) = (int16_t)h->st_mode;
-    /* st_bsdflags @26: no host counterpart; left 0 */
-    *(int32_t *)(w + 28) = (int32_t)h->st_uid;
-    *(int32_t *)(w + 32) = (int32_t)h->st_gid;
-    /* st_padding1 @36: 0 */
-    *(int64_t *)(w + 40) = (int64_t)h->st_rdev;
-    /* st_atim/mtim/ctim/birthtim @48..111: leave 0 (nvim's hot path
-     * doesn't read them; the auto-gen converter on Linux also skips). */
-    *(int64_t *)(w + 80) = (int64_t)h->st_size;
-    *(int64_t *)(w + 88) = (int64_t)h->st_blocks;
-    *(int32_t *)(w + 96) = (int32_t)h->st_blksize;
-    *(int32_t *)(w + 100) = (int32_t)h->st_flags;
-    *(int64_t *)(w + 104) = (int64_t)h->st_gen;
-}
-#else
-extern void cv_stat_h2w(uint8_t *w, const struct stat *h);
-#endif
+#include "impl/io/cv_stat.h"
+/* yos_cv_stat_fbi() in impl/io/cv_stat.c is the authoritative writer.
+ * Both this file and impl/io/fifo.c call it; field offsets were
+ * extracted with tools/struct-offsets.py stat sys/stat.h. */
 
 int32_t yos_fstat(struct yos_exec_ctx *ctx, int32_t wfd, uint32_t statbuf_off)
 {
@@ -791,7 +758,7 @@ int32_t yos_fstat(struct yos_exec_ctx *ctx, int32_t wfd, uint32_t statbuf_off)
         ydebug("fstat(wfd=%d hfd=%d) mode=0%o (%s)\n",
                wfd, hfd, (unsigned)h.st_mode, kind);
     }
-    cv_stat_h2w(ctx->memory + statbuf_off, &h);
+    yos_cv_stat_fbi(ctx->memory + statbuf_off, &h);
     return 0;
 }
 
