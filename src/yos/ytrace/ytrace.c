@@ -13,7 +13,8 @@
 #include <stdarg.h>
 #include <string.h>
 #include <unistd.h>
-#include <sys/syscall.h>
+#include <pthread.h>      /* pthread_self() — for the trace-file tid suffix */
+#include <stdint.h>       /* uintptr_t */
 
 /* Global state */
 static ytrace_point_t g_points[YTRACE_C_MAX_POINTS];
@@ -86,7 +87,7 @@ static FILE *yt_thread_file(void)
     const char *prefix = getenv("YTRACE_FILE_PREFIX");
     if (!prefix || !*prefix) return NULL;
     char path[512];
-    long tid = (long)syscall(SYS_gettid);
+    long tid = (long)(uintptr_t)pthread_self();
     snprintf(path, sizeof path, "%s-%s-%ld", prefix, _yt_comm, tid);
     _yt_file = fopen(path, "w");
     if (_yt_file) setvbuf(_yt_file, NULL, _IOLBF, 0);

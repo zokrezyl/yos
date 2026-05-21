@@ -272,6 +272,12 @@ if get_option('ios_unblock')
   api_bridge_extra_c_args += ['-include', ios_unblock_hdr]
   api_bridge_extra_sources += ios_unblock_src
 endif
+if get_option('tvos_unblock')
+  tvos_unblock_hdr = meson.project_source_root() / 'build-tools' / 'tvos' / 'tvos-unblock.h'
+  tvos_unblock_src = files(meson.project_source_root() / 'build-tools' / 'tvos' / 'tvos-unblock.c')
+  api_bridge_extra_c_args += ['-include', tvos_unblock_hdr]
+  api_bridge_extra_sources += tvos_unblock_src
+endif
 
 api_bridge_lib = static_library(
   'yos_api_bridge',

@@ -128,6 +128,10 @@ yos_runtime_sources = files(
   'impl/syslog_extras.c',
   'impl/pty.c',                   # posix_openpt + grantpt + unlockpt + ptsname
                                   # for telnetd PTY allocation
+  'impl/fifo.c',                  # mkfifo emulation for sandboxes that
+                                  # forbid host mkfifo (tvOS / iOS); routes
+                                  # open(path) → dup of a pre-registered
+                                  # host pipe pair
   # ytrace + yplatform — switchable trace-point machinery imported
   # verbatim from yetty (with yetty_yplatform → yos_yplatform).
   # ytrace.h defines ydebug/yinfo/ywarn/yerror/ytrace and the
@@ -186,22 +190,17 @@ yos_common_deps = [
   iconv_dep,           # darwin/BSD: separate libiconv
 ] + optional_deps
 
-yos_exe = executable(
-  'yos',
-  yos_runtime_sources,
-  platform_sources,
-  optional_sources,
-  include_directories : yos_inc,
-  dependencies : yos_common_deps,
-  c_args : yos_common_c_args,
-  install : false,
-)
-
-# tvOS / iOS app bundles need a static library: the bundle's launcher
-# (build-tools/tvos/launcher.m) provides main() + UIApplicationMain and
-# pthread_create's a worker that jumps to yos_main(). Same sources as
-# the executable, just compiled with -DYOS_AS_LIBRARY so main.c emits
-# `yos_main` instead of `main`. See -Dbuild_static_lib=true.
+# tvOS / iOS app bundles need a static library, not an executable:
+# the bundle's launcher (build-tools/tvos/launcher.m) provides main()
+# + UIApplicationMain and pthread_create's a worker that jumps to
+# yos_main(). Same sources as the executable, just compiled with
+# -DYOS_AS_LIBRARY so main.c emits `yos_main` instead of `main`. See
+# -Dbuild_static_lib=true.
+#
+# For the lib case we DON'T also build the executable, because that
+# would give meson two targets named `yos` (ambiguous on the command
+# line) and tvOS clang refuses to link an executable anyway without
+# `main` (which the lib renames away).
 if get_option('build_static_lib')
   yos_static = static_library(
     'yos',
@@ -211,6 +210,17 @@ if get_option('build_static_lib')
     include_directories : yos_inc,
     dependencies : yos_common_deps,
     c_args : yos_common_c_args + ['-DYOS_AS_LIBRARY=1'],
+    install : false,
+  )
+else
+  yos_exe = executable(
+    'yos',
+    yos_runtime_sources,
+    platform_sources,
+    optional_sources,
+    include_directories : yos_inc,
+    dependencies : yos_common_deps,
+    c_args : yos_common_c_args,
     install : false,
   )
 endif

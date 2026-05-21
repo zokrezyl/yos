@@ -82,16 +82,14 @@ static int find_entry(const struct yos_env_store *st,
     return -1;
 }
 
-/* Walk host environ and copy entries into wasm. Used both for
- * lazy-init on first getenv/setenv AND from yos_env_reload() to
- * reset state between FreeBSD ATF test cases (their atf-runner
- * forks per-test; we run them serially in one process, so without
- * an explicit reload hook the previous test's clearenv() would
- * leave the env empty for the next test). */
-static void env_load_from_host(struct yos_exec_ctx *ctx)
+/* Walk an environ-style char** vector and copy entries into wasm.
+ * Used by env_init_once with EITHER the per-ctx exec envp (preferred
+ * when an exec'd wasm process inherited a curated env) OR the host's
+ * environ (for the first/root process). */
+static void env_load_from_vec(struct yos_exec_ctx *ctx, char **vec)
 {
-    if (!environ) return;
-    for (char **p = environ; *p && g_env.count < YOS_ENV_MAX; p++) {
+    if (!vec) return;
+    for (char **p = vec; *p && g_env.count < YOS_ENV_MAX; p++) {
         const char *eq = strchr(*p, '=');
         if (!eq) continue;
         size_t nlen = (size_t)(eq - *p);
@@ -109,11 +107,40 @@ static void env_load_from_host(struct yos_exec_ctx *ctx)
     }
 }
 
+static void env_load_from_host(struct yos_exec_ctx *ctx)
+{
+    env_load_from_vec(ctx, environ);
+}
+
+/* Pick the right source. Per-ctx envp (set by execve / fork) wins
+ * over host environ — after a wasm-side execve, host environ still
+ * reflects the yos host process's env, but the new wasm program
+ * inherited a curated envp from its parent that we need to honour
+ * (PATH, PWD, USER, TERM, etc. that telnetd and friends set). */
 static void env_init_once(struct yos_exec_ctx *ctx)
 {
     if (g_env.initialised) return;
     g_env.initialised = 1;
-    env_load_from_host(ctx);
+    if (ctx && ctx->envp && ctx->envc > 0) {
+        env_load_from_vec(ctx, ctx->envp);
+    } else {
+        env_load_from_host(ctx);
+    }
+}
+
+/* Called from the execve flow when the wasm guest replaces its
+ * module: the wasm linear memory is fresh, so every wasm offset we
+ * cached in g_env (name_off / value_off) is now stale. Wipe the
+ * cache; the next getenv/setenv re-loads from the new ctx's envp.
+ * Without this, zsh inheriting a parent telnetd's env reads back
+ * garbage and traps deep inside its param-table init. */
+void yos_env_post_execve_reset(void)
+{
+    /* DON'T yos_free here: the offsets are into the OLD wasm memory
+     * which has already been freed by m3_FreeRuntime. The allocator
+     * lives inside guest memory; once that memory blob is gone, so
+     * is the allocator state. Just zero the table. */
+    memset(&g_env, 0, sizeof g_env);
 }
 
 /* Test-only: drop all known entries and re-pull from host environ.

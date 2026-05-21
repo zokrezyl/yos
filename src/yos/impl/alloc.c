@@ -142,7 +142,20 @@ uint32_t yos_calloc(struct yos_exec_ctx *ctx, uint32_t nmemb, uint32_t size)
     if (nmemb && size > UINT32_MAX / nmemb) return 0;
     uint32_t total = nmemb * size;
     uint32_t off   = yos_malloc(ctx, total);
-    if (off) memset(ctx->memory + off, 0, total);
+    if (!off) return 0;
+    /* Zero through the END of the underlying block, not just the
+     * caller-visible `total`. yos_malloc rounds up to the alignment
+     * boundary (ALIGN=16) plus HDR_SIZE for the block header — any
+     * slop between `total` and the block end is uninitialised heap.
+     * zsh's hash-table walk on arm64 + wasm3 reads a struct field
+     * past `total` and pulls in garbage; defensively zero the
+     * whole block so the caller never sees uninit bytes regardless
+     * of which side of the size boundary it touches. */
+    uint32_t blk_off = off - HDR_SIZE;
+    uint32_t bsz     = blk_size(ctx, blk_off);
+    uint32_t usable  = (bsz > HDR_SIZE) ? bsz - HDR_SIZE : total;
+    if (usable < total) usable = total;
+    memset(ctx->memory + off, 0, usable);
     return off;
 }
 

@@ -12,6 +12,7 @@
 #include <sys/wait.h>
 #include <sys/stat.h>  /* execvp_path_search: stat() the PATH candidates */
 #include <sys/syscall.h>
+#include <pthread.h>     /* pthread_self() — used by fork trace lines */
 /* CLEARTID exit-wake done via pthread_cond_broadcast on the proc's
  * wait_cond (see below). No Linux futex syscall needed on the host;
  * any guest libc that uses futex semantics goes through a small
@@ -406,7 +407,7 @@ typedef struct {
 
 static void *fork_thread_func(void *arg)
 {
-    ydebug("fork_thread_func: child thread tid=%d\n", (int)syscall(SYS_gettid));
+    ydebug("fork_thread_func: child thread tid=%d\n", (int)(uintptr_t)pthread_self());
     fork_thread_arg_t *fork_thread_arg = (fork_thread_arg_t *)arg;
     /* Label this thread's per-thread trace file with the inheriting
      * proc's comm so YTRACE_FILE_PREFIX produces readable filenames
@@ -672,6 +673,15 @@ static void *fork_thread_func(void *arg)
         m3_FreeRuntime(rt);
         m3_FreeEnvironment(env);
 
+        /* The old wasm linear memory just went away — every wasm
+         * offset cached host-side (env table, anything else keyed by
+         * pointer-into-memory) is now stale. Reset before any guest
+         * code runs that could read those caches. */
+        {
+            extern void yos_env_post_execve_reset(void);
+            yos_env_post_execve_reset();
+        }
+
         child_ctx->argc = child_ctx->exec_argc;
         child_ctx->argv = child_ctx->exec_argv;
         /* Install the env that was passed to execve (if any). NULL
@@ -923,7 +933,26 @@ static void *fork_thread_func(void *arg)
  * failure. On overflow the snapshot is still byte-correct (every
  * resident page was copied) but the live-region list is incomplete,
  * so the caller MUST fall back to a full-size memcpy at restore. */
-#define YOS_PAGE_SIZE 4096u
+/* The host kernel's page size — what mincore() reports residency at.
+ * Linux x86_64 + macOS x86_64: 4 KiB. macOS arm64 (Apple Silicon) and
+ * iOS/tvOS arm64: 16 KiB. We probe at first use with sysconf rather
+ * than hard-coding, because a mismatch makes mincore's vec[] reads
+ * randomized — every fourth slot is "set" on a 4 K walk over 16 K
+ * pages — and the live-region copy then misses three quarters of the
+ * actually-resident pages (including the asyncify state buffer that
+ * the child's rewind reads back). Symptom: every child wasm process
+ * traps at `child: trap: [trap] out of bounds memory access` on
+ * rewind. */
+static uintptr_t yos_page_size(void)
+{
+    static uintptr_t cached = 0;
+    if (!cached) {
+        long ps = sysconf(_SC_PAGESIZE);
+        cached = (ps > 0) ? (uintptr_t)ps : 4096u;
+    }
+    return cached;
+}
+#define YOS_PAGE_SIZE (yos_page_size())
 static int snapshot_wasm_memory(uint8_t *dst, const uint8_t *src,
                                 size_t size,
                                 struct yos_fork_region *out_regions,
@@ -1183,7 +1212,7 @@ void yos_fork_pump(struct yos_exec_ctx *ctx)
         }
         pthread_detach(t);
 
-        ydebug("forked child pid=%d (parent thread tid=%d), resuming parent\n", child_proc->pid, (int)syscall(SYS_gettid));
+        ydebug("forked child pid=%d (parent thread tid=%d), resuming parent\n", child_proc->pid, (int)(uintptr_t)pthread_self());
 
         /* Resume parent - start rewind */
         call_asyncify(wrt, "asyncify_start_rewind", ctx->asyncify_ptr);

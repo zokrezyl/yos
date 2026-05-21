@@ -46,4 +46,9 @@ endif
 
 subdir('build-tools')
 subdir('src')
-subdir('tests')
+# Tests run yos as a host binary against the wasm sysroot, so they
+# only make sense when we're building the executable. Skip when
+# cross-building the static lib (tvOS / iOS app bundles).
+if not get_option('build_static_lib')
+  subdir('tests')
+endif

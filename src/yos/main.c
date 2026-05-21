@@ -557,7 +557,13 @@ void yos_brg_dump_handler(int sig)
     (void)close(fd);
 }
 
-#ifdef __APPLE__
+#include <TargetConditionals.h>
+/* TARGET_OS_TV: tvOS marks task_set_exception_ports / thread_set_exception_ports
+ * / mach_msg as unavailable to app-bundle code. Skip the Mach handler
+ * entirely on tvOS; the OS terminates the bundle on faults with its
+ * own crash report. The BSD-signal handler (yos_host_crash_handler_si)
+ * still runs for any signal that does reach it. */
+#if defined(__APPLE__) && !TARGET_OS_TV
 /* ── Darwin Mach exception handler ──────────────────────────────────
  *
  * On macOS, synchronous CPU faults (illegal instruction, bad access,
@@ -2009,6 +2015,12 @@ int main(int argc, char **argv)
     if (g_log_dir) setenv("LOG_DIR", g_log_dir, 1);
 
     if (g_daemon) {
+#if defined(YOS_AS_LIBRARY)
+        /* App-bundle builds (tvOS / iOS) have no controlling terminal
+         * to detach from and the host's fork(2) is sandbox-blocked.
+         * Bundle lifecycle is owned by the OS; --daemon is a no-op. */
+        fprintf(stderr, "yos: --daemon ignored in app-bundle build\n");
+#else
         /* Classic double-fork. Detach from the controlling tty, lose
          * session leadership, redirect stdio to <log-dir>/yos-server.log,
          * write the second-fork PID to <log-dir>/yos-server.pid so
@@ -2058,13 +2070,19 @@ int main(int argc, char **argv)
             (void)!write(pfd, buf, (size_t)n);
             close(pfd);
         }
+#endif
     }
     (void)g_server;  /* reserved — future runit-aware behaviour */
 
     /* Crash diagnostics. The crashing thread on darwin can have a
      * corrupted stack (e.g. wasm3 jumped into garbage) — install a
      * sigaltstack so the handler has somewhere safe to run. Use
-     * SA_ONSTACK + SA_SIGINFO to also receive the faulting address. */
+     * SA_ONSTACK + SA_SIGINFO to also receive the faulting address.
+     *
+     * tvOS marks sigaltstack(3) unavailable to apps; skip it there.
+     * The crash handler still runs on the thread's regular stack —
+     * less robust but the bundle's process gets killed by the OS
+     * anyway on any unhandled fault. */
     {
         extern void yos_host_crash_handler_si(int, siginfo_t *, void *);
         /* glibc 2.34+ made SIGSTKSZ a sysconf() call (not a constant),
@@ -2075,7 +2093,11 @@ int main(int argc, char **argv)
         ss.ss_sp = altstack_buf;
         ss.ss_size = sizeof altstack_buf;
         ss.ss_flags = 0;
+#if !TARGET_OS_TV
         sigaltstack(&ss, NULL);
+#else
+        (void)ss;
+#endif
         struct sigaction sa = {0};
         sa.sa_sigaction = yos_host_crash_handler_si;
         sa.sa_flags = SA_SIGINFO | SA_ONSTACK | SA_RESETHAND;
@@ -2099,11 +2121,12 @@ int main(int argc, char **argv)
         pthread_sigmask(SIG_UNBLOCK, &unblock, NULL);
     }
 
-#ifdef __APPLE__
+#if defined(__APPLE__) && !TARGET_OS_TV
     /* Darwin: synchronous CPU faults are routed through Mach exception
      * ports BEFORE BSD signals. Install a Mach handler so we get a
      * register dump on SIGILL/SIGSEGV/SIGFPE — the POSIX handler above
-     * never fires for those on darwin. */
+     * never fires for those on darwin. tvOS marks the underlying Mach
+     * APIs unavailable to bundle code; skip. */
     yos_mach_install_exc_handler();
 #endif
 

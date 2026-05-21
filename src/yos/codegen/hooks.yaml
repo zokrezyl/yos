@@ -170,6 +170,18 @@ custom_proc:
   - unlockpt
   - ptsname
   - ptsname_r
+  # impl/fifo.c — userspace FIFO registry. tvOS / iOS sandboxes
+  # reject host mkfifo(2) with EPERM, which breaks runit's runsv
+  # at startup. yos_mkfifo creates a placeholder file + a host
+  # pipe(2) pair under that path; yos_open returns a dup of the
+  # matching pipe end. See impl/fifo.c.
+  - mkfifo
+  - mkfifoat
+  # stat/lstat/fstatat — overlay S_IFIFO on registry-matched paths
+  # so runsv and friends see our placeholder file as a real FIFO.
+  - stat
+  - lstat
+  - fstatat
   # impl/mbwc.c — host scratch mbstate_t per call. FreeBSD's
   # mbstate_t is 128 bytes (union with __mbstate8[128]); glibc's is
   # 8 bytes — passing the guest pointer straight through trips
@@ -542,11 +554,11 @@ custom_sig:
 # names refer to converters emitted into struct_convert.{c,h} by our
 # generate_struct_convert.py.
 struct_convert:
-  # stat / lstat / fstatat: auto-bridge via struct_convert (cv_stat_h2w).
+  # stat / lstat / fstatat moved to custom_vfs (impl/fifo.c) — they
+  # need a FIFO-registry st_mode overlay after the host stat() call,
+  # then run cv_stat_h2w themselves to convert the result. Listing
+  # them HERE in addition would make codegen emit a duplicate body.
   # fstat: hand-bridged in impl/posix.c (fd translation through fd_map).
-  stat:           {out: statbuf, type: stat}
-  lstat:          {out: statbuf, type: stat}
-  fstatat:        {out: statbuf, type: stat}
   # struct timespec
   clock_gettime:  {out: tp,      type: timespec}
   clock_getres:   {out: res,     type: timespec}

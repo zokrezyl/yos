@@ -19,6 +19,7 @@
 #include <sys/stat.h>
 #include <sys/uio.h>
 #include <sys/syscall.h>
+#include <pthread.h>     /* pthread_self() — used by the ioctl tid trace */
 #ifdef __linux__
 #  include <linux/stat.h>  /* for struct statx */
 #  include <linux/time_types.h> /* struct __kernel_timespec */
@@ -385,6 +386,29 @@ int32_t yos_open(struct yos_exec_ctx *ctx, uint32_t path, int32_t flags, int32_t
         }
     }
 
+    /* Fake-FIFO lookup. mkfifo(2) is forbidden on tvOS/iOS sandboxes,
+     * so yos_mkfifo registers (path → host pipe fds) and the matching
+     * open() returns a dup of the right end. See impl/fifo.c. Helper
+     * sets errno=0 + returns -1 on "not a FIFO" so we fall through
+     * to the regular path. */
+    {
+        extern int yos_fifo_try_open(const char *path, int flags);
+        int hfifo = yos_fifo_try_open(s, flags);
+        if (hfifo >= 0) return yos_fd_alloc(ctx, hfifo);
+        if (errno != 0) return yos_errno_neg(ctx, errno);
+    }
+
+    /* Fake-PTY slave lookup. posix_openpt on sandboxed darwin (tvOS,
+     * iOS) returns EPERM; impl/pty.c falls back to socketpair and
+     * synthesises "/dev/yos-pts/N". The matching open() of that path
+     * needs to hand back a dup of the slave end. */
+    {
+        extern int yos_pty_try_open(const char *path, int flags);
+        int hpty = yos_pty_try_open(s, flags);
+        if (hpty >= 0) return yos_fd_alloc(ctx, hpty);
+        if (errno != 0) return yos_errno_neg(ctx, errno);
+    }
+
     int hflags = oflags_fb_to_lx(flags);
     /* open() is `int open(const char *path, int flags, ...)` in
      * FreeBSD headers — variadic. clang's wasm32 ABI passes the
@@ -453,6 +477,12 @@ int32_t yos_unlink(struct yos_exec_ctx *ctx, uint32_t pathname)
     const char *raw = wstr(ctx, pathname);
     if (!raw) return yos_errno_neg(ctx, EFAULT);
     const char *s = yos_path_resolve(ctx, raw);
+    /* If this was a fake FIFO, drop the registry entry first so the
+     * held pipe fds get freed; then unlink the placeholder file. */
+    {
+        extern int yos_fifo_drop(const char *path);
+        (void)yos_fifo_drop(s);
+    }
     return yos_errno_check(ctx, unlink(s));
 }
 
@@ -685,7 +715,7 @@ int32_t yos_ioctl(struct yos_exec_ctx *ctx, int32_t fd, uint32_t cmd, uint32_t a
     }
 
     ydebug("ioctl(tid=%d fd=%d, cmd=0x%x->0x%x, va_pack=0x%x user_arg=0x%x)\n",
-           (int)syscall(SYS_gettid), fd, cmd, lcmd, arg, user_arg);
+           (int)(uintptr_t)pthread_self(), fd, cmd, lcmd, arg, user_arg);
 
     int hfd = host_fd(ctx, fd);
     void *argp = user_arg ? wptr(ctx, user_arg) : NULL;

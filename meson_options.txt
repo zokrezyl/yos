@@ -45,6 +45,12 @@ option('ios_unblock',
   description : 'When building against the iPhoneSimulator SDK, work around the six libc symbols (system, drem, gamma, finite, significand, clock_settime) that Apple marks `unavailable` on iOS but ships in libSystem at runtime. Resolves them via dlsym on first call.',
 )
 
+option('tvos_unblock',
+  type        : 'boolean',
+  value       : false,
+  description : 'When building against the AppleTVOS SDK, work around the libc symbols Apple marks `unavailable` on tvOS (the iOS set plus daemon and execvP). Resolves them via dlsym on first call. See build-tools/tvos/tvos-unblock.{h,c}.',
+)
+
 option('build_static_lib',
   type        : 'boolean',
   value       : false,
