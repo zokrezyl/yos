@@ -184,6 +184,7 @@ yos_runtime_sources = files(
   # syslog, env, getopt, timezone, password DB, etc.
   'impl/libc/posix.c',
   'impl/libc/printf.c',
+  'impl/libc/scanf.c',
   'impl/libc/env.c',
   'impl/libc/getopt.c',
   'impl/libc/tz.c',

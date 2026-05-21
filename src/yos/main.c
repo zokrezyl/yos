@@ -54,6 +54,12 @@ extern int32_t yos_vsprintf(struct yos_exec_ctx *ctx,
                             uint32_t dst, uint32_t fmt, uint32_t va);
 extern int32_t yos_vsnprintf(struct yos_exec_ctx *ctx,
                              uint32_t dst, uint32_t n, uint32_t fmt, uint32_t va);
+extern int32_t yos_scanf  (struct yos_exec_ctx *ctx,
+                           uint32_t fmt, uint32_t va);
+extern int32_t yos_fscanf (struct yos_exec_ctx *ctx,
+                           uint32_t fp, uint32_t fmt, uint32_t va);
+extern int32_t yos_sscanf (struct yos_exec_ctx *ctx,
+                           uint32_t src, uint32_t fmt, uint32_t va);
 
 /* exec family — must trap to unwind out of wasm so the host's exec
  * pump can load the new module. yos_execve* set exec_pending=1 and
@@ -146,6 +152,32 @@ static m3ApiRawFunction(m3_vsprintf) {
     struct yos_exec_ctx *ctx = (struct yos_exec_ctx *)m3_GetUserData(runtime);
     pfx_refresh(runtime, ctx);
     m3ApiReturn(yos_vsprintf(ctx, dst, fmt, va));
+}
+static m3ApiRawFunction(m3_scanf) {
+    m3ApiReturnType(int32_t);
+    m3ApiGetArg(uint32_t, fmt); m3ApiGetArg(uint32_t, va);
+    struct yos_exec_ctx *ctx = (struct yos_exec_ctx *)m3_GetUserData(runtime);
+    pfx_refresh(runtime, ctx);
+    PFX_TRACE("scanf");
+    m3ApiReturn(yos_scanf(ctx, fmt, va));
+}
+static m3ApiRawFunction(m3_fscanf) {
+    m3ApiReturnType(int32_t);
+    m3ApiGetArg(uint32_t, fp); m3ApiGetArg(uint32_t, fmt);
+    m3ApiGetArg(uint32_t, va);
+    struct yos_exec_ctx *ctx = (struct yos_exec_ctx *)m3_GetUserData(runtime);
+    pfx_refresh(runtime, ctx);
+    PFX_TRACE("fscanf");
+    m3ApiReturn(yos_fscanf(ctx, fp, fmt, va));
+}
+static m3ApiRawFunction(m3_sscanf) {
+    m3ApiReturnType(int32_t);
+    m3ApiGetArg(uint32_t, src); m3ApiGetArg(uint32_t, fmt);
+    m3ApiGetArg(uint32_t, va);
+    struct yos_exec_ctx *ctx = (struct yos_exec_ctx *)m3_GetUserData(runtime);
+    pfx_refresh(runtime, ctx);
+    PFX_TRACE("sscanf");
+    m3ApiReturn(yos_sscanf(ctx, src, fmt, va));
 }
 static m3ApiRawFunction(m3_vsnprintf) {
     m3ApiReturnType(int32_t);
@@ -1269,6 +1301,9 @@ void yos_link_imports(IM3Module module, struct yos_exec_ctx *ctx)
     m3_LinkRawFunction(module, "env", "vfprintf",  "i(iii)",  m3_vfprintf);
     m3_LinkRawFunction(module, "env", "vsprintf",  "i(iii)",  m3_vsprintf);
     m3_LinkRawFunction(module, "env", "vsnprintf", "i(iiii)", m3_vsnprintf);
+    m3_LinkRawFunction(module, "env", "scanf",     "i(ii)",   m3_scanf);
+    m3_LinkRawFunction(module, "env", "fscanf",    "i(iii)",  m3_fscanf);
+    m3_LinkRawFunction(module, "env", "sscanf",    "i(iii)",  m3_sscanf);
 
     /* Per-ctx libc-globals isolation (build-tools/libbridge/policies/libc.yaml).
      *

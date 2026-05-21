@@ -51,3 +51,6 @@ runtime/runit/*/supervise/
 runtime/runit/*/log/supervise/
 runtime/runit/*/log/main/
 runtime/logs/
+
+# clangd index cache
+.cache/
