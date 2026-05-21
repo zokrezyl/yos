@@ -177,6 +177,17 @@ int32_t yos_fd_close(struct yos_exec_ctx *ctx, int32_t wfd)
     return yos_errno_check(ctx, (int32_t)r);
 }
 
+/* Release a wasm-fd slot WITHOUT calling close(host_fd). Used by
+ * impl/io/file.c::free_handle after fclose(host_FILE) has already
+ * closed the underlying host fd — calling close on a stale fd would
+ * EBADF (or worse, close someone else's freshly-opened fd that got
+ * the recycled number). */
+void yos_fd_release_slot(struct yos_exec_ctx *ctx, int32_t wfd)
+{
+    if (!ctx || wfd < 0 || wfd >= YOS_FD_MAX) return;
+    ctx->fd_map[wfd] = -1;
+}
+
 void yos_fd_fork_dup(struct yos_exec_ctx *child, struct yos_exec_ctx *parent)
 {
     for (int i = 0; i < YOS_FD_MAX; i++) {

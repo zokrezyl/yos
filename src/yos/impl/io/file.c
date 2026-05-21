@@ -33,10 +33,35 @@
 #include "impl/errno_helpers.h"
 
 #define YOS_FILE_MAX 256
-static FILE *yos_files[YOS_FILE_MAX];
+
+/* Per-slot state: the host FILE* AND the wasm fd that wraps the
+ * file's underlying host fd. Two pieces are needed because the wasm
+ * guest sees them as DIFFERENT NAMESPACES:
+ *
+ *   - FILE-handle index (the value returned by fopen / passed to
+ *     fread / fwrite / etc.). 1..3 are stdin/stdout/stderr, 4..MAX
+ *     are dynamically allocated.
+ *
+ *   - wasm fd (the value returned by fileno() / dirfd() / passed to
+ *     read / write / fstat / fcntl / close). Indexes into ctx->fd_map
+ *     which holds host fds.
+ *
+ * Pre-fix: yos_fileno returned `fileno(host_FILE)` directly — the
+ * raw host fd. The wasm guest passed that to env.fstat, which
+ * routed it through yos_fd_get(wasm_fd) and tried to look up the
+ * host fd as a wasm fd. fd_map[host_fd] was unset → EBADF →
+ * "ssh nixem" failed with `fstat /Users/.../.ssh/config: Bad file
+ * descriptor` after the underlying fopen had succeeded. */
+struct yos_file_slot {
+    FILE   *fp;
+    int32_t wfd;   /* -1 if not allocated */
+};
+static struct yos_file_slot yos_files[YOS_FILE_MAX];
 static pthread_mutex_t yos_file_lock = PTHREAD_MUTEX_INITIALIZER;
 
 extern int yos_fd_get(struct yos_exec_ctx *ctx, int wasm_fd);
+extern int32_t yos_fd_alloc(struct yos_exec_ctx *ctx, int host_fd);
+extern int32_t yos_fd_close(struct yos_exec_ctx *ctx, int32_t wfd);
 
 FILE *yos_handle_to_file(uint32_t h)
 {
@@ -45,7 +70,7 @@ FILE *yos_handle_to_file(uint32_t h)
     if (h == 2) return stdout;
     if (h == 3) return stderr;
     if (h < 4 || h >= YOS_FILE_MAX) return NULL;
-    return yos_files[h];
+    return yos_files[h].fp;
 }
 #define handle_to_file yos_handle_to_file
 
@@ -70,31 +95,57 @@ static int std_handle_hfd(struct yos_exec_ctx *ctx, uint32_t h)
     return -1;
 }
 
-static uint32_t alloc_handle(FILE *f)
+/* Register a host FILE* in the wasm-side handle table AND allocate
+ * a wasm fd that wraps the host fd underneath. Two-step contract:
+ *
+ *   1. Slot the FILE* so fread / fwrite / etc. can find it by handle.
+ *   2. Allocate a wasm fd in ctx->fd_map for the host fd inside the
+ *      FILE — fileno() returns this wasm fd so subsequent stat / read
+ *      / write / fcntl bridges resolve it correctly via yos_fd_get.
+ *
+ * Caller passes ctx so we can reach ctx->fd_map. wfd_out is the
+ * allocated wasm fd (or -1 on alloc failure). */
+static uint32_t alloc_handle(struct yos_exec_ctx *ctx, FILE *f)
 {
     if (!f) return 0;
+    int hfd = fileno(f);
+    int32_t wfd = (hfd >= 0 && ctx) ? yos_fd_alloc(ctx, hfd) : -1;
     pthread_mutex_lock(&yos_file_lock);
     for (uint32_t i = 4; i < YOS_FILE_MAX; i++) {
-        if (yos_files[i] == NULL) {
-            yos_files[i] = f;
+        if (yos_files[i].fp == NULL) {
+            yos_files[i].fp  = f;
+            yos_files[i].wfd = wfd;
             pthread_mutex_unlock(&yos_file_lock);
             return i;
         }
     }
     pthread_mutex_unlock(&yos_file_lock);
+    /* Out of slots — undo the wasm-fd alloc so we don't leak it. */
+    if (wfd >= 0 && ctx) yos_fd_close(ctx, wfd);
     return 0;
 }
 
 /* Public version for other impl files (impl/pwd.c::yos_tmpfile etc.)
  * that need to register a host FILE in the wasm-side handle table. */
-uint32_t yos_alloc_file_handle(FILE *f) { return alloc_handle(f); }
+uint32_t yos_alloc_file_handle(struct yos_exec_ctx *ctx, FILE *f)
+{ return alloc_handle(ctx, f); }
 
-static void free_handle(uint32_t h)
+static void free_handle(struct yos_exec_ctx *ctx, uint32_t h)
 {
     if (h < 4 || h >= YOS_FILE_MAX) return;
     pthread_mutex_lock(&yos_file_lock);
-    yos_files[h] = NULL;
+    int32_t wfd = yos_files[h].wfd;
+    yos_files[h].fp  = NULL;
+    yos_files[h].wfd = -1;
     pthread_mutex_unlock(&yos_file_lock);
+    /* The host fd is closed by fclose() before we reach this point —
+     * the wasm-fd slot just needs to be released (NOT close again,
+     * which would EBADF). yos_fd_close hits close(hfd) again, so
+     * we release the slot manually. */
+    if (wfd >= 0 && ctx) {
+        extern void yos_fd_release_slot(struct yos_exec_ctx *ctx, int32_t wfd);
+        yos_fd_release_slot(ctx, wfd);
+    }
 }
 
 /* ── fopen / fclose / fdopen / freopen ─────────────────────────────── */
@@ -107,7 +158,7 @@ uint32_t yos_fopen(struct yos_exec_ctx *ctx, uint32_t path_off, uint32_t mode_of
     const char *mode = (const char *)(ctx->memory + mode_off);
     FILE *f = fopen(path, mode);
     if (!f) return 0;
-    uint32_t h = alloc_handle(f);
+    uint32_t h = alloc_handle(ctx, f);
     if (!h) fclose(f);
     return h;
 }
@@ -123,8 +174,8 @@ uint32_t yos_freopen(struct yos_exec_ctx *ctx, uint32_t path_off,
     if (!f_new) return 0;
     /* If reopened in-place, return the same handle. */
     if (f_new == f_old) return fp;
-    if (fp >= 4 && fp < YOS_FILE_MAX) free_handle(fp);
-    return alloc_handle(f_new);
+    if (fp >= 4 && fp < YOS_FILE_MAX) free_handle(ctx, fp);
+    return alloc_handle(ctx, f_new);
 }
 
 uint32_t yos_fdopen(struct yos_exec_ctx *ctx, int32_t wfd, uint32_t mode_off)
@@ -135,7 +186,7 @@ uint32_t yos_fdopen(struct yos_exec_ctx *ctx, int32_t wfd, uint32_t mode_off)
     const char *mode = (const char *)(ctx->memory + mode_off);
     FILE *f = fdopen(hfd, mode);
     if (!f) return 0;
-    return alloc_handle(f);
+    return alloc_handle(ctx, f);
 }
 
 int32_t yos_fclose(struct yos_exec_ctx *ctx, uint32_t fp)
@@ -143,7 +194,7 @@ int32_t yos_fclose(struct yos_exec_ctx *ctx, uint32_t fp)
     FILE *f = handle_to_file(fp);
     if (!f) return yos_errno_neg(ctx, EBADF);
     int r = fclose(f);
-    if (fp >= 4 && fp < YOS_FILE_MAX) free_handle(fp);
+    if (fp >= 4 && fp < YOS_FILE_MAX) free_handle(ctx, fp);
     return yos_errno_check(ctx, r);
 }
 
@@ -328,7 +379,26 @@ int32_t yos_fflush(struct yos_exec_ctx *ctx, uint32_t fp)
 int32_t yos_feof   (struct yos_exec_ctx *ctx, uint32_t fp) { (void)ctx; FILE *f=handle_to_file(fp); return f?feof(f):0; }
 int32_t yos_ferror (struct yos_exec_ctx *ctx, uint32_t fp) { (void)ctx; FILE *f=handle_to_file(fp); return f?ferror(f):0; }
 int32_t yos_clearerr(struct yos_exec_ctx *ctx, uint32_t fp){ (void)ctx; FILE *f=handle_to_file(fp); if(f) clearerr(f); return 0; }
-int32_t yos_fileno (struct yos_exec_ctx *ctx, uint32_t fp) { (void)ctx; FILE *f=handle_to_file(fp); return f?fileno(f):-1; }
+/* fileno(fp) — MUST return the WASM fd, not the host fd. The wasm
+ * guest will then pass that to fstat / read / fcntl / close etc.,
+ * all of which go through yos_fd_get to map the wasm fd to a host
+ * fd. Returning the host fd directly (which old code did) made
+ * fstat/read/fcntl EBADF every time — see commit message that
+ * introduced struct yos_file_slot.wfd for the ssh bug context. */
+int32_t yos_fileno(struct yos_exec_ctx *ctx, uint32_t fp)
+{
+    (void)ctx;
+    /* Stream handles 1/2/3 map to the per-ctx wasm fds 0/1/2
+     * (stdin/stdout/stderr). */
+    if (fp == 1) return 0;
+    if (fp == 2) return 1;
+    if (fp == 3) return 2;
+    if (fp < 4 || fp >= YOS_FILE_MAX) return -1;
+    pthread_mutex_lock(&yos_file_lock);
+    int32_t wfd = yos_files[fp].wfd;
+    pthread_mutex_unlock(&yos_file_lock);
+    return wfd;
+}
 
 /* ── seek/tell ─────────────────────────────────────────────────── */
 
@@ -378,21 +448,79 @@ int32_t yos_setlinebuf(struct yos_exec_ctx *ctx, uint32_t fp)
 
 /* ── getline / getdelim ─────────────────────────────────────────── */
 
+extern uint32_t yos_malloc(struct yos_exec_ctx *ctx, uint32_t size);
+extern uint32_t yos_realloc(struct yos_exec_ctx *ctx, uint32_t off, uint32_t newsize);
+
+/* getdelim core. `lineptr_off` is a wasm pointer-to-uint32 (i.e. the
+ * guest's `char **lineptr`); `n_off` is wasm pointer-to-uint32
+ * (the `size_t *n`). On entry *lineptr may be 0 (we allocate via
+ * yos_malloc), otherwise we use it as the seed buffer and grow it
+ * via yos_realloc. We always update *lineptr / *n to reflect the
+ * final buffer.
+ *
+ * Pre-fix ssh's ~/.ssh/config never got parsed because OpenSSH's
+ * read_config_file uses getline() and our bridge returned -ENOSYS,
+ * so every Host stanza was silently skipped. yos then handed the
+ * un-resolved hostname (e.g. "nixem") straight to getaddrinfo. */
+static int32_t do_getdelim(struct yos_exec_ctx *ctx,
+                           uint32_t lineptr_off, uint32_t n_off,
+                           int delim, uint32_t fp)
+{
+    FILE *f = handle_to_file(fp);
+    if (!f) { errno = EBADF; return -1; }
+    if (lineptr_off + 4 > ctx->memory_size || n_off + 4 > ctx->memory_size) {
+        errno = EFAULT;
+        return -1;
+    }
+    uint32_t buf_off = *(uint32_t *)(ctx->memory + lineptr_off);
+    uint32_t buf_cap = *(uint32_t *)(ctx->memory + n_off);
+
+    if (buf_off == 0 || buf_cap == 0) {
+        buf_cap = 128;
+        buf_off = yos_malloc(ctx, buf_cap);
+        if (!buf_off) { errno = ENOMEM; return -1; }
+    }
+
+    size_t pos = 0;
+    int c;
+    for (;;) {
+        c = fgetc(f);
+        if (c == EOF) {
+            if (pos == 0) {
+                /* No data read AND EOF → return -1 per POSIX. errno
+                 * stays 0 if it's a clean EOF, or has the read error. */
+                *(uint32_t *)(ctx->memory + lineptr_off) = buf_off;
+                *(uint32_t *)(ctx->memory + n_off)       = buf_cap;
+                return -1;
+            }
+            break;
+        }
+        /* Need room for c AND the trailing NUL. */
+        if (pos + 1 >= buf_cap) {
+            uint32_t new_cap = buf_cap * 2;
+            uint32_t new_off = yos_realloc(ctx, buf_off, new_cap);
+            if (!new_off) { errno = ENOMEM; return -1; }
+            buf_off = new_off;
+            buf_cap = new_cap;
+        }
+        ctx->memory[buf_off + pos++] = (uint8_t)c;
+        if (c == delim) break;
+    }
+    ctx->memory[buf_off + pos] = '\0';
+
+    *(uint32_t *)(ctx->memory + lineptr_off) = buf_off;
+    *(uint32_t *)(ctx->memory + n_off)       = buf_cap;
+    return (int32_t)pos;
+}
+
 int32_t yos_getline(struct yos_exec_ctx *ctx, uint32_t lineptr, uint32_t n,
                     uint32_t fp)
 {
-    /* Need to allocate via guest malloc — can't expose host pointer.
-     * Stub for now until the alloc side learns to hand out wasm
-     * offsets to bridges that need them. */
-    (void)ctx; (void)lineptr; (void)n; (void)fp;
-    errno = ENOSYS;
-    return -1;
+    return do_getdelim(ctx, lineptr, n, '\n', fp);
 }
 
 int32_t yos_getdelim(struct yos_exec_ctx *ctx, uint32_t lineptr, uint32_t n,
                      int32_t delim, uint32_t fp)
 {
-    (void)ctx; (void)lineptr; (void)n; (void)delim; (void)fp;
-    errno = ENOSYS;
-    return -1;
+    return do_getdelim(ctx, lineptr, n, delim, fp);
 }

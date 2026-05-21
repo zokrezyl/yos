@@ -659,9 +659,11 @@ stub:
   - getbytefromcharset
   - tocharset
   - tree2cset
-  - ___runetype
-  - ___tolower
-  - ___toupper
+  # ___runetype / ___tolower / ___toupper unstubbed — analyse-report
+  # classifies them as compatible/mechanical (pure int → int with the
+  # same signature on darwin), codegen auto-emits a real passthrough.
+  # __srget still needs human-curated bridge (needs_policy: FILE*
+  # internals).
   - __srget
   # __swbuf moved to custom_proc (impl/posix.c) — wraps yos_fputc.
   # __xuname (uname's backend) moved to custom_proc (impl/posix.c).
@@ -725,7 +727,9 @@ stub:
   - toupper_l
   - towlower_l
   - towupper_l
-  - towctrans
+  # towctrans unstubbed — compatible signature on darwin, codegen
+  # auto-passthrough. towctrans_l still stubbed (locale_t is a host
+  # opaque pointer the bridge would have to translate).
   - towctrans_l
   # Wide-char variadic-like fns. Take va_list as a regular arg, but
   # bridge.py mis-renders the wrapper-vs-body arg count for them.
@@ -800,8 +804,10 @@ stub:
   # sbrk — implemented in impl/posix.c (custom_vfs / custom_proc /
   # custom_mem / custom_sig per hooks.yaml).
   # alarm / sleep / ualarm — fully portable; auto-passthrough works.
-  - revoke
-  - wait        # yos-private has wait4 only; map at next iteration
+  # revoke + wait unstubbed — both classified compatible by analyse,
+  # darwin/iOS/tvOS export them with the same signature, codegen
+  # auto-passthrough Just Works. zsh's wait(2) round-trip now uses
+  # the host call rather than ENOSYS-trapping out of the shell loop.
   # Note: wait3 was previously stubbed here. zsh's `wait_for_processes`
   # calls wait3 (configure detected HAVE_WAIT3) and treats anything
   # that isn't 0 / -1+ECHILD as a hard error → "wait failed:" warnings

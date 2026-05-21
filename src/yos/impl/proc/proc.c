@@ -1877,6 +1877,16 @@ int yos_proc_kill_by_pid(struct yos_runtime *rt, int32_t pid, int32_t sig)
     return deliver_to_proc(p, sig);
 }
 
+/* wait(int *status) — equivalent to waitpid(-1, status, 0). POSIX
+ * blocks until ANY child changes state. yos_waitpid handles the
+ * blocking + status writeback already. Was stubbed -ENOSYS via
+ * hooks.yaml; promoted to passthrough by removing the entry, so
+ * codegen's m3w_wait wrapper looks up this symbol. */
+int32_t yos_wait(struct yos_exec_ctx *ctx, uint32_t stat_addr)
+{
+    return yos_waitpid(ctx, -1, stat_addr, 0);
+}
+
 /* wait3(status, options, rusage) — equivalent to waitpid(-1, status,
  * options) with rusage data. zsh's `wait_for_processes` uses wait3
  * with WNOHANG to drain zombies after a SIGCHLD. The bridge previously

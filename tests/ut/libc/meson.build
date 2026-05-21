@@ -94,6 +94,27 @@ libc_tests = [
   # info-leak ls printed before yos_lpathconf called yos_errno_neg
   # ("./<file>: Undefined error: 0"). See impl/libc/posix.c::yos_lpathconf.
   'test_lpathconf_errno',
+  # fopen → fileno → fstat round-trip. Pre-fix yos_fileno returned
+  # the host fd, which couldn't be looked up in ctx->fd_map; every
+  # subsequent fstat/read/fcntl EBADF'd. ssh's "fstat /Users/.../
+  # .ssh/config: Bad file descriptor" pinned by this test.
+  'test_fopen_fileno_fstat',
+  # lstat on a symlink: AT_SYMLINK_NOFOLLOW must be translated to
+  # the host's bit (FreeBSD 0x200 → darwin 0x20) so the call
+  # doesn't collapse to stat(). And the result's mode bits must be
+  # normalised to 0777 (FreeBSD contract) regardless of what the
+  # host lstat returns. ls used to display symlinks as regular
+  # files because both pieces were broken.
+  'test_symlink_lstat_perms',
+  # user_from_uid + group_from_gid must use SEPARATE wasm scratch
+  # buffers. ls's `printf("%s %s", uname, gname)` evaluated both
+  # before printf; pre-fix they wrote into one shared buffer and
+  # ls displayed `staff staff` for every file.
+  'test_pwd_user_group_distinct',
+  # getline(): reads lines from a FILE* — used by ssh's config
+  # parser. Was stubbed -ENOSYS; ssh got zero lines from
+  # ~/.ssh/config and tried to DNS-resolve every Host alias.
+  'test_getline_basic',
 ]
 
 # Path to the generator's output dir, exposed by src/yos/codegen.

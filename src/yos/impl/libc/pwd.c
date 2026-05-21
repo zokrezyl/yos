@@ -928,14 +928,14 @@ uint32_t yos_strptime(struct yos_exec_ctx *ctx, uint32_t buf_off,
  * in impl/file.c's handle table. The auto-bridge stubs this
  * because the return type FILE* is complex; the handle table makes
  * it trivial. */
-extern uint32_t yos_alloc_file_handle(FILE *f);
+extern uint32_t yos_alloc_file_handle(struct yos_exec_ctx *ctx, FILE *f);
 
 uint32_t yos_tmpfile(struct yos_exec_ctx *ctx)
 {
     (void)ctx;
     FILE *f = tmpfile();
     if (!f) return 0;
-    uint32_t h = yos_alloc_file_handle(f);
+    uint32_t h = yos_alloc_file_handle(ctx, f);
     if (!h) fclose(f);
     return h;
 }
