@@ -1806,7 +1806,26 @@ static int load_wasm_module(struct yos_exec_ctx *ctx, IM3Environment env,
      * A guest that needs more than its declared initial can still
      * memory.grow() up to maxPages at runtime — wasm3 handles that. */
     extern M3Result ResizeMemory(IM3Runtime, uint32_t);
+    /* Honour an env override so tvOS / iOS app-bundle builds (where
+     * the per-process address-space budget is much tighter than a
+     * desktop's) can shrink the default. Each fork allocates a fresh
+     * linear-memory blob; on a tvOS app a few outstanding telnet
+     * connections multiplied by 256 MiB hits the jetsam ceiling and
+     * ResizeMemory starts failing with "have 131072, need
+     * 268435456" — every later fork then traps inside asyncify's
+     * rewind. 1024 pages = 64 MiB is enough for zsh + the runit
+     * supervisor and small enough that 8+ live forks still fit. */
     uint32_t resize_pages = 4096;
+    {
+        const char *env_pages = getenv("YOS_WASM_PAGES");
+        if (env_pages && *env_pages) {
+            char *e = NULL;
+            unsigned long v = strtoul(env_pages, &e, 10);
+            if (e && *e == '\0' && v > 0 && v <= 65536u) {
+                resize_pages = (uint32_t)v;
+            }
+        }
+    }
     if (module->memoryInfo.maxPages > 0 &&
         module->memoryInfo.maxPages < resize_pages) {
         resize_pages = module->memoryInfo.maxPages;

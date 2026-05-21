@@ -771,9 +771,20 @@ static void *fork_thread_func(void *arg)
         /* Use the just-loaded module's declared max (capped at 4096 pages
          * = 256 MiB for nvim's sake). Avoids over-committing memory the
          * execed binary doesn't need — fork after exec then snapshots a
-         * smaller arena. */
+         * smaller arena. YOS_WASM_PAGES overrides the default so
+         * sandbox-constrained hosts (tvOS/iOS app bundles, where every
+         * forked wasm process eats its share of a ≤1 GiB total budget)
+         * can shrink it. */
         {
             uint32_t pages = 4096;
+            const char *env_pages = getenv("YOS_WASM_PAGES");
+            if (env_pages && *env_pages) {
+                char *e = NULL;
+                unsigned long v = strtoul(env_pages, &e, 10);
+                if (e && *e == '\0' && v > 0 && v <= 65536u) {
+                    pages = (uint32_t)v;
+                }
+            }
             if (mod->memoryInfo.maxPages > 0 &&
                 mod->memoryInfo.maxPages < pages)
                 pages = mod->memoryInfo.maxPages;

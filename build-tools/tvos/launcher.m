@@ -310,6 +310,15 @@ static void *yos_worker(void *arg) {
     setenv("PATH",              [libexec UTF8String], 1);
     setenv("LOG_DIR",           [logdir UTF8String], 1);
     setenv("YTRACE_DEFAULT_ON", "yes", 1);
+    /* tvOS app sandbox has a much tighter per-process address-space
+     * cap than a desktop. yos's default linear-memory size is 256 MiB
+     * per wasm process; multiplied by 5–10 concurrent forks (one per
+     * accepted telnet connection that hasn't been reaped yet), we'd
+     * blow past the jetsam limit and ResizeMemory starts failing.
+     * 64 MiB per process easily covers zsh + supervisor + tcpserver
+     * while leaving room for 8+ live children. Read by main.c during
+     * load_wasm_module. */
+    setenv("YOS_WASM_PAGES", "1024", 1);
 
     NSString *runsvdir = [libexec stringByAppendingPathComponent:@"runsvdir"];
     const char *argv[] = {

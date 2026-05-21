@@ -71,6 +71,16 @@ int32_t yos_isatty(struct yos_exec_ctx *ctx, int32_t wfd)
 {
     int hfd = yos_fd_get(ctx, wfd);
     if (hfd < 0) { errno = EBADF; ydebug("isatty(wfd=%d) -> 0 (EBADF)\n", wfd); return 0; }
+    /* Fake-PTY recognition. tvOS sandboxed posix_openpt failed, so
+     * impl/pty.c gave the caller socketpair fds. host isatty() on a
+     * socket returns 0 — but the wasm guest (zsh) really IS hooked up
+     * to what is semantically a terminal pair. Without saying yes
+     * here zsh never enters interactive mode (no prompt, no echo). */
+    extern int yos_pty_is_pty_fd(int hfd);
+    if (yos_pty_is_pty_fd(hfd)) {
+        ydebug("isatty(wfd=%d hfd=%d) -> 1 (fake PTY)\n", wfd, hfd);
+        return 1;
+    }
     int r = isatty(hfd);
     ydebug("isatty(wfd=%d hfd=%d) -> %d\n", wfd, hfd, r);
     return r;
@@ -1217,11 +1227,66 @@ static void termios_lx_to_fb(uint8_t *w, const struct termios *h)
     *(uint32_t *)(w + 40) = (uint32_t)cfgetospeed(h);
 }
 
+/* Fill a host termios with the defaults a real PTY master/slave gets
+ * after openpt(): canonical mode, echo on, common control chars,
+ * 38400 baud. This is what zsh's tcgetattr sees on a working PTY and
+ * lets the shell turn on its interactive features (prompt, echo,
+ * line editing). The wasm guest may then tcsetattr to switch the
+ * line discipline; we silently accept those and remember the last
+ * struct so subsequent tcgetattr round-trips are stable. */
+static struct termios g_fake_pty_termios;
+static int            g_fake_pty_termios_init;
+
+static void fake_pty_termios_defaults(struct termios *t)
+{
+    /* Synthesise the cooked-mode termios a real PTY reports after
+     * posix_openpt(): ICANON + ECHO on, common control chars, 38400
+     * baud. This is what zsh and telnetd both expect from a TTY.
+     *
+     * NB: telnetd's net-output path uses ESC → IAC DM (synch) framing
+     * when it sees an ESC in a stream marked TTY. That's standard
+     * RFC 854 / 855 — real telnet clients UNSTUFF IAC DM correctly
+     * and display ESC as the escape byte. A naive raw recv that
+     * consumes IAC as a 3-byte command will lose the byte after DM —
+     * that's a client-side framing bug, not a telnetd bug. */
+    memset(t, 0, sizeof *t);
+    t->c_iflag = ICRNL | IXON | BRKINT;
+    t->c_oflag = OPOST | ONLCR;
+    t->c_cflag = CS8 | CREAD | HUPCL;
+    t->c_lflag = ECHO | ECHOE | ECHOK | ECHONL | ICANON | ISIG | IEXTEN;
+    t->c_cc[VINTR]    = 003;  /* ^C  */
+    t->c_cc[VQUIT]    = 034;  /* ^\  */
+    t->c_cc[VERASE]   = 0177; /* DEL */
+    t->c_cc[VKILL]    = 025;  /* ^U  */
+    t->c_cc[VEOF]     = 004;  /* ^D  */
+    t->c_cc[VSTART]   = 021;  /* ^Q  */
+    t->c_cc[VSTOP]    = 023;  /* ^S  */
+    t->c_cc[VSUSP]    = 032;  /* ^Z  */
+    t->c_cc[VMIN]     = 1;
+    t->c_cc[VTIME]    = 0;
+    cfsetispeed(t, B38400);
+    cfsetospeed(t, B38400);
+}
+
 int32_t yos_tcgetattr(struct yos_exec_ctx *ctx, int32_t wfd, uint32_t t_off)
 {
     if (t_off + YOS_FBSD_TERMIOS_SIZE > ctx->memory_size) return yos_errno_neg(ctx, EFAULT);
     int hfd = yos_fd_get(ctx, wfd);
     if (hfd < 0) return yos_errno_neg(ctx, EBADF);
+
+    /* Synthesise termios for fake PTYs (socketpair host fds — host
+     * tcgetattr returns ENOTSUP/ENOTTY on them). Without this zsh
+     * picks the no-tty code path and runs without a prompt. */
+    extern int yos_pty_is_pty_fd(int hfd);
+    if (yos_pty_is_pty_fd(hfd)) {
+        if (!g_fake_pty_termios_init) {
+            fake_pty_termios_defaults(&g_fake_pty_termios);
+            g_fake_pty_termios_init = 1;
+        }
+        termios_lx_to_fb(ctx->memory + t_off, &g_fake_pty_termios);
+        return 0;
+    }
+
     struct termios h;
     if (tcgetattr(hfd, &h) < 0) return yos_errno_neg(ctx, errno);
     termios_lx_to_fb(ctx->memory + t_off, &h);
@@ -1234,6 +1299,23 @@ int32_t yos_tcsetattr(struct yos_exec_ctx *ctx, int32_t wfd,
     if (t_off + YOS_FBSD_TERMIOS_SIZE > ctx->memory_size) return yos_errno_neg(ctx, EFAULT);
     int hfd = yos_fd_get(ctx, wfd);
     if (hfd < 0) return yos_errno_neg(ctx, EBADF);
+
+    /* Fake-PTY: store the requested termios in our shared synthetic
+     * slot so a subsequent guest tcgetattr round-trip returns what
+     * was just set. We don't actually enforce line discipline at the
+     * host socket level (it's a socket, no kernel TTY behind it) —
+     * the guest is responsible for its own raw/cooked switching. */
+    extern int yos_pty_is_pty_fd(int hfd);
+    if (yos_pty_is_pty_fd(hfd)) {
+        if (!g_fake_pty_termios_init) {
+            fake_pty_termios_defaults(&g_fake_pty_termios);
+            g_fake_pty_termios_init = 1;
+        }
+        termios_fb_to_lx(&g_fake_pty_termios, ctx->memory + t_off);
+        (void)actions;
+        return 0;
+    }
+
     /* FreeBSD TCSANOW=0, TCSADRAIN=1, TCSAFLUSH=2 — same on Linux, no
      * remap needed. */
     struct termios h;

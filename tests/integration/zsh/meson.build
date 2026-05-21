@@ -161,3 +161,19 @@ foreach name, cfg : zsh_int_tests
        is_parallel : not _serial_zsh.get(name, false),
        timeout : 30)
 endforeach
+
+# tvOS-only round-trip test: drives a wasm zsh on a paired Apple TV
+# over telnet. Skipped automatically (exit 0 with "SKIP: ...") when
+# YOS_TVOS_LAN_IP isn't set or the device isn't reachable, so it's
+# safe to keep in the default suite — it's a no-op on CI / hosts
+# without a tvOS device. Set YOS_TVOS_LAN_IP=192.168.1.9 (or use
+# build-tools/tvos/deploy.sh which gives the IP in its banner) to
+# enable the live-device check.
+test('zsh-tvos-telnet',
+     py3,
+     args : files('test_tvos_telnet.py'),
+     suite : 'integration-zsh',
+     env : zsh_int_env,
+     should_fail : false,
+     is_parallel : false,
+     timeout : 60)

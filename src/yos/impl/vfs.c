@@ -249,6 +249,17 @@ int32_t yos_read(struct yos_exec_ctx *ctx, int32_t fd, uint32_t buf, uint32_t co
     extern void yos_signal_pump(struct yos_exec_ctx *);
     yos_signal_pump(ctx);
     ssize_t r;
+    /* Fake-PTY master in TIOCPKT mode: prepend a 0x00 status byte so
+     * telnetd doesn't misinterpret the first data byte as packet
+     * flags. -2 means "not a packet-mode master", fall through. */
+    {
+        extern ssize_t yos_pty_packet_read(int hfd, void *buf, size_t cap);
+        ssize_t pr = yos_pty_packet_read(hfd, p, count);
+        if (pr != -2) {
+            r = pr;
+            goto read_done;
+        }
+    }
     for (;;) {
         r = read(hfd, p, count);
         if (r >= 0 || errno != EINTR) break;
@@ -259,6 +270,7 @@ int32_t yos_read(struct yos_exec_ctx *ctx, int32_t fd, uint32_t buf, uint32_t co
          * second-stage return from its wasm handler. */
         yos_signal_pump(ctx);
     }
+read_done:;
     if (ytrace_default_enabled()) {
         pid_t tid = yos_plat_gettid();
         char hex[3 * 16 + 1] = {0};
@@ -719,6 +731,19 @@ int32_t yos_ioctl(struct yos_exec_ctx *ctx, int32_t fd, uint32_t cmd, uint32_t a
 
     int hfd = host_fd(ctx, fd);
     void *argp = user_arg ? wptr(ctx, user_arg) : NULL;
+
+    /* TIOCPKT on a fake-PTY master: remember the flag so subsequent
+     * read()s on the master prepend the synthesised status byte.
+     * Without this every output char gets eaten by telnetd as a
+     * packet flag and FLUSHWRITE bits emit spurious IAC DM. Match
+     * EITHER encoding since ioctl_cmd_fb_to_lx is a no-op on darwin
+     * (lcmd stays as FB_TIOCPKT) and a translation on Linux. */
+    if ((lcmd == LX_TIOCPKT || lcmd == FB_TIOCPKT || cmd == FB_TIOCPKT)
+        && hfd >= 0) {
+        extern int yos_pty_set_packet_mode(int hfd, int on);
+        int on_val = (argp && user_arg) ? *(int *)argp : 0;
+        if (yos_pty_set_packet_mode(hfd, on_val)) return 0;
+    }
 
     /* Virtualize controlling-tty foreground pgrp queries/sets so the
      * pgid the wasm caller stores/reads belongs to the *guest* pid

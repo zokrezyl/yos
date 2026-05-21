@@ -61,6 +61,15 @@ struct pty_entry {
     dev_t master_dev;
     int   slave_hfd;
     char *slave_path;     /* "/dev/yos-pts/N" */
+    /* TIOCPKT (packet mode) state. telnetd sets it on the master via
+     * ioctl(master, TIOCPKT, &on=1) at startup. In packet mode each
+     * master read returns a leading status byte (TIOCPKT_FLUSHWRITE
+     * etc.) before the actual data. Our socketpair has no such
+     * framing; we synthesise the leading 0x00 status byte in the
+     * read bridge so telnetd's main loop doesn't interpret the FIRST
+     * REAL DATA BYTE as a packet flag (which made every output char
+     * vanish and the FLUSHWRITE bit emit spurious IAC DM). */
+    int   packet_mode;
     struct pty_entry *next;
 };
 
@@ -83,6 +92,78 @@ static struct pty_entry *pty_lookup_by_path_locked(const char *path) {
     for (struct pty_entry *e = g_pty_head; e; e = e->next)
         if (strcmp(e->slave_path, path) == 0) return e;
     return NULL;
+}
+
+/* Internal: find the entry whose master socket shares its inode/dev
+ * with the given host fd. Returns NULL on miss. Must be called with
+ * g_pty_lock held. */
+static struct pty_entry *pty_find_master_locked(int hfd) {
+    struct stat ms;
+    if (fstat(hfd, &ms) < 0) return NULL;
+    for (struct pty_entry *e = g_pty_head; e; e = e->next)
+        if (e->master_ino == ms.st_ino && e->master_dev == ms.st_dev)
+            return e;
+    return NULL;
+}
+
+/* TIOCPKT switch. Returns 1 if hfd matched a master and the flag was
+ * stored (caller's ioctl bridge returns 0); 0 on miss. */
+int yos_pty_set_packet_mode(int hfd, int on) {
+    pthread_mutex_lock(&g_pty_lock);
+    struct pty_entry *e = pty_find_master_locked(hfd);
+    if (e) {
+        e->packet_mode = on ? 1 : 0;
+        ydebug("pty: TIOCPKT(%d) on master hfd=%d (fake)\n", on, hfd);
+    }
+    int hit = (e != NULL);
+    pthread_mutex_unlock(&g_pty_lock);
+    return hit;
+}
+
+/* If hfd is a fake-master in packet mode AND `buf` has room for an
+ * extra leading byte, do the actual read into `buf+1` and prepend
+ * 0x00 (no flags set). Returns number of bytes written into buf
+ * (including the leading status byte), or -1 with errno on error,
+ * or -2 if hfd isn't a packet-mode master (caller falls through). */
+ssize_t yos_pty_packet_read(int hfd, void *buf, size_t cap) {
+    pthread_mutex_lock(&g_pty_lock);
+    struct pty_entry *e = pty_find_master_locked(hfd);
+    int pkt = (e && e->packet_mode);
+    pthread_mutex_unlock(&g_pty_lock);
+    if (!pkt) return -2;
+    if (cap < 2) { errno = EINVAL; return -1; }
+    char *p = (char *)buf;
+    /* Read up to cap-1 bytes into buf+1, then prepend 0x00. */
+    ssize_t n = read(hfd, p + 1, cap - 1);
+    if (n < 0) return -1;
+    p[0] = 0;
+    return n + 1;
+}
+
+/* Probe whether `hfd` is one of the fake PTY pair endpoints (either
+ * the master end held in fd_map after posix_openpt, or any dup of the
+ * slave end). Used by yos_isatty / yos_tcgetattr / yos_tcsetattr to
+ * synthesise terminal semantics that the underlying socketpair fds
+ * don't have. Match via fstat ino+dev — multiple host dups of the
+ * same socket share the inode/dev pair. */
+int yos_pty_is_pty_fd(int hfd) {
+    struct stat ms;
+    if (fstat(hfd, &ms) < 0) return 0;
+    pthread_mutex_lock(&g_pty_lock);
+    for (struct pty_entry *e = g_pty_head; e; e = e->next) {
+        struct stat ss;
+        if (e->master_ino == ms.st_ino && e->master_dev == ms.st_dev) {
+            pthread_mutex_unlock(&g_pty_lock);
+            return 1;
+        }
+        if (fstat(e->slave_hfd, &ss) == 0 &&
+            ss.st_ino == ms.st_ino && ss.st_dev == ms.st_dev) {
+            pthread_mutex_unlock(&g_pty_lock);
+            return 1;
+        }
+    }
+    pthread_mutex_unlock(&g_pty_lock);
+    return 0;
 }
 
 /* Called from yos_open: returns a fresh dup of the slave end on hit,
