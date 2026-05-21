@@ -16,6 +16,17 @@
 #include <stdint.h>
 
 extern int32_t yos_fd_translate(struct yos_exec_ctx *ctx, int32_t fd);
+extern int32_t yos_fd_get      (struct yos_exec_ctx *ctx, int32_t wfd);
+extern int32_t yos_fd_alloc    (struct yos_exec_ctx *ctx, int host_fd);
+extern int32_t yos_fd_close    (struct yos_exec_ctx *ctx, int32_t wfd);
+extern int     yos_xlate_dfd   (struct yos_exec_ctx *ctx, int32_t wfd);
+extern const char *yos_path_resolve(struct yos_exec_ctx *ctx, const char *p);
+extern void    yos_signal_pump (struct yos_exec_ctx *ctx);
+
+struct iovec;
+extern int yos_iovec_w32_to_host(struct yos_exec_ctx *ctx,
+                                 uint32_t wasm_iov, int32_t iovcnt,
+                                 struct iovec *host_iov);
 
 /* wasm32 offset → host pointer. NULL offset and out-of-bounds both
  * return NULL so callers can EFAULT cleanly. */

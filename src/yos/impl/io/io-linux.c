@@ -21,6 +21,8 @@
 #include "yos/types.h"
 #include "impl/io/io-internal.h"
 #include "impl/errno_helpers.h"
+#include "host64_structs.h"
+#include "struct_convert.h"
 #include <yos/ytrace/ytrace.h>
 
 #include <stdint.h>

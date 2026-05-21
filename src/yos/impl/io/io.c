@@ -1046,7 +1046,7 @@ int32_t yos_fchown(struct yos_exec_ctx *ctx, int32_t fd, int32_t user, int32_t g
  * iovec[] (16 bytes/entry: u64 base, u64 len) by translating each base
  * pointer through the wasm linear memory. The host array must already
  * be sized for `vlen` entries. Returns 0 on success, -errno on bad ptr. */
-static int yos_iovec_w32_to_host(struct yos_exec_ctx *ctx,
+int yos_iovec_w32_to_host(struct yos_exec_ctx *ctx,
                                   uint32_t wasm_vec, int vlen,
                                   struct iovec *host_iov)
 {
