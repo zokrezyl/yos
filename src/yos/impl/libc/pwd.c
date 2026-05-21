@@ -79,7 +79,14 @@ extern uint32_t yos_malloc(struct yos_exec_ctx *ctx, uint32_t size);
 static uint32_t pwd_buf_off;        /* wasm offset of passwd buffer (struct+strs) */
 static uint32_t grp_buf_off;        /* wasm offset of group buffer */
 static uint32_t login_buf_off;      /* wasm offset of login-name buffer */
-static uint32_t ugname_buf_off;     /* user_from_uid / group_from_gid result */
+/* SEPARATE buffers for user_from_uid vs group_from_gid. ls prints both
+ * via `printf("%s %s", user_from_uid(...), group_from_gid(...))` —
+ * arg evaluation order writes user first, group second, both into the
+ * same buffer if shared, then printf reads `user` AT PRINT TIME and
+ * gets the group name back from the now-overwritten slot. Two anchors
+ * keep the values stable for the duration of one printf call. */
+static uint32_t ufu_buf_off;        /* user_from_uid result */
+static uint32_t gfg_buf_off;        /* group_from_gid result */
 
 static uint32_t ensure_buf(struct yos_exec_ctx *ctx,
                            uint32_t *anchor, uint32_t want)
@@ -1000,9 +1007,10 @@ uint32_t yos_getprotobynumber(struct yos_exec_ctx *ctx, int32_t number)
  * scratch buffer per kind (one user, one group) — same lifetime
  * contract as FreeBSD's own static, and matches how ls/find use the
  * call (one-at-a-time per entry, no nested results held). */
-static uint32_t emit_ugname(struct yos_exec_ctx *ctx, const char *s)
+static uint32_t emit_ugname(struct yos_exec_ctx *ctx,
+                            uint32_t *anchor, const char *s)
 {
-    uint32_t buf = ensure_buf(ctx, &ugname_buf_off, UGNAME_BUF_SZ);
+    uint32_t buf = ensure_buf(ctx, anchor, UGNAME_BUF_SZ);
     if (!buf) return 0;
     size_t n = strlen(s);
     if (n >= UGNAME_BUF_SZ) n = UGNAME_BUF_SZ - 1;
@@ -1015,20 +1023,20 @@ uint32_t yos_user_from_uid(struct yos_exec_ctx *ctx, uint32_t uid, int32_t nouse
 {
     struct passwd *pw = getpwuid((uid_t)uid);
     if (pw && pw->pw_name && pw->pw_name[0])
-        return emit_ugname(ctx, pw->pw_name);
+        return emit_ugname(ctx, &ufu_buf_off, pw->pw_name);
     if (nouser) return 0;
     char num[16];
     snprintf(num, sizeof num, "%u", uid);
-    return emit_ugname(ctx, num);
+    return emit_ugname(ctx, &ufu_buf_off, num);
 }
 
 uint32_t yos_group_from_gid(struct yos_exec_ctx *ctx, uint32_t gid, int32_t nogroup)
 {
     struct group *gr = getgrgid((gid_t)gid);
     if (gr && gr->gr_name && gr->gr_name[0])
-        return emit_ugname(ctx, gr->gr_name);
+        return emit_ugname(ctx, &gfg_buf_off, gr->gr_name);
     if (nogroup) return 0;
     char num[16];
     snprintf(num, sizeof num, "%u", gid);
-    return emit_ugname(ctx, num);
+    return emit_ugname(ctx, &gfg_buf_off, num);
 }

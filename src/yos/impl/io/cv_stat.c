@@ -83,7 +83,15 @@ void yos_cv_stat_fbi(uint8_t *w, const struct stat *h)
     *(int64_t  *)(w + FBI_ST_OFF_DEV)   = (int64_t)h->st_dev;
     *(int64_t  *)(w + FBI_ST_OFF_INO)   = (int64_t)h->st_ino;
     *(int64_t  *)(w + FBI_ST_OFF_NLINK) = (int64_t)h->st_nlink;
-    *(int16_t  *)(w + FBI_ST_OFF_MODE)  = (int16_t)h->st_mode;
+    {
+        /* FreeBSD/Linux guarantee symlinks read back with permissions
+         * 0777; darwin's lstat returns the symlink's actual perm bits
+         * (often 0755). Normalise so guest code (ls's strmode, find -
+         * perm) sees the BSD-shape contract. */
+        mode_t m = h->st_mode;
+        if (S_ISLNK(m)) m = (m & ~(mode_t)0777) | 0777;
+        *(int16_t  *)(w + FBI_ST_OFF_MODE) = (int16_t)m;
+    }
     /* st_bsdflags @26 — host has no equivalent; leave 0. */
     *(int32_t  *)(w + FBI_ST_OFF_UID)   = (int32_t)h->st_uid;
     *(int32_t  *)(w + FBI_ST_OFF_GID)   = (int32_t)h->st_gid;
