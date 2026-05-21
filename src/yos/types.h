@@ -297,6 +297,11 @@ struct yos_exec_ctx {
      * use wfd ≥ YOS_VFS_FD_BASE and skip this table. */
 #define YOS_FD_MAX 256
     int fd_map[YOS_FD_MAX];
+    /* yos_fd_table_init runs at every load_wasm_module call (initial
+     * load + every execve). After the first run, parent's dup2/redirect
+     * setup must NOT be wiped by a second init. fd_table_inited stays
+     * set across execve so the second call is a no-op. */
+    int fd_table_inited;
 
     /* Current working directory (tracked for virtual paths) */
     char cwd[PATH_MAX];

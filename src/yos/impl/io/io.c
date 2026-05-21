@@ -77,6 +77,20 @@ const char *yos_path_resolve(struct yos_exec_ctx *ctx, const char *p)
 
 void yos_fd_table_init(struct yos_exec_ctx *ctx)
 {
+    /* Idempotent. main.c::load_wasm_module runs on BOTH initial
+     * process load AND every execve (after m3_FreeRuntime tears
+     * down the old wasm module). Re-running the dup loop on execve
+     * wipes the parent shell's fd setup: zsh's dup2(some_pipe, 2)
+     * gets replaced by a fresh F_DUPFD of the host's literal stderr,
+     * the new host fd lands at some kernel-picked slot (typically 8),
+     * and the subsequent CLOEXEC walk in execve closes it. The
+     * child's first write to stderr then EBADFs.
+     *
+     * Use ctx->fd_table_inited as the "already done" flag — checking
+     * fd_map[0] alone won't work because ctx is calloc'd to zeros and
+     * a fresh ctx has fd_map[0] == 0, not -1. */
+    if (ctx->fd_table_inited) return;
+    ctx->fd_table_inited = 1;
     for (int i = 0; i < YOS_FD_MAX; i++) ctx->fd_map[i] = -1;
     /* Inherit yos's stdio at the conventional positions — but as DUPS
      * of the host's 0/1/2, not the originals.
@@ -459,6 +473,32 @@ int32_t yos_close(struct yos_exec_ctx *ctx, int32_t fd)
     }
 
     return yos_fd_close(ctx, fd);
+}
+
+void yos_closefrom(struct yos_exec_ctx *ctx, int32_t lowfd)
+{
+    if (lowfd < 0) lowfd = 0;
+    for (int i = lowfd; i < YOS_FD_MAX; i++) {
+        int hfd = ctx->fd_map[i];
+        if (hfd < 0) continue;
+        close(hfd);
+        ctx->fd_map[i] = -1;
+    }
+}
+
+int32_t yos_close_range(struct yos_exec_ctx *ctx, uint32_t lowfd,
+                        uint32_t maxfd, int32_t flags)
+{
+    (void)flags;
+    if (lowfd >= YOS_FD_MAX) return 0;
+    uint32_t hi = maxfd >= YOS_FD_MAX ? YOS_FD_MAX - 1 : maxfd;
+    for (uint32_t i = lowfd; i <= hi; i++) {
+        int hfd = ctx->fd_map[i];
+        if (hfd < 0) continue;
+        close(hfd);
+        ctx->fd_map[i] = -1;
+    }
+    return 0;
 }
 
 int32_t yos_creat(struct yos_exec_ctx *ctx, uint32_t pathname, int32_t mode)

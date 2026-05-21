@@ -329,6 +329,16 @@ runtime_owned_pthread: &runtime_owned_pthread
 # ─── VFS (fd virtualisation, cwd-relative paths) ──────────────────────
 custom_vfs:
   - socketpair  # impl/posix.c
+  # closefrom(lowfd) / close_range(lowfd, hifd, flags) — POSIX "close
+  # every fd >= lowfd". glibc 2.34+ exposes both as host libc symbols,
+  # so the auto-classifier sees them on Linux and emits a passthrough
+  # that calls the host versions with the WASM fd numbers — wiping out
+  # host fds 3/4/5 where yos_fd_table_init parks the stdin/stdout/stderr
+  # dups. ssh -v on Linux exited silently from EBADF on every stderr
+  # write. Hand bridges in impl/io/io.c walk ctx->fd_map[a0..] and call
+  # yos_fd_close, so the host stdio dups stay intact.
+  - closefrom
+  - close_range
   # termios family — FreeBSD struct termios is 44 B with c_cc[20] and a
   # different control-char index assignment (VINTR=8 vs Linux 0).
   # Linux glibc termios is 60 B with c_line + c_cc[32]. The auto-bridge

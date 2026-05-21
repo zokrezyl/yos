@@ -47,6 +47,7 @@ libc_tests = [
   'test_socketpair_flags',
   'test_fcntl_dupfd_cloexec',
   'test_dup2_pipe_pair',
+  'test_closefrom_preserves_stdio',
   'test_socketpair_sotype_isatty',
   'test_kqueue_evfilt_read',
   'test_ioctl_fionbio',
