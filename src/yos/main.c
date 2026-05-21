@@ -1906,10 +1906,17 @@ int main(int argc, char **argv)
         g_runtime.envp = environ;
     }
 
-    /* Initialize VFS mount table and mount /proc */
+    /* Initialize VFS mount table. The mount infrastructure stays —
+     * we keep it for future devfs/ramfs/etc. — but the /proc mount
+     * is GONE by default. FreeBSD doesn't ship /proc; procfs(5) is
+     * a disabled-by-default Linux-compat shim. yos's process-list
+     * surface is sysctl(KERN_PROC_*) in impl/libc/sysctl.c, which is
+     * what the FreeBSD-shaped libc actually calls. The procfs synth
+     * backend in src/yos/vfs/procfs.c stays available; a guest that
+     * really wants Linux semantics can register it via an explicit
+     * mount once we expose mount(2). */
     static struct yos_mount_table mount_table;
     yos_mount_table_init(&mount_table);
-    yos_mount_add(&mount_table, "/proc", &yos_procfs_ops);
     g_runtime.mount_table = &mount_table;
 
     /* yctl: spin up the introspection/control daemon if --yctl-socket

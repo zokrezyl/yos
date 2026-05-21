@@ -1115,12 +1115,17 @@ int32_t yos_tcsetattr(struct yos_exec_ctx *ctx, int32_t wfd,
      * host socket level (it's a socket, no kernel TTY behind it) —
      * the guest is responsible for its own raw/cooked switching. */
     extern int yos_pty_is_pty_fd(int hfd);
+    extern int yos_pty_set_onlcr(int hfd, int on);
     if (yos_pty_is_pty_fd(hfd)) {
         if (!g_fake_pty_termios_init) {
             fake_pty_termios_defaults(&g_fake_pty_termios);
             g_fake_pty_termios_init = 1;
         }
         termios_fb_to_lx(&g_fake_pty_termios, ctx->memory + t_off);
+        /* Sync ONLCR to the pty-entry so master reads emit CRLF when
+         * the guest leaves the slave in cooked mode (default) and
+         * raw LF when the guest cleared the bit (cfmakeraw etc.). */
+        yos_pty_set_onlcr(hfd, !!(g_fake_pty_termios.c_oflag & ONLCR));
         (void)actions;
         return 0;
     }

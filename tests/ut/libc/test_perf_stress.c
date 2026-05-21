@@ -71,6 +71,7 @@
 #include <pthread.h>
 #include <signal.h>
 #include <dirent.h>
+#include <sys/sysctl.h>
 #include <sys/wait.h>
 
 extern char **environ;
@@ -852,9 +853,9 @@ int main(int argc, char **argv)
         }
     }
 
-    /* ---- 3. /proc consistency walk ---------------------------- */
+    /* ---- 3. process-list consistency check (sysctl KERN_PROC_PROC) -- */
     if (cfg.procfs_n <= 0) {
-        emit("procfs walk : SKIPPED (-p 0)\n");
+        emit("proc list   : SKIPPED (-p 0)\n");
     } else {
         const int N = cfg.procfs_n;
         int pipes[N][2];
@@ -864,62 +865,64 @@ int main(int argc, char **argv)
         for (int i = 0; i < N; i++) {
             if (pipe(pipes[i]) < 0) { emit_err("pipe failed\n"); fail++; break; }
             pid_t pid = fork();
-            if (pid < 0) { emit_err("procfs fork failed\n"); fail++; break; }
+            if (pid < 0) { emit_err("proc-list fork failed\n"); fail++; break; }
             if (pid == 0) {
-                /* Child: close write-ends of EVERY pipe (this child's
-                 * own write-end AND every prior sibling's write-end
-                 * that we inherited at fork time). Without this, when
-                 * the parent later closes its copy of pipes[k][1] for
-                 * sibling k, child k's read still doesn't see EOF —
-                 * siblings k+1..N-1 are still holding write-ends and
-                 * the pipe's reader-count stays > 0. yos's fork now
-                 * correctly duplicates the full parent fd table, so
-                 * the bug bites; on a host that did partial fd-dup
-                 * the test happened to pass anyway. */
+                /* Child: close write-ends of every pipe so the parent's
+                 * later close of pipes[i][1] hits a single-writer pipe
+                 * and the child's read returns EOF. */
                 for (int j = 0; j <= i; j++) close(pipes[j][1]);
                 char b;
                 (void)read(pipes[i][0], &b, 1);
                 _exit(0);
             }
-            /* Parent: close read end. */
             close(pipes[i][0]);
             kids[i] = pid;
             spawned++;
         }
-        /* Walk /proc and check every spawned PID appears. */
-        DIR *d = opendir("/proc");
+        /* sysctl(CTL_KERN, KERN_PROC, KERN_PROC_PROC) — the FreeBSD
+         * way to enumerate procs. NOT /proc — that's a Linux-ism.
+         * First call with oldp=NULL gets the buffer size; second
+         * call fills it. yos's bridge holds rt->proc_lock for the
+         * whole snapshot so the result is consistent (no dirent-
+         * resume drift like the old vfs/procfs.c had). */
+        int mib[3] = { 1 /*CTL_KERN*/, 14 /*KERN_PROC*/, 8 /*KERN_PROC_PROC*/ };
+        size_t buflen = 0;
         int found = 0;
-        if (!d) {
-            /* /proc may not be mounted on this build — degrade to SKIP
-             * for this phase rather than failing the whole test. */
-            emit("procfs walk : SKIP (no /proc mount)\n");
+        if (sysctl(mib, 3, NULL, &buflen, NULL, 0) != 0) {
+            emit_err("proc list: sysctl(size) failed\n");
+            fail++;
         } else {
-            int present[64] = {0};
-            struct dirent *ent;
-            while ((ent = readdir(d)) != NULL) {
-                /* Numeric dir name = PID. */
-                long p = 0;
-                int isnum = ent->d_name[0] != '\0';
-                for (const char *s = ent->d_name; *s; s++) {
-                    if (*s < '0' || *s > '9') { isnum = 0; break; }
-                    p = p * 10 + (*s - '0');
-                }
-                if (!isnum) continue;
-                for (int i = 0; i < spawned; i++) {
-                    if ((long)kids[i] == p && !present[i]) {
-                        present[i] = 1;
-                        found++;
-                        break;
+            /* 768 = sizeof(struct kinfo_proc) on FreeBSD-i386 wasm32. */
+            void *buf = malloc(buflen);
+            if (!buf) {
+                emit_err("proc list: malloc failed\n");
+                fail++;
+            } else if (sysctl(mib, 3, buf, &buflen, NULL, 0) != 0) {
+                emit_err("proc list: sysctl(fill) failed\n");
+                fail++;
+                free(buf);
+            } else {
+                int present[64] = {0};
+                size_t n = buflen / 768;
+                for (size_t k = 0; k < n; k++) {
+                    /* ki_pid lives at offset 40. */
+                    pid_t p = *(pid_t *)((char *)buf + k * 768 + 40);
+                    for (int i = 0; i < spawned; i++) {
+                        if (kids[i] == p && !present[i]) {
+                            present[i] = 1;
+                            found++;
+                            break;
+                        }
                     }
                 }
-            }
-            closedir(d);
-            if (found != spawned) {
-                snprintf(line, sizeof line,
-                  "procfs: only %d of %d child PIDs visible in /proc\n",
-                  found, spawned);
-                emit_err(line);
-                fail++;
+                free(buf);
+                if (found != spawned) {
+                    snprintf(line, sizeof line,
+                      "proc list: only %d of %d child PIDs in sysctl(KERN_PROC_PROC)\n",
+                      found, spawned);
+                    emit_err(line);
+                    fail++;
+                }
             }
         }
         /* Drain children: close write end → child read returns 0 → exits. */
@@ -930,7 +933,7 @@ int main(int argc, char **argv)
         }
         long long tb = now_us();
         snprintf(line, sizeof line,
-                 "procfs walk  x%-3d : %8lld us total (%d/%d PIDs visible)\n",
+                 "proc list   x%-3d : %8lld us total (%d/%d PIDs visible)\n",
                  spawned, tb - ta, found, spawned);
         emit(line);
     }

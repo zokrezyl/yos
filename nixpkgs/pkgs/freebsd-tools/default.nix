@@ -482,108 +482,97 @@ stdenv.mkDerivation {
     } > "$STAGE/locale-stub/yos_locale_stub.c"
 
     # ── yos-native ps ────────────────────────────────────────────────
-    # Reads yos's synthetic /proc (mounted at startup by src/yos/main.c
-    # via src/yos/vfs/procfs.c). Output mirrors `ps -e` from BSD ps
-    # closely enough to be useful in the yos shell without dragging in
-    # libkvm + 3 kloc of FreeBSD's actual bin/ps. Pure libc — opendir/
-    # readdir/closedir + open/read on /proc/<pid>/stat.
+    # Output mirrors `ps -e` from BSD ps closely enough to be useful in
+    # the yos shell without dragging in libkvm + 3 kloc of FreeBSD's
+    # actual bin/ps.
+    #
+    # Reads the process list via FreeBSD's standard
+    # sysctl(CTL_KERN, KERN_PROC, KERN_PROC_PROC) — yos's libc bridge in
+    # src/yos/impl/libc/sysctl.c serves that from ctx->rt->procs[].
+    # FreeBSD does NOT ship /proc (procfs(5) is a deprecated, disabled-
+    # by-default Linux-compat shim), so opendir("/proc") would return
+    # ENOENT — sysctl is the right contract.
     mkdir -p "$STAGE/yos-ps"
     cat > "$STAGE/yos-ps/yos_ps.c" <<'YOSPS_EOF'
-    /* yos-native ps(1) — reads yos's synthetic /proc.
+    /* yos-native ps(1) — FreeBSD-shaped, sysctl(KERN_PROC_PROC).
      *
      * Output columns: PID  PPID  STAT  COMMAND
      *
-     * The /proc/<pid>/stat format is Linux-flavoured (see
-     * src/yos/vfs/procfs.c generate_stat): "<pid> (<comm>) <state>
-     * <ppid> <pgrp> <session> 0 -1 0 ...". We parse just the first
-     * four fields and ignore the rest.
+     * Each record is a struct kinfo_proc; we read the fields we need
+     * at the hand-baked FreeBSD-i386 offsets (sizeof(kinfo_proc) = 768
+     * on that ABI; see tools/struct-offsets.py kinfo_proc to verify).
+     * Doing it this way means ps doesn't need to know the full struct
+     * — just the four byte offsets it actually reads.
      */
-    #include <ctype.h>
-    #include <dirent.h>
     #include <errno.h>
-    #include <fcntl.h>
     #include <stdint.h>
     #include <stdio.h>
     #include <stdlib.h>
     #include <string.h>
-    #include <unistd.h>
+    #include <sys/sysctl.h>
 
-    static int is_all_digits(const char *s)
+    /* FreeBSD-i386 struct kinfo_proc field offsets. */
+    #define KP_SIZE         768
+    #define KP_OFF_PID       40
+    #define KP_OFF_PPID      44
+    #define KP_OFF_STAT     308   /* char */
+    #define KP_OFF_COMM     367   /* char[20] */
+
+    /* FreeBSD ki_stat → letter, mirroring real ps's STAT column. */
+    static char stat_letter(unsigned char s)
     {
-        if (!*s) return 0;
-        for (; *s; s++) if (*s < '0' || *s > '9') return 0;
-        return 1;
-    }
-
-    /* Parse /proc/<pid>/stat. comm comes back in `comm_out`
-     * (NUL-terminated, up to `comm_max` bytes including the NUL).
-     * Returns 0 on success, -1 on parse failure. */
-    static int parse_stat(const char *path, int *pid, int *ppid,
-                          char *state, char *comm_out, size_t comm_max)
-    {
-        int fd = open(path, O_RDONLY);
-        if (fd < 0) return -1;
-        char buf[1024];
-        ssize_t n = read(fd, buf, sizeof(buf) - 1);
-        close(fd);
-        if (n <= 0) return -1;
-        buf[n] = '\0';
-
-        /* pid */
-        char *p = buf;
-        *pid = (int)strtol(p, &p, 10);
-        while (*p == ' ') p++;
-        /* (comm) — comm may contain spaces and parentheses, so find
-         * the LAST ')' before reading further. */
-        if (*p != '(') return -1;
-        p++;
-        const char *comm_start = p;
-        const char *comm_end = strrchr(p, ')');
-        if (!comm_end) return -1;
-        size_t clen = (size_t)(comm_end - comm_start);
-        if (clen >= comm_max) clen = comm_max - 1;
-        memcpy(comm_out, comm_start, clen);
-        comm_out[clen] = '\0';
-        p = (char *)comm_end + 1;
-        while (*p == ' ') p++;
-        /* state */
-        *state = *p ? *p : '?';
-        if (*p) p++;
-        while (*p == ' ') p++;
-        /* ppid */
-        *ppid = (int)strtol(p, &p, 10);
-        return 0;
+        switch (s) {
+        case 1: return 'I';  /* SIDL  */
+        case 2: return 'R';  /* SRUN  */
+        case 3: return 'S';  /* SSLEEP */
+        case 4: return 'T';  /* SSTOP */
+        case 5: return 'Z';  /* SZOMB */
+        case 6: return 'W';  /* SWAIT */
+        case 7: return 'L';  /* SLOCK */
+        default: return '?';
+        }
     }
 
     int main(int argc, char **argv)
     {
         (void)argc; (void)argv;
-        DIR *dir = opendir("/proc");
-        if (!dir) {
-            fprintf(stderr, "ps: opendir(/proc): %s\n", strerror(errno));
+
+        int mib[3] = { CTL_KERN, KERN_PROC, KERN_PROC_PROC };
+
+        /* Two-call sysctl idiom: NULL buffer first to learn the size. */
+        size_t buflen = 0;
+        if (sysctl(mib, 3, NULL, &buflen, NULL, 0) < 0) {
+            fprintf(stderr, "ps: sysctl(KERN_PROC_PROC) size: %s\n",
+                    strerror(errno));
             return 1;
         }
-        printf("  PID  PPID S COMMAND\n");
+        void *buf = malloc(buflen);
+        if (!buf) {
+            fprintf(stderr, "ps: malloc(%zu) failed\n", buflen);
+            return 1;
+        }
+        if (sysctl(mib, 3, buf, &buflen, NULL, 0) < 0) {
+            fprintf(stderr, "ps: sysctl(KERN_PROC_PROC) fill: %s\n",
+                    strerror(errno));
+            free(buf);
+            return 1;
+        }
 
-        struct dirent *de;
+        printf("  PID  PPID S COMMAND\n");
+        size_t n = buflen / KP_SIZE;
         int rows = 0;
-        while ((de = readdir(dir)) != NULL) {
-            if (!is_all_digits(de->d_name)) continue;
-            char path[64];
-            snprintf(path, sizeof(path), "/proc/%s/stat", de->d_name);
-            int pid = 0, ppid = 0;
-            char state = '?';
-            char comm[64] = {0};
-            if (parse_stat(path, &pid, &ppid, &state,
-                           comm, sizeof(comm)) != 0)
-                continue;
-            printf("%5d %5d %c %s\n", pid, ppid, state, comm);
+        for (size_t i = 0; i < n; i++) {
+            const unsigned char *kp = (const unsigned char *)buf + i * KP_SIZE;
+            int  pid  = *(const int32_t *)(kp + KP_OFF_PID);
+            int  ppid = *(const int32_t *)(kp + KP_OFF_PPID);
+            char st   = stat_letter(kp[KP_OFF_STAT]);
+            const char *comm = (const char *)(kp + KP_OFF_COMM);
+            printf("%5d %5d %c %s\n", pid, ppid, st, comm);
             rows++;
         }
-        closedir(dir);
+        free(buf);
         if (rows == 0)
-            fprintf(stderr, "ps: no processes found in /proc — is yos's "
-                            "procfs mounted?\n");
+            fprintf(stderr, "ps: KERN_PROC_PROC returned 0 records\n");
         return 0;
     }
     YOSPS_EOF

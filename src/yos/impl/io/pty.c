@@ -70,6 +70,14 @@ struct pty_entry {
      * REAL DATA BYTE as a packet flag (which made every output char
      * vanish and the FLUSHWRITE bit emit spurious IAC DM). */
     int   packet_mode;
+    /* ONLCR (slave c_oflag): translate LF → CRLF on the master-side
+     * read path. A real PTY does this in the kernel TTY layer; our
+     * socketpair has no such layer, so we emulate. Default ON to
+     * match the cooked-mode default a fresh openpt(2) hands back —
+     * the line-editor of an interactive shell will tcsetattr(raw)
+     * to disable, and external commands (ps, ls, echo) write LF
+     * relying on the kernel to emit CRLF on their behalf. */
+    int   onlcr;
     struct pty_entry *next;
 };
 
@@ -120,24 +128,96 @@ int yos_pty_set_packet_mode(int hfd, int on) {
     return hit;
 }
 
+/* ONLCR setter — called by posix.c::yos_tcsetattr when a fake-PTY
+ * slave has its termios changed. Returns 1 if hfd matched (caller
+ * uses this signal to know the fd was ours), 0 on miss. */
+int yos_pty_set_onlcr(int hfd, int on) {
+    pthread_mutex_lock(&g_pty_lock);
+    struct pty_entry *e = pty_find_master_locked(hfd);
+    /* yos_pty_set_onlcr is called with EITHER end's fd — try master
+     * first, then walk for a slave-fd match. */
+    if (!e) {
+        struct stat ss;
+        if (fstat(hfd, &ss) == 0) {
+            for (struct pty_entry *p = g_pty_head; p; p = p->next) {
+                struct stat ps;
+                if (fstat(p->slave_hfd, &ps) == 0 &&
+                    ps.st_ino == ss.st_ino && ps.st_dev == ss.st_dev) {
+                    e = p;
+                    break;
+                }
+            }
+        }
+    }
+    if (e) e->onlcr = on ? 1 : 0;
+    int hit = (e != NULL);
+    pthread_mutex_unlock(&g_pty_lock);
+    return hit;
+}
+
+/* LF → CRLF expansion. Reads up to `cap_in` bytes into a scratch buf,
+ * writes to `out` expanding bare \n to \r\n. Caller-supplied scratch
+ * must be at least cap_in bytes (we read at most cap_in, may write up
+ * to 2*cap_in to `out` so caller must size accordingly). Returns the
+ * number of bytes written to `out`. */
+static ssize_t pty_read_expand_onlcr(int hfd, char *out, size_t out_cap)
+{
+    /* Read at most out_cap/2 host bytes so worst-case 1-byte-LF input
+     * still fits expanded as CRLF. */
+    size_t host_cap = out_cap / 2;
+    if (host_cap == 0) { errno = EINVAL; return -1; }
+    char scratch[4096];
+    if (host_cap > sizeof scratch) host_cap = sizeof scratch;
+    ssize_t n = read(hfd, scratch, host_cap);
+    if (n <= 0) return n;
+    size_t o = 0;
+    char prev = 0;
+    for (ssize_t i = 0; i < n; i++) {
+        char c = scratch[i];
+        if (c == '\n' && prev != '\r') {
+            out[o++] = '\r';
+        }
+        out[o++] = c;
+        prev = c;
+    }
+    return (ssize_t)o;
+}
+
 /* If hfd is a fake-master in packet mode AND `buf` has room for an
  * extra leading byte, do the actual read into `buf+1` and prepend
- * 0x00 (no flags set). Returns number of bytes written into buf
- * (including the leading status byte), or -1 with errno on error,
- * or -2 if hfd isn't a packet-mode master (caller falls through). */
+ * 0x00 (no flags set). Also expands LF → CRLF when the slave-side
+ * ONLCR flag is set (which is the cooked-mode default a fresh
+ * openpt(2) returns — only cleared by tcsetattr(raw)). Real PTYs
+ * do this in the kernel TTY layer; our socketpair doesn't, so the
+ * translation lands here on the master-read path.
+ *
+ * Returns the number of bytes written into buf (including the
+ * leading status byte and any expanded CRs), -1 with errno on error,
+ * or -2 if hfd isn't a fake-PTY master (caller falls through). */
 ssize_t yos_pty_packet_read(int hfd, void *buf, size_t cap) {
     pthread_mutex_lock(&g_pty_lock);
     struct pty_entry *e = pty_find_master_locked(hfd);
-    int pkt = (e && e->packet_mode);
+    int pkt   = (e && e->packet_mode);
+    int onlcr = (e && e->onlcr);
+    int is_fake_master = (e != NULL);
     pthread_mutex_unlock(&g_pty_lock);
-    if (!pkt) return -2;
-    if (cap < 2) { errno = EINVAL; return -1; }
+    if (!is_fake_master) return -2;
+    if (cap < 4) { errno = EINVAL; return -1; }
+
     char *p = (char *)buf;
-    /* Read up to cap-1 bytes into buf+1, then prepend 0x00. */
-    ssize_t n = read(hfd, p + 1, cap - 1);
+    size_t header = pkt ? 1 : 0;
+    if (header) p[0] = 0;  /* packet-mode status byte */
+
+    if (onlcr) {
+        ssize_t n = pty_read_expand_onlcr(hfd, p + header, cap - header);
+        if (n < 0) return -1;
+        return (ssize_t)(header + (size_t)n);
+    }
+
+    /* Raw-mode read — no LF/CRLF transform. */
+    ssize_t n = read(hfd, p + header, cap - header);
     if (n < 0) return -1;
-    p[0] = 0;
-    return n + 1;
+    return (ssize_t)(header + (size_t)n);
 }
 
 /* Probe whether `hfd` is one of the fake PTY pair endpoints (either
@@ -214,6 +294,7 @@ int32_t yos_posix_openpt(struct yos_exec_ctx *ctx, int32_t fb_flags)
     e->master_ino = ms.st_ino;
     e->master_dev = ms.st_dev;
     e->slave_hfd  = sp[1];
+    e->onlcr      = 1;  /* cooked-mode default; cleared by tcsetattr(raw) */
 
     pthread_mutex_lock(&g_pty_lock);
     int id = g_pty_next_id++;

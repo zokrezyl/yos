@@ -26,7 +26,200 @@
 /* FreeBSD sysctl MIB constants (from sys/sysctl.h, sys/proc.h). */
 #define CTL_KERN              1
 #define KERN_PROC            14
+#define KERN_PROC_ALL         0  /* everything */
+#define KERN_PROC_PID         1  /* by process id */
+#define KERN_PROC_ARGS        7  /* get/set arguments/proctitle */
+#define KERN_PROC_PROC        8  /* only processes (no threads) */
 #define KERN_PROC_PATHNAME   12
+
+/* struct kinfo_proc, FreeBSD-i386 (wasm32 ABI). Total 768 bytes.
+ * Layout extracted via tools/struct-offsets.py kinfo_proc — re-run
+ * that if a future sysroot bump changes the FreeBSD definition. The
+ * codegen pipeline doesn't see this struct (no libc fn signature
+ * mentions it), so we hand-bake the offsets here. */
+#define FBI_KP_SIZE              768
+#define FBI_KP_OFF_STRUCTSIZE      0  /* int      — must equal 768 */
+#define FBI_KP_OFF_PID            40  /* pid_t */
+#define FBI_KP_OFF_PPID           44
+#define FBI_KP_OFF_PGID           48
+#define FBI_KP_OFF_TPGID          52
+#define FBI_KP_OFF_SID            56
+#define FBI_KP_OFF_TSID           60
+#define FBI_KP_OFF_JOBC           64  /* short */
+#define FBI_KP_OFF_UID           136  /* uid_t */
+#define FBI_KP_OFF_RUID          140
+#define FBI_KP_OFF_RUNTIME       272  /* u_int64_t — usec */
+#define FBI_KP_OFF_START_SEC     280  /* struct timeval { time_t sec; suseconds_t usec; } */
+#define FBI_KP_OFF_START_USEC    284
+#define FBI_KP_OFF_FLAG          296  /* long */
+#define FBI_KP_OFF_STAT          308  /* char */
+#define FBI_KP_OFF_NICE          309  /* signed char */
+#define FBI_KP_OFF_TDNAME        314  /* char[17] */
+#define FBI_KP_OFF_COMM          367  /* char[20] */
+#define FBI_KP_OFF_NUMTHREADS    516  /* int */
+#define FBI_KP_OFF_TID           520  /* lwpid_t */
+
+/* FreeBSD ki_stat values. */
+#define FBI_SRUN    2
+#define FBI_SZOMB   5
+
+static int fbi_ki_stat(yos_proc_state_t s)
+{
+    /* Map yos's coarser states to FreeBSD's. ps(1) only cares about
+     * SRUN/SSLEEP/SZOMB for the STAT column; we have no sleeping
+     * state of our own, so READY/RUNNING both render as 'R'. */
+    return (s == YOS_PROC_ZOMBIE) ? FBI_SZOMB : FBI_SRUN;
+}
+
+/* Fill one kinfo_proc record at `dst` (must be 768 bytes valid). */
+static void fbi_fill_kinfo_proc(uint8_t *dst, const struct yos_proc *p)
+{
+    memset(dst, 0, FBI_KP_SIZE);
+    *(int32_t  *)(dst + FBI_KP_OFF_STRUCTSIZE) = FBI_KP_SIZE;
+    *(int32_t  *)(dst + FBI_KP_OFF_PID)        = p->pid;
+    *(int32_t  *)(dst + FBI_KP_OFF_PPID)       = p->ppid;
+    *(int32_t  *)(dst + FBI_KP_OFF_PGID)       = p->pgid;
+    *(int32_t  *)(dst + FBI_KP_OFF_SID)        = p->sid;
+    *(int32_t  *)(dst + FBI_KP_OFF_TID)        = p->pid;
+    *(int32_t  *)(dst + FBI_KP_OFF_NUMTHREADS) = 1;
+    *(uint32_t *)(dst + FBI_KP_OFF_UID)        = 0;  /* uid model TBD */
+    *(uint32_t *)(dst + FBI_KP_OFF_RUID)       = 0;
+    dst[FBI_KP_OFF_STAT] = (uint8_t)fbi_ki_stat(p->state);
+    dst[FBI_KP_OFF_NICE] = 0;
+    /* ki_comm[COMMLEN+1] = char[20]. p->comm is char[16], NUL-padded. */
+    size_t n = strnlen(p->comm, sizeof p->comm);
+    if (n > 19) n = 19;
+    memcpy(dst + FBI_KP_OFF_COMM, p->comm, n);
+    /* ki_tdname[TDNAMLEN+1] = char[17]. Mirror comm — yos has no
+     * separate thread name yet. */
+    size_t tn = (n > 16) ? 16 : n;
+    memcpy(dst + FBI_KP_OFF_TDNAME, p->comm, tn);
+}
+
+/* Stream kinfo_proc records into the wasm-side buffer for the procs
+ * matching `selector`. selector_arg is the pid for KERN_PROC_PID, 0
+ * otherwise. Handles the FreeBSD size-query (oldp NULL or buflen too
+ * small): writes required size to *oldlenp + returns ENOMEM.
+ *
+ * Iterates ctx->rt->procs[] under proc_lock so the snapshot is
+ * consistent — no race with concurrent fork/exit. The full pass runs
+ * in one bridge call (no incremental refill across getdents-style
+ * resumes), which removes the dirent-resume drift the old /proc
+ * impl had. */
+static int32_t do_kern_proc_select(struct yos_exec_ctx *ctx,
+                                   int selector, int selector_arg,
+                                   uint32_t old_off, uint32_t oldlenp_off)
+{
+    if (!ctx || !ctx->rt) return -EINVAL;
+
+    uint32_t buflen = 0;
+    if (oldlenp_off) {
+        if (oldlenp_off + 4 > ctx->memory_size) return -EFAULT;
+        buflen = *(uint32_t *)(ctx->memory + oldlenp_off);
+    }
+
+    pthread_mutex_lock(&ctx->rt->proc_lock);
+
+    /* First pass: count matching records. */
+    size_t count = 0;
+    for (int i = 0; i < YOS_MAX_PROCS; i++) {
+        const struct yos_proc *p = &ctx->rt->procs[i];
+        if (p->state == YOS_PROC_FREE) continue;
+        if (selector == KERN_PROC_PID && p->pid != selector_arg) continue;
+        count++;
+    }
+    size_t need = count * FBI_KP_SIZE;
+
+    if (old_off == 0 || buflen < need) {
+        pthread_mutex_unlock(&ctx->rt->proc_lock);
+        if (oldlenp_off)
+            *(uint32_t *)(ctx->memory + oldlenp_off) = (uint32_t)need;
+        if (old_off == 0) return 0;
+        return -ENOMEM;
+    }
+    if (old_off + need > ctx->memory_size) {
+        pthread_mutex_unlock(&ctx->rt->proc_lock);
+        return -EFAULT;
+    }
+
+    /* Second pass: emit. */
+    uint8_t *out = ctx->memory + old_off;
+    for (int i = 0; i < YOS_MAX_PROCS; i++) {
+        const struct yos_proc *p = &ctx->rt->procs[i];
+        if (p->state == YOS_PROC_FREE) continue;
+        if (selector == KERN_PROC_PID && p->pid != selector_arg) continue;
+        fbi_fill_kinfo_proc(out, p);
+        out += FBI_KP_SIZE;
+    }
+    pthread_mutex_unlock(&ctx->rt->proc_lock);
+
+    if (oldlenp_off)
+        *(uint32_t *)(ctx->memory + oldlenp_off) = (uint32_t)need;
+    return 0;
+}
+
+/* KERN_PROC_ARGS — return the NUL-separated argv buffer for the given
+ * PID. Caller can also write it (proctitle update); we accept-and-drop
+ * because yos doesn't expose proctitle yet. */
+static int32_t do_kern_proc_args(struct yos_exec_ctx *ctx, int pid,
+                                 uint32_t old_off, uint32_t oldlenp_off,
+                                 uint32_t newp_off, uint32_t newlen)
+{
+    (void)newp_off; (void)newlen;  /* TODO: implement proctitle write */
+    if (!ctx || !ctx->rt) return -EINVAL;
+
+    pthread_mutex_lock(&ctx->rt->proc_lock);
+    const struct yos_proc *p = NULL;
+    for (int i = 0; i < YOS_MAX_PROCS; i++) {
+        if (ctx->rt->procs[i].state != YOS_PROC_FREE &&
+            ctx->rt->procs[i].pid == pid) {
+            p = &ctx->rt->procs[i];
+            break;
+        }
+    }
+    if (!p || !p->cmdline) {
+        pthread_mutex_unlock(&ctx->rt->proc_lock);
+        return -ESRCH;
+    }
+
+    /* Compute the NUL-separated buffer size. */
+    size_t need = 0;
+    for (int i = 0; i < p->cmdline_argc; i++)
+        need += strlen(p->cmdline[i]) + 1;
+
+    uint32_t buflen = 0;
+    if (oldlenp_off) {
+        if (oldlenp_off + 4 > ctx->memory_size) {
+            pthread_mutex_unlock(&ctx->rt->proc_lock);
+            return -EFAULT;
+        }
+        buflen = *(uint32_t *)(ctx->memory + oldlenp_off);
+    }
+
+    if (old_off == 0 || buflen < need) {
+        pthread_mutex_unlock(&ctx->rt->proc_lock);
+        if (oldlenp_off)
+            *(uint32_t *)(ctx->memory + oldlenp_off) = (uint32_t)need;
+        if (old_off == 0) return 0;
+        return -ENOMEM;
+    }
+    if (old_off + need > ctx->memory_size) {
+        pthread_mutex_unlock(&ctx->rt->proc_lock);
+        return -EFAULT;
+    }
+
+    uint8_t *out = ctx->memory + old_off;
+    for (int i = 0; i < p->cmdline_argc; i++) {
+        size_t n = strlen(p->cmdline[i]) + 1;
+        memcpy(out, p->cmdline[i], n);
+        out += n;
+    }
+    pthread_mutex_unlock(&ctx->rt->proc_lock);
+
+    if (oldlenp_off)
+        *(uint32_t *)(ctx->memory + oldlenp_off) = (uint32_t)need;
+    return 0;
+}
 
 static int32_t do_kern_proc_pathname(struct yos_exec_ctx *ctx,
                                      uint32_t old_off, uint32_t oldlenp_off)
@@ -105,10 +298,35 @@ static m3ApiRawFunction(m3_yos_sysctl)
     if (namelen < 2 || name_off + 4u * namelen > mem_size) m3ApiReturn(-EINVAL);
     int32_t *mib = (int32_t *)(ctx->memory + name_off);
 
-    if (mib[0] == CTL_KERN && mib[1] == KERN_PROC && namelen >= 3 &&
-        mib[2] == KERN_PROC_PATHNAME) {
-        ydebug("sysctl(KERN_PROC_PATHNAME)\n");
-        m3ApiReturn(do_kern_proc_pathname(ctx, oldp_off, oldlenp_off));
+    if (mib[0] == CTL_KERN && mib[1] == KERN_PROC && namelen >= 3) {
+        switch (mib[2]) {
+        case KERN_PROC_PATHNAME:
+            ydebug("sysctl(KERN_PROC_PATHNAME)\n");
+            m3ApiReturn(do_kern_proc_pathname(ctx, oldp_off, oldlenp_off));
+        case KERN_PROC_ALL:
+        case KERN_PROC_PROC: {
+            int arg = (namelen >= 4) ? mib[3] : 0;
+            (void)arg;  /* PROC_ALL/PROC ignore the arg slot */
+            ydebug("sysctl(KERN_PROC_%s)\n",
+                   mib[2] == KERN_PROC_ALL ? "ALL" : "PROC");
+            m3ApiReturn(do_kern_proc_select(ctx, mib[2], 0,
+                                            oldp_off, oldlenp_off));
+        }
+        case KERN_PROC_PID: {
+            if (namelen < 4) m3ApiReturn(-EINVAL);
+            ydebug("sysctl(KERN_PROC_PID, %d)\n", mib[3]);
+            m3ApiReturn(do_kern_proc_select(ctx, KERN_PROC_PID, mib[3],
+                                            oldp_off, oldlenp_off));
+        }
+        case KERN_PROC_ARGS: {
+            if (namelen < 4) m3ApiReturn(-EINVAL);
+            ydebug("sysctl(KERN_PROC_ARGS, %d)\n", mib[3]);
+            m3ApiReturn(do_kern_proc_args(ctx, mib[3], oldp_off,
+                                          oldlenp_off, newp_off, newlen));
+        }
+        default:
+            break;
+        }
     }
 
     ydebug("sysctl: unhandled mib[%u] = {%d, %d, %d, ...}\n",
