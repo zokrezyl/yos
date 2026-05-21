@@ -137,12 +137,16 @@ if host_os == 'linux'
   impl_platform_sources += files(
     'impl/proc/sig-linux.c',
     'impl/libc/kqueue-linux.c',
+    'impl/libc/posix-linux.c',
     'impl/main-linux.c',
+    'impl/io/io-linux.c',
   )
 elif host_os == 'darwin'
   impl_platform_sources += files(
     'impl/proc/sig-darwin.c',
     'impl/libc/kqueue-darwin.c',
+    'impl/libc/posix-darwin.c',
+    'impl/io/io-darwin.c',
   )
   if is_darwin_app
     # iOS / tvOS app bundle: Mach exception ports + sigaltstack are

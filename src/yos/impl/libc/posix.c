@@ -42,6 +42,7 @@
 #include <yos/ytrace/ytrace.h>
 #include "platform.h"
 #include "impl/errno_helpers.h"
+#include "impl/libc/posix-internal.h"
 
 extern int  yos_fd_alloc(struct yos_exec_ctx *ctx, int host_fd);
 extern int  yos_fd_get  (struct yos_exec_ctx *ctx, int wasm_fd);
@@ -115,11 +116,7 @@ int32_t yos_getsockname(struct yos_exec_ctx *ctx, int32_t wfd,
      * of AF_UNIX, classifying the IPC socketpair end as
      * UV_UNKNOWN_HANDLE — root cause of "ch 1 was closed by the
      * client" in tmp/nvim-runtime-issues.md. */
-#if defined(__APPLE__) || defined(__FreeBSD__)
-    uint16_t host_fam = (uint16_t)host_buf[1];
-#else
-    uint16_t host_fam = (uint16_t)(host_buf[0] | (host_buf[1] << 8));
-#endif
+    uint16_t host_fam = read_host_sa_family(host_buf);
     /* Re-emit FreeBSD shape: sa_len, sa_family[, sa_data...]. */
     uint8_t *w = ctx->memory + addr_off;
     socklen_t out = host_len < cap ? host_len : cap;
@@ -222,22 +219,6 @@ int32_t yos_socket(struct yos_exec_ctx *ctx, int32_t domain, int32_t type, int32
  * byte, AF_INET=2 in the high byte → 0x0202, an unknown family)
  * and silently fail. Same for sockaddr_in6 (family always at
  * offset 0/1 regardless, but sin6_len needs stripping). */
-static void freebsd_sockaddr_to_host(uint8_t *buf, socklen_t len)
-{
-#ifndef __FreeBSD__
-#ifndef __APPLE__
-    if (len >= 2) {
-        uint8_t sin_len_byte    = buf[0];
-        uint8_t sin_family_byte = buf[1];
-        (void)sin_len_byte;
-        /* Linux: sin_family is uint16 little-endian at offset 0/1.
-         * Just zero the high byte and put sa_family in the low. */
-        buf[0] = sin_family_byte;
-        buf[1] = 0;
-    }
-#endif
-#endif
-}
 
 int32_t yos_bind(struct yos_exec_ctx *ctx, int32_t fd, uint32_t addr_off,
                  uint32_t addrlen)
@@ -1029,106 +1010,9 @@ enum { YOS_FB_VEOF=0, YOS_FB_VEOL=1, YOS_FB_VEOL2=2, YOS_FB_VERASE=3,
        YOS_FB_VDISCARD=15, YOS_FB_VMIN=16, YOS_FB_VTIME=17,
        YOS_FB_VSTATUS=18 };
 
-/* FreeBSD c_iflag bits (sys/_termios.h). Names that match Linux's by
- * value are omitted; only divergent ones below.
- *   IGNBRK 0x0001, BRKINT 0x0002, IGNPAR 0x0004, PARMRK 0x0008,
- *   INPCK 0x0010, ISTRIP 0x0020, INLCR 0x0040, IGNCR 0x0080,
- *   ICRNL 0x0100, IXON 0x0200, IXOFF 0x0400, IXANY 0x0800,
- *   IMAXBEL 0x2000
- * Linux iflag (bits/termios-c_iflag.h):
- *   IGNBRK 0001, BRKINT 0002, IGNPAR 0004, PARMRK 0010,
- *   INPCK 0020, ISTRIP 0040, INLCR 0100, IGNCR 0200,
- *   ICRNL 0400, IUCLC 01000, IXON 02000, IXANY 04000,
- *   IXOFF 010000, IMAXBEL 020000
- * — first six bits identical, then offsets diverge. Same shape for
- *   the other three flag words. Translate via per-flag table. */
-
-struct flag_map { uint32_t fb; uint32_t lx; };
-
-static const struct flag_map iflag_map[] = {
-    {0x0001, 0000001}, /* IGNBRK */
-    {0x0002, 0000002}, /* BRKINT */
-    {0x0004, 0000004}, /* IGNPAR */
-    {0x0008, 0000010}, /* PARMRK */
-    {0x0010, 0000020}, /* INPCK  */
-    {0x0020, 0000040}, /* ISTRIP */
-    {0x0040, 0000100}, /* INLCR  */
-    {0x0080, 0000200}, /* IGNCR  */
-    {0x0100, 0000400}, /* ICRNL  */
-    {0x0200, 0002000}, /* IXON   */
-    {0x0400, 0010000}, /* IXOFF  */
-    {0x0800, 0004000}, /* IXANY  */
-    {0x2000, 0020000}, /* IMAXBEL*/
-};
-
-static const struct flag_map oflag_map[] = {
-    {0x0001, 0000001}, /* OPOST */
-    {0x0002, 0000004}, /* ONLCR (FreeBSD 0x2 → Linux 0o4) */
-    {0x0004, 0000040}, /* OXTABS (FreeBSD) → XTABS (Linux 040, mostly tab3) */
-    {0x0008, 0000020}, /* ONOEOT (FreeBSD)/OFILL (Linux) — best-effort */
-    {0x0010, 0000010}, /* OCRNL  */
-    {0x0020, 0000100}, /* ONOCR  */
-    {0x0040, 0000200}, /* ONLRET */
-};
-
-/* c_cflag — Linux uses CSIZE bits 060 (CS5..CS8 = 0/0o20/0o40/0o60),
- * FreeBSD uses 0x300 (CS5..CS8 = 0/0x100/0x200/0x300). */
-static const struct flag_map cflag_map[] = {
-    {0x0100, 0000020}, /* CS6 */
-    {0x0200, 0000040}, /* CS7 */
-    {0x0300, 0000060}, /* CS8 */
-    {0x0400, 0000100}, /* CSTOPB */
-    {0x0800, 0000200}, /* CREAD  */
-    {0x1000, 0000400}, /* PARENB */
-    {0x2000, 0001000}, /* PARODD */
-    {0x4000, 0002000}, /* HUPCL  */
-    {0x8000, 0004000}, /* CLOCAL */
-};
-
-/* c_lflag — divergent in BIT POSITION:
- *  FreeBSD: ECHOKE 0x1, ECHOE 0x2, ECHOK 0x4, ECHO 0x8, ECHONL 0x10,
- *           ECHOPRT 0x20, ECHOCTL 0x40, ISIG 0x80, ICANON 0x100,
- *           ALTWERASE 0x200, IEXTEN 0x400, EXTPROC 0x800, TOSTOP 0x400000,
- *           FLUSHO 0x800000, NOKERNINFO 0x2000000, PENDIN 0x20000000,
- *           NOFLSH 0x80000000
- *  Linux:   ISIG 0o1, ICANON 0o2, XCASE 0o4, ECHO 0o10, ECHOE 0o20,
- *           ECHOK 0o40, ECHONL 0o100, NOFLSH 0o200, TOSTOP 0o400,
- *           ECHOCTL 0o1000, ECHOPRT 0o2000, ECHOKE 0o4000, FLUSHO 0o10000,
- *           PENDIN 0o40000, IEXTEN 0o100000, EXTPROC 0o200000
- * The two ones nvim/libuv care about for raw mode are ISIG and ICANON
- * (cleared) and ECHO (cleared). */
-static const struct flag_map lflag_map[] = {
-    {0x00000001, 0004000}, /* ECHOKE */
-    {0x00000002, 0000020}, /* ECHOE  */
-    {0x00000004, 0000040}, /* ECHOK  */
-    {0x00000008, 0000010}, /* ECHO   */
-    {0x00000010, 0000100}, /* ECHONL */
-    {0x00000020, 0002000}, /* ECHOPRT*/
-    {0x00000040, 0001000}, /* ECHOCTL*/
-    {0x00000080, 0000001}, /* ISIG   */
-    {0x00000100, 0000002}, /* ICANON */
-    {0x00000400, 0100000}, /* IEXTEN */
-    {0x00000800, 0200000}, /* EXTPROC*/
-    {0x00400000, 0000400}, /* TOSTOP */
-    {0x00800000, 0010000}, /* FLUSHO */
-    {0x20000000, 0040000}, /* PENDIN */
-    {0x80000000u,0000200}, /* NOFLSH */
-};
-
-static uint32_t map_flags(uint32_t v, const struct flag_map *m, size_t n,
-                          int fb_to_lx)
-{
-    uint32_t r = 0;
-    for (size_t i = 0; i < n; i++) {
-        uint32_t src = fb_to_lx ? m[i].fb : m[i].lx;
-        uint32_t dst = fb_to_lx ? m[i].lx : m[i].fb;
-        if (v & src) r |= dst;
-    }
-    return r;
-}
 
 /* c_cc[] index translation. fb_idx → linux_idx (or -1 if not on Linux). */
-static int cc_fb_to_lx(int fb_idx)
+int cc_fb_to_lx(int fb_idx)
 {
     switch (fb_idx) {
     case YOS_FB_VEOF:    return VEOF;
@@ -1151,81 +1035,6 @@ static int cc_fb_to_lx(int fb_idx)
     }
 }
 
-static void termios_fb_to_lx(struct termios *h, const uint8_t *w)
-{
-    uint32_t iflag = *(uint32_t *)(w +  0);
-    uint32_t oflag = *(uint32_t *)(w +  4);
-    uint32_t cflag = *(uint32_t *)(w +  8);
-    uint32_t lflag = *(uint32_t *)(w + 12);
-    const uint8_t *cc = w + 16;
-    uint32_t ispeed = *(uint32_t *)(w + 36);
-    uint32_t ospeed = *(uint32_t *)(w + 40);
-
-    memset(h, 0, sizeof *h);
-#if defined(__APPLE__) || defined(__FreeBSD__)
-    /* darwin/FreeBSD host: termios flag bit positions match the
-     * FreeBSD wasm guest verbatim (both BSD lineage). The map_flags
-     * tables convert to LINUX positions, which on darwin would set
-     * the wrong host bits — e.g. nvim's cfmakeraw clears ISIG (0x80
-     * in FreeBSD) but the bridge would write Linux ISIG (0x1) to
-     * the host, leaving darwin's ISIG (0x80) untouched and the pty
-     * stuck in cooked mode. nvim's keystrokes then never reach the
-     * read pipeline. Pass the flag words straight through; only the
-     * c_cc[] index translation still applies because darwin's index
-     * macros (VEOF/VINTR/VMIN/...) name the same numeric positions. */
-    h->c_iflag = iflag;
-    h->c_oflag = oflag;
-    h->c_cflag = cflag;
-    h->c_lflag = lflag;
-#else
-    h->c_iflag = map_flags(iflag, iflag_map,
-                           sizeof iflag_map/sizeof iflag_map[0], 1);
-    h->c_oflag = map_flags(oflag, oflag_map,
-                           sizeof oflag_map/sizeof oflag_map[0], 1);
-    /* CSIZE bits handled explicitly (CS5/CS6/CS7/CS8). */
-    h->c_cflag = map_flags(cflag, cflag_map,
-                           sizeof cflag_map/sizeof cflag_map[0], 1);
-    h->c_lflag = map_flags(lflag, lflag_map,
-                           sizeof lflag_map/sizeof lflag_map[0], 1);
-#endif
-    for (int i = 0; i < YOS_FBSD_NCCS; i++) {
-        int li = cc_fb_to_lx(i);
-        if (li >= 0 && li < NCCS) h->c_cc[li] = cc[i];
-    }
-    cfsetispeed(h, ispeed);
-    cfsetospeed(h, ospeed);
-}
-
-static void termios_lx_to_fb(uint8_t *w, const struct termios *h)
-{
-    memset(w, 0, YOS_FBSD_TERMIOS_SIZE);
-#if defined(__APPLE__) || defined(__FreeBSD__)
-    /* See termios_fb_to_lx: identity passthrough on BSD-lineage
-     * hosts; the bit positions already match the FreeBSD wasm guest's
-     * expectations. Otherwise tcgetattr returns flags that, when
-     * passed back through tcsetattr, get scrambled by the round-trip. */
-    *(uint32_t *)(w +  0) = (uint32_t)h->c_iflag;
-    *(uint32_t *)(w +  4) = (uint32_t)h->c_oflag;
-    *(uint32_t *)(w +  8) = (uint32_t)h->c_cflag;
-    *(uint32_t *)(w + 12) = (uint32_t)h->c_lflag;
-#else
-    *(uint32_t *)(w +  0) = map_flags(h->c_iflag, iflag_map,
-                                      sizeof iflag_map/sizeof iflag_map[0], 0);
-    *(uint32_t *)(w +  4) = map_flags(h->c_oflag, oflag_map,
-                                      sizeof oflag_map/sizeof oflag_map[0], 0);
-    *(uint32_t *)(w +  8) = map_flags(h->c_cflag, cflag_map,
-                                      sizeof cflag_map/sizeof cflag_map[0], 0);
-    *(uint32_t *)(w + 12) = map_flags(h->c_lflag, lflag_map,
-                                      sizeof lflag_map/sizeof lflag_map[0], 0);
-#endif
-    uint8_t *cc = w + 16;
-    for (int i = 0; i < YOS_FBSD_NCCS; i++) {
-        int li = cc_fb_to_lx(i);
-        if (li >= 0 && li < NCCS) cc[i] = h->c_cc[li];
-    }
-    *(uint32_t *)(w + 36) = (uint32_t)cfgetispeed(h);
-    *(uint32_t *)(w + 40) = (uint32_t)cfgetospeed(h);
-}
 
 /* Fill a host termios with the defaults a real PTY master/slave gets
  * after openpt(): canonical mode, echo on, common control chars,
@@ -1515,32 +1324,6 @@ uint32_t yos_if_indextoname(struct yos_exec_ctx *ctx,
  * Auto-bridge classified as "unportable Linux extension"; on Linux it
  * IS available (glibc 2.10+). Stub on darwin until a fcntl-based
  * fallback lands. */
-int32_t yos_accept4(struct yos_exec_ctx *ctx, int32_t wfd,
-                    uint32_t addr_off, uint32_t addrlen_off, int32_t flags)
-{
-#if defined(__linux__)
-    int hfd = yos_fd_get(ctx, wfd);
-    if (hfd < 0) return yos_errno_neg(ctx, EBADF);
-    /* Strip FreeBSD-specific bits we can't honour atomically and
-     * convert to host equivalents. */
-    int hflags = 0;
-    if (flags & 0x10000000) hflags |= SOCK_CLOEXEC;   /* FreeBSD SOCK_CLOEXEC */
-    if (flags & 0x20000000) hflags |= SOCK_NONBLOCK;  /* FreeBSD SOCK_NONBLOCK */
-    /* Auto-bridge can't translate sockaddr; we accept into a host
-     * buffer and copy back, mirroring yos_accept's pattern in the
-     * generated code. For minimum portability, ignore the addr
-     * out-param if non-NULL — caller can getpeername later. */
-    int new_hfd = accept4(hfd, NULL, NULL, hflags);
-    (void)addr_off; (void)addrlen_off;
-    if (new_hfd < 0) return yos_errno_neg(ctx, errno);
-    int new_wfd = yos_fd_alloc(ctx, new_hfd);
-    if (new_wfd < 0) { close(new_hfd); return yos_errno_neg(ctx, EMFILE); }
-    return new_wfd;
-#else
-    (void)ctx; (void)wfd; (void)addr_off; (void)addrlen_off; (void)flags;
-    return yos_errno_neg(ctx, ENOSYS);
-#endif
-}
 
 #include <grp.h>
 
