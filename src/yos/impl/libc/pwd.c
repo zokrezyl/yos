@@ -84,7 +84,18 @@ static uint32_t login_buf_off;      /* wasm offset of login-name buffer */
  * arg evaluation order writes user first, group second, both into the
  * same buffer if shared, then printf reads `user` AT PRINT TIME and
  * gets the group name back from the now-overwritten slot. Two anchors
- * keep the values stable for the duration of one printf call. */
+ * keep the values stable for the duration of one printf call.
+ *
+ * ALL the *_buf_off anchors above are wasm-memory offsets — they are
+ * meaningful ONLY inside the wasm memory of the proc that ensure_buf'd
+ * them. After execve frees the old wasm memory and m3_NewRuntime
+ * allocates fresh memory, those offsets are stale and writing to them
+ * scribbles random bytes into the new program's heap. Two ls(1) calls
+ * in a row in the same yos run hit exactly this: first ls allocates
+ * the buffer, exits; second ls reuses the stale offset, corrupts
+ * itself, traps. yos_pwd_post_execve_reset() (called from proc.c after
+ * every m3_FreeRuntime, mirrors yos_env_post_execve_reset) wipes the
+ * anchors so each new wasm process re-allocates fresh. */
 static uint32_t ufu_buf_off;        /* user_from_uid result */
 static uint32_t gfg_buf_off;        /* group_from_gid result */
 
@@ -1039,4 +1050,45 @@ uint32_t yos_group_from_gid(struct yos_exec_ctx *ctx, uint32_t gid, int32_t nogr
     char num[16];
     snprintf(num, sizeof num, "%u", gid);
     return emit_ugname(ctx, &gfg_buf_off, num);
+}
+
+/* Called from impl/proc/proc.c::fork_thread_func right after the old
+ * wasm runtime is m3_FreeRuntime'd during execve. All the *_buf_off
+ * anchors above are offsets INTO THE NOW-FREED wasm linear memory;
+ * the next yos_malloc on the fresh memory will hand back an unrelated
+ * region but ensure_buf would return the stale offset as if it had
+ * already allocated. Symptom: second `ls` (or anything pwd-using) in
+ * a single yos session traps because user_from_uid writes the result
+ * string into garbage / random wasm memory. Mirrors the same fix
+ * yos_env_post_execve_reset does for env.c. */
+void yos_pwd_post_execve_reset(void)
+{
+    /* Every `*_buf_off` anchor declared at file scope in this TU is a
+     * wasm offset that survives across the m3_FreeRuntime + m3_NewRuntime
+     * pair execve does. The next process's ensure_buf() / equivalent
+     * would otherwise see the anchor as already-allocated and hand back
+     * a stale offset into freed memory. Zero them so each new wasm
+     * program starts with fresh allocations. */
+    pwd_buf_off          = 0;
+    grp_buf_off          = 0;
+    login_buf_off        = 0;
+    ufu_buf_off          = 0;
+    gfg_buf_off          = 0;
+    tm_buf_off           = 0;
+    timestr_buf_off      = 0;
+    errstr_buf_off       = 0;
+    gaistr_buf_off       = 0;
+    hstr_buf_off         = 0;
+    signam_buf_off       = 0;
+    ttyname_buf_off      = 0;
+    ctermid_buf_off      = 0;
+    dirname_buf_off      = 0;
+    l64a_buf_off         = 0;
+    nl_langinfo_buf_off  = 0;
+    setlocale_buf_off    = 0;
+    getwd_buf_off        = 0;
+    tempnam_buf_off      = 0;
+    getusershell_buf_off = 0;
+    tmpnam_buf_off       = 0;
+    proto_buf_off        = 0;
 }

@@ -450,17 +450,23 @@ int32_t yos_posix_fallocate(struct yos_exec_ctx *ctx, int32_t fd,
  * without ACL support) makes ls skip the warn cleanly. */
 int32_t yos_lpathconf(struct yos_exec_ctx *ctx, uint32_t path_off, int32_t name)
 {
-    if (!path_off) { errno = EFAULT; return -1; }
+    if (!path_off) return yos_errno_neg(ctx, EFAULT);
     const char *path = (const char *)(ctx->memory + path_off);
     /* Try host pathconf — works for many _PC_* values (LINK_MAX,
      * NAME_MAX, …). Linux has no lpathconf; pathconf follows
      * symlinks but for ls's use case that's fine. */
+    errno = 0;
     long r = pathconf(path, name);
     if (r < 0) {
         /* Many FreeBSD-only _PC_* (NFS4 ACL, ACL_PATH_MAX) return -1
          * on Linux with EINVAL, which is exactly what ls expects to
-         * mean "no ACLs". Pass that through. */
-        return -1;
+         * mean "no ACLs". Set the wasm errno so ls's `errno != EINVAL`
+         * check correctly skips the warning — without this the wasm
+         * errno keeps whatever it was set to before the call (often
+         * 0 from a prior `errno = 0` reset in fts_safe_readdir), and
+         * ls prints "<name>: Undefined error: 0" / "<name>: Success"
+         * for every entry it tries to ACL-probe. */
+        return yos_errno_neg(ctx, errno ? errno : EINVAL);
     }
     return (int32_t)r;
 }

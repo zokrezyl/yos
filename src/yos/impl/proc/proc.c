@@ -679,7 +679,11 @@ static void *fork_thread_func(void *arg)
          * code runs that could read those caches. */
         {
             extern void yos_env_post_execve_reset(void);
+            extern void yos_pwd_post_execve_reset(void);
+            extern void yos_freebsd_userland_post_execve_reset(void);
             yos_env_post_execve_reset();
+            yos_pwd_post_execve_reset();
+            yos_freebsd_userland_post_execve_reset();
         }
 
         child_ctx->argc = child_ctx->exec_argc;

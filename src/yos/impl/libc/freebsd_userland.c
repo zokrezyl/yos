@@ -461,3 +461,13 @@ void yos_freebsd_userland_link(IM3Module mod)
     m3_LinkRawFunction(mod, "env", "asprintf",      "i(iii)",   m3_yos_asprintf);
     m3_LinkRawFunction(mod, "env", "vasprintf",     "i(iii)",   m3_yos_vasprintf);
 }
+
+/* Called from impl/proc/proc.c after m3_FreeRuntime during execve.
+ * g_progname_off is a wasm offset into the now-freed memory; the next
+ * process's getprogname() would otherwise hand back the stale offset
+ * and the guest would dereference whatever happens to live there
+ * in the fresh wasm linear memory. */
+void yos_freebsd_userland_post_execve_reset(void)
+{
+    g_progname_off = 0;
+}

@@ -90,6 +90,10 @@ libc_tests = [
   # glibc has no equivalent and the codegen ENOSYS stub left every
   # ls -l line with a blank mode column.
   'test_strmode',
+  # yos_lpathconf bridge errno contract — pins the fix for the fts
+  # info-leak ls printed before yos_lpathconf called yos_errno_neg
+  # ("./<file>: Undefined error: 0"). See impl/libc/posix.c::yos_lpathconf.
+  'test_lpathconf_errno',
 ]
 
 # Path to the generator's output dir, exposed by src/yos/codegen.
