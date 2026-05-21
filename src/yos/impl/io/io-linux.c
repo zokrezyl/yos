@@ -23,6 +23,8 @@
 #include "impl/errno_helpers.h"
 #include "host64_structs.h"
 #include "struct_convert.h"
+#include "vfs/mount.h"
+#include "vfs/file.h"
 #include <yos/ytrace/ytrace.h>
 
 #include <stdint.h>
