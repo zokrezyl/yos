@@ -2,6 +2,7 @@
 , meson, ninja, pkg-config, python3, llvmPackages_18, binaryen
 , libffi, libiconv, apple-sdk_13 ? null
 , msgpack-c
+, openssl
 , src
 }:
 
@@ -85,6 +86,13 @@ in stdenv.mkDerivation {
     # (src/yos/yctl/yctl.c). pkg-config picks the `msgpack-c` (or older
     # `msgpack`) module up from this input.
     msgpack-c
+    # Host openssl — libssl + libcrypto linked into the yos binary so
+    # wasm guests can call env.SSL_*, env.EVP_*, env.RAND_*, env.ERR_*
+    # via the bridges in src/yos/impl/libc/openssl.c. pkg-config
+    # exposes the `openssl` module; meson's `with_openssl=auto` picks
+    # it up. Constrained Apple SDKs that don't ship libssl (iOS sim
+    # in some configurations) can disable via -Dwith_openssl=disabled.
+    openssl
   ] ++ lib.optionals stdenv.isDarwin [
     libiconv
     # Without this, nix's stdenv on darwin gates libSystem at the 10.12

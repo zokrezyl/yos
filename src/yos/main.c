@@ -1373,6 +1373,19 @@ void yos_link_imports(IM3Module module, struct yos_exec_ctx *ctx)
     yos_libpython_link(module);
 #endif
 
+    /* openssl (libcrypto + libssl) — env.SSL_*, env.EVP_*, env.RAND_*,
+     * env.ERR_*. The host yos links libssl/libcrypto; the wasm guest
+     * imports these names and yos resolves them through per-ctx handle
+     * tables (so SSL_CTX/SSL/EVP_MD_CTX from guest A are unreachable
+     * from guest B). See impl/libc/openssl.c. When the build is
+     * configured with -Dwith_openssl=disabled (e.g. iOS SDK that
+     * doesn't ship libssl), this is compiled out and the guest's
+     * openssl imports fall through to the unresolved-import trap. */
+#ifdef YOS_HAVE_OPENSSL
+    extern void yos_openssl_link(IM3Module mod);
+    yos_openssl_link(module);
+#endif
+
     /* Auto-generated bridges for the FreeBSD-libc-name import surface.
      * For guests that import each libc fn by name (env.write, env.read,
      * env.exit, …) instead of going through __yos_syscall. Bridges

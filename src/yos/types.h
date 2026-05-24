@@ -216,6 +216,28 @@ struct yos_exec_ctx {
      *   See impl/libpython.c. */
     void *py_tstate;
 
+    /* openssl per-guest state. yos's host openssl is shared across every
+     * guest (one libcrypto/libssl in the address space), but each guest's
+     * SSL_CTX, SSL, EVP_MD_CTX, BIO, ... must be isolated — guest A's
+     * SSL_CTX_set_verify_callback may not be observable from guest B.
+     *
+     * The bridge passes opaque host pointers to the guest as i32 handle
+     * IDs through a per-ctx handle table. ssl_handles is a void* array
+     * indexed 1..ssl_handles_cap-1 (slot 0 reserved so a valid handle
+     * is never 0/NULL); first free slot is found by linear scan. Freed
+     * slots are reused. Cleared on ctx teardown; the bridge's
+     * yos_openssl_ctx_free walks the table and calls the appropriate
+     * destructor for each live handle.
+     *
+     * No host openssl global mutates per-guest behaviour — algorithm
+     * registries are init-once + immutable, the error queue lives in
+     * ERR_get_error()'s per-thread storage (and yos's fork=pthread
+     * model gives per-guest threads), RNG state is per-process and
+     * shared (which is fine: the guest can't disable reseed). See
+     * build-tools/libbridge/policies/openssl.yaml. */
+    void   **ssl_handles;
+    uint32_t ssl_handles_cap;
+
     /* "Did this ctx write to stderr (wfd=2) since the last failed exec?"
      * Used by yos_exit to detect a forked child that died after exec
      * failure without printing — under asyncify-fork, zsh's zwarning code

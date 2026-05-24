@@ -1,7 +1,31 @@
 { stdenv, lib, fetchurl, python3, toolchain, sysroot, zlib, openssl }:
 
 # openssh — ssh / sshd / scp / sftp / ssh-keygen / ssh-agent / ssh-add,
-# wasm32 static-linked against our zlib + openssl ports.
+# wasm32 for yos. zlib is statically linked (it's small, no global
+# state to worry about, no per-guest isolation problem). openssl is
+# NOT statically linked: every openssl call becomes a wasm import on
+# env.<name> resolved by yos's host bridges in
+# src/yos/impl/libc/openssl.c. One host libssl in the yos host
+# process serves every guest; per-guest isolation is enforced by the
+# bridge holding each guest's SSL_CTX/SSL/EVP_MD_CTX in a per-
+# yos_exec_ctx handle table.
+#
+# That's how openssh "talks to the exposed wasm surface": no
+# libcrypto.a / libssl.a bodies inside ssh.wasm — just unresolved
+# references the linker emits as imports. wasm-ld's
+# --allow-undefined flag makes that the default behaviour; the
+# ${openssl} input is still needed for HEADERS (declarations,
+# struct layouts, OSSL_PARAM macros) and for openssh's configure to
+# accept --with-ssl-dir. The openssl .a files in that derivation
+# are unused at link time.
+#
+# Note: yos's openssl bridge currently exposes ~30 symbols (init,
+# SSL_*, EVP_* digest, RAND_bytes, ERR_*). openssh imports HUNDREDS.
+# Any openssl call from a code path actually exercised that isn't
+# bridged will trap at runtime through yos's wildcard
+# env.* unresolved-import stub with a clear "yos: unresolved import
+# env.X" diagnostic. Coverage grows incrementally as paths get
+# exercised.
 #
 # Style follows upstream nixpkgs' openssh recipe (autoreconf-driven,
 # explicit --without-X knobs to drop host-only integrations): no PAM,
@@ -197,10 +221,15 @@ stdenv.mkDerivation rec {
     "${sysroot}/usr/lib/crt1.o"
     "-L${sysroot}/usr/lib"
     "-L${zlib}/lib"
-    "-L${openssl}/lib"
+    # No -L${openssl}/lib: every openssl symbol becomes a wasm import
+    # resolved against yos's host openssl bridge. See top-of-file.
   ];
 
-  LIBS = "-lssl -lcrypto -lz -lc -lyos_stubs";
+  # LIBS — what autoconf appends after the object files at link time.
+  # No -lssl / -lcrypto: those symbols stay undefined references, and
+  # wasm-ld (with --allow-undefined above) emits them as imports on
+  # `env`. yos's host bridge resolves them at module load.
+  LIBS = "-lz -lc -lyos_stubs";
 
   configurePhase = ''
     runHook preConfigure
@@ -316,6 +345,30 @@ stdenv.mkDerivation rec {
         --disable-utmp --disable-wtmp --disable-lastlog \
         --disable-pututline --disable-pututxline --disable-strip \
         --without-privsep-user
+
+    # openssh's configure auto-prepends -lcrypto / -lssl to @LIBS@ and
+    # @LDFLAGS@ when --with-ssl-dir is given. We deliberately want
+    # those to stay UNRESOLVED at link time so wasm-ld emits them as
+    # env.<name> imports for yos's bridge to resolve. Strip them from
+    # the generated Makefile and config.status; everything else
+    # configure decided about openssl (headers, struct layouts,
+    # HAVE_* defines) stays intact.
+    python3 - <<'PY'
+    import pathlib, re
+    for f in ['Makefile', 'openbsd-compat/Makefile', 'regress/Makefile']:
+        p = pathlib.Path(f)
+        if not p.exists(): continue
+        text = p.read_text()
+        # Strip -lcrypto / -lssl from any LIBS/LDFLAGS line. The
+        # -L''${openssl}/lib has already been removed from our LDFLAGS
+        # env var; configure still appends -L''${openssl}/lib via
+        # SSLLDFLAGS, drop that too so the empty (or absent) libssl/
+        # libcrypto search dir doesn't matter either way.
+        text = re.sub(r'-lcrypto\b', "", text)
+        text = re.sub(r'-lssl\b',    "", text)
+        text = re.sub(r'-L\S*-openssl-\S*/lib\b', "", text)
+        p.write_text(text)
+    PY
     # --without-stackprotect: clang's -fstack-protector for wasm32
     # emits a canary load from memory[0..3], which on wasm-clang is
     # the same slot wasm-libc uses for thread-state bookkeeping —

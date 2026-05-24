@@ -39,6 +39,12 @@ option('with_libpython',
   description : 'libpython3-embed bridges (env.Py_Initialize / Py_Finalize / PyRun_SimpleString). Disable to drop the dep; guests calling Py_* get unresolved-import traps at load time.',
 )
 
+option('with_openssl',
+  type        : 'feature',
+  value       : 'auto',
+  description : 'openssl host bridges (env.SSL_*, env.EVP_*, env.RAND_*, env.ERR_*). Requires host libssl + libcrypto. Disable to drop the dep; guests calling these get unresolved-import traps at load time.',
+)
+
 option('ios_unblock',
   type        : 'boolean',
   value       : false,
