@@ -48,6 +48,10 @@
 
 #include "wasm3.h"
 #include "m3_env.h"
+#include "m3_compile.h"      /* CompileFunction — m3_Call requires
+                              * a function with compiled code; wasm3
+                              * compiles on demand for direct calls
+                              * but not for table-lookup hits. */
 #include "yos/types.h"
 #include <yos/ytrace/ytrace.h>
 
@@ -335,9 +339,40 @@ static struct yos_exec_ctx *lua_lookup_ctx(lua_State *L)
     return ctx;
 }
 
+/* Magic prefix stamped on lightuserdata used as our trampoline tag.
+ * User lightuserdata (real wasm-memory offsets pushed by guest code)
+ * has high bits of the wasm_offset (low 32 bits of host pointer +
+ * top of ctx->memory base). 0xDEADBEEF in the high 32 bits is
+ * essentially impossible for a real ctx->memory + off address on
+ * any of yos's target architectures (x86_64 / aarch64 darwin and
+ * linux), so the trampoline can disambiguate. */
+#define YOS_TRAMP_MAGIC  0xDEADBEEF00000000ull
+
+static void *yos_tramp_encode(uint32_t wasm_idx)
+{
+    return (void *)(uintptr_t)(YOS_TRAMP_MAGIC | (uint64_t)wasm_idx);
+}
+
+static int yos_tramp_decode(void *p, uint32_t *out)
+{
+    uint64_t v = (uint64_t)(uintptr_t)p;
+    if ((v & 0xFFFFFFFF00000000ull) != YOS_TRAMP_MAGIC) return 0;
+    if (out) *out = (uint32_t)v;
+    return 1;
+}
+
+/* Lua 5.1 type constants (pinned to avoid <lua.h> pollution). */
+#define YOS_LUA_TNONE          (-1)
+#define YOS_LUA_TLIGHTUSERDATA  2
+
 /* The single host C function pushed onto Lua as the "C function"
  * for every wasm-registered Lua callable. When Lua invokes a
- * registered function, control lands here. */
+ * registered function, control lands here. We:
+ *   1. Scan our upvalues for the magic-tagged lightuserdata. The
+ *      user's own upvalues come first (1..n) so their
+ *      lua_upvalueindex(i) is untranslated; ours sits at upvalue
+ *      n+1 with a magic high-bit pattern so we can find it.
+ *   2. Dispatch into the wasm runtime via m3_Call. */
 static int host_trampoline(lua_State *L)
 {
     struct yos_exec_ctx *ctx = lua_lookup_ctx(L);
@@ -345,13 +380,17 @@ static int host_trampoline(lua_State *L)
         return luaL_error(L, "yos: no ctx in lua registry");
     }
 
-    /* Upvalue 1 is a lightuserdata holding the wasm function table
-     * index. lua_upvalueindex(i) is the macro `LUA_GLOBALSINDEX - i`
-     * = `-10002 - i` in lua 5.1; the upvalue 1 pseudo-index is
-     * -10003. Inlined rather than #including <lua.h>. */
-    int up1 = -10003;
-    uintptr_t tag = (uintptr_t)lua_touserdata(L, up1);
-    uint32_t wasm_idx = (uint32_t)tag;
+    uint32_t wasm_idx = 0;
+    for (int i = 1; i < 64; ++i) {  /* lua 5.1 MAXUPVAL = 60 */
+        int up = -10002 - i;
+        int t = lua_type(L, up);
+        if (t == YOS_LUA_TNONE) break;
+        if (t != YOS_LUA_TLIGHTUSERDATA) continue;
+        if (yos_tramp_decode(lua_touserdata(L, up), &wasm_idx)) break;
+    }
+    if (wasm_idx == 0) {
+        return luaL_error(L, "yos: trampoline upvalue tag not found");
+    }
 
     IM3Module module = (IM3Module)ctx->module;
     if (!module || wasm_idx >= module->table0Size) {
@@ -362,6 +401,15 @@ static int host_trampoline(lua_State *L)
     if (!fn) {
         return luaL_error(L, "yos: wasm fn idx %u is null",
                           (unsigned)wasm_idx);
+    }
+    /* wasm3 compiles function bodies lazily on first call. Functions
+     * we reach via table0[] (i.e. via call_indirect / function-pointer
+     * stores in C) skip the direct-call path's auto-compile; we have
+     * to drive it ourselves. */
+    if (!fn->compiled) {
+        M3Result crc = CompileFunction(fn);
+        if (crc) return luaL_error(L, "yos: CompileFunction(idx=%u) failed: %s",
+                                   (unsigned)wasm_idx, crc);
     }
 
     /* The wasm function expects a lua_State * argument — but in our
@@ -790,16 +838,16 @@ static const void *m3_yos_lua_pushthread(IM3Runtime rt, IM3ImportContext _c,
 
 /* env.lua_pushcclosure — v(L_h, wasm_fn_idx, int n).
  *
- * Trampoline path. We push the wasm function index as a hidden
- * lightuserdata upvalue (becomes upvalue 1 inside host_trampoline),
- * then host lua_pushcclosure(L, host_trampoline, 1).
+ * Trampoline path. The guest's n user upvalues are already at the
+ * top of the stack; we push our magic-tagged lightuserdata ON TOP
+ * (becomes upvalue n+1 in the resulting closure). User upvalues
+ * stay at 1..n so the wasm-side lua_upvalueindex(i) for i in 1..n
+ * works untranslated. The trampoline scans for the magic tag to
+ * find its wasm function index.
  *
- * Limitation: n=0 only. For n>0 the caller has n user upvalues on
- * top of the stack already and they'd need to coexist with our tag;
- * Lua 5.1 indexes upvalues by position (no symbolic name) so the
- * wasm callback's view of lua_upvalueindex(1..n) would silently
- * shift. Until we wire the index translation, n>0 raises a warning
- * and falls through to push nil. */
+ * n=0 is the lua_pushcfunction case (no user upvalues, just the
+ * function). nvim uses both n=0 (luaL_register entries) and n=1
+ * (nlua_module_preloader with the module index as upvalue). */
 static const void *m3_yos_lua_pushcclosure(IM3Runtime rt, IM3ImportContext _c,
                                            uint64_t *_sp, void *_m)
 {
@@ -809,23 +857,16 @@ static const void *m3_yos_lua_pushcclosure(IM3Runtime rt, IM3ImportContext _c,
     uint32_t wasm_idx = (uint32_t)_sp[1];
     int n = (int)_sp[2];
     if (!L) return NULL;
-    if (n != 0) {
-        /* Pop user upvalues, push nil. */
+    if (wasm_idx == 0) {
+        /* C-equivalent of pushing a NULL function pointer. */
         lua_settop(L, lua_gettop(L) - n);
         lua_pushnil(L);
-        ywarn("lua_pushcclosure(n=%d): user upvalues with wasm "
-              "callback not bridged yet; pushing nil\n", n);
         return NULL;
     }
-    if (wasm_idx == 0) {
-        /* C-equivalent: pushing NULL function pointer. Push nil. */
-        lua_pushnil(L);
-        return NULL;
-    }
-    lua_pushlightuserdata(L, (void *)(uintptr_t)wasm_idx);
-    /* Note: host lua_pushcclosure expects a real lua_CFunction. We
-     * have one — host_trampoline. */
-    lua_pushcclosure(L, host_trampoline, 1);
+    /* Push our magic-tagged lightuserdata on top of the n user
+     * upvalues. Total upvalues = n + 1. */
+    lua_pushlightuserdata(L, yos_tramp_encode(wasm_idx));
+    lua_pushcclosure(L, host_trampoline, n + 1);
     return NULL;
 }
 
@@ -893,7 +934,7 @@ static const void *m3_yos_luaL_register(IM3Runtime rt, IM3ImportContext _c,
         const char *name = guest_cstr(ctx, name_off);
         if (!name) { off += 8; continue; }
         if (fn_idx != 0) {
-            lua_pushlightuserdata(L, (void *)(uintptr_t)fn_idx);
+            lua_pushlightuserdata(L, yos_tramp_encode(fn_idx));
             lua_pushcclosure(L, host_trampoline, 1);
         } else {
             lua_pushnil(L);
