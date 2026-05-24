@@ -160,8 +160,7 @@ extern lua_Integer luaL_optinteger (lua_State *L, int narg, lua_Integer d);
 extern const char *luaL_optlstring (lua_State *L, int narg, const char *d, size_t *l);
 extern void        luaL_checktype  (lua_State *L, int narg, int t);
 extern void        luaL_checkany   (lua_State *L, int narg);
-extern int         luaL_checkstack_real(lua_State *L, int sz, const char *msg);
-#define luaL_checkstack luaL_checkstack_real  /* avoid colliding with macro form */
+extern void        luaL_checkstack(lua_State *L, int sz, const char *msg);
 extern int         luaL_error      (lua_State *L, const char *fmt, ...);
 extern int         luaL_argerror   (lua_State *L, int numarg, const char *extramsg);
 extern int         luaL_typerror   (lua_State *L, int narg, const char *tname);
@@ -280,6 +279,113 @@ static uint32_t guest_stash_string(struct yos_exec_ctx *ctx,
 
 /* ── bridges ────────────────────────────────────────────────────── */
 
+/* ── host → wasm trampoline ────────────────────────────────────
+ *
+ * When the wasm guest registers a Lua C function (lua_pushcclosure,
+ * luaL_register), the "C function" it hands us is a wasm function
+ * table index — useless to call directly from host code. We give
+ * host Lua our own C function (`host_trampoline`) and stash the
+ * wasm index in the closure's upvalue. When Lua later invokes the
+ * closure, host_trampoline runs, reads the wasm index, and dispatches
+ * back into the wasm runtime via m3_Call.
+ *
+ * Setup pieces:
+ *  - The yos ctx pointer is stashed in the lua state registry under
+ *    the key "yos_ctx" when luaL_newstate is bridged.
+ *  - The wasm function index goes into the closure as upvalue 1.
+ *  - We currently only support n=0 user upvalues (i.e. pushcfunction-
+ *    style registration via luaL_register / lua_pushcfunction macro
+ *    which is the only thing nvim's openers use). lua_pushcclosure
+ *    with n>0 falls back to "push nil + warn" as before.
+ */
+
+/* Find the i32 handle that maps back to a given host L. Linear scan
+ * — usually just slot 1 (the main state). */
+static uint32_t lua_handle_of(struct yos_exec_ctx *ctx, lua_State *L)
+{
+    if (!ctx || !ctx->lua_handles) return 0;
+    for (uint32_t i = 1; i < ctx->lua_handles_cap; ++i)
+        if (ctx->lua_handles[i] == L) return i;
+    return 0;
+}
+
+/* Stash the yos ctx pointer in L's registry so host_trampoline can
+ * find it later. Key is a lightuserdata pointing at a fixed host
+ * address (this static below) so it can't collide with any Lua-side
+ * string key. */
+static int s_yos_ctx_registry_key_marker;
+
+/* Lua 5.1's LUA_REGISTRYINDEX pseudo-index, pinned here so we don't
+ * have to pull <lua.h> into yos's TU pollution graph. */
+#define YOS_LUA_REGISTRYINDEX (-10000)
+
+static void lua_register_ctx_real(lua_State *L, struct yos_exec_ctx *ctx)
+{
+    lua_pushlightuserdata(L, &s_yos_ctx_registry_key_marker);
+    lua_pushlightuserdata(L, ctx);
+    lua_rawset(L, YOS_LUA_REGISTRYINDEX);
+}
+
+static struct yos_exec_ctx *lua_lookup_ctx(lua_State *L)
+{
+    lua_pushlightuserdata(L, &s_yos_ctx_registry_key_marker);
+    lua_rawget(L, YOS_LUA_REGISTRYINDEX);
+    struct yos_exec_ctx *ctx = (struct yos_exec_ctx *)lua_touserdata(L, -1);
+    lua_settop(L, lua_gettop(L) - 1);   /* pop */
+    return ctx;
+}
+
+/* The single host C function pushed onto Lua as the "C function"
+ * for every wasm-registered Lua callable. When Lua invokes a
+ * registered function, control lands here. */
+static int host_trampoline(lua_State *L)
+{
+    struct yos_exec_ctx *ctx = lua_lookup_ctx(L);
+    if (!ctx) {
+        return luaL_error(L, "yos: no ctx in lua registry");
+    }
+
+    /* Upvalue 1 is a lightuserdata holding the wasm function table
+     * index. lua_upvalueindex(i) is the macro `LUA_GLOBALSINDEX - i`
+     * = `-10002 - i` in lua 5.1; the upvalue 1 pseudo-index is
+     * -10003. Inlined rather than #including <lua.h>. */
+    int up1 = -10003;
+    uintptr_t tag = (uintptr_t)lua_touserdata(L, up1);
+    uint32_t wasm_idx = (uint32_t)tag;
+
+    IM3Module module = (IM3Module)ctx->module;
+    if (!module || wasm_idx >= module->table0Size) {
+        return luaL_error(L, "yos: wasm fn idx %u out of range",
+                          (unsigned)wasm_idx);
+    }
+    IM3Function fn = module->table0[wasm_idx];
+    if (!fn) {
+        return luaL_error(L, "yos: wasm fn idx %u is null",
+                          (unsigned)wasm_idx);
+    }
+
+    /* The wasm function expects a lua_State * argument — but in our
+     * world that's an i32 handle, not a host pointer. Find the
+     * handle this L corresponds to. */
+    uint32_t L_handle = lua_handle_of(ctx, L);
+    if (!L_handle) {
+        return luaL_error(L, "yos: lua_State not in handle table");
+    }
+
+    /* Call: wasm fn takes (i32 L) returns (i32 nresults). */
+    const void *args[1] = { &L_handle };
+    M3Result rc = m3_Call(fn, 1, args);
+    if (rc) {
+        return luaL_error(L, "yos: wasm trampoline call failed: %s", rc);
+    }
+    uint32_t nresults = 0;
+    const void *retptrs[1] = { &nresults };
+    /* If the wasm function returned no result (void), GetResults is
+     * a no-op or returns an error; treat as 0. */
+    (void)m3_GetResults(fn, 1, retptrs);
+    return (int)nresults;
+}
+
 /* env.luaL_newstate — i32(). Returns a NEW lua_State handle. The
  * first call from a guest creates the main state; later calls would
  * create additional ones (rare; usually only one). */
@@ -289,6 +395,7 @@ static const void *m3_yos_luaL_newstate(IM3Runtime rt, IM3ImportContext _c,
     (void)_c; (void)_m;
     struct yos_exec_ctx *ctx = CTX(rt);
     lua_State *L = luaL_newstate();
+    if (L) lua_register_ctx_real(L, ctx);  /* enable trampoline */
     _sp[0] = (uint64_t)lua_handles_wrap(ctx, L);
     ydebug("luaL_newstate() = handle %u (p=%p)\n", (uint32_t)_sp[0], (void *)L);
     return NULL;
@@ -522,19 +629,42 @@ static const void *m3_yos_lua_tocfunction(IM3Runtime rt, IM3ImportContext _c,
 }
 
 /* env.lua_touserdata — i32(L_h, int idx).
- * Returns a wasm-side i32 representation of a host void *. We don't
- * have a clean way to expose a host pointer to the guest; the
- * common pattern is for the guest to use lua_newuserdata which we
- * DO bridge with a wasm-offset return. For arbitrary userdata
- * created by other means, return 0. */
+ *
+ * Counterpart of lua_newuserdata: the userdata pushed by our
+ * lua_newuserdata bridge is a 4-byte host wrapper holding a wasm
+ * offset. lua_touserdata returns that offset so the guest can deref
+ * the same wasm memory it originally got.
+ *
+ * For light-userdata (created via lua_pushlightuserdata, which
+ * stores a host pointer — but we pass (ctx->memory + off) in,
+ * making it really `ctx->memory + off`), we can recover the
+ * original wasm offset by subtracting ctx->memory.
+ */
 static const void *m3_yos_lua_touserdata(IM3Runtime rt, IM3ImportContext _c,
                                          uint64_t *_sp, void *_m)
 {
-    (void)rt; (void)_c; (void)_m;
-    /* Stub — see note above. Caller's lua_newuserdata returns a
-     * guest-memory offset; if they pass that back here, returning
-     * the same offset would be ideal but requires tracking which
-     * offsets are userdata. First cut: 0. */
+    (void)_c; (void)_m;
+    struct yos_exec_ctx *ctx = CTX(rt);
+    lua_State *L = (lua_State *)lua_handles_resolve(ctx, (uint32_t)_sp[1]);
+    int idx = (int)_sp[2];
+    if (!L) { _sp[0] = 0; return NULL; }
+    void *p = lua_touserdata(L, idx);
+    if (!p) { _sp[0] = 0; return NULL; }
+    /* Light userdata case: the host pointer is (ctx->memory + off).
+     * Recover off by subtracting ctx->memory. Bounds-check to make
+     * sure the result is plausibly in linear memory. */
+    if (ctx->memory && (uint8_t *)p >= ctx->memory &&
+        (uint8_t *)p < ctx->memory + ctx->memory_size) {
+        _sp[0] = (uint64_t)(uint32_t)((uint8_t *)p - ctx->memory);
+        return NULL;
+    }
+    /* Full userdata case: our newuserdata wrapper stores the wasm
+     * offset in the first 4 bytes of the host userdata. */
+    uint32_t wasm_off = *(uint32_t *)p;
+    if (wasm_off && wasm_off < ctx->memory_size) {
+        _sp[0] = (uint64_t)wasm_off;
+        return NULL;
+    }
     _sp[0] = 0;
     return NULL;
 }
@@ -658,30 +788,122 @@ static const void *m3_yos_lua_pushthread(IM3Runtime rt, IM3ImportContext _c,
     return NULL;
 }
 
-/* env.lua_pushcclosure — v(L_h, fn_idx, int n).
+/* env.lua_pushcclosure — v(L_h, wasm_fn_idx, int n).
  *
- * DEFERRED: registering a wasm function as a Lua C closure requires
- * a host-side trampoline that dispatches calls back into the wasm
- * runtime. Not implemented in this first cut. Push nil and discard
- * the n upvalues from the stack so the caller's state stays
- * coherent. The Lua side will see nil instead of the function — any
- * call attempt will raise "attempt to call a nil value".
+ * Trampoline path. We push the wasm function index as a hidden
+ * lightuserdata upvalue (becomes upvalue 1 inside host_trampoline),
+ * then host lua_pushcclosure(L, host_trampoline, 1).
  *
- * (Once the trampoline lands, the bridge will wrap fn_idx + n
- * upvalues into a host-side stub that calls back into wasm.) */
+ * Limitation: n=0 only. For n>0 the caller has n user upvalues on
+ * top of the stack already and they'd need to coexist with our tag;
+ * Lua 5.1 indexes upvalues by position (no symbolic name) so the
+ * wasm callback's view of lua_upvalueindex(1..n) would silently
+ * shift. Until we wire the index translation, n>0 raises a warning
+ * and falls through to push nil. */
 static const void *m3_yos_lua_pushcclosure(IM3Runtime rt, IM3ImportContext _c,
                                            uint64_t *_sp, void *_m)
 {
     (void)_c; (void)_m;
-    lua_State *L = (lua_State *)lua_handles_resolve(CTX(rt), (uint32_t)_sp[0]);
+    struct yos_exec_ctx *ctx = CTX(rt);
+    lua_State *L = (lua_State *)lua_handles_resolve(ctx, (uint32_t)_sp[0]);
+    uint32_t wasm_idx = (uint32_t)_sp[1];
     int n = (int)_sp[2];
     if (!L) return NULL;
-    /* Pop the n upvalues the caller pushed, then push nil so the
-     * stack-balance contract holds. */
-    lua_settop(L, lua_gettop(L) - n);
-    lua_pushnil(L);
-    ywarn("lua_pushcclosure: C function callback not bridged yet; "
-          "pushing nil\n");
+    if (n != 0) {
+        /* Pop user upvalues, push nil. */
+        lua_settop(L, lua_gettop(L) - n);
+        lua_pushnil(L);
+        ywarn("lua_pushcclosure(n=%d): user upvalues with wasm "
+              "callback not bridged yet; pushing nil\n", n);
+        return NULL;
+    }
+    if (wasm_idx == 0) {
+        /* C-equivalent: pushing NULL function pointer. Push nil. */
+        lua_pushnil(L);
+        return NULL;
+    }
+    lua_pushlightuserdata(L, (void *)(uintptr_t)wasm_idx);
+    /* Note: host lua_pushcclosure expects a real lua_CFunction. We
+     * have one — host_trampoline. */
+    lua_pushcclosure(L, host_trampoline, 1);
+    return NULL;
+}
+
+/* env.luaL_register — v(L_h, libname_off, regs_off).
+ *
+ * luaL_register registers a library: a table of (name, function)
+ * pairs. The wasm-side luaL_Reg layout is two i32 pointers per
+ * entry, terminated by {NULL, NULL}. We walk the array, push name
+ * + wasm-fn-trampoline-closure pairs onto a fresh library table,
+ * and either expose it as a global module (if libname is non-NULL)
+ * or leave it on the stack.
+ *
+ * libname == NULL is the "extend existing top-of-stack table" form
+ * — used after luaL_findtable. We support it by reusing the
+ * table already on top of the stack.
+ *
+ * This is the function nvim's luaopen_luv / luaopen_lpeg /
+ * luaopen_mpack / nvim's own ext modules all use to register the
+ * wasm-side C bindings into Lua. */
+static const void *m3_yos_luaL_register(IM3Runtime rt, IM3ImportContext _c,
+                                        uint64_t *_sp, void *_m)
+{
+    (void)_c; (void)_m;
+    struct yos_exec_ctx *ctx = CTX(rt);
+    lua_State *L = (lua_State *)lua_handles_resolve(ctx, (uint32_t)_sp[0]);
+    uint32_t libname_off = (uint32_t)_sp[1];
+    uint32_t regs_off    = (uint32_t)_sp[2];
+    if (!L) return NULL;
+
+    const char *libname = libname_off ? guest_cstr(ctx, libname_off) : NULL;
+
+    /* If libname is non-NULL, create / locate the library table on
+     * the stack. luaL_register's documented behaviour is roughly:
+     *   if libname is given:
+     *     - if package.loaded[libname] exists, push it
+     *     - else create a new table; set _G[libname] = it
+     *   else:
+     *     - use the table already on top of the stack
+     */
+    if (libname) {
+        /* Simplification: just create a new empty table and bind it
+         * to _G[libname]. The "respect package.loaded" subtlety
+         * isn't critical for first-cut nvim loading. */
+        lua_createtable(L, 0, 0);
+        /* Stack: ..., libtable. Duplicate so we can both set and
+         * keep it. */
+        lua_pushvalue(L, -1);
+        /* Set _G[libname] = libtable. Use lua_setglobal-equivalent
+         * via the LUA_GLOBALSINDEX pseudo-index. In lua 5.1
+         * lua_setfield with LUA_GLOBALSINDEX works. */
+        lua_setfield(L, -10002 /* LUA_GLOBALSINDEX */, libname);
+        /* Stack: ..., libtable (original; the duplicate was
+         * consumed by setfield). */
+    }
+    /* The table to populate is now at the top of the stack. Read
+     * entries from the wasm-side luaL_Reg array. */
+    if (!ctx->memory) return NULL;
+    uint32_t off = regs_off;
+    int count = 0;
+    while (off + 8 <= ctx->memory_size) {
+        uint32_t name_off = *(const uint32_t *)(ctx->memory + off);
+        uint32_t fn_idx   = *(const uint32_t *)(ctx->memory + off + 4);
+        if (name_off == 0 && fn_idx == 0) break;
+        if (name_off == 0) { off += 8; continue; }
+        const char *name = guest_cstr(ctx, name_off);
+        if (!name) { off += 8; continue; }
+        if (fn_idx != 0) {
+            lua_pushlightuserdata(L, (void *)(uintptr_t)fn_idx);
+            lua_pushcclosure(L, host_trampoline, 1);
+        } else {
+            lua_pushnil(L);
+        }
+        lua_setfield(L, -2 /* libtable */, name);
+        off += 8;
+        if (++count > 4096) break;   /* runaway guard */
+    }
+    ydebug("luaL_register(%s) %d entries\n",
+           libname ? libname : "<top-of-stack>", count);
     return NULL;
 }
 
@@ -715,24 +937,52 @@ static const void *m3_yos_lua_setfield(IM3Runtime rt, IM3ImportContext _c,
 }
 
 /* env.lua_newuserdata — i32(L_h, size_t sz).
- * Allocates Lua-managed memory of sz bytes, pushes the userdata
- * onto the stack, returns a HANDLE-style token. The userdata lives
- * in host memory the guest can't directly access; for the typical
- * "stash some bytes that the guest later identifies" pattern this is
- * sufficient because the guest passes the same userdata pointer back
- * via lua_topointer / identity-compare. Mutating the userdata
- * contents from the wasm side needs a sibling bridge we don't
- * provide yet. */
+ *
+ * The Lua C API contract: caller gets a sz-byte buffer they can
+ * read/write as if it were a normal struct pointer. Naively bridging
+ * to host lua_newuserdata gives back a HOST pointer; the wasm guest
+ * would dereference it as a wasm-memory offset and OOB instantly
+ * (lua-cjson does exactly this for its cjson_state config struct).
+ *
+ * Real fix: allocate the bytes IN WASM linear memory via yos_malloc,
+ * then push a HOST Lua userdata wrapper that just stores the wasm
+ * offset (4 bytes) inside it. The guest sees the wasm offset as the
+ * "pointer" and can deref normally. lua_touserdata's bridge looks
+ * INTO the wrapper to retrieve that wasm offset.
+ *
+ * Leak warning: nothing frees the wasm-side allocation when Lua's GC
+ * reclaims the userdata. A future revision will attach a __gc
+ * metamethod that calls yos_free on the wasm offset. For embedded
+ * use this is bounded — lua-cjson allocates one cjson_state per
+ * interpreter, never more.
+ */
+extern uint32_t yos_malloc(struct yos_exec_ctx *ctx, uint32_t size);
+
 static const void *m3_yos_lua_newuserdata(IM3Runtime rt, IM3ImportContext _c,
                                           uint64_t *_sp, void *_m)
 {
     (void)_c; (void)_m;
-    lua_State *L = (lua_State *)lua_handles_resolve(CTX(rt), (uint32_t)_sp[1]);
+    struct yos_exec_ctx *ctx = CTX(rt);
+    lua_State *L = (lua_State *)lua_handles_resolve(ctx, (uint32_t)_sp[1]);
     uint32_t sz = (uint32_t)_sp[2];
-    void *p = L ? lua_newuserdata(L, sz) : NULL;
-    /* Return the low 32 bits of the host pointer; comparable as an
-     * opaque token only. */
-    _sp[0] = (uint64_t)(uint32_t)(uintptr_t)p;
+    if (!L) { _sp[0] = 0; return NULL; }
+    /* Allocate the actual sz bytes in wasm linear memory. */
+    uint32_t wasm_off = yos_malloc(ctx, sz ? sz : 1);
+    if (!wasm_off) { _sp[0] = 0; return NULL; }
+    /* Zero the allocation — lua's lua_newuserdata returns zeroed
+     * memory; cjson and many other consumers rely on that. */
+    if (sz) memset(ctx->memory + wasm_off, 0, sz);
+    /* Wrap with a host Lua userdata that records the wasm offset.
+     * 4-byte payload is enough for an i32 offset. */
+    void *udata = lua_newuserdata(L, sizeof(uint32_t));
+    if (!udata) {
+        /* alloc failed host-side; can't easily yos_free here without
+         * a yos_free extern. The wasm bytes leak. */
+        _sp[0] = 0;
+        return NULL;
+    }
+    *(uint32_t *)udata = wasm_off;
+    _sp[0] = (uint64_t)wasm_off;
     return NULL;
 }
 
@@ -1009,6 +1259,19 @@ static const void *m3_yos_luaL_typerror(IM3Runtime rt, IM3ImportContext _c,
     return NULL;
 }
 
+/* env.luaL_checkstack — v(L_h, int sz, msg_off). */
+static const void *m3_yos_luaL_checkstack(IM3Runtime rt, IM3ImportContext _c,
+                                          uint64_t *_sp, void *_m)
+{
+    (void)_c; (void)_m;
+    struct yos_exec_ctx *ctx = CTX(rt);
+    lua_State *L = (lua_State *)lua_handles_resolve(ctx, (uint32_t)_sp[0]);
+    int sz = (int)_sp[1];
+    const char *msg = guest_cstr(ctx, (uint32_t)_sp[2]);
+    if (L) luaL_checkstack(L, sz, msg ? msg : "stack overflow");
+    return NULL;
+}
+
 /* env.luaL_checkudata — i32(L_h, int ud, tname_off) */
 static const void *m3_yos_luaL_checkudata(IM3Runtime rt, IM3ImportContext _c,
                                           uint64_t *_sp, void *_m)
@@ -1130,6 +1393,8 @@ void yos_liblua_link(IM3Module mod)
     m3_LinkRawFunction(mod, "env", "luaL_error",          "i(ii)",   m3_yos_luaL_error);
     m3_LinkRawFunction(mod, "env", "luaL_argerror",       "i(iii)",  m3_yos_luaL_argerror);
     m3_LinkRawFunction(mod, "env", "luaL_typerror",       "i(iii)",  m3_yos_luaL_typerror);
+    m3_LinkRawFunction(mod, "env", "luaL_register",       "v(iii)",  m3_yos_luaL_register);
+    m3_LinkRawFunction(mod, "env", "luaL_checkstack",     "v(iii)",  m3_yos_luaL_checkstack);
 }
 
 /* Per-ctx teardown — close any lua_State still in the handle table.
