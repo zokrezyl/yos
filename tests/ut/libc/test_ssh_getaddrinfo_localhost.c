@@ -131,6 +131,21 @@ void _start(void) {
     const char *msg = gai_strerror(0);
     if (!msg || !msg[0]) { say("gai_strerror FAIL\n"); _exit(7); }
 
+    /* The host slot of getnameinfo with NI_NUMERICHOST MUST be the
+     * dotted-quad IP — never a DNS name. On Linux NI_NUMERICHOST has a
+     * different bit value than FreeBSD; pre-fix the bridge passed the
+     * flags unchanged and Linux saw the FreeBSD bit as
+     * NI_NUMERICSERV, ran a reverse DNS lookup, and stuck the FQDN in
+     * the host slot. ssh's "host key unknown" prompt then showed the
+     * FQDN where the IP belonged. */
+    if (host[0] == '\0' ||
+        (host[0] < '0' || host[0] > '9')) {
+        say("getnameinfo FAIL: NUMERICHOST produced a name, not an IP: ");
+        say(host);
+        say("\n");
+        _exit(20);
+    }
+
     freeaddrinfo(res);
 
     say("ssh-getaddrinfo ok\n");

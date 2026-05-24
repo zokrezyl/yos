@@ -549,6 +549,89 @@ static void host_sockaddr_to_freebsd(uint8_t *out, const struct sockaddr *src,
     }
 }
 
+/* AI_* / NI_* flag bits diverge between FreeBSD and Linux. Examples:
+ *   FreeBSD NI_NUMERICHOST = 0x02 — Linux NI_NUMERICHOST = 0x01.
+ *   FreeBSD NI_NUMERICSERV = 0x08 — Linux NI_NUMERICSERV = 0x02.
+ * Without translation, ssh's `getnameinfo(..., NI_NUMERICHOST)` on a
+ * Linux host runs a reverse DNS lookup instead and returns the
+ * remote's FQDN where the dotted-quad IP should appear — visible as
+ * "The authenticity of host 'macbook.main.misi.com (macbook.main.misi.com)'
+ * can't be established." (the IP slot is the FQDN, not the IP).
+ *
+ * Darwin's NI_* / AI_* match FreeBSD's, so the translation is a no-op
+ * there — return the bits unchanged. */
+#if defined(__linux__)
+/* FreeBSD bit values (from /usr/include/netdb.h on the FreeBSD guest). */
+#define FB_NI_NOFQDN       0x01
+#define FB_NI_NUMERICHOST  0x02
+#define FB_NI_NAMEREQD     0x04
+#define FB_NI_NUMERICSERV  0x08
+#define FB_NI_DGRAM        0x10
+#define FB_NI_NUMERICSCOPE 0x20
+
+#define FB_AI_PASSIVE      0x0001
+#define FB_AI_CANONNAME    0x0002
+#define FB_AI_NUMERICHOST  0x0004
+#define FB_AI_NUMERICSERV  0x0008
+#define FB_AI_ALL          0x0100
+#define FB_AI_V4MAPPED_CFG 0x0200
+#define FB_AI_ADDRCONFIG   0x0400
+#define FB_AI_V4MAPPED     0x0800
+
+static int ni_flags_fb_to_lx(int f)
+{
+    int r = 0;
+    if (f & FB_NI_NOFQDN)       r |= NI_NOFQDN;
+    if (f & FB_NI_NUMERICHOST)  r |= NI_NUMERICHOST;
+    if (f & FB_NI_NAMEREQD)     r |= NI_NAMEREQD;
+    if (f & FB_NI_NUMERICSERV)  r |= NI_NUMERICSERV;
+    if (f & FB_NI_DGRAM)        r |= NI_DGRAM;
+    /* NI_NUMERICSCOPE: glibc accepts it as bit 4 (=32) on IPv6 scopes;
+     * older glibc doesn't define it. Fall through silently if absent. */
+#ifdef NI_NUMERICSCOPE
+    if (f & FB_NI_NUMERICSCOPE) r |= NI_NUMERICSCOPE;
+#endif
+    return r;
+}
+
+static int ai_flags_fb_to_lx(int f)
+{
+    int r = 0;
+    /* PASSIVE / CANONNAME / NUMERICHOST share bit values across both.
+     * The rest (V4MAPPED, ALL, ADDRCONFIG, NUMERICSERV) don't. */
+    if (f & FB_AI_PASSIVE)      r |= AI_PASSIVE;
+    if (f & FB_AI_CANONNAME)    r |= AI_CANONNAME;
+    if (f & FB_AI_NUMERICHOST)  r |= AI_NUMERICHOST;
+    if (f & FB_AI_NUMERICSERV)  r |= AI_NUMERICSERV;
+    if (f & FB_AI_ALL)          r |= AI_ALL;
+    if (f & FB_AI_ADDRCONFIG)   r |= AI_ADDRCONFIG;
+    if (f & (FB_AI_V4MAPPED | FB_AI_V4MAPPED_CFG)) r |= AI_V4MAPPED;
+    return r;
+}
+
+/* Reverse: Linux ai_flags bits → FreeBSD bits, used when copying the
+ * host's getaddrinfo result chain back to the wasm guest. The guest
+ * rarely reads ai_flags but the wasm-side type is signed int — leaving
+ * Linux's bits in there would make any guest-side `if (info->ai_flags
+ * & AI_CANONNAME)` test misfire. */
+static int ai_flags_lx_to_fb(int f)
+{
+    int r = 0;
+    if (f & AI_PASSIVE)      r |= FB_AI_PASSIVE;
+    if (f & AI_CANONNAME)    r |= FB_AI_CANONNAME;
+    if (f & AI_NUMERICHOST)  r |= FB_AI_NUMERICHOST;
+    if (f & AI_NUMERICSERV)  r |= FB_AI_NUMERICSERV;
+    if (f & AI_ALL)          r |= FB_AI_ALL;
+    if (f & AI_ADDRCONFIG)   r |= FB_AI_ADDRCONFIG;
+    if (f & AI_V4MAPPED)     r |= FB_AI_V4MAPPED;
+    return r;
+}
+#else  /* darwin / FreeBSD / *BSD — same bits as the guest. */
+static inline int ni_flags_fb_to_lx(int f) { return f; }
+static inline int ai_flags_fb_to_lx(int f) { return f; }
+static inline int ai_flags_lx_to_fb(int f) { return f; }
+#endif
+
 int32_t yos_getaddrinfo(struct yos_exec_ctx *ctx, uint32_t node_off,
                         uint32_t service_off, uint32_t hints_off,
                         uint32_t res_off)
@@ -561,7 +644,11 @@ int32_t yos_getaddrinfo(struct yos_exec_ctx *ctx, uint32_t node_off,
     struct addrinfo *host_hints_p = NULL;
     if (hints_off && hints_off + WASM_ADDRINFO_SZ <= ctx->memory_size) {
         const uint8_t *w = ctx->memory + hints_off;
-        host_hints.ai_flags    = *(int32_t *)(w +  0);
+        /* AI_* flag bits diverge — translate before handing to host
+         * getaddrinfo. Without this, ssh's hints.ai_flags=AI_CANONNAME
+         * (0x02 on both) survives but ai_socktype's host-side filter
+         * trips on AI_NUMERICSERV=8 (FreeBSD) ↔ AI_V4MAPPED=8 (Linux). */
+        host_hints.ai_flags    = ai_flags_fb_to_lx(*(int32_t *)(w +  0));
         host_hints.ai_family   = *(int32_t *)(w +  4);
         host_hints.ai_socktype = *(int32_t *)(w +  8);
         host_hints.ai_protocol = *(int32_t *)(w + 12);
@@ -588,7 +675,7 @@ int32_t yos_getaddrinfo(struct yos_exec_ctx *ctx, uint32_t node_off,
         if (!blk) { freeaddrinfo(host_res); return EAI_MEMORY; }
         uint8_t *w = ctx->memory + blk;
         memset(w, 0, total);
-        *(int32_t *)(w +  0) = p->ai_flags;
+        *(int32_t *)(w +  0) = ai_flags_lx_to_fb(p->ai_flags);
         *(int32_t *)(w +  4) = p->ai_family;
         *(int32_t *)(w +  8) = p->ai_socktype;
         *(int32_t *)(w + 12) = p->ai_protocol;
@@ -629,7 +716,13 @@ void yos_freeaddrinfo(struct yos_exec_ctx *ctx, uint32_t res_off)
  * Linux host wants sa_family as uint16 LE @0/1; darwin / BSD host wants
  * sa_len @0, sa_family @1 — same as the guest, no rewrite. The
  * platform-specific freebsd_sockaddr_to_host helper does the right
- * thing in both cases. */
+ * thing in both cases.
+ *
+ * NI_* flag values also diverge between FreeBSD and Linux (see
+ * ni_flags_fb_to_lx above); without translation ssh's
+ * `getnameinfo(addr, NI_NUMERICHOST)` on a Linux host runs a reverse-
+ * DNS lookup instead of returning the dotted-quad IP, and the
+ * "host key not yet known" prompt shows the FQDN in the IP slot. */
 int32_t yos_getnameinfo(struct yos_exec_ctx *ctx, uint32_t sa_off,
                         uint32_t salen, uint32_t host_off, uint32_t hostlen,
                         uint32_t serv_off, uint32_t servlen, int32_t flags)
@@ -642,7 +735,8 @@ int32_t yos_getnameinfo(struct yos_exec_ctx *ctx, uint32_t sa_off,
     char *hbuf = host_off ? (char *)(ctx->memory + host_off) : NULL;
     char *sbuf = serv_off ? (char *)(ctx->memory + serv_off) : NULL;
     return getnameinfo((const struct sockaddr *)hostbuf_sa, (socklen_t)salen,
-                       hbuf, (socklen_t)hostlen, sbuf, (socklen_t)servlen, flags);
+                       hbuf, (socklen_t)hostlen, sbuf, (socklen_t)servlen,
+                       ni_flags_fb_to_lx(flags));
 }
 
 /* posix_madvise — auto-bridge passes wasm offset converted to host
