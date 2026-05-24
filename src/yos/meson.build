@@ -67,6 +67,24 @@ else
   openssl_dep = dependency('openssl', required: with_openssl_opt)
   have_openssl = openssl_dep.found()
 endif
+# liblua-5.1 (host) — embedded into the yos binary so wasm guests can
+# call env.lua_* / env.luaL_* (impl/libc/liblua.c). pkg-config name
+# differs across distros: nixpkgs ships all three of lua-5.1, lua5.1,
+# and lua.pc for lua-5.1.5. Try in that order.
+with_liblua_opt = get_option('with_liblua')
+if with_liblua_opt.disabled()
+  liblua_dep = dependency('', required: false)
+  have_liblua = false
+else
+  liblua_dep = dependency('lua-5.1', required: false)
+  if not liblua_dep.found()
+    liblua_dep = dependency('lua5.1', required: false)
+  endif
+  if not liblua_dep.found()
+    liblua_dep = dependency('lua', required: with_liblua_opt, version: '>= 5.1, < 5.2')
+  endif
+  have_liblua = liblua_dep.found()
+endif
 # iconv: glibc folds it into libc; darwin/BSD ship a separate libiconv
 # whose symbols start with `iconv_*` (and `__iconv_*` for the GNU
 # extras). yos's bridge calls those names, so we need explicit linkage
@@ -260,6 +278,11 @@ if have_openssl
   optional_sources += files('impl/libc/openssl.c')
   optional_args    += '-DYOS_HAVE_OPENSSL=1'
   optional_deps    += openssl_dep
+endif
+if have_liblua
+  optional_sources += files('impl/libc/liblua.c')
+  optional_args    += '-DYOS_HAVE_LIBLUA=1'
+  optional_deps    += liblua_dep
 endif
 
 yos_common_c_args = [

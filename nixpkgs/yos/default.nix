@@ -3,6 +3,7 @@
 , libffi, libiconv, apple-sdk_13 ? null
 , msgpack-c
 , openssl
+, lua5_1
 , src
 }:
 
@@ -93,6 +94,12 @@ in stdenv.mkDerivation {
     # it up. Constrained Apple SDKs that don't ship libssl (iOS sim
     # in some configurations) can disable via -Dwith_openssl=disabled.
     openssl
+    # Host liblua-5.1 — linked into yos so wasm guests can call
+    # env.lua_* / env.luaL_* via src/yos/impl/libc/liblua.c. pkg-config
+    # name is `lua-5.1` (nixpkgs); meson's `with_liblua=auto` picks
+    # it up. Disable with -Dwith_liblua=disabled if a target SDK
+    # doesn't have lua-5.1.
+    lua5_1
   ] ++ lib.optionals stdenv.isDarwin [
     libiconv
     # Without this, nix's stdenv on darwin gates libSystem at the 10.12
