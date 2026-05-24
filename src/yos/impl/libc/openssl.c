@@ -189,6 +189,12 @@ extern int     BN_is_bit_set(const BIGNUM *a, int n);
 extern int     BN_is_negative(const BIGNUM *a);
 extern const BIGNUM *BN_value_one(void);
 extern int     BN_sub(BIGNUM *r, const BIGNUM *a, const BIGNUM *b);
+extern int     BN_div(BIGNUM *dv, BIGNUM *rem, const BIGNUM *a, const BIGNUM *d, BN_CTX *ctx);
+extern int     BN_mod_inverse(BIGNUM *r, const BIGNUM *a, const BIGNUM *n, BN_CTX *ctx);
+extern int     BN_add(BIGNUM *r, const BIGNUM *a, const BIGNUM *b);
+extern int     BN_mul(BIGNUM *r, const BIGNUM *a, const BIGNUM *b, BN_CTX *ctx);
+/* BN_mod is a #define on the host (BN_div with dv=NULL); no symbol. */
+extern int     BN_hex2bn(BIGNUM **a, const char *str);
 extern BN_CTX *BN_CTX_new(void);
 extern void    BN_CTX_free(BN_CTX *c);
 extern BIGNUM *BN_bin2bn(const unsigned char *s, int len, BIGNUM *ret);
@@ -709,31 +715,30 @@ static const void *m3_yos_RAND_poll(IM3Runtime rt, IM3ImportContext _c,
 }
 
 /* env.RAND_seed — v(buf_off, int num). Mixes guest entropy into the
- * shared host pool. */
+ * shared host pool. Void bridge: args at sp[0..1]. */
 static const void *m3_yos_RAND_seed(IM3Runtime rt, IM3ImportContext _c,
                                     uint64_t *_sp, void *_m)
 {
     (void)_c; (void)_m;
     struct yos_exec_ctx *ctx = CTX(rt);
-    uint32_t off = (uint32_t)_sp[1];
-    int      n   = (int)_sp[2];
+    uint32_t off = (uint32_t)_sp[0];
+    int      n   = (int)_sp[1];
     const void *buf = (n > 0) ? guest_buf_ro(ctx, off, (uint32_t)n) : NULL;
     if (buf) RAND_seed(buf, n);
     return NULL;
 }
 
-/* env.RAND_add — v(buf_off, int num, double entropy). */
+/* env.RAND_add — v(buf_off, int num, double entropy). Void bridge:
+ * args at sp[0..2]; sp[2] is the f64 (i64-slotted) entropy. */
 static const void *m3_yos_RAND_add(IM3Runtime rt, IM3ImportContext _c,
                                    uint64_t *_sp, void *_m)
 {
     (void)_c; (void)_m;
     struct yos_exec_ctx *ctx = CTX(rt);
-    uint32_t off = (uint32_t)_sp[1];
-    int      n   = (int)_sp[2];
-    /* arg [3] is f64 — m3 stores doubles in _sp slots bit-cast as
-     * uint64. memcpy-cast preserves the bit pattern. */
+    uint32_t off = (uint32_t)_sp[0];
+    int      n   = (int)_sp[1];
     double entropy;
-    memcpy(&entropy, &_sp[3], sizeof(entropy));
+    memcpy(&entropy, &_sp[2], sizeof(entropy));
     const void *buf = (n > 0) ? guest_buf_ro(ctx, off, (uint32_t)n) : NULL;
     if (buf) RAND_add(buf, n, entropy);
     return NULL;
@@ -869,6 +874,18 @@ static const void *m3_yos_ERR_clear_error(IM3Runtime rt, IM3ImportContext _c,
 }
 
 /* ── boilerplate macros for the most common bridge shapes ─────────── */
+/*
+ * wasm3 raw-function calling convention (see wasm3/source/wasm3.h):
+ *   m3ApiReturnType(T)  → consumes sp[0]
+ *   m3ApiGetArg(T,…)    → consumes next sp slot
+ *
+ * Concretely:
+ *   "i(...)"  return at sp[0], args at sp[1..n]
+ *   "v(...)"  args at sp[0..n-1] (no return slot reserved)
+ *
+ * That's why BR_VOID_* macros read from sp[0+] and BR_INT_* / BR_PTR_*
+ * read from sp[1+].
+ */
 
 /* T *fn(void) → wrap returned host pointer in a handle. */
 #define BR_RETPTR_NOARG(NAME, HOST_FN)                                       \
@@ -883,7 +900,7 @@ static const void *m3_yos_##NAME(IM3Runtime rt, IM3ImportContext _c,         \
 static const void *m3_yos_##NAME(IM3Runtime rt, IM3ImportContext _c,         \
                                  uint64_t *_sp, void *_m)                    \
 { (void)_c; (void)_m;                                                        \
-  HOST_T *p = (HOST_T *)ssl_handles_release(CTX(rt), (uint32_t)_sp[1]);      \
+  HOST_T *p = (HOST_T *)ssl_handles_release(CTX(rt), (uint32_t)_sp[0]);      \
   if (p) HOST_FN(p);                                                          \
   return NULL; }
 
@@ -954,7 +971,23 @@ BR_INT_HND       (EVP_PKEY_get_bits,           EVP_PKEY_get_bits,     EVP_PKEY)
 BR_INT_HND       (EVP_PKEY_get_size,           EVP_PKEY_get_size,     EVP_PKEY)
 BR_INT_HND_HND   (EVP_PKEY_set1_RSA,           EVP_PKEY_set1_RSA,     EVP_PKEY, RSA)
 BR_INT_HND_HND   (EVP_PKEY_set1_EC_KEY,        EVP_PKEY_set1_EC_KEY,  EVP_PKEY, EC_KEY)
-BR_PTR_HND       (EVP_PKEY_get0_RSA,           EVP_PKEY_get0_RSA,     EVP_PKEY)
+/* EVP_PKEY_get0_RSA — instrumented variant. The plain BR_PTR_HND
+ * works but we want to see what's flowing in the dump build. */
+static const void *m3_yos_EVP_PKEY_get0_RSA(IM3Runtime rt, IM3ImportContext _c,
+                                            uint64_t *_sp, void *_m)
+{
+    (void)_c; (void)_m;
+    struct yos_exec_ctx *ctx = CTX(rt);
+    EVP_PKEY *p = (EVP_PKEY *)ssl_handles_resolve(ctx, (uint32_t)_sp[1]);
+    void *rsa = p ? (void *)EVP_PKEY_get0_RSA(p) : NULL;
+    uint32_t h = ssl_handles_wrap(ctx, rsa);
+    if (getenv("YOS_OPENSSL_DUMP_DIGEST")) {
+        fprintf(stderr, "[EVP_PKEY_get0_RSA] pkey_h=%u pkey=%p rsa=%p -> rsa_h=%u\n",
+                (uint32_t)_sp[1], (void *)p, rsa, h);
+    }
+    _sp[0] = (uint64_t)h;
+    return NULL;
+}
 BR_PTR_HND       (EVP_PKEY_get0_EC_KEY,        EVP_PKEY_get0_EC_KEY,  EVP_PKEY)
 BR_PTR_HND       (EVP_PKEY_get1_RSA,           EVP_PKEY_get1_RSA,     EVP_PKEY)
 BR_PTR_HND       (EVP_PKEY_get1_EC_KEY,        EVP_PKEY_get1_EC_KEY,  EVP_PKEY)
@@ -1036,7 +1069,18 @@ static const void *m3_yos_EVP_PKEY_get_raw_public_key(IM3Runtime rt, IM3ImportCo
 BR_RETPTR_NOARG (RSA_new,           RSA_new)
 BR_VOID_HND     (RSA_free,          RSA_free,    RSA)
 BR_INT_HND      (RSA_size,          RSA_size,    RSA)
-BR_INT_HND_HND  (RSA_blinding_on,   RSA_blinding_on,  RSA, BN_CTX)
+/* RSA_blinding_on — i32(rsa_h, bn_ctx_h). NULL bn_ctx is the
+ * documented "use default" case; resolve only the RSA strictly. */
+static const void *m3_yos_RSA_blinding_on(IM3Runtime rt, IM3ImportContext _c,
+                                          uint64_t *_sp, void *_m)
+{
+    (void)_c; (void)_m;
+    struct yos_exec_ctx *ctx = CTX(rt);
+    RSA *r = (RSA *)ssl_handles_resolve(ctx, (uint32_t)_sp[1]);
+    BN_CTX *bn = (uint32_t)_sp[2] ? (BN_CTX *)ssl_handles_resolve(ctx, (uint32_t)_sp[2]) : NULL;
+    _sp[0] = (uint64_t)(uint32_t)(r ? RSA_blinding_on(r, bn) : 0);
+    return NULL;
+}
 
 /* ── EC_KEY family ──────────────────────────────────────────────── */
 BR_RETPTR_NOARG (EC_KEY_new,                  EC_KEY_new)
@@ -1059,13 +1103,13 @@ BR_RETPTR_NOARG (BN_value_one,  BN_value_one)
 BR_RETPTR_NOARG (BN_CTX_new,    BN_CTX_new)
 BR_VOID_HND     (BN_CTX_free,   BN_CTX_free,   BN_CTX)
 
-/* BN_set_flags — v(bn_h, int flags) */
+/* BN_set_flags — v(bn_h, int flags). Void bridge: args at sp[0..1]. */
 static const void *m3_yos_BN_set_flags(IM3Runtime rt, IM3ImportContext _c,
                                        uint64_t *_sp, void *_m)
 {
     (void)_c; (void)_m;
-    BIGNUM *b = (BIGNUM *)ssl_handles_resolve(CTX(rt), (uint32_t)_sp[1]);
-    if (b) BN_set_flags(b, (int)_sp[2]);
+    BIGNUM *b = (BIGNUM *)ssl_handles_resolve(CTX(rt), (uint32_t)_sp[0]);
+    if (b) BN_set_flags(b, (int)_sp[1]);
     return NULL;
 }
 
@@ -1079,6 +1123,116 @@ static const void *m3_yos_BN_sub(IM3Runtime rt, IM3ImportContext _c,
     BIGNUM *a = (BIGNUM *)ssl_handles_resolve(ctx, (uint32_t)_sp[2]);
     BIGNUM *b = (BIGNUM *)ssl_handles_resolve(ctx, (uint32_t)_sp[3]);
     _sp[0] = (uint64_t)(uint32_t)((r && a && b) ? BN_sub(r, a, b) : 0);
+    return NULL;
+}
+
+/* BN_add / BN_mul / BN_mod — same shape as BN_sub but optional BN_CTX
+ * for the latter two. */
+static const void *m3_yos_BN_add(IM3Runtime rt, IM3ImportContext _c,
+                                 uint64_t *_sp, void *_m)
+{
+    (void)_c; (void)_m;
+    struct yos_exec_ctx *ctx = CTX(rt);
+    BIGNUM *r = (BIGNUM *)ssl_handles_resolve(ctx, (uint32_t)_sp[1]);
+    BIGNUM *a = (BIGNUM *)ssl_handles_resolve(ctx, (uint32_t)_sp[2]);
+    BIGNUM *b = (BIGNUM *)ssl_handles_resolve(ctx, (uint32_t)_sp[3]);
+    _sp[0] = (uint64_t)(uint32_t)((r && a && b) ? BN_add(r, a, b) : 0);
+    return NULL;
+}
+
+static const void *m3_yos_BN_mul(IM3Runtime rt, IM3ImportContext _c,
+                                 uint64_t *_sp, void *_m)
+{
+    (void)_c; (void)_m;
+    struct yos_exec_ctx *ctx = CTX(rt);
+    BIGNUM *r = (BIGNUM *)ssl_handles_resolve(ctx, (uint32_t)_sp[1]);
+    BIGNUM *a = (BIGNUM *)ssl_handles_resolve(ctx, (uint32_t)_sp[2]);
+    BIGNUM *b = (BIGNUM *)ssl_handles_resolve(ctx, (uint32_t)_sp[3]);
+    BN_CTX *bn = (uint32_t)_sp[4] ? (BN_CTX *)ssl_handles_resolve(ctx, (uint32_t)_sp[4]) : NULL;
+    _sp[0] = (uint64_t)(uint32_t)((r && a && b) ? BN_mul(r, a, b, bn) : 0);
+    return NULL;
+}
+
+/* BN_mod is a host-side #define for BN_div(NULL, rem, m, d, ctx); we
+ * bridge it identically through env.BN_mod only if openssh's wasm code
+ * actually imports the symbol. Skip declaring an extern (no host
+ * symbol) and route guests through BN_div. */
+static const void *m3_yos_BN_mod(IM3Runtime rt, IM3ImportContext _c,
+                                 uint64_t *_sp, void *_m)
+{
+    (void)_c; (void)_m;
+    struct yos_exec_ctx *ctx = CTX(rt);
+    BIGNUM *rem = (BIGNUM *)ssl_handles_resolve(ctx, (uint32_t)_sp[1]);
+    BIGNUM *a   = (BIGNUM *)ssl_handles_resolve(ctx, (uint32_t)_sp[2]);
+    BIGNUM *m   = (BIGNUM *)ssl_handles_resolve(ctx, (uint32_t)_sp[3]);
+    BN_CTX *bn  = (uint32_t)_sp[4] ? (BN_CTX *)ssl_handles_resolve(ctx, (uint32_t)_sp[4]) : NULL;
+    _sp[0] = (uint64_t)(uint32_t)((rem && a && m) ? BN_div(NULL, rem, a, m, bn) : 0);
+    return NULL;
+}
+
+/* BN_div — i32(dv_h, rem_h, a_h, d_h, ctx_h). dv and rem may be 0
+ * (NULL) to skip writing those outputs. */
+static const void *m3_yos_BN_div(IM3Runtime rt, IM3ImportContext _c,
+                                 uint64_t *_sp, void *_m)
+{
+    (void)_c; (void)_m;
+    struct yos_exec_ctx *ctx = CTX(rt);
+    BIGNUM *dv  = (uint32_t)_sp[1] ? (BIGNUM *)ssl_handles_resolve(ctx, (uint32_t)_sp[1]) : NULL;
+    BIGNUM *rem = (uint32_t)_sp[2] ? (BIGNUM *)ssl_handles_resolve(ctx, (uint32_t)_sp[2]) : NULL;
+    BIGNUM *a   = (BIGNUM *)ssl_handles_resolve(ctx, (uint32_t)_sp[3]);
+    BIGNUM *d   = (BIGNUM *)ssl_handles_resolve(ctx, (uint32_t)_sp[4]);
+    BN_CTX *bn  = (uint32_t)_sp[5] ? (BN_CTX *)ssl_handles_resolve(ctx, (uint32_t)_sp[5]) : NULL;
+    int rc = (a && d) ? BN_div(dv, rem, a, d, bn) : 0;
+    if (getenv("YOS_OPENSSL_DUMP_DIGEST")) {
+        unsigned long err = rc ? 0 : ERR_get_error();
+        char ebuf[256] = "";
+        if (err) ERR_error_string_n(err, ebuf, sizeof(ebuf));
+        fprintf(stderr, "[BN_div] dv=%p rem=%p a=%p(%d) d=%p(%d) ctx=%p rc=%d err=%s\n",
+                (void *)dv, (void *)rem,
+                (void *)a, a ? BN_num_bits(a) : -1,
+                (void *)d, d ? BN_num_bits(d) : -1,
+                (void *)bn, rc, ebuf);
+    }
+    _sp[0] = (uint64_t)(uint32_t)rc;
+    return NULL;
+}
+
+/* BN_mod_inverse — i32(r_h, a_h, n_h, ctx_h). r may be 0 (allocate). */
+static const void *m3_yos_BN_mod_inverse(IM3Runtime rt, IM3ImportContext _c,
+                                         uint64_t *_sp, void *_m)
+{
+    (void)_c; (void)_m;
+    struct yos_exec_ctx *ctx = CTX(rt);
+    BIGNUM *r = (uint32_t)_sp[1] ? (BIGNUM *)ssl_handles_resolve(ctx, (uint32_t)_sp[1]) : NULL;
+    BIGNUM *a = (BIGNUM *)ssl_handles_resolve(ctx, (uint32_t)_sp[2]);
+    BIGNUM *n = (BIGNUM *)ssl_handles_resolve(ctx, (uint32_t)_sp[3]);
+    BN_CTX *bn= (uint32_t)_sp[4] ? (BN_CTX *)ssl_handles_resolve(ctx, (uint32_t)_sp[4]) : NULL;
+    /* BN_mod_inverse returns the BIGNUM* result; on failure NULL. We
+     * encode as i32 success/0. If r was 0 (caller wanted alloc), wrap
+     * the returned bn in a fresh handle and shove it back? wasm-side
+     * signature is i(iiii) returning int; openssh treats it as bool. */
+    void *res = (a && n) ? (void *)BN_mod_inverse(r, a, n, bn) : NULL;
+    _sp[0] = (uint64_t)(uint32_t)(res ? 1 : 0);
+    return NULL;
+}
+
+/* BN_hex2bn — i32(out_off, str_off). out_off is BIGNUM** in guest. */
+static const void *m3_yos_BN_hex2bn(IM3Runtime rt, IM3ImportContext _c,
+                                    uint64_t *_sp, void *_m)
+{
+    (void)_c; (void)_m;
+    struct yos_exec_ctx *ctx = CTX(rt);
+    uint32_t out_off = (uint32_t)_sp[1];
+    uint32_t str_off = (uint32_t)_sp[2];
+    const char *str = guest_cstr(ctx, str_off);
+    if (!str) { _sp[0] = 0; return NULL; }
+    BIGNUM *bn = NULL;
+    int rc = BN_hex2bn(&bn, str);
+    if (out_off) {
+        uint32_t *slot = (uint32_t *)guest_buf_rw(ctx, out_off, sizeof(uint32_t));
+        if (slot) *slot = bn ? ssl_handles_wrap(ctx, bn) : 0;
+    }
+    _sp[0] = (uint64_t)(uint32_t)rc;
     return NULL;
 }
 
@@ -1110,6 +1264,10 @@ static const void *m3_yos_BN_bin2bn(IM3Runtime rt, IM3ImportContext _c,
     const unsigned char *s = (len > 0) ? (const unsigned char *)guest_buf_ro(ctx, off, (uint32_t)len) : NULL;
     BIGNUM *ret = ret_h ? (BIGNUM *)ssl_handles_resolve(ctx, ret_h) : NULL;
     BIGNUM *out = (s || len == 0) ? BN_bin2bn(s, len, ret) : NULL;
+    if (getenv("YOS_OPENSSL_DUMP_DIGEST")) {
+        fprintf(stderr, "[BN_bin2bn] off=%u len=%d ret_h=%u -> %p (%d bits)\n",
+                off, len, ret_h, (void *)out, out ? BN_num_bits(out) : -1);
+    }
     /* If caller passed an existing handle, return the same handle ID
      * (openssl writes into it in place). Otherwise wrap fresh. */
     if (out && ret_h && out == ret) _sp[0] = (uint64_t)ret_h;
@@ -1196,39 +1354,46 @@ static void store_handle_at(struct yos_exec_ctx *ctx, uint32_t off, void *p)
     *slot = p ? ssl_handles_wrap(ctx, p) : 0;
 }
 
-/* DH_get0_pqg — v(dh_h, p_off, q_off, g_off). */
+/* DH_get0_pqg — v(dh_h, p_off, q_off, g_off). Void: args at sp[0..3]. */
 static const void *m3_yos_DH_get0_pqg(IM3Runtime rt, IM3ImportContext _c,
                                       uint64_t *_sp, void *_m)
 {
     (void)_c; (void)_m;
     struct yos_exec_ctx *ctx = CTX(rt);
-    DH *dh = (DH *)ssl_handles_resolve(ctx, (uint32_t)_sp[1]);
+    DH *dh = (DH *)ssl_handles_resolve(ctx, (uint32_t)_sp[0]);
     const BIGNUM *p = NULL, *q = NULL, *g = NULL;
     if (dh) DH_get0_pqg(dh, &p, &q, &g);
-    store_handle_at(ctx, (uint32_t)_sp[2], (void *)p);
-    store_handle_at(ctx, (uint32_t)_sp[3], (void *)q);
-    store_handle_at(ctx, (uint32_t)_sp[4], (void *)g);
+    store_handle_at(ctx, (uint32_t)_sp[1], (void *)p);
+    store_handle_at(ctx, (uint32_t)_sp[2], (void *)q);
+    store_handle_at(ctx, (uint32_t)_sp[3], (void *)g);
     return NULL;
 }
 
-/* DH_get0_key — v(dh_h, pub_off, priv_off). */
+/* DH_get0_key — v(dh_h, pub_off, priv_off). Void: args at sp[0..2]. */
 static const void *m3_yos_DH_get0_key(IM3Runtime rt, IM3ImportContext _c,
                                       uint64_t *_sp, void *_m)
 {
     (void)_c; (void)_m;
     struct yos_exec_ctx *ctx = CTX(rt);
-    DH *dh = (DH *)ssl_handles_resolve(ctx, (uint32_t)_sp[1]);
+    DH *dh = (DH *)ssl_handles_resolve(ctx, (uint32_t)_sp[0]);
     const BIGNUM *pub = NULL, *priv = NULL;
     if (dh) DH_get0_key(dh, &pub, &priv);
-    store_handle_at(ctx, (uint32_t)_sp[2], (void *)pub);
-    store_handle_at(ctx, (uint32_t)_sp[3], (void *)priv);
+    store_handle_at(ctx, (uint32_t)_sp[1], (void *)pub);
+    store_handle_at(ctx, (uint32_t)_sp[2], (void *)priv);
     return NULL;
 }
 
 /* ── RSA set0/get0 ──────────────────────────────────────────────── */
 
 /* RSA_set0_key — i32(r_h, n_h, e_h, d_h). e may be NULL for some
- * pure-private cases; n is always required. */
+ * pure-private cases; in openssh 9.9 the flow is:
+ *   1) RSA_set0_key(rsa, n, e, NULL)  — set public components
+ *   2) RSA_set0_key(rsa, NULL, NULL, d) — add private exponent
+ * So we need to ALLOW n=NULL, e=NULL when d is non-NULL. The host
+ * openssl's check is `(r->n==NULL && n==NULL) || (r->e==NULL && e==NULL)`
+ * — meaning at least the combined state must be non-NULL. Our bridge
+ * MUST forward the call even when n and e are 0 (NULL), letting host
+ * libcrypto evaluate that combined state. */
 static const void *m3_yos_RSA_set0_key(IM3Runtime rt, IM3ImportContext _c,
                                        uint64_t *_sp, void *_m)
 {
@@ -1236,10 +1401,20 @@ static const void *m3_yos_RSA_set0_key(IM3Runtime rt, IM3ImportContext _c,
     struct yos_exec_ctx *ctx = CTX(rt);
     RSA *r = (RSA *)ssl_handles_resolve(ctx, (uint32_t)_sp[1]);
     uint32_t h_n = (uint32_t)_sp[2], h_e = (uint32_t)_sp[3], h_d = (uint32_t)_sp[4];
-    BIGNUM *n = (BIGNUM *)ssl_handles_resolve(ctx, h_n);
+    BIGNUM *n = h_n ? (BIGNUM *)ssl_handles_resolve(ctx, h_n) : NULL;
     BIGNUM *e = h_e ? (BIGNUM *)ssl_handles_resolve(ctx, h_e) : NULL;
     BIGNUM *d = h_d ? (BIGNUM *)ssl_handles_resolve(ctx, h_d) : NULL;
-    int rc = (r && n) ? RSA_set0_key(r, n, e, d) : 0;
+    int rc = r ? RSA_set0_key(r, n, e, d) : 0;
+    if (getenv("YOS_OPENSSL_DUMP_DIGEST")) {
+        unsigned long err = rc ? 0 : ERR_get_error();
+        char ebuf[256] = "";
+        if (err) ERR_error_string_n(err, ebuf, sizeof(ebuf));
+        fprintf(stderr, "[RSA_set0_key] r_h=%u r=%p  n_h=%u n=%p(%d bits)  e_h=%u e=%p(%d bits)  d_h=%u -> rc=%d  err=%s\n",
+                (uint32_t)_sp[1], (void *)r,
+                h_n, (void *)n, n ? BN_num_bits(n) : -1,
+                h_e, (void *)e, e ? BN_num_bits(e) : -1,
+                h_d, rc, ebuf);
+    }
     release_handles_on_success(ctx, rc, h_n, h_e, h_d, 0);
     _sp[0] = (uint64_t)(uint32_t)rc;
     return NULL;
@@ -1256,6 +1431,14 @@ static const void *m3_yos_RSA_set0_factors(IM3Runtime rt, IM3ImportContext _c,
     BIGNUM *p = (BIGNUM *)ssl_handles_resolve(ctx, h_p);
     BIGNUM *q = (BIGNUM *)ssl_handles_resolve(ctx, h_q);
     int rc = (r && p && q) ? RSA_set0_factors(r, p, q) : 0;
+    if (getenv("YOS_OPENSSL_DUMP_DIGEST")) {
+        unsigned long err = rc ? 0 : ERR_get_error();
+        char ebuf[256] = "";
+        if (err) ERR_error_string_n(err, ebuf, sizeof(ebuf));
+        fprintf(stderr, "[RSA_set0_factors] r=%p p=%p(%d) q=%p(%d) rc=%d err=%s\n",
+                (void *)r, (void *)p, p ? BN_num_bits(p) : -1,
+                (void *)q, q ? BN_num_bits(q) : -1, rc, ebuf);
+    }
     release_handles_on_success(ctx, rc, h_p, h_q, 0, 0);
     _sp[0] = (uint64_t)(uint32_t)rc;
     return NULL;
@@ -1273,52 +1456,63 @@ static const void *m3_yos_RSA_set0_crt_params(IM3Runtime rt, IM3ImportContext _c
     BIGNUM *dmq1 = (BIGNUM *)ssl_handles_resolve(ctx, h2);
     BIGNUM *iqmp = (BIGNUM *)ssl_handles_resolve(ctx, h3);
     int rc = (r && dmp1 && dmq1 && iqmp) ? RSA_set0_crt_params(r, dmp1, dmq1, iqmp) : 0;
+    if (getenv("YOS_OPENSSL_DUMP_DIGEST")) {
+        unsigned long err = rc ? 0 : ERR_get_error();
+        char ebuf[256] = "";
+        if (err) ERR_error_string_n(err, ebuf, sizeof(ebuf));
+        fprintf(stderr, "[RSA_set0_crt_params] r=%p dmp1=%p(%d) dmq1=%p(%d) iqmp=%p(%d) rc=%d err=%s\n",
+                (void *)r,
+                (void *)dmp1, dmp1 ? BN_num_bits(dmp1) : -1,
+                (void *)dmq1, dmq1 ? BN_num_bits(dmq1) : -1,
+                (void *)iqmp, iqmp ? BN_num_bits(iqmp) : -1,
+                rc, ebuf);
+    }
     release_handles_on_success(ctx, rc, h1, h2, h3, 0);
     _sp[0] = (uint64_t)(uint32_t)rc;
     return NULL;
 }
 
-/* RSA_get0_key — v(r_h, n_off, e_off, d_off). */
+/* RSA_get0_key — v(r_h, n_off, e_off, d_off). Void: args at sp[0..3]. */
 static const void *m3_yos_RSA_get0_key(IM3Runtime rt, IM3ImportContext _c,
                                        uint64_t *_sp, void *_m)
 {
     (void)_c; (void)_m;
     struct yos_exec_ctx *ctx = CTX(rt);
-    RSA *r = (RSA *)ssl_handles_resolve(ctx, (uint32_t)_sp[1]);
+    RSA *r = (RSA *)ssl_handles_resolve(ctx, (uint32_t)_sp[0]);
     const BIGNUM *n = NULL, *e = NULL, *d = NULL;
     if (r) RSA_get0_key(r, &n, &e, &d);
-    store_handle_at(ctx, (uint32_t)_sp[2], (void *)n);
-    store_handle_at(ctx, (uint32_t)_sp[3], (void *)e);
-    store_handle_at(ctx, (uint32_t)_sp[4], (void *)d);
+    store_handle_at(ctx, (uint32_t)_sp[1], (void *)n);
+    store_handle_at(ctx, (uint32_t)_sp[2], (void *)e);
+    store_handle_at(ctx, (uint32_t)_sp[3], (void *)d);
     return NULL;
 }
 
-/* RSA_get0_factors — v(r_h, p_off, q_off). */
+/* RSA_get0_factors — v(r_h, p_off, q_off). Void: args at sp[0..2]. */
 static const void *m3_yos_RSA_get0_factors(IM3Runtime rt, IM3ImportContext _c,
                                            uint64_t *_sp, void *_m)
 {
     (void)_c; (void)_m;
     struct yos_exec_ctx *ctx = CTX(rt);
-    RSA *r = (RSA *)ssl_handles_resolve(ctx, (uint32_t)_sp[1]);
+    RSA *r = (RSA *)ssl_handles_resolve(ctx, (uint32_t)_sp[0]);
     const BIGNUM *p = NULL, *q = NULL;
     if (r) RSA_get0_factors(r, &p, &q);
-    store_handle_at(ctx, (uint32_t)_sp[2], (void *)p);
-    store_handle_at(ctx, (uint32_t)_sp[3], (void *)q);
+    store_handle_at(ctx, (uint32_t)_sp[1], (void *)p);
+    store_handle_at(ctx, (uint32_t)_sp[2], (void *)q);
     return NULL;
 }
 
-/* RSA_get0_crt_params — v(r_h, dmp1_off, dmq1_off, iqmp_off). */
+/* RSA_get0_crt_params — v(r_h, dmp1_off, dmq1_off, iqmp_off). Void: args sp[0..3]. */
 static const void *m3_yos_RSA_get0_crt_params(IM3Runtime rt, IM3ImportContext _c,
                                               uint64_t *_sp, void *_m)
 {
     (void)_c; (void)_m;
     struct yos_exec_ctx *ctx = CTX(rt);
-    RSA *r = (RSA *)ssl_handles_resolve(ctx, (uint32_t)_sp[1]);
+    RSA *r = (RSA *)ssl_handles_resolve(ctx, (uint32_t)_sp[0]);
     const BIGNUM *a = NULL, *b = NULL, *c = NULL;
     if (r) RSA_get0_crt_params(r, &a, &b, &c);
-    store_handle_at(ctx, (uint32_t)_sp[2], (void *)a);
-    store_handle_at(ctx, (uint32_t)_sp[3], (void *)b);
-    store_handle_at(ctx, (uint32_t)_sp[4], (void *)c);
+    store_handle_at(ctx, (uint32_t)_sp[1], (void *)a);
+    store_handle_at(ctx, (uint32_t)_sp[2], (void *)b);
+    store_handle_at(ctx, (uint32_t)_sp[3], (void *)c);
     return NULL;
 }
 
@@ -1338,13 +1532,13 @@ BR_INT_HND      (EC_GROUP_get_degree,        EC_GROUP_get_degree,      EC_GROUP)
 BR_PTR_HND      (EC_GROUP_method_of,         EC_GROUP_method_of,       EC_GROUP)
 BR_INT_HND      (EC_METHOD_get_field_type,   EC_METHOD_get_field_type, EC_METHOD)
 
-/* EC_GROUP_set_asn1_flag — v(group_h, int flag) */
+/* EC_GROUP_set_asn1_flag — v(group_h, int flag). Void: args sp[0..1]. */
 static const void *m3_yos_EC_GROUP_set_asn1_flag(IM3Runtime rt, IM3ImportContext _c,
                                                  uint64_t *_sp, void *_m)
 {
     (void)_c; (void)_m;
-    EC_GROUP *g = (EC_GROUP *)ssl_handles_resolve(CTX(rt), (uint32_t)_sp[1]);
-    if (g) EC_GROUP_set_asn1_flag(g, (int)_sp[2]);
+    EC_GROUP *g = (EC_GROUP *)ssl_handles_resolve(CTX(rt), (uint32_t)_sp[0]);
+    if (g) EC_GROUP_set_asn1_flag(g, (int)_sp[1]);
     return NULL;
 }
 
@@ -1453,17 +1647,17 @@ static const void *m3_yos_EC_POINT_point2oct(IM3Runtime rt, IM3ImportContext _c,
 BR_RETPTR_NOARG (ECDSA_SIG_new,  ECDSA_SIG_new)
 BR_VOID_HND     (ECDSA_SIG_free, ECDSA_SIG_free, ECDSA_SIG)
 
-/* ECDSA_SIG_get0 — v(sig_h, r_off, s_off). */
+/* ECDSA_SIG_get0 — v(sig_h, r_off, s_off). Void: args sp[0..2]. */
 static const void *m3_yos_ECDSA_SIG_get0(IM3Runtime rt, IM3ImportContext _c,
                                          uint64_t *_sp, void *_m)
 {
     (void)_c; (void)_m;
     struct yos_exec_ctx *ctx = CTX(rt);
-    ECDSA_SIG *sig = (ECDSA_SIG *)ssl_handles_resolve(ctx, (uint32_t)_sp[1]);
+    ECDSA_SIG *sig = (ECDSA_SIG *)ssl_handles_resolve(ctx, (uint32_t)_sp[0]);
     const BIGNUM *r = NULL, *s = NULL;
     if (sig) ECDSA_SIG_get0(sig, &r, &s);
-    store_handle_at(ctx, (uint32_t)_sp[2], (void *)r);
-    store_handle_at(ctx, (uint32_t)_sp[3], (void *)s);
+    store_handle_at(ctx, (uint32_t)_sp[1], (void *)r);
+    store_handle_at(ctx, (uint32_t)_sp[2], (void *)s);
     return NULL;
 }
 
@@ -1590,42 +1784,40 @@ static const void *m3_yos_EVP_CIPHER_CTX_set_params(IM3Runtime rt, IM3ImportCont
 
 /* env.OSSL_PARAM_construct_octet_string — wasm-side struct constructor.
  *
- * Host returns OSSL_PARAM BY VALUE; wasm32 lowers a by-value struct
- * return to a hidden first arg (sret pointer). So the wasm sig is:
- *   void OSSL_PARAM_construct_octet_string(OSSL_PARAM *out,
- *                                          const char *key, void *buf, size_t bsize)
- *
- * We just write the wasm-layout struct directly — no need to call
- * the host function since the constructor is pure metadata. */
+ * Host openssl returns OSSL_PARAM by value. wasm32 clang lowers the
+ * by-value struct return to an sret-style first arg (the wasm-side
+ * type is `void(out_ptr, key, buf, bsize)`). The bridge writes the
+ * wasm-layout struct directly; no host call needed. Lowering to
+ * host's 40-byte OSSL_PARAM happens later in EVP_CIPHER_CTX_set_params
+ * when the array is consumed. Void bridge: args at sp[0..3]. */
 static const void *m3_yos_OSSL_PARAM_construct_octet_string(IM3Runtime rt, IM3ImportContext _c,
                                                             uint64_t *_sp, void *_m)
 {
     (void)_c; (void)_m;
     struct yos_exec_ctx *ctx = CTX(rt);
-    uint32_t out_off = (uint32_t)_sp[1];
-    uint32_t key_off = (uint32_t)_sp[2];
-    uint32_t buf_off = (uint32_t)_sp[3];
-    uint32_t bsize   = (uint32_t)_sp[4];
+    uint32_t out_off = (uint32_t)_sp[0];
+    uint32_t key_off = (uint32_t)_sp[1];
+    uint32_t buf_off = (uint32_t)_sp[2];
+    uint32_t bsize   = (uint32_t)_sp[3];
     uint8_t *out = (uint8_t *)guest_buf_rw(ctx, out_off, YOS_OSSL_PARAM_WASM_SIZE);
     if (!out) return NULL;
-    /* OSSL_PARAM_OCTET_STRING == 5 in openssl-3.x core_dispatch.h.
-     * We pin the constant rather than #include the header (avoids
-     * dragging OSSL_PARAM macros into yos's TU). */
+    /* OSSL_PARAM_OCTET_STRING == 5 in openssl-3.x core_dispatch.h. */
     *(uint32_t *)(out + 0)  = key_off;
-    *(uint32_t *)(out + 4)  = 5;          /* OSSL_PARAM_OCTET_STRING */
+    *(uint32_t *)(out + 4)  = 5;
     *(uint32_t *)(out + 8)  = buf_off;
     *(uint32_t *)(out + 12) = bsize;
     *(uint32_t *)(out + 16) = (uint32_t)-1;
     return NULL;
 }
 
-/* env.OSSL_PARAM_construct_end — void(out_off). Sentinel: all zeros. */
+/* env.OSSL_PARAM_construct_end — v(out_off). Sentinel: all zeros.
+ * Void bridge: arg at sp[0]. */
 static const void *m3_yos_OSSL_PARAM_construct_end(IM3Runtime rt, IM3ImportContext _c,
                                                    uint64_t *_sp, void *_m)
 {
     (void)_c; (void)_m;
     struct yos_exec_ctx *ctx = CTX(rt);
-    uint32_t out_off = (uint32_t)_sp[1];
+    uint32_t out_off = (uint32_t)_sp[0];
     uint8_t *out = (uint8_t *)guest_buf_rw(ctx, out_off, YOS_OSSL_PARAM_WASM_SIZE);
     if (out) memset(out, 0, YOS_OSSL_PARAM_WASM_SIZE);
     return NULL;
@@ -1775,6 +1967,18 @@ static const void *m3_yos_EVP_Digest(IM3Runtime rt, IM3ImportContext _c,
     if (size_off) {
         uint32_t *slot = (uint32_t *)guest_buf_rw(ctx, size_off, sizeof(uint32_t));
         if (slot) *slot = (uint32_t)sz;
+    }
+    /* Setting YOS_OPENSSL_DUMP_DIGEST=1 in the env enables a hex dump
+     * of every hashed message + the resulting digest, used while
+     * pinning down the publickey-auth signing path. Off by default. */
+    if (getenv("YOS_OPENSSL_DUMP_DIGEST")) {
+        const unsigned char *p = (const unsigned char *)data;
+        fprintf(stderr, "[EVP_Digest] count=%u rc=%d sz=%u bytes=", count, rc, sz);
+        for (uint32_t i = 0; i < count && i < 64; ++i) fprintf(stderr, "%02x", p[i]);
+        if (count > 64) fprintf(stderr, "...");
+        fprintf(stderr, "  digest=");
+        for (uint32_t i = 0; i < sz && i < 32; ++i) fprintf(stderr, "%02x", md[i]);
+        fprintf(stderr, "\n");
     }
     _sp[0] = (uint64_t)(uint32_t)rc;
     return NULL;
@@ -1926,15 +2130,16 @@ static const void *m3_yos_ERR_get_error(IM3Runtime rt, IM3ImportContext _c,
 /* env.ERR_error_string_n — void(uint32 code, buf_off, buf_len).
  *
  * `unsigned long e` on wasm32 is i32 (see ERR_get_error above for the
- * ABI rationale). Widen to host `unsigned long` before passing. */
+ * ABI rationale). Widen to host `unsigned long` before passing.
+ * Void bridge: args at sp[0..2]. */
 static const void *m3_yos_ERR_error_string_n(IM3Runtime rt, IM3ImportContext _c,
                                              uint64_t *_sp, void *_m)
 {
     (void)_c; (void)_m;
     struct yos_exec_ctx *ctx = CTX(rt);
-    unsigned long e = (unsigned long)(uint32_t)_sp[1];
-    uint32_t off    = (uint32_t)_sp[2];
-    uint32_t len    = (uint32_t)_sp[3];
+    unsigned long e = (unsigned long)(uint32_t)_sp[0];
+    uint32_t off    = (uint32_t)_sp[1];
+    uint32_t len    = (uint32_t)_sp[2];
     char *buf = (char *)guest_buf_rw(ctx, off, len);
     if (buf && len > 0) ERR_error_string_n(e, buf, len);
     return NULL;
@@ -2039,6 +2244,12 @@ void yos_openssl_link(IM3Module mod)
     m3_LinkRawFunction(mod, "env", "BN_is_negative",         "i(i)",   m3_yos_BN_is_negative);
     m3_LinkRawFunction(mod, "env", "BN_value_one",           "i()",    m3_yos_BN_value_one);
     m3_LinkRawFunction(mod, "env", "BN_sub",                 "i(iii)", m3_yos_BN_sub);
+    m3_LinkRawFunction(mod, "env", "BN_add",                 "i(iii)", m3_yos_BN_add);
+    m3_LinkRawFunction(mod, "env", "BN_mul",                 "i(iiii)",m3_yos_BN_mul);
+    m3_LinkRawFunction(mod, "env", "BN_mod",                 "i(iiii)",m3_yos_BN_mod);
+    m3_LinkRawFunction(mod, "env", "BN_div",                 "i(iiiii)",m3_yos_BN_div);
+    m3_LinkRawFunction(mod, "env", "BN_mod_inverse",         "i(iiii)",m3_yos_BN_mod_inverse);
+    m3_LinkRawFunction(mod, "env", "BN_hex2bn",              "i(ii)",  m3_yos_BN_hex2bn);
     m3_LinkRawFunction(mod, "env", "BN_CTX_new",             "i()",    m3_yos_BN_CTX_new);
     m3_LinkRawFunction(mod, "env", "BN_CTX_free",            "v(i)",   m3_yos_BN_CTX_free);
     m3_LinkRawFunction(mod, "env", "BN_bn2bin",              "i(ii)",  m3_yos_BN_bn2bin);
@@ -2130,6 +2341,9 @@ void yos_openssl_link(IM3Module mod)
      * arg in wasm32. */
     m3_LinkRawFunction(mod, "env", "OSSL_PARAM_construct_octet_string", "v(iiii)", m3_yos_OSSL_PARAM_construct_octet_string);
     m3_LinkRawFunction(mod, "env", "OSSL_PARAM_construct_end",          "v(i)",    m3_yos_OSSL_PARAM_construct_end);
+    /* (note: both above are void in the wasm imports — confirmed via
+     * wasm-tools print. Args therefore start at sp[0] inside the
+     * bridge bodies — see comment above BR_RETPTR_NOARG.) */
 
     /* EVP_MD extras */
     m3_LinkRawFunction(mod, "env", "EVP_MD_get_block_size", "i(i)",  m3_yos_EVP_MD_get_block_size);
