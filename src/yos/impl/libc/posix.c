@@ -503,11 +503,14 @@ static void host_sockaddr_to_freebsd(uint8_t *out, const struct sockaddr *src,
                                      socklen_t len)
 {
     memcpy(out, src, len);
-    /* Convert host sa_family (uint16 @0) to FreeBSD sa_len@0,
-     * sa_family@1. */
+    /* FreeBSD wasm guest expects: sa_len byte @0, sa_family byte @1.
+     * Linux host gives: sa_family uint16 little-endian @0/1. BSD-
+     * lineage host (darwin, FreeBSD, *BSD) already matches the guest's
+     * layout (sa_len @0, sa_family @1) so no rewrite is needed and
+     * doing one corrupts sa_family. Read the family via the platform-
+     * specific helper to get this right on both. */
     if (len >= 2) {
-        uint16_t fam = ((uint16_t)((unsigned char)out[0])) |
-                       (((uint16_t)((unsigned char)out[1])) << 8);
+        uint16_t fam = read_host_sa_family(out);
         out[0] = (uint8_t)len;
         out[1] = (uint8_t)(fam & 0xff);
     }
@@ -587,7 +590,13 @@ void yos_freeaddrinfo(struct yos_exec_ctx *ctx, uint32_t res_off)
     }
 }
 
-/* getnameinfo — host call with FreeBSD→host sockaddr conversion. */
+/* getnameinfo — host call with FreeBSD→host sockaddr conversion.
+ *
+ * The guest hands us a FreeBSD-shape sockaddr (sa_len @0, sa_family @1).
+ * Linux host wants sa_family as uint16 LE @0/1; darwin / BSD host wants
+ * sa_len @0, sa_family @1 — same as the guest, no rewrite. The
+ * platform-specific freebsd_sockaddr_to_host helper does the right
+ * thing in both cases. */
 int32_t yos_getnameinfo(struct yos_exec_ctx *ctx, uint32_t sa_off,
                         uint32_t salen, uint32_t host_off, uint32_t hostlen,
                         uint32_t serv_off, uint32_t servlen, int32_t flags)
@@ -596,8 +605,7 @@ int32_t yos_getnameinfo(struct yos_exec_ctx *ctx, uint32_t sa_off,
     uint8_t hostbuf_sa[256];
     if (salen > sizeof(hostbuf_sa)) return EAI_SYSTEM;
     memcpy(hostbuf_sa, ctx->memory + sa_off, salen);
-    /* FreeBSD layout → Linux: sa_family at offset 0/1 (low byte). */
-    if (salen >= 2) { uint8_t fam = hostbuf_sa[1]; hostbuf_sa[0] = fam; hostbuf_sa[1] = 0; }
+    freebsd_sockaddr_to_host(hostbuf_sa, (socklen_t)salen);
     char *hbuf = host_off ? (char *)(ctx->memory + host_off) : NULL;
     char *sbuf = serv_off ? (char *)(ctx->memory + serv_off) : NULL;
     return getnameinfo((const struct sockaddr *)hostbuf_sa, (socklen_t)salen,
@@ -1609,4 +1617,130 @@ void yos_strmode(struct yos_exec_ctx *ctx, uint32_t mode_in, uint32_t p_off)
 
     p[10] = ' ';
     p[11] = '\0';
+}
+
+/* explicit_bzero(ptr, n) — zero out memory in a way the compiler may
+ * not elide. Used by ssh / sshd / ssh-keygen to wipe key material
+ * after use. The host-API extractor misses the declaration on darwin
+ * (it lives behind a feature-test the extractor doesn't define), so
+ * codegen leaves a no-op void stub that drops the call on the floor.
+ * That doesn't crash anything but it silently defeats the secret-
+ * scrubbing the caller asked for. Implement it as a memset through a
+ * volatile pointer so the optimiser can't see the result is dead.
+ */
+void yos_explicit_bzero(struct yos_exec_ctx *ctx, uint32_t buf_off,
+                        uint32_t n)
+{
+    if (!buf_off || !n) return;
+    if (buf_off + n > ctx->memory_size) return;
+    volatile uint8_t *p = (volatile uint8_t *)(ctx->memory + buf_off);
+    while (n--) *p++ = 0;
+}
+
+/* getservbyname / getservbyport — services-DB lookup.
+ *
+ * The codegen leaves these as a returns-0 stub ("complex arg/return
+ * types") because the host `struct servent` is pointer-heavy (s_name,
+ * s_aliases, s_proto are all host char* the auto-bridge can't translate
+ * to wasm offsets). Hand-bridge: call host getservby*, then marshal
+ * the result into a per-ctx wasm slab that mirrors the FreeBSD-i386
+ * layout (16 bytes: s_name, s_aliases, s_port, s_proto).
+ *
+ * ssh / sshd resolve symbolic Port and ListenAddress entries via these
+ * calls. A stub silently coerces every "Port ssh" or "-p ssh" to the
+ * compiled-in fallback 22, masking real services-file misconfiguration.
+ */
+#include <netdb.h>
+
+#define WASM_SERVENT_SZ 16u
+
+extern uint32_t yos_malloc(struct yos_exec_ctx *ctx, uint32_t size);
+
+static uint32_t pack_servent(struct yos_exec_ctx *ctx,
+                             struct yos_exec_ctx *anchor_ctx,
+                             struct servent *se)
+{
+    (void)anchor_ctx;
+    if (!se) return 0;
+    /* Per-call slab. ssh holds the result only across one or two
+     * field reads, so reusing a single buffer per ctx is safe. We
+     * size for: 16-byte servent + s_name + s_proto + null-terminated
+     * aliases array of 4-byte wasm offsets + each alias string.
+     * 1 KiB is more than any /etc/services entry needs. */
+    static uint32_t slab_off; /* cached across calls (per-process) */
+    static const uint32_t SLAB_SZ = 1024;
+    if (!slab_off) {
+        slab_off = yos_malloc(ctx, SLAB_SZ);
+        if (!slab_off) return 0;
+    }
+    uint8_t *base = ctx->memory + slab_off;
+    /* Layout: [0..16) = servent, [16..) = packed strings + aliases array. */
+    uint32_t cursor = WASM_SERVENT_SZ;
+
+    /* Helper macro: copy NUL-terminated string `s` into the slab and
+     * return its wasm offset, or 0 if NULL/no room. */
+    #define PACK_STR(s) ({                                           \
+        const char *_s = (s);                                        \
+        uint32_t _off = 0;                                           \
+        if (_s) {                                                    \
+            size_t _n = strlen(_s) + 1;                              \
+            if (cursor + _n <= SLAB_SZ) {                            \
+                memcpy(base + cursor, _s, _n);                       \
+                _off = slab_off + cursor;                            \
+                cursor += (uint32_t)_n;                              \
+            }                                                        \
+        }                                                            \
+        _off;                                                        \
+    })
+
+    uint32_t name_off  = PACK_STR(se->s_name);
+    uint32_t proto_off = PACK_STR(se->s_proto);
+
+    /* Aliases array: NULL-terminated array of char*; pack each alias
+     * string, then write a wasm-offset array. Most lookups have no
+     * aliases — that case just writes a single 0 pointer. */
+    uint32_t aliases_off = 0;
+    if (se->s_aliases) {
+        int n = 0;
+        for (char **a = se->s_aliases; *a; a++) n++;
+        uint32_t arr_bytes = (uint32_t)(n + 1) * 4;
+        if (cursor + arr_bytes <= SLAB_SZ) {
+            aliases_off = slab_off + cursor;
+            cursor += arr_bytes;
+            for (int i = 0; i < n; i++) {
+                uint32_t a_off = PACK_STR(se->s_aliases[i]);
+                *(uint32_t *)(base + (aliases_off - slab_off) + (uint32_t)i*4) = a_off;
+            }
+            *(uint32_t *)(base + (aliases_off - slab_off) + (uint32_t)n*4) = 0;
+        }
+    }
+    #undef PACK_STR
+
+    /* s_port is already in network byte order on both host and FreeBSD;
+     * no bswap. FreeBSD's s_port is `int` (4 bytes), zero-extended. */
+    *(uint32_t *)(base +  0) = name_off;
+    *(uint32_t *)(base +  4) = aliases_off;
+    *(int32_t  *)(base +  8) = (int32_t)se->s_port;
+    *(uint32_t *)(base + 12) = proto_off;
+    return slab_off;
+}
+
+uint32_t yos_getservbyname(struct yos_exec_ctx *ctx, uint32_t name_off,
+                           uint32_t proto_off)
+{
+    if (!name_off || name_off >= ctx->memory_size) return 0;
+    const char *name  = (const char *)(ctx->memory + name_off);
+    const char *proto = proto_off && proto_off < ctx->memory_size
+                        ? (const char *)(ctx->memory + proto_off) : NULL;
+    struct servent *se = getservbyname(name, proto);
+    return pack_servent(ctx, ctx, se);
+}
+
+uint32_t yos_getservbyport(struct yos_exec_ctx *ctx, int32_t port_net,
+                           uint32_t proto_off)
+{
+    const char *proto = proto_off && proto_off < ctx->memory_size
+                        ? (const char *)(ctx->memory + proto_off) : NULL;
+    struct servent *se = getservbyport((int)port_net, proto);
+    return pack_servent(ctx, ctx, se);
 }

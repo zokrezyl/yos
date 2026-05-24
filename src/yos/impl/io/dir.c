@@ -466,6 +466,8 @@ int32_t yos_copy_file_range(struct yos_exec_ctx *ctx,
  * edit and the line driver echoes through canonical mode oddly.
  */
 #include <poll.h>
+#include <fcntl.h>
+#include <sys/stat.h>
 int32_t yos_poll(struct yos_exec_ctx *ctx,
                  uint32_t pfds_off, uint32_t nfds, int32_t timeout)
 {
@@ -475,6 +477,16 @@ int32_t yos_poll(struct yos_exec_ctx *ctx,
     if (nfds > 1024) return yos_errno_neg(ctx, EINVAL);
     if (pfds_off == 0 || pfds_off + nfds * 8 > ctx->memory_size)
         return yos_errno_neg(ctx, EFAULT);
+
+    /* "Always-ready" sentinel — darwin's poll(2) returns POLLNVAL when
+     * the fd is a regular file or /dev/null, while Linux poll(2)
+     * returns POLLIN|POLLOUT immediately. The FreeBSD-shape contract
+     * the guest sees is Linux's. For fds where fstat says "regular
+     * file" or "char device matching /dev/null", we synthesise the
+     * Linux answer locally and pass -1 to host poll so darwin doesn't
+     * scream POLLNVAL at us. */
+    int16_t synth_revents[1024];
+    for (uint32_t i = 0; i < nfds; i++) synth_revents[i] = 0;
 
     struct pollfd host_pfds[1024];
     uint8_t *w = ctx->memory + pfds_off;
@@ -487,15 +499,121 @@ int32_t yos_poll(struct yos_exec_ctx *ctx,
         host_pfds[i].fd      = (wfd < 0) ? wfd : (hfd < 0 ? -1 : hfd);
         host_pfds[i].events  = events;
         host_pfds[i].revents = 0;
+
+        if (host_pfds[i].fd >= 0) {
+            struct stat sb;
+            if (fstat(host_pfds[i].fd, &sb) == 0) {
+                int always_ready = 0;
+                if (S_ISREG(sb.st_mode) || S_ISDIR(sb.st_mode))
+                    always_ready = 1;
+                else if (S_ISCHR(sb.st_mode)) {
+                    /* /dev/null check — stat() the path once and cache.
+                     * If the cached stat fails we just leave the fd in
+                     * the host poll set; nothing breaks. */
+                    static dev_t null_dev;
+                    static ino_t null_ino;
+                    static int   null_init;
+                    if (!null_init) {
+                        struct stat nb;
+                        if (stat("/dev/null", &nb) == 0) {
+                            null_dev = nb.st_dev;
+                            null_ino = nb.st_ino;
+                        }
+                        null_init = 1;
+                    }
+                    if (sb.st_dev == null_dev && sb.st_ino == null_ino)
+                        always_ready = 1;
+                }
+                if (always_ready) {
+                    /* Mirror Linux: any requested event is immediately
+                     * "ready" on a file / /dev/null. */
+                    synth_revents[i] = events & (POLLIN | POLLOUT | POLLRDNORM | POLLWRNORM);
+                    if (synth_revents[i] == 0 && events != 0)
+                        synth_revents[i] = POLLIN;
+                    host_pfds[i].fd = -1;  /* skip in host poll */
+                }
+            }
+        }
     }
 
-    int r = poll(host_pfds, (nfds_t)nfds, timeout);
+    /* If every fd was synthesised (always-ready), short-circuit the
+     * host poll — there's nothing to wait for, all "events" are
+     * already known. */
+    int any_real = 0;
+    for (uint32_t i = 0; i < nfds; i++)
+        if (host_pfds[i].fd >= 0) { any_real = 1; break; }
+    int r;
+    if (any_real) {
+        /* If we're synthesising readiness on some fds, the caller wants
+         * to know about THOSE events right now — don't block in poll. */
+        int has_synth = 0;
+        for (uint32_t i = 0; i < nfds; i++)
+            if (synth_revents[i]) { has_synth = 1; break; }
+        int eff_timeout = has_synth ? 0 : timeout;
+        r = poll(host_pfds, (nfds_t)nfds, eff_timeout);
+    } else {
+        r = 0;
+    }
     int saved = errno;
 
+    /* Merge synthesised events into the result. */
+    int merged_count = 0;
     for (uint32_t i = 0; i < nfds; i++) {
         int16_t revents = (int16_t)host_pfds[i].revents;
+        if (synth_revents[i]) revents = synth_revents[i];
         memcpy(w + i*8 + 6, &revents, 2);
+        if (revents) merged_count++;
     }
-    if (r < 0) return yos_errno_neg(ctx, saved);
-    return (int32_t)r;
+    if (r < 0 && !merged_count) return yos_errno_neg(ctx, saved);
+    if (r < 0) r = 0;  /* synthesised events override the poll error */
+    /* Total fired = whatever host poll said plus the synthesised slots
+     * that weren't already counted (host poll left their fd=-1). */
+    int total = r;
+    for (uint32_t i = 0; i < nfds; i++)
+        if (synth_revents[i] && host_pfds[i].fd < 0) total++;
+    return (int32_t)total;
+}
+
+/* ppoll — poll variant with a timespec timeout and an atomic signal
+ * mask swap. Codegen leaves it as an ENOSYS stub on every host except
+ * Linux because the syscall is Linux-native. ssh's libc dispatch loop
+ * goes through ppoll for every server read with timeout=NULL,
+ * sigmask=NULL — i.e. asking for "block until any fd is ready, no
+ * mask change" — so the stub turns every ssh session into an
+ * immediate fatal "Connection lost" right after the handshake.
+ *
+ * Portable shim: translate timespec → milliseconds, optionally wrap
+ * the poll call in sigprocmask(SIG_SETMASK,...) save/restore, then
+ * defer to yos_poll for the fd marshalling. The signal mask path is
+ * NOT atomic with the poll wait; if no sigmask is supplied (ssh's
+ * case) that doesn't matter. */
+#include <signal.h>
+#include <time.h>
+#include <fcntl.h>
+
+int32_t yos_ppoll(struct yos_exec_ctx *ctx, uint32_t pfds_off,
+                  uint32_t nfds, uint32_t timeout_off, uint32_t sigmask_off)
+{
+    /* Translate timespec → ms. NULL or negative = block forever. */
+    int ms = -1;
+    if (timeout_off) {
+        if (timeout_off + 8 > ctx->memory_size)
+            return yos_errno_neg(ctx, EFAULT);
+        int32_t tv_sec;  memcpy(&tv_sec,  ctx->memory + timeout_off + 0, 4);
+        int32_t tv_nsec; memcpy(&tv_nsec, ctx->memory + timeout_off + 4, 4);
+        if (tv_sec < 0 || tv_nsec < 0) return yos_errno_neg(ctx, EINVAL);
+        long long total_ms = (long long)tv_sec * 1000 + tv_nsec / 1000000;
+        if (total_ms > 0x7fffffffLL) total_ms = 0x7fffffffLL;
+        ms = (int)total_ms;
+    }
+
+    /* Signal-mask swap. FreeBSD wasm sigset_t is 16 bytes; the host's
+     * sigset_t is opaque. Copying bits across is unsafe — instead the
+     * guest tells us "set the mask to X for the duration of this
+     * call", and we keep things simple: only honour the empty-mask
+     * case (sigmask_off==0, i.e. NULL). A non-NULL mask is silently
+     * ignored — ssh never passes one. */
+    (void)sigmask_off;
+
+    return yos_poll(ctx, pfds_off, nfds, ms);
 }

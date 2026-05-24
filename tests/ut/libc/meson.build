@@ -116,6 +116,47 @@ libc_tests = [
   # parser. Was stubbed -ENOSYS; ssh got zero lines from
   # ~/.ssh/config and tried to DNS-resolve every Host alias.
   'test_getline_basic',
+  # ssh libc-surface pins. The ytrace of `ssh nixem` shows 47 distinct
+  # libc imports; the entries below cover the non-trivial ones (BSD
+  # string ops, secret scrubbing, address resolution, host/services
+  # DB, randomness, set-uid detection). The pure mem/str passthroughs
+  # are covered by test_libc_coverage and test_write_passthrough.
+  'test_ssh_explicit_bzero',
+  'test_ssh_str_bsd',
+  'test_ssh_arc4random_buf',
+  'test_ssh_getaddrinfo_localhost',
+  'test_ssh_gethostname',
+  'test_ssh_issetugid',
+  'test_ssh_getservbyname',
+  'test_ssh_ppoll',
+  # /dev/null pollability — darwin returns POLLNVAL where Linux
+  # returns POLLIN. ssh dups stdin and polls it; when stdin is
+  # /dev/null (cron, non-interactive shells, `ssh host cmd </dev/null`),
+  # the POLLNVAL trips ssh's fatal "invalid rfd pollfd[N]" check.
+  # yos_poll detects regular-file / /dev/null fds via fstat and
+  # synthesises POLLIN|POLLOUT.
+  'test_ssh_poll_dev_null',
+  # dup/dup2/close cycle ssh runs against stdio when setting up its
+  # session channel. A bug where close on the source kills the dup
+  # poisons every subsequent write to the session.
+  'test_ssh_dup_stdio',
+  # socket → bind → listen → connect → accept → getsockname /
+  # getpeername / setsockopt / getsockopt. The same dance ssh runs
+  # to set up its TCP connection. Pins the darwin sockaddr family
+  # byte position (sa_family @ byte 1, not @ uint16 little-endian
+  # @0/1 like Linux).
+  'test_ssh_socket_loopback',
+  # sigaction + sigprocmask round-trip on the FreeBSD 16-byte
+  # sigset_t. ssh wraps every channel-loop iteration in these.
+  'test_ssh_sigaction_mask',
+  # atoi / timingsafe_bcmp / memcmp / memmove / memchr / umask /
+  # getpid / getuid / time / clock_gettime / setlocale.
+  'test_ssh_misc_libc',
+  # strlen/strcmp/strncmp/str*casecmp/strchr/strrchr/strcpy.
+  'test_ssh_string_basic',
+  # malloc/calloc/realloc/free contracts ssh leans on for channel
+  # state and packet buffers.
+  'test_ssh_alloc_basic',
 ]
 
 # Path to the generator's output dir, exposed by src/yos/codegen.

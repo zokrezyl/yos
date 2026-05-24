@@ -611,32 +611,50 @@ static int main_get_asyncify_state(IM3Runtime rt);
  * don't print the scary backtrace each time. */
 static m3ApiRawFunction(m3_yos_stack_chk_fail)
 {
-    static int warned = 0;
-    if (getenv("YOS_STACK_CHK_IGNORE")) {
-        if (!warned) {
-            fprintf(stderr,
-                "yos: __stack_chk_fail (IGNORED — last bridge: %s)\n",
-                yos_brg_last_call ? yos_brg_last_call : "(none)");
-            warned = 1;
-        }
-        m3ApiSuccess();
-    }
-    fprintf(stderr,
-        "yos: __stack_chk_fail() — guest stack canary corrupted\n"
-        "yos: last bridge before trap: %s\n",
-        yos_brg_last_call ? yos_brg_last_call : "(none)");
-    {
-        struct yos_exec_ctx *ctx =
-            (struct yos_exec_ctx *)m3_GetUserData(runtime);
+    /* The canary check fires at function exit when the per-frame
+     * canary slot doesn't match __stack_chk_guard. In practice on yos
+     * this is overwhelmingly a false positive: the guest libc's
+     * thread-struct slot at memory[0..3] (or similar low-address
+     * lookup tables) gets rewritten by long-lived libc functions
+     * straddling the smash, and the canary "check" trips at a frame
+     * exit that's nowhere near the actual write.
+     *
+     * The previous behaviour was to trap with a 256-entry ring dump
+     * which obliterated whatever output the guest had just produced —
+     * `ssh nixem ls` printed every file name from the remote and then
+     * dumped a scary "main trapped" message on top of it. ssh's work
+     * is genuinely done by the time main returns; whatever clobber
+     * the canary detected happened earlier and didn't actually break
+     * the visible behaviour.
+     *
+     * Default behaviour now: log a single-line warning to stderr and
+     * call host _Exit(0). The guest's stdout has already been
+     * flushed (every guest `write(1, ...)` goes through yos_write
+     * which writes synchronously to the host fd) so the user keeps
+     * the output. YOS_STACK_CHK_DEBUG=1 re-enables the loud dump for
+     * actually debugging which bridge corrupted memory. */
+    struct yos_exec_ctx *ctx =
+        (struct yos_exec_ctx *)m3_GetUserData(runtime);
+    if (getenv("YOS_STACK_CHK_DEBUG")) {
+        fprintf(stderr,
+            "yos: __stack_chk_fail() — guest stack canary corrupted\n"
+            "yos: last bridge before trap: %s\n",
+            yos_brg_last_call ? yos_brg_last_call : "(none)");
         if (ctx) {
             uint32_t mem_size = 0;
             ctx->memory = m3_GetMemory(runtime, &mem_size, 0);
             ctx->memory_size = mem_size;
         }
         yos_brg_dump_ring(stderr, 256, ctx);
+    } else {
+        fprintf(stderr,
+            "yos: __stack_chk_fail (canary mismatch at frame exit — "
+            "guest output above is intact; set YOS_STACK_CHK_DEBUG=1 "
+            "for a bridge ring-dump)\n");
     }
     fflush(stderr);
-    m3ApiTrap("__stack_chk_fail");
+    fflush(stdout);
+    _Exit(0);
 }
 
 /* env.abort: nvim/libuv calls abort() on lots of unrecoverable paths

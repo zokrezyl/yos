@@ -162,6 +162,21 @@ custom_proc:
   # 11-char "drwxr-xr-x " column ls -l prints. Pure / stateless; no
   # glibc equivalent. Without it ls -l silently drops the mode column.
   - strmode
+  # impl/posix.c — secure-zero of caller-supplied memory that the
+  # compiler is forbidden to elide. The host-API extractor misses it
+  # on darwin (declaration sits behind a feature-test that doesn't
+  # match our extractor's predefines), so without a hook it would
+  # silently route to the ENOSYS-style void stub and leak key
+  # material in ssh / sshd / ssh-keygen.
+  - explicit_bzero
+  # impl/posix.c — services-DB lookup. Codegen leaves these as
+  # "complex arg/return types" stubs (return 0) because struct servent
+  # carries host char* pointers the auto-bridge can't marshal. ssh's
+  # "Port ssh" / "-p ssh" parsing calls getservbyname; without a real
+  # bridge the symbol resolves to NULL and ssh falls back to its
+  # compiled 22 with no diagnostic.
+  - getservbyname
+  - getservbyport
   # impl/pty.c — pseudo-terminal allocation chain telnetd needs to
   # set up a session. Codegen leaves these as ENOSYS stubs which
   # makes telnetd write "All network ports in use" and exit.
@@ -500,6 +515,14 @@ custom_vfs:
   # impl/io/io.c: translate per-pollfd fd through fd_map, leave events/
   # revents unchanged (POLL* bit values match between FreeBSD and Linux).
   - poll
+  # ppoll(2): codegen labels it Linux-only and stubs it ENOSYS on
+  # darwin/BSD. ssh's dispatch_run loop calls ppoll(pfds, nfds, NULL,
+  # NULL) for every server read after the handshake — the stub returns
+  # -1/ENOSYS and ssh prints "ssh_dispatch_run_fatal: Connection lost"
+  # immediately after MSG_NEWKEYS. impl/io/dir.c::yos_ppoll converts
+  # the timespec timeout to milliseconds and forwards to yos_poll;
+  # the sigmask argument is ignored (ssh passes NULL).
+  - ppoll
 
 # ─── Memory ───────────────────────────────────────────────────────────
 custom_mem:
