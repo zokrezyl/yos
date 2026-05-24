@@ -293,6 +293,16 @@ read_done:;
                r > 0 ? " hex=" : "",
                r > 0 ? hex : "");
     }
+    /* YOS_DUMP_SOCK=<fd>: dump every byte read/written on that wasm fd to
+     * /tmp/yos-sock-{r,w}.bin. Diagnostic for MAC failures — lets us see
+     * if the bytes ssh's crypto consumes match what the server sent. */
+    if (r > 0) {
+        const char *dump = getenv("YOS_DUMP_SOCK");
+        if (dump && (int)strtol(dump, NULL, 10) == fd) {
+            FILE *f = fopen("/tmp/yos-sock-r.bin", "ab");
+            if (f) { fwrite(p, 1, (size_t)r, f); fclose(f); }
+        }
+    }
     return yos_errno_check(ctx, (int32_t)r);
 }
 
@@ -366,6 +376,15 @@ int32_t yos_write(struct yos_exec_ctx *ctx, int32_t fd, uint32_t buf, uint32_t c
     }
     ssize_t r = write(hfd, p, count);
     int saved_errno = (r < 0) ? errno : 0;
+    /* YOS_DUMP_SOCK=<fd>: dump every byte written on that wasm fd —
+     * sibling of the read-side dump above for MAC-failure diagnosis. */
+    if (r > 0) {
+        const char *dump = getenv("YOS_DUMP_SOCK");
+        if (dump && (int)strtol(dump, NULL, 10) == fd) {
+            FILE *f = fopen("/tmp/yos-sock-w.bin", "ab");
+            if (f) { fwrite(p, 1, (size_t)r, f); fclose(f); }
+        }
+    }
     if (ytrace_default_enabled() && fd != 4 && fd != 5) {
         pid_t tid = yos_plat_gettid();
         char hex[3 * 32 + 1] = {0};
