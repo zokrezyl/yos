@@ -29,6 +29,9 @@
 
 #include "wasm3.h"
 #include "m3_env.h"
+#include "m3_compile.h"      /* CompileFunction — table-lookup hits
+                              * need on-demand compile; see liblua.c
+                              * trampoline for the same pattern. */
 #include "yos/types.h"
 #include <yos/ytrace/ytrace.h>
 
@@ -128,6 +131,16 @@ extern void      PyErr_Restore(PyObject *type, PyObject *value, PyObject *traceb
 extern PyObject _Py_NoneStruct;
 extern PyObject _Py_TrueStruct;
 extern PyObject _Py_FalseStruct;
+
+/* Common exception type singletons (set once at libpython init).
+ * Identity stable; sharing across guests is correct by design. */
+extern PyObject *PyExc_RuntimeError;
+extern PyObject *PyExc_TypeError;
+extern PyObject *PyExc_ValueError;
+
+/* Variadic helpers — declare without the `...` since we only call
+ * with a fixed arity (no marshal of variadic args from wasm). */
+extern PyObject *PyErr_Format(PyObject *exception, const char *format, ...);
 
 /* One-shot main-interpreter init. Py_Initialize is documented as
  * idempotent (no-op on second call), but we still want exactly one
@@ -1050,6 +1063,420 @@ static const void *m3_yos_PyErr_ExceptionMatches(IM3Runtime rt, IM3ImportContext
 
 /* ── eval ──────────────────────────────────────────────────────── */
 
+/* ── host → wasm trampoline for PyCFunction (PyMethodDef) ──────
+ *
+ * Python's PyCFunction is `PyObject *(*)(PyObject *self, PyObject *args)`.
+ * Plain function pointer — there's no upvalue mechanism like Lua. We
+ * give Python a HOST function pointer; Python stores it in
+ * PyMethodDef.ml_meth. When a Python script calls the registered
+ * function, host Python invokes that pointer.
+ *
+ * Each registered wasm function needs a *distinct host C function
+ * pointer* so the trampoline knows which wasm function to dispatch
+ * to. Without libffi (which would emit closures at runtime), we
+ * pre-generate a FIXED POOL of trampoline functions, each hard-coded
+ * to a unique slot id. Registration allocates one slot from the pool
+ * and stores (ctx, wasm_idx); the slot's pre-built trampoline goes
+ * into the PyMethodDef.
+ *
+ * Limit: YOS_PY_NTRAMPS slots = at most 128 simultaneously registered
+ * wasm-backed PyCFunctions per host process. Most Python C extensions
+ * are well under this; the os module has ~80 functions, sys has ~30.
+ * Grow YOS_PY_NTRAMPS if a real consumer exhausts it.
+ */
+#define YOS_PY_NTRAMPS 128
+
+typedef PyObject *(*PyCFunction)(PyObject *self, PyObject *args);
+
+struct yos_py_tramp_slot {
+    struct yos_exec_ctx *ctx;
+    uint32_t wasm_idx;          /* 0 = unused */
+    int      flags;             /* METH_VARARGS etc. — informational */
+};
+static struct yos_py_tramp_slot g_py_tramps[YOS_PY_NTRAMPS];
+
+static int py_alloc_tramp(struct yos_exec_ctx *ctx, uint32_t wasm_idx,
+                          int flags)
+{
+    for (int i = 0; i < YOS_PY_NTRAMPS; ++i) {
+        if (g_py_tramps[i].wasm_idx == 0) {
+            g_py_tramps[i].ctx = ctx;
+            g_py_tramps[i].wasm_idx = wasm_idx;
+            g_py_tramps[i].flags = flags;
+            return i;
+        }
+    }
+    return -1;
+}
+
+/* Shared dispatch — every per-slot trampoline forwards here with its
+ * own slot index. Wraps self+args as guest handles, calls the wasm
+ * function via wasm3, unwraps the returned handle. */
+static PyObject *py_tramp_dispatch(int slot, PyObject *self, PyObject *args)
+{
+    struct yos_py_tramp_slot *s = &g_py_tramps[slot];
+    if (!s->wasm_idx || !s->ctx) {
+        PyErr_SetString(PyExc_RuntimeError, "yos: dead Py trampoline slot");
+        return NULL;
+    }
+    struct yos_exec_ctx *ctx = s->ctx;
+    PyThreadState *prev = py_swap_in(ctx);
+
+    /* Python documents PyCFunction's (self, args) as BORROWED refs.
+     * For the wasm side we wrap them under the per-guest handle
+     * table so they survive the call duration. We Py_IncRef so the
+     * wasm-side handle owns its own ref — wasm can Py_DecRef it
+     * (the standard yos handle-table convention) without affecting
+     * Python's accounting. The trampoline releases those handles
+     * after the wasm function returns (in case the wasm guest did
+     * not call Py_DecRef itself). */
+    uint32_t self_h = self ? py_handles_wrap(ctx, self) : 0;
+    if (self) Py_IncRef(self);
+    uint32_t args_h = args ? py_handles_wrap(ctx, args) : 0;
+    if (args) Py_IncRef(args);
+
+    IM3Module module = (IM3Module)ctx->module;
+    if (!module || s->wasm_idx >= module->table0Size) {
+        PyErr_SetString(PyExc_RuntimeError,
+                        "yos: wasm fn idx out of range");
+        py_swap_out(prev);
+        return NULL;
+    }
+    IM3Function fn = module->table0[s->wasm_idx];
+    if (!fn) {
+        PyErr_SetString(PyExc_RuntimeError, "yos: wasm fn idx null");
+        py_swap_out(prev);
+        return NULL;
+    }
+    if (!fn->compiled) {
+        M3Result crc = CompileFunction(fn);
+        if (crc) {
+            PyErr_Format(PyExc_RuntimeError,
+                         "yos: CompileFunction(%u) failed: %s",
+                         (unsigned)s->wasm_idx, crc);
+            py_swap_out(prev);
+            return NULL;
+        }
+    }
+
+    const void *fn_args[2] = { &self_h, &args_h };
+    M3Result rc = m3_Call(fn, 2, fn_args);
+    if (rc) {
+        PyErr_Format(PyExc_RuntimeError,
+                     "yos: Py trampoline wasm call failed: %s", rc);
+        py_swap_out(prev);
+        return NULL;
+    }
+    uint32_t result_h = 0;
+    const void *retptrs[1] = { &result_h };
+    (void)m3_GetResults(fn, 1, retptrs);
+
+    /* Recover the host PyObject * from the returned handle. The wasm
+     * side returned a NEW reference (Python convention); we pass
+     * that ref through to the caller of the trampoline. We DO need
+     * to release the self/args handle slots; the host refs we
+     * IncRef'd above are owned by the wasm side and (assumed) DecRef'd
+     * by the wasm function — but in case it didn't, we mop up. */
+    PyObject *result = py_handles_resolve(ctx, result_h);
+
+    /* Conservatively decref + release our self/args wrappers. If the
+     * wasm function already Py_DecRef'd, that path released them via
+     * the bridge and our slots are NULL now. */
+    if (self_h && py_handles_resolve(ctx, self_h) == self) {
+        py_handles_release(ctx, self_h);
+        Py_DecRef(self);
+    }
+    if (args_h && py_handles_resolve(ctx, args_h) == args) {
+        py_handles_release(ctx, args_h);
+        Py_DecRef(args);
+    }
+
+    py_swap_out(prev);
+    return result;
+}
+
+/* Generate YOS_PY_NTRAMPS distinct C functions, each hard-coding its
+ * own slot index. List-and-paste; gross but trivial. */
+#define YOS_PY_TR(n) \
+static PyObject *py_tr_##n(PyObject *s, PyObject *a) \
+{ return py_tramp_dispatch(n, s, a); }
+
+YOS_PY_TR(0)   YOS_PY_TR(1)   YOS_PY_TR(2)   YOS_PY_TR(3)
+YOS_PY_TR(4)   YOS_PY_TR(5)   YOS_PY_TR(6)   YOS_PY_TR(7)
+YOS_PY_TR(8)   YOS_PY_TR(9)   YOS_PY_TR(10)  YOS_PY_TR(11)
+YOS_PY_TR(12)  YOS_PY_TR(13)  YOS_PY_TR(14)  YOS_PY_TR(15)
+YOS_PY_TR(16)  YOS_PY_TR(17)  YOS_PY_TR(18)  YOS_PY_TR(19)
+YOS_PY_TR(20)  YOS_PY_TR(21)  YOS_PY_TR(22)  YOS_PY_TR(23)
+YOS_PY_TR(24)  YOS_PY_TR(25)  YOS_PY_TR(26)  YOS_PY_TR(27)
+YOS_PY_TR(28)  YOS_PY_TR(29)  YOS_PY_TR(30)  YOS_PY_TR(31)
+YOS_PY_TR(32)  YOS_PY_TR(33)  YOS_PY_TR(34)  YOS_PY_TR(35)
+YOS_PY_TR(36)  YOS_PY_TR(37)  YOS_PY_TR(38)  YOS_PY_TR(39)
+YOS_PY_TR(40)  YOS_PY_TR(41)  YOS_PY_TR(42)  YOS_PY_TR(43)
+YOS_PY_TR(44)  YOS_PY_TR(45)  YOS_PY_TR(46)  YOS_PY_TR(47)
+YOS_PY_TR(48)  YOS_PY_TR(49)  YOS_PY_TR(50)  YOS_PY_TR(51)
+YOS_PY_TR(52)  YOS_PY_TR(53)  YOS_PY_TR(54)  YOS_PY_TR(55)
+YOS_PY_TR(56)  YOS_PY_TR(57)  YOS_PY_TR(58)  YOS_PY_TR(59)
+YOS_PY_TR(60)  YOS_PY_TR(61)  YOS_PY_TR(62)  YOS_PY_TR(63)
+YOS_PY_TR(64)  YOS_PY_TR(65)  YOS_PY_TR(66)  YOS_PY_TR(67)
+YOS_PY_TR(68)  YOS_PY_TR(69)  YOS_PY_TR(70)  YOS_PY_TR(71)
+YOS_PY_TR(72)  YOS_PY_TR(73)  YOS_PY_TR(74)  YOS_PY_TR(75)
+YOS_PY_TR(76)  YOS_PY_TR(77)  YOS_PY_TR(78)  YOS_PY_TR(79)
+YOS_PY_TR(80)  YOS_PY_TR(81)  YOS_PY_TR(82)  YOS_PY_TR(83)
+YOS_PY_TR(84)  YOS_PY_TR(85)  YOS_PY_TR(86)  YOS_PY_TR(87)
+YOS_PY_TR(88)  YOS_PY_TR(89)  YOS_PY_TR(90)  YOS_PY_TR(91)
+YOS_PY_TR(92)  YOS_PY_TR(93)  YOS_PY_TR(94)  YOS_PY_TR(95)
+YOS_PY_TR(96)  YOS_PY_TR(97)  YOS_PY_TR(98)  YOS_PY_TR(99)
+YOS_PY_TR(100) YOS_PY_TR(101) YOS_PY_TR(102) YOS_PY_TR(103)
+YOS_PY_TR(104) YOS_PY_TR(105) YOS_PY_TR(106) YOS_PY_TR(107)
+YOS_PY_TR(108) YOS_PY_TR(109) YOS_PY_TR(110) YOS_PY_TR(111)
+YOS_PY_TR(112) YOS_PY_TR(113) YOS_PY_TR(114) YOS_PY_TR(115)
+YOS_PY_TR(116) YOS_PY_TR(117) YOS_PY_TR(118) YOS_PY_TR(119)
+YOS_PY_TR(120) YOS_PY_TR(121) YOS_PY_TR(122) YOS_PY_TR(123)
+YOS_PY_TR(124) YOS_PY_TR(125) YOS_PY_TR(126) YOS_PY_TR(127)
+#undef YOS_PY_TR
+
+#define YOS_PY_E(n) py_tr_##n,
+static PyCFunction g_py_tramp_fns[YOS_PY_NTRAMPS] = {
+    YOS_PY_E(0)   YOS_PY_E(1)   YOS_PY_E(2)   YOS_PY_E(3)
+    YOS_PY_E(4)   YOS_PY_E(5)   YOS_PY_E(6)   YOS_PY_E(7)
+    YOS_PY_E(8)   YOS_PY_E(9)   YOS_PY_E(10)  YOS_PY_E(11)
+    YOS_PY_E(12)  YOS_PY_E(13)  YOS_PY_E(14)  YOS_PY_E(15)
+    YOS_PY_E(16)  YOS_PY_E(17)  YOS_PY_E(18)  YOS_PY_E(19)
+    YOS_PY_E(20)  YOS_PY_E(21)  YOS_PY_E(22)  YOS_PY_E(23)
+    YOS_PY_E(24)  YOS_PY_E(25)  YOS_PY_E(26)  YOS_PY_E(27)
+    YOS_PY_E(28)  YOS_PY_E(29)  YOS_PY_E(30)  YOS_PY_E(31)
+    YOS_PY_E(32)  YOS_PY_E(33)  YOS_PY_E(34)  YOS_PY_E(35)
+    YOS_PY_E(36)  YOS_PY_E(37)  YOS_PY_E(38)  YOS_PY_E(39)
+    YOS_PY_E(40)  YOS_PY_E(41)  YOS_PY_E(42)  YOS_PY_E(43)
+    YOS_PY_E(44)  YOS_PY_E(45)  YOS_PY_E(46)  YOS_PY_E(47)
+    YOS_PY_E(48)  YOS_PY_E(49)  YOS_PY_E(50)  YOS_PY_E(51)
+    YOS_PY_E(52)  YOS_PY_E(53)  YOS_PY_E(54)  YOS_PY_E(55)
+    YOS_PY_E(56)  YOS_PY_E(57)  YOS_PY_E(58)  YOS_PY_E(59)
+    YOS_PY_E(60)  YOS_PY_E(61)  YOS_PY_E(62)  YOS_PY_E(63)
+    YOS_PY_E(64)  YOS_PY_E(65)  YOS_PY_E(66)  YOS_PY_E(67)
+    YOS_PY_E(68)  YOS_PY_E(69)  YOS_PY_E(70)  YOS_PY_E(71)
+    YOS_PY_E(72)  YOS_PY_E(73)  YOS_PY_E(74)  YOS_PY_E(75)
+    YOS_PY_E(76)  YOS_PY_E(77)  YOS_PY_E(78)  YOS_PY_E(79)
+    YOS_PY_E(80)  YOS_PY_E(81)  YOS_PY_E(82)  YOS_PY_E(83)
+    YOS_PY_E(84)  YOS_PY_E(85)  YOS_PY_E(86)  YOS_PY_E(87)
+    YOS_PY_E(88)  YOS_PY_E(89)  YOS_PY_E(90)  YOS_PY_E(91)
+    YOS_PY_E(92)  YOS_PY_E(93)  YOS_PY_E(94)  YOS_PY_E(95)
+    YOS_PY_E(96)  YOS_PY_E(97)  YOS_PY_E(98)  YOS_PY_E(99)
+    YOS_PY_E(100) YOS_PY_E(101) YOS_PY_E(102) YOS_PY_E(103)
+    YOS_PY_E(104) YOS_PY_E(105) YOS_PY_E(106) YOS_PY_E(107)
+    YOS_PY_E(108) YOS_PY_E(109) YOS_PY_E(110) YOS_PY_E(111)
+    YOS_PY_E(112) YOS_PY_E(113) YOS_PY_E(114) YOS_PY_E(115)
+    YOS_PY_E(116) YOS_PY_E(117) YOS_PY_E(118) YOS_PY_E(119)
+    YOS_PY_E(120) YOS_PY_E(121) YOS_PY_E(122) YOS_PY_E(123)
+    YOS_PY_E(124) YOS_PY_E(125) YOS_PY_E(126) YOS_PY_E(127)
+};
+#undef YOS_PY_E
+
+/* ── PyMethodDef / module-add bridges ─────────────────────────── */
+
+/* PyMethodDef layout on wasm32 (4 i32 fields, 16 bytes total).
+ * Host layout has 8-byte pointers and Py_ssize_t alignment, so we
+ * build a fresh host-side array and forward the wasm-side method
+ * table through it. */
+#define YOS_PY_METHODDEF_WASM_SIZE  16
+
+extern int PyModule_AddFunctions(PyObject *module, void *methods);
+extern int PyModule_AddObject(PyObject *module, const char *name, PyObject *value);
+extern int PyModule_AddIntConstant(PyObject *module, const char *name,
+                                   long value);
+extern int PyModule_AddStringConstant(PyObject *module, const char *name,
+                                      const char *value);
+
+/* Host-side PyMethodDef. Mirrors CPython's struct PyMethodDef. */
+struct yos_host_PyMethodDef {
+    const char *ml_name;
+    PyCFunction ml_meth;
+    int         ml_flags;
+    const char *ml_doc;
+};
+
+/* env.PyModule_AddFunctions — i32(module_h, methods_off).
+ *
+ * Walks the wasm-side PyMethodDef[] (terminated by {NULL, NULL,
+ * 0, NULL}), allocates a trampoline slot per entry, builds a host
+ * PyMethodDef[] with host trampolines + strduped names/docs, and
+ * calls host PyModule_AddFunctions.
+ *
+ * The host array + strdups leak — Python doesn't free them and
+ * we don't track them. For embedded use that's bounded; for
+ * unload/reload paths we'd add a per-ctx allocation list. */
+static const void *m3_yos_PyModule_AddFunctions(IM3Runtime rt, IM3ImportContext _c,
+                                                uint64_t *_sp, void *_m)
+{
+    (void)_c; (void)_m;
+    struct yos_exec_ctx *ctx = PY_CTX(rt);
+    PyObject *m  = py_handles_resolve(ctx, (uint32_t)_sp[1]);
+    uint32_t off = (uint32_t)_sp[2];
+    if (!m || !ctx->memory) { _sp[0] = (uint64_t)(uint32_t)-1; return NULL; }
+
+    /* Count entries (terminator = all-zero). */
+    uint32_t n = 0;
+    for (uint32_t p = off; p + YOS_PY_METHODDEF_WASM_SIZE <= ctx->memory_size;
+         p += YOS_PY_METHODDEF_WASM_SIZE) {
+        uint32_t name = *(const uint32_t *)(ctx->memory + p);
+        uint32_t meth = *(const uint32_t *)(ctx->memory + p + 4);
+        if (name == 0 && meth == 0) break;
+        ++n;
+        if (n > 4096) break;   /* runaway guard */
+    }
+
+    struct yos_host_PyMethodDef *host =
+        calloc(n + 1, sizeof(struct yos_host_PyMethodDef));
+    if (!host) { _sp[0] = (uint64_t)(uint32_t)-1; return NULL; }
+
+    for (uint32_t i = 0; i < n; ++i) {
+        uint32_t base = off + i * YOS_PY_METHODDEF_WASM_SIZE;
+        uint32_t name_off = *(const uint32_t *)(ctx->memory + base);
+        uint32_t meth_idx = *(const uint32_t *)(ctx->memory + base + 4);
+        int      flags    = *(const int32_t  *)(ctx->memory + base + 8);
+        uint32_t doc_off  = *(const uint32_t *)(ctx->memory + base + 12);
+
+        const char *name = guest_cstr_py(ctx, name_off);
+        const char *doc  = doc_off ? guest_cstr_py(ctx, doc_off) : NULL;
+        host[i].ml_name  = name ? strdup(name) : NULL;
+        host[i].ml_doc   = doc  ? strdup(doc)  : NULL;
+        host[i].ml_flags = flags;
+        if (meth_idx != 0) {
+            int slot = py_alloc_tramp(ctx, meth_idx, flags);
+            if (slot < 0) {
+                /* trampoline pool exhausted — slot stays NULL,
+                 * Python sees a nameless function and skips it. */
+                ywarn("PyModule_AddFunctions: trampoline pool full "
+                      "(YOS_PY_NTRAMPS=%d); function '%s' won't be "
+                      "callable\n", YOS_PY_NTRAMPS, name ? name : "?");
+                host[i].ml_meth = NULL;
+            } else {
+                host[i].ml_meth = g_py_tramp_fns[slot];
+            }
+        } else {
+            host[i].ml_meth = NULL;
+        }
+    }
+    /* host[n] stays zeroed → PyMethodDef sentinel. */
+
+    PyThreadState *prev = py_swap_in(ctx);
+    int rc = PyModule_AddFunctions(m, host);
+    py_swap_out(prev);
+
+    /* Note: `host` array intentionally leaked. CPython does NOT take
+     * ownership but it indexes into it for the lifetime of the
+     * module; freeing here would invalidate every registered
+     * function. */
+    _sp[0] = (uint64_t)(uint32_t)rc;
+    return NULL;
+}
+
+/* env.PyModule_AddObject — i32(module_h, name_off, value_h).
+ * STEALS the value reference on success — we release the handle
+ * slot but DON'T Py_DecRef. */
+static const void *m3_yos_PyModule_AddObject(IM3Runtime rt, IM3ImportContext _c,
+                                             uint64_t *_sp, void *_m)
+{
+    (void)_c; (void)_m;
+    struct yos_exec_ctx *ctx = PY_CTX(rt);
+    PyObject *m   = py_handles_resolve(ctx, (uint32_t)_sp[1]);
+    const char *name = guest_cstr_py(ctx, (uint32_t)_sp[2]);
+    uint32_t h_v  = (uint32_t)_sp[3];
+    PyObject *v   = py_handles_release(ctx, h_v);
+    if (!m || !name || !v) {
+        _sp[0] = (uint64_t)(uint32_t)-1; return NULL;
+    }
+    PyThreadState *prev = py_swap_in(ctx);
+    int rc = PyModule_AddObject(m, name, v);
+    if (rc != 0) Py_DecRef(v);   /* on failure caller still owns; we released the slot */
+    py_swap_out(prev);
+    _sp[0] = (uint64_t)(uint32_t)rc;
+    return NULL;
+}
+
+/* env.PyModule_AddIntConstant — i32(module_h, name_off, i64 value). */
+static const void *m3_yos_PyModule_AddIntConstant(IM3Runtime rt, IM3ImportContext _c,
+                                                  uint64_t *_sp, void *_m)
+{
+    (void)_c; (void)_m;
+    struct yos_exec_ctx *ctx = PY_CTX(rt);
+    PyObject *m = py_handles_resolve(ctx, (uint32_t)_sp[1]);
+    const char *name = guest_cstr_py(ctx, (uint32_t)_sp[2]);
+    long v = (long)(int64_t)_sp[3];
+    if (!m || !name) { _sp[0] = (uint64_t)(uint32_t)-1; return NULL; }
+    PyThreadState *prev = py_swap_in(ctx);
+    int rc = PyModule_AddIntConstant(m, name, v);
+    py_swap_out(prev);
+    _sp[0] = (uint64_t)(uint32_t)rc;
+    return NULL;
+}
+
+/* env.PyModule_AddStringConstant — i32(module_h, name_off, value_off). */
+static const void *m3_yos_PyModule_AddStringConstant(IM3Runtime rt, IM3ImportContext _c,
+                                                     uint64_t *_sp, void *_m)
+{
+    (void)_c; (void)_m;
+    struct yos_exec_ctx *ctx = PY_CTX(rt);
+    PyObject *m = py_handles_resolve(ctx, (uint32_t)_sp[1]);
+    const char *name  = guest_cstr_py(ctx, (uint32_t)_sp[2]);
+    const char *value = guest_cstr_py(ctx, (uint32_t)_sp[3]);
+    if (!m || !name || !value) {
+        _sp[0] = (uint64_t)(uint32_t)-1; return NULL;
+    }
+    PyThreadState *prev = py_swap_in(ctx);
+    int rc = PyModule_AddStringConstant(m, name, value);
+    py_swap_out(prev);
+    _sp[0] = (uint64_t)(uint32_t)rc;
+    return NULL;
+}
+
+/* ── PyBytes ──────────────────────────────────────────────────── */
+
+extern PyObject  *PyBytes_FromStringAndSize(const char *v, Py_ssize_t len);
+extern int        PyBytes_AsStringAndSize(PyObject *obj, char **s, Py_ssize_t *len);
+
+/* env.PyBytes_FromStringAndSize — i32(buf_off, int size). New ref. */
+static const void *m3_yos_PyBytes_FromStringAndSize(IM3Runtime rt, IM3ImportContext _c,
+                                                    uint64_t *_sp, void *_m)
+{
+    (void)_c; (void)_m;
+    struct yos_exec_ctx *ctx = PY_CTX(rt);
+    uint32_t off = (uint32_t)_sp[1];
+    int      sz  = (int)_sp[2];
+    const char *s = sz ? (const char *)guest_buf_ro_py(ctx, off, (uint32_t)sz) : "";
+    if (sz > 0 && !s) { _sp[0] = 0; return NULL; }
+    PyThreadState *prev = py_swap_in(ctx);
+    PyObject *r = PyBytes_FromStringAndSize(s, (Py_ssize_t)sz);
+    py_swap_out(prev);
+    _sp[0] = PY_WRAP_NEW(ctx, r);
+    return NULL;
+}
+
+/* env.PyBytes_AsStringAndSize — i32(obj_h, size_off). Returns offset
+ * of a stashed copy of the bytes (since the host pointer points into
+ * Python-managed storage we can't expose directly). */
+static const void *m3_yos_PyBytes_AsStringAndSize(IM3Runtime rt, IM3ImportContext _c,
+                                                  uint64_t *_sp, void *_m)
+{
+    (void)_c; (void)_m;
+    struct yos_exec_ctx *ctx = PY_CTX(rt);
+    PyObject *o = py_handles_resolve(ctx, (uint32_t)_sp[1]);
+    uint32_t size_off = (uint32_t)_sp[2];
+    if (!o) { _sp[0] = 0; return NULL; }
+    PyThreadState *prev = py_swap_in(ctx);
+    char *s = NULL;
+    Py_ssize_t sz = 0;
+    int rc = PyBytes_AsStringAndSize(o, &s, &sz);
+    py_swap_out(prev);
+    if (rc != 0 || !s) { _sp[0] = 0; return NULL; }
+    if (size_off) {
+        uint32_t *lp = (uint32_t *)guest_buf_rw_py(ctx, size_off, sizeof(uint32_t));
+        if (lp) *lp = (uint32_t)sz;
+    }
+    _sp[0] = (uint64_t)libpython_stash_string(ctx, s, (size_t)sz);
+    return NULL;
+}
+
 /* env.PyRun_String — i32(str_off, int start, globals_h, locals_h).
  * Py_eval_input = 258, Py_file_input = 257, Py_single_input = 256.
  * New ref result. */
@@ -1140,6 +1567,16 @@ void yos_libpython_link(IM3Module mod)
 
     /* Eval. */
     m3_LinkRawFunction(mod, "env", "PyRun_String", "i(iiii)", m3_yos_PyRun_String);
+
+    /* Module-level registration helpers + PyCFunction trampoline path. */
+    m3_LinkRawFunction(mod, "env", "PyModule_AddFunctions",     "i(ii)",  m3_yos_PyModule_AddFunctions);
+    m3_LinkRawFunction(mod, "env", "PyModule_AddObject",        "i(iii)", m3_yos_PyModule_AddObject);
+    m3_LinkRawFunction(mod, "env", "PyModule_AddIntConstant",   "i(iiI)", m3_yos_PyModule_AddIntConstant);
+    m3_LinkRawFunction(mod, "env", "PyModule_AddStringConstant","i(iii)", m3_yos_PyModule_AddStringConstant);
+
+    /* PyBytes. */
+    m3_LinkRawFunction(mod, "env", "PyBytes_FromStringAndSize", "i(ii)",  m3_yos_PyBytes_FromStringAndSize);
+    m3_LinkRawFunction(mod, "env", "PyBytes_AsStringAndSize",   "i(ii)",  m3_yos_PyBytes_AsStringAndSize);
 }
 
 /* Per-ctx teardown — called from yos's proc shutdown. Releases all
