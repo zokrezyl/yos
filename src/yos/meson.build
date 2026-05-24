@@ -54,6 +54,19 @@ else
   python_embed_dep = dependency('python3-embed', required: with_libpython_opt)
   have_libpython = python_embed_dep.found()
 endif
+# openssl (libcrypto + libssl) — host-side, embedded into the yos
+# binary so wasm guests can call env.SSL_*, env.EVP_*, env.RAND_*,
+# env.ERR_* (impl/libc/openssl.c). Optional: if libssl isn't installed
+# (iOS sim SDK, some constrained CI images), the bridges still compile
+# but every openssl import traps unresolved at guest load time.
+with_openssl_opt = get_option('with_openssl')
+if with_openssl_opt.disabled()
+  openssl_dep = dependency('', required: false)
+  have_openssl = false
+else
+  openssl_dep = dependency('openssl', required: with_openssl_opt)
+  have_openssl = openssl_dep.found()
+endif
 # iconv: glibc folds it into libc; darwin/BSD ship a separate libiconv
 # whose symbols start with `iconv_*` (and `__iconv_*` for the GNU
 # extras). yos's bridge calls those names, so we need explicit linkage
@@ -242,6 +255,11 @@ if have_libpython
   optional_sources += files('impl/libc/libpython.c')
   optional_args    += '-DYOS_HAVE_LIBPYTHON=1'
   optional_deps    += python_embed_dep
+endif
+if have_openssl
+  optional_sources += files('impl/libc/openssl.c')
+  optional_args    += '-DYOS_HAVE_OPENSSL=1'
+  optional_deps    += openssl_dep
 endif
 
 yos_common_c_args = [
