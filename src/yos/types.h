@@ -216,6 +216,16 @@ struct yos_exec_ctx {
      *   See impl/libpython.c. */
     void *py_tstate;
 
+    /* PyObject handle table — same shape as ssl_handles[] /
+     * lua_handles[]. Every PyObject * the bridge surface passes back
+     * to the guest is wrapped here and the guest holds an i32
+     * handle. Per-subinterpreter isolation guarantees that handles
+     * across different guests cannot collide: each guest's
+     * PyObject*'s are allocated inside its own PyInterpreterState
+     * arena. See policies/python.yaml. */
+    void   **py_handles;
+    uint32_t py_handles_cap;
+
     /* openssl per-guest state. yos's host openssl is shared across every
      * guest (one libcrypto/libssl in the address space), but each guest's
      * SSL_CTX, SSL, EVP_MD_CTX, BIO, ... must be isolated — guest A's

@@ -45,13 +45,89 @@
  * each other's global state — `import os; os.path = trap` in guest A
  * would poison guest B's next `os.path.join(...)`. */
 typedef struct _ts PyThreadState;
+typedef struct _object PyObject;
+typedef ssize_t Py_ssize_t;
+
 extern void Py_Initialize(void);
 extern void Py_Finalize(void);
 extern int  PyRun_SimpleString(const char *command);
+extern PyObject *PyRun_String(const char *str, int start,
+                              PyObject *globals, PyObject *locals);
 extern PyThreadState *Py_NewInterpreter(void);
 extern void Py_EndInterpreter(PyThreadState *);
 extern PyThreadState *PyThreadState_Swap(PyThreadState *);
 extern int  Py_IsInitialized(void);
+
+/* Refcount management. Macros in Python.h; the public functions
+ * exist too for binding-language consumers. */
+extern void Py_IncRef(PyObject *);
+extern void Py_DecRef(PyObject *);
+
+/* PyObject access. */
+extern PyObject *PyObject_GetAttrString(PyObject *o, const char *attr);
+extern int       PyObject_SetAttrString(PyObject *o, const char *attr, PyObject *v);
+extern int       PyObject_HasAttrString(PyObject *o, const char *attr);
+extern PyObject *PyObject_GetItem(PyObject *o, PyObject *key);
+extern int       PyObject_SetItem(PyObject *o, PyObject *key, PyObject *v);
+extern int       PyObject_DelItemString(PyObject *o, const char *key);
+extern PyObject *PyObject_Str(PyObject *o);
+extern PyObject *PyObject_Repr(PyObject *o);
+extern Py_ssize_t PyObject_Length(PyObject *o);
+extern int       PyObject_IsTrue(PyObject *o);
+extern int       PyObject_Not(PyObject *o);
+extern int       PyObject_RichCompareBool(PyObject *a, PyObject *b, int op);
+extern PyObject *PyObject_Type(PyObject *o);
+extern PyObject *PyObject_Call(PyObject *callable, PyObject *args, PyObject *kwargs);
+extern PyObject *PyObject_CallObject(PyObject *callable, PyObject *args);
+
+/* Containers. */
+extern PyObject *PyDict_New(void);
+extern int       PyDict_SetItemString(PyObject *p, const char *key, PyObject *val);
+extern PyObject *PyDict_GetItemString(PyObject *p, const char *key);
+extern int       PyDict_DelItemString(PyObject *p, const char *key);
+extern Py_ssize_t PyDict_Size(PyObject *p);
+
+extern PyObject *PyList_New(Py_ssize_t len);
+extern int       PyList_Append(PyObject *list, PyObject *item);
+extern Py_ssize_t PyList_Size(PyObject *list);
+extern PyObject *PyList_GetItem(PyObject *list, Py_ssize_t index);
+extern int       PyList_SetItem(PyObject *list, Py_ssize_t index, PyObject *item);
+
+extern PyObject *PyTuple_New(Py_ssize_t len);
+extern Py_ssize_t PyTuple_Size(PyObject *p);
+extern PyObject *PyTuple_GetItem(PyObject *p, Py_ssize_t pos);
+extern int       PyTuple_SetItem(PyObject *p, Py_ssize_t pos, PyObject *o);
+
+/* Scalars. */
+extern PyObject *PyLong_FromLongLong(long long v);
+extern long long PyLong_AsLongLong(PyObject *o);
+extern PyObject *PyFloat_FromDouble(double v);
+extern double    PyFloat_AsDouble(PyObject *o);
+extern PyObject *PyBool_FromLong(long v);
+
+/* Strings. */
+extern PyObject *PyUnicode_FromString(const char *u);
+extern PyObject *PyUnicode_FromStringAndSize(const char *u, Py_ssize_t size);
+extern const char *PyUnicode_AsUTF8AndSize(PyObject *unicode, Py_ssize_t *size);
+
+/* Import. */
+extern PyObject *PyImport_ImportModule(const char *name);
+extern PyObject *PyImport_AddModule(const char *name);
+extern PyObject *PyModule_GetDict(PyObject *module);
+
+/* Error. */
+extern PyObject *PyErr_Occurred(void);
+extern void      PyErr_Clear(void);
+extern void      PyErr_Print(void);
+extern void      PyErr_SetString(PyObject *type, const char *message);
+extern int       PyErr_ExceptionMatches(PyObject *exc);
+extern void      PyErr_Fetch(PyObject **type, PyObject **value, PyObject **traceback);
+extern void      PyErr_Restore(PyObject *type, PyObject *value, PyObject *traceback);
+
+/* Singletons (immutable; identity-stable across guests). */
+extern PyObject _Py_NoneStruct;
+extern PyObject _Py_TrueStruct;
+extern PyObject _Py_FalseStruct;
 
 /* One-shot main-interpreter init. Py_Initialize is documented as
  * idempotent (no-op on second call), but we still want exactly one
@@ -165,13 +241,921 @@ static const void *m3_yos_PyRun_SimpleString(IM3Runtime runtime,
     return NULL;
 }
 
+/* ── PyObject handle table ──────────────────────────────────────
+ *
+ * The guest holds an i32 handle for every PyObject *. Slot 0 is
+ * reserved so 0 == NULL == "no object". The three immortal
+ * singletons (None / True / False) get permanent pre-bound handles
+ * 1 / 2 / 3 — they're identity-stable across the whole process and
+ * shared across guests on purpose (Python's `x is None` requires
+ * pointer identity).
+ *
+ * For all other PyObject *, the bridge wraps fresh into the table.
+ * Ref-count discipline: when a bridge wraps a NEW reference (from
+ * a host call like PyObject_GetAttrString), the wrap returns a
+ * handle but doesn't bump refcount on host side — the caller owns
+ * the ref (per CPython convention, the function returned a new ref).
+ * Py_DecRef bridge releases the handle slot AND decrefs the host
+ * ref. For BORROWED refs (PyDict_GetItemString etc.), we Py_IncRef
+ * before wrapping so the guest's handle owns its own ref.
+ */
+
+enum {
+    YOS_PY_HANDLE_NONE  = 1,
+    YOS_PY_HANDLE_TRUE  = 2,
+    YOS_PY_HANDLE_FALSE = 3,
+    YOS_PY_HANDLE_FIRST_FREE = 4,
+};
+
+#define YOS_PY_HANDLES_GROW 16
+
+static int py_handles_reserve(struct yos_exec_ctx *ctx)
+{
+    if (!ctx) return -1;
+    if (ctx->py_handles_cap == 0) {
+        size_t cap = YOS_PY_HANDLES_GROW;
+        void **slots = calloc(cap, sizeof(void *));
+        if (!slots) return -1;
+        /* Pre-bind singleton handles. */
+        slots[YOS_PY_HANDLE_NONE]  = &_Py_NoneStruct;
+        slots[YOS_PY_HANDLE_TRUE]  = &_Py_TrueStruct;
+        slots[YOS_PY_HANDLE_FALSE] = &_Py_FalseStruct;
+        ctx->py_handles = slots;
+        ctx->py_handles_cap = (uint32_t)cap;
+        return 0;
+    }
+    for (uint32_t i = YOS_PY_HANDLE_FIRST_FREE; i < ctx->py_handles_cap; ++i)
+        if (!ctx->py_handles[i]) return 0;
+    size_t newcap = (size_t)ctx->py_handles_cap + YOS_PY_HANDLES_GROW;
+    void **next = realloc(ctx->py_handles, newcap * sizeof(void *));
+    if (!next) return -1;
+    memset(next + ctx->py_handles_cap, 0,
+           (newcap - ctx->py_handles_cap) * sizeof(void *));
+    ctx->py_handles = next;
+    ctx->py_handles_cap = (uint32_t)newcap;
+    return 0;
+}
+
+static uint32_t py_handles_wrap(struct yos_exec_ctx *ctx, PyObject *p)
+{
+    if (!p) return 0;
+    if (py_handles_reserve(ctx) < 0) return 0;
+    /* Singleton shortcuts — preserve identity. */
+    if (p == &_Py_NoneStruct)  return YOS_PY_HANDLE_NONE;
+    if (p == &_Py_TrueStruct)  return YOS_PY_HANDLE_TRUE;
+    if (p == &_Py_FalseStruct) return YOS_PY_HANDLE_FALSE;
+    for (uint32_t i = YOS_PY_HANDLE_FIRST_FREE; i < ctx->py_handles_cap; ++i)
+        if (!ctx->py_handles[i]) { ctx->py_handles[i] = p; return i; }
+    return 0;
+}
+
+static PyObject *py_handles_resolve(struct yos_exec_ctx *ctx, uint32_t h)
+{
+    if (!ctx || !ctx->py_handles) return NULL;
+    if (h == 0 || h >= ctx->py_handles_cap) return NULL;
+    return (PyObject *)ctx->py_handles[h];
+}
+
+static PyObject *py_handles_release(struct yos_exec_ctx *ctx, uint32_t h)
+{
+    if (!ctx || !ctx->py_handles) return NULL;
+    if (h == 0 || h >= ctx->py_handles_cap) return NULL;
+    /* Singletons aren't released; they live forever. */
+    if (h <= YOS_PY_HANDLE_FALSE) return (PyObject *)ctx->py_handles[h];
+    PyObject *p = (PyObject *)ctx->py_handles[h];
+    ctx->py_handles[h] = NULL;
+    return p;
+}
+
+/* Wrap a host string under the wasm guest's pool of return strings.
+ * Mirrors lua/openssl's guest_stash_string — overwrites previous
+ * stash slots; caller copies. Returns wasm offset. */
+static uint32_t libpython_stash_string(struct yos_exec_ctx *ctx,
+                                       const char *s, size_t len)
+{
+    if (!s || !ctx || !ctx->memory) return 0;
+    if (ctx->memory_size < 4096 + 16) return 0;
+    static __thread uint32_t bump;
+    static __thread uint32_t base;
+    if (!base) base = ctx->memory_size - 4096;
+    if (bump + len + 1 > 4096) bump = 0;
+    uint32_t at = base + bump;
+    memcpy(ctx->memory + at, s, len);
+    ctx->memory[at + len] = 0;
+    bump += (uint32_t)len + 1;
+    return at;
+}
+
+/* Memory accessors — copies of the libpython/openssl helpers. */
+static const void *guest_buf_ro_py(struct yos_exec_ctx *ctx,
+                                   uint32_t off, uint32_t len)
+{
+    if (!ctx || !ctx->memory) return NULL;
+    if (len == 0) return ctx->memory + off;
+    uint64_t end = (uint64_t)off + (uint64_t)len;
+    if (off >= ctx->memory_size || end > ctx->memory_size) return NULL;
+    return ctx->memory + off;
+}
+static void *guest_buf_rw_py(struct yos_exec_ctx *ctx,
+                             uint32_t off, uint32_t len)
+{
+    return (void *)guest_buf_ro_py(ctx, off, len);
+}
+static const char *guest_cstr_py(struct yos_exec_ctx *ctx, uint32_t off)
+{
+    if (!ctx || !ctx->memory || off == 0 || off >= ctx->memory_size)
+        return NULL;
+    const char *p = (const char *)(ctx->memory + off);
+    const char *end = (const char *)(ctx->memory + ctx->memory_size);
+    for (const char *q = p; q < end; ++q) if (*q == 0) return p;
+    return NULL;
+}
+
+/* Subinterpreter swap helper — used by every bridge that calls
+ * into host libpython. Returns the previous tstate so the caller
+ * swaps it back after the call. */
+static PyThreadState *py_swap_in(struct yos_exec_ctx *ctx)
+{
+    PyThreadState *guest = libpython_ctx_tstate(ctx);
+    return guest ? PyThreadState_Swap(guest) : NULL;
+}
+static void py_swap_out(PyThreadState *prev)
+{
+    /* prev may be NULL (no previous tstate) — PyThreadState_Swap(NULL)
+     * is valid. */
+    PyThreadState_Swap(prev);
+}
+
+#define PY_CTX(rt)  ((struct yos_exec_ctx *)m3_GetUserData(rt))
+
+/* ── PyObject bridges ──────────────────────────────────────────── */
+
+/* env.Py_IncRef — v(obj_h). On the host side we bump refcount; on
+ * the wasm side the guest's handle stays valid. */
+static const void *m3_yos_Py_IncRef(IM3Runtime rt, IM3ImportContext _c,
+                                    uint64_t *_sp, void *_m)
+{
+    (void)_c; (void)_m;
+    struct yos_exec_ctx *ctx = PY_CTX(rt);
+    PyObject *o = py_handles_resolve(ctx, (uint32_t)_sp[0]);
+    if (!o) return NULL;
+    PyThreadState *prev = py_swap_in(ctx);
+    Py_IncRef(o);
+    py_swap_out(prev);
+    return NULL;
+}
+
+/* env.Py_DecRef — v(obj_h). Release the handle slot AND decref. */
+static const void *m3_yos_Py_DecRef(IM3Runtime rt, IM3ImportContext _c,
+                                    uint64_t *_sp, void *_m)
+{
+    (void)_c; (void)_m;
+    struct yos_exec_ctx *ctx = PY_CTX(rt);
+    uint32_t h = (uint32_t)_sp[0];
+    if (h <= YOS_PY_HANDLE_FALSE) return NULL;  /* singletons immortal */
+    PyObject *o = py_handles_release(ctx, h);
+    if (!o) return NULL;
+    PyThreadState *prev = py_swap_in(ctx);
+    Py_DecRef(o);
+    py_swap_out(prev);
+    return NULL;
+}
+
+/* Wrap-result helper: convert a fresh host PyObject * to a guest
+ * handle. NULL → 0. The host function gave us a NEW reference; the
+ * caller owns it via the handle's slot. Py_DecRef releases it. */
+#define PY_WRAP_NEW(ctx, p)  ((uint64_t)py_handles_wrap((ctx), (p)))
+
+/* For BORROWED references (PyDict_GetItemString, PyList_GetItem,
+ * PyTuple_GetItem, PyModule_GetDict): bump refcount before wrapping
+ * so the guest's handle owns its own ref. */
+static uint32_t py_wrap_borrowed(struct yos_exec_ctx *ctx, PyObject *p)
+{
+    if (!p) return 0;
+    Py_IncRef(p);
+    return py_handles_wrap(ctx, p);
+}
+
+/* env.PyObject_GetAttrString — i32(obj_h, name_off). New ref. */
+static const void *m3_yos_PyObject_GetAttrString(IM3Runtime rt, IM3ImportContext _c,
+                                                 uint64_t *_sp, void *_m)
+{
+    (void)_c; (void)_m;
+    struct yos_exec_ctx *ctx = PY_CTX(rt);
+    PyObject *o = py_handles_resolve(ctx, (uint32_t)_sp[1]);
+    const char *name = guest_cstr_py(ctx, (uint32_t)_sp[2]);
+    if (!o || !name) { _sp[0] = 0; return NULL; }
+    PyThreadState *prev = py_swap_in(ctx);
+    PyObject *r = PyObject_GetAttrString(o, name);
+    py_swap_out(prev);
+    _sp[0] = PY_WRAP_NEW(ctx, r);
+    return NULL;
+}
+
+/* env.PyObject_SetAttrString — i32(obj_h, name_off, val_h). */
+static const void *m3_yos_PyObject_SetAttrString(IM3Runtime rt, IM3ImportContext _c,
+                                                 uint64_t *_sp, void *_m)
+{
+    (void)_c; (void)_m;
+    struct yos_exec_ctx *ctx = PY_CTX(rt);
+    PyObject *o = py_handles_resolve(ctx, (uint32_t)_sp[1]);
+    const char *name = guest_cstr_py(ctx, (uint32_t)_sp[2]);
+    PyObject *v = py_handles_resolve(ctx, (uint32_t)_sp[3]);
+    if (!o || !name) { _sp[0] = (uint64_t)(uint32_t)-1; return NULL; }
+    PyThreadState *prev = py_swap_in(ctx);
+    int rc = PyObject_SetAttrString(o, name, v);
+    py_swap_out(prev);
+    _sp[0] = (uint64_t)(uint32_t)rc;
+    return NULL;
+}
+
+/* env.PyObject_HasAttrString — i32(obj_h, name_off). */
+static const void *m3_yos_PyObject_HasAttrString(IM3Runtime rt, IM3ImportContext _c,
+                                                 uint64_t *_sp, void *_m)
+{
+    (void)_c; (void)_m;
+    struct yos_exec_ctx *ctx = PY_CTX(rt);
+    PyObject *o = py_handles_resolve(ctx, (uint32_t)_sp[1]);
+    const char *name = guest_cstr_py(ctx, (uint32_t)_sp[2]);
+    if (!o || !name) { _sp[0] = 0; return NULL; }
+    PyThreadState *prev = py_swap_in(ctx);
+    int rc = PyObject_HasAttrString(o, name);
+    py_swap_out(prev);
+    _sp[0] = (uint64_t)(uint32_t)rc;
+    return NULL;
+}
+
+/* env.PyObject_Str / Repr — i32(obj_h). Both return NEW unicode object. */
+static const void *m3_yos_PyObject_Str(IM3Runtime rt, IM3ImportContext _c,
+                                       uint64_t *_sp, void *_m)
+{
+    (void)_c; (void)_m;
+    struct yos_exec_ctx *ctx = PY_CTX(rt);
+    PyObject *o = py_handles_resolve(ctx, (uint32_t)_sp[1]);
+    if (!o) { _sp[0] = 0; return NULL; }
+    PyThreadState *prev = py_swap_in(ctx);
+    PyObject *r = PyObject_Str(o);
+    py_swap_out(prev);
+    _sp[0] = PY_WRAP_NEW(ctx, r);
+    return NULL;
+}
+static const void *m3_yos_PyObject_Repr(IM3Runtime rt, IM3ImportContext _c,
+                                        uint64_t *_sp, void *_m)
+{
+    (void)_c; (void)_m;
+    struct yos_exec_ctx *ctx = PY_CTX(rt);
+    PyObject *o = py_handles_resolve(ctx, (uint32_t)_sp[1]);
+    if (!o) { _sp[0] = 0; return NULL; }
+    PyThreadState *prev = py_swap_in(ctx);
+    PyObject *r = PyObject_Repr(o);
+    py_swap_out(prev);
+    _sp[0] = PY_WRAP_NEW(ctx, r);
+    return NULL;
+}
+
+/* env.PyObject_Length — i32(obj_h). Py_ssize_t result narrowed. */
+static const void *m3_yos_PyObject_Length(IM3Runtime rt, IM3ImportContext _c,
+                                          uint64_t *_sp, void *_m)
+{
+    (void)_c; (void)_m;
+    struct yos_exec_ctx *ctx = PY_CTX(rt);
+    PyObject *o = py_handles_resolve(ctx, (uint32_t)_sp[1]);
+    if (!o) { _sp[0] = (uint64_t)(uint32_t)-1; return NULL; }
+    PyThreadState *prev = py_swap_in(ctx);
+    Py_ssize_t n = PyObject_Length(o);
+    py_swap_out(prev);
+    _sp[0] = (uint64_t)(uint32_t)(int32_t)n;
+    return NULL;
+}
+
+/* env.PyObject_IsTrue / Not — i32(obj_h). */
+static const void *m3_yos_PyObject_IsTrue(IM3Runtime rt, IM3ImportContext _c,
+                                          uint64_t *_sp, void *_m)
+{
+    (void)_c; (void)_m;
+    struct yos_exec_ctx *ctx = PY_CTX(rt);
+    PyObject *o = py_handles_resolve(ctx, (uint32_t)_sp[1]);
+    if (!o) { _sp[0] = 0; return NULL; }
+    PyThreadState *prev = py_swap_in(ctx);
+    int rc = PyObject_IsTrue(o);
+    py_swap_out(prev);
+    _sp[0] = (uint64_t)(uint32_t)rc;
+    return NULL;
+}
+
+/* env.PyObject_Type — i32(obj_h). New ref. */
+static const void *m3_yos_PyObject_Type(IM3Runtime rt, IM3ImportContext _c,
+                                        uint64_t *_sp, void *_m)
+{
+    (void)_c; (void)_m;
+    struct yos_exec_ctx *ctx = PY_CTX(rt);
+    PyObject *o = py_handles_resolve(ctx, (uint32_t)_sp[1]);
+    if (!o) { _sp[0] = 0; return NULL; }
+    PyThreadState *prev = py_swap_in(ctx);
+    PyObject *r = PyObject_Type(o);
+    py_swap_out(prev);
+    _sp[0] = PY_WRAP_NEW(ctx, r);
+    return NULL;
+}
+
+/* env.PyObject_Call — i32(callable_h, args_h, kwargs_h). */
+static const void *m3_yos_PyObject_Call(IM3Runtime rt, IM3ImportContext _c,
+                                        uint64_t *_sp, void *_m)
+{
+    (void)_c; (void)_m;
+    struct yos_exec_ctx *ctx = PY_CTX(rt);
+    PyObject *fn  = py_handles_resolve(ctx, (uint32_t)_sp[1]);
+    PyObject *a   = py_handles_resolve(ctx, (uint32_t)_sp[2]);
+    PyObject *kw  = (uint32_t)_sp[3] ? py_handles_resolve(ctx, (uint32_t)_sp[3]) : NULL;
+    if (!fn || !a) { _sp[0] = 0; return NULL; }
+    PyThreadState *prev = py_swap_in(ctx);
+    PyObject *r = PyObject_Call(fn, a, kw);
+    py_swap_out(prev);
+    _sp[0] = PY_WRAP_NEW(ctx, r);
+    return NULL;
+}
+
+/* env.PyObject_CallObject — i32(callable_h, args_h). */
+static const void *m3_yos_PyObject_CallObject(IM3Runtime rt, IM3ImportContext _c,
+                                              uint64_t *_sp, void *_m)
+{
+    (void)_c; (void)_m;
+    struct yos_exec_ctx *ctx = PY_CTX(rt);
+    PyObject *fn  = py_handles_resolve(ctx, (uint32_t)_sp[1]);
+    PyObject *a   = (uint32_t)_sp[2] ? py_handles_resolve(ctx, (uint32_t)_sp[2]) : NULL;
+    if (!fn) { _sp[0] = 0; return NULL; }
+    PyThreadState *prev = py_swap_in(ctx);
+    PyObject *r = PyObject_CallObject(fn, a);
+    py_swap_out(prev);
+    _sp[0] = PY_WRAP_NEW(ctx, r);
+    return NULL;
+}
+
+/* ── containers ────────────────────────────────────────────────── */
+
+/* env.PyDict_New — i32(). */
+static const void *m3_yos_PyDict_New(IM3Runtime rt, IM3ImportContext _c,
+                                     uint64_t *_sp, void *_m)
+{
+    (void)_c; (void)_m;
+    struct yos_exec_ctx *ctx = PY_CTX(rt);
+    PyThreadState *prev = py_swap_in(ctx);
+    PyObject *r = PyDict_New();
+    py_swap_out(prev);
+    _sp[0] = PY_WRAP_NEW(ctx, r);
+    return NULL;
+}
+
+/* env.PyDict_SetItemString — i32(dict_h, key_off, val_h). */
+static const void *m3_yos_PyDict_SetItemString(IM3Runtime rt, IM3ImportContext _c,
+                                               uint64_t *_sp, void *_m)
+{
+    (void)_c; (void)_m;
+    struct yos_exec_ctx *ctx = PY_CTX(rt);
+    PyObject *d = py_handles_resolve(ctx, (uint32_t)_sp[1]);
+    const char *k = guest_cstr_py(ctx, (uint32_t)_sp[2]);
+    PyObject *v = py_handles_resolve(ctx, (uint32_t)_sp[3]);
+    if (!d || !k || !v) { _sp[0] = (uint64_t)(uint32_t)-1; return NULL; }
+    PyThreadState *prev = py_swap_in(ctx);
+    int rc = PyDict_SetItemString(d, k, v);
+    py_swap_out(prev);
+    _sp[0] = (uint64_t)(uint32_t)rc;
+    return NULL;
+}
+
+/* env.PyDict_GetItemString — i32(dict_h, key_off). Returns BORROWED ref. */
+static const void *m3_yos_PyDict_GetItemString(IM3Runtime rt, IM3ImportContext _c,
+                                               uint64_t *_sp, void *_m)
+{
+    (void)_c; (void)_m;
+    struct yos_exec_ctx *ctx = PY_CTX(rt);
+    PyObject *d = py_handles_resolve(ctx, (uint32_t)_sp[1]);
+    const char *k = guest_cstr_py(ctx, (uint32_t)_sp[2]);
+    if (!d || !k) { _sp[0] = 0; return NULL; }
+    PyThreadState *prev = py_swap_in(ctx);
+    PyObject *r = PyDict_GetItemString(d, k);
+    py_swap_out(prev);
+    _sp[0] = (uint64_t)py_wrap_borrowed(ctx, r);
+    return NULL;
+}
+
+/* env.PyDict_Size — i32(dict_h). */
+static const void *m3_yos_PyDict_Size(IM3Runtime rt, IM3ImportContext _c,
+                                      uint64_t *_sp, void *_m)
+{
+    (void)_c; (void)_m;
+    struct yos_exec_ctx *ctx = PY_CTX(rt);
+    PyObject *d = py_handles_resolve(ctx, (uint32_t)_sp[1]);
+    if (!d) { _sp[0] = (uint64_t)(uint32_t)-1; return NULL; }
+    PyThreadState *prev = py_swap_in(ctx);
+    Py_ssize_t n = PyDict_Size(d);
+    py_swap_out(prev);
+    _sp[0] = (uint64_t)(uint32_t)(int32_t)n;
+    return NULL;
+}
+
+/* env.PyList_New — i32(int len). */
+static const void *m3_yos_PyList_New(IM3Runtime rt, IM3ImportContext _c,
+                                     uint64_t *_sp, void *_m)
+{
+    (void)_c; (void)_m;
+    struct yos_exec_ctx *ctx = PY_CTX(rt);
+    int len = (int)_sp[1];
+    PyThreadState *prev = py_swap_in(ctx);
+    PyObject *r = PyList_New((Py_ssize_t)len);
+    py_swap_out(prev);
+    _sp[0] = PY_WRAP_NEW(ctx, r);
+    return NULL;
+}
+
+/* env.PyList_Append — i32(list_h, item_h). */
+static const void *m3_yos_PyList_Append(IM3Runtime rt, IM3ImportContext _c,
+                                        uint64_t *_sp, void *_m)
+{
+    (void)_c; (void)_m;
+    struct yos_exec_ctx *ctx = PY_CTX(rt);
+    PyObject *l = py_handles_resolve(ctx, (uint32_t)_sp[1]);
+    PyObject *i = py_handles_resolve(ctx, (uint32_t)_sp[2]);
+    if (!l || !i) { _sp[0] = (uint64_t)(uint32_t)-1; return NULL; }
+    PyThreadState *prev = py_swap_in(ctx);
+    int rc = PyList_Append(l, i);
+    py_swap_out(prev);
+    _sp[0] = (uint64_t)(uint32_t)rc;
+    return NULL;
+}
+
+/* env.PyList_Size — i32(list_h). */
+static const void *m3_yos_PyList_Size(IM3Runtime rt, IM3ImportContext _c,
+                                      uint64_t *_sp, void *_m)
+{
+    (void)_c; (void)_m;
+    struct yos_exec_ctx *ctx = PY_CTX(rt);
+    PyObject *l = py_handles_resolve(ctx, (uint32_t)_sp[1]);
+    if (!l) { _sp[0] = (uint64_t)(uint32_t)-1; return NULL; }
+    PyThreadState *prev = py_swap_in(ctx);
+    Py_ssize_t n = PyList_Size(l);
+    py_swap_out(prev);
+    _sp[0] = (uint64_t)(uint32_t)(int32_t)n;
+    return NULL;
+}
+
+/* env.PyList_GetItem — i32(list_h, int idx). BORROWED. */
+static const void *m3_yos_PyList_GetItem(IM3Runtime rt, IM3ImportContext _c,
+                                         uint64_t *_sp, void *_m)
+{
+    (void)_c; (void)_m;
+    struct yos_exec_ctx *ctx = PY_CTX(rt);
+    PyObject *l = py_handles_resolve(ctx, (uint32_t)_sp[1]);
+    int idx = (int)_sp[2];
+    if (!l) { _sp[0] = 0; return NULL; }
+    PyThreadState *prev = py_swap_in(ctx);
+    PyObject *r = PyList_GetItem(l, (Py_ssize_t)idx);
+    py_swap_out(prev);
+    _sp[0] = (uint64_t)py_wrap_borrowed(ctx, r);
+    return NULL;
+}
+
+/* env.PyList_SetItem — i32(list_h, int idx, item_h). STEALS ref. */
+static const void *m3_yos_PyList_SetItem(IM3Runtime rt, IM3ImportContext _c,
+                                         uint64_t *_sp, void *_m)
+{
+    (void)_c; (void)_m;
+    struct yos_exec_ctx *ctx = PY_CTX(rt);
+    PyObject *l = py_handles_resolve(ctx, (uint32_t)_sp[1]);
+    int idx = (int)_sp[2];
+    uint32_t h_item = (uint32_t)_sp[3];
+    /* SetItem steals the reference to item — so we release the
+     * guest's handle slot but DON'T decref host-side. */
+    PyObject *item = py_handles_release(ctx, h_item);
+    if (!l || !item) { _sp[0] = (uint64_t)(uint32_t)-1; return NULL; }
+    PyThreadState *prev = py_swap_in(ctx);
+    int rc = PyList_SetItem(l, (Py_ssize_t)idx, item);
+    py_swap_out(prev);
+    _sp[0] = (uint64_t)(uint32_t)rc;
+    return NULL;
+}
+
+/* env.PyTuple_New — i32(int len). */
+static const void *m3_yos_PyTuple_New(IM3Runtime rt, IM3ImportContext _c,
+                                      uint64_t *_sp, void *_m)
+{
+    (void)_c; (void)_m;
+    struct yos_exec_ctx *ctx = PY_CTX(rt);
+    int len = (int)_sp[1];
+    PyThreadState *prev = py_swap_in(ctx);
+    PyObject *r = PyTuple_New((Py_ssize_t)len);
+    py_swap_out(prev);
+    _sp[0] = PY_WRAP_NEW(ctx, r);
+    return NULL;
+}
+
+/* env.PyTuple_Size — i32(tuple_h). */
+static const void *m3_yos_PyTuple_Size(IM3Runtime rt, IM3ImportContext _c,
+                                       uint64_t *_sp, void *_m)
+{
+    (void)_c; (void)_m;
+    struct yos_exec_ctx *ctx = PY_CTX(rt);
+    PyObject *t = py_handles_resolve(ctx, (uint32_t)_sp[1]);
+    if (!t) { _sp[0] = (uint64_t)(uint32_t)-1; return NULL; }
+    PyThreadState *prev = py_swap_in(ctx);
+    Py_ssize_t n = PyTuple_Size(t);
+    py_swap_out(prev);
+    _sp[0] = (uint64_t)(uint32_t)(int32_t)n;
+    return NULL;
+}
+
+/* env.PyTuple_GetItem — i32(tuple_h, int idx). BORROWED. */
+static const void *m3_yos_PyTuple_GetItem(IM3Runtime rt, IM3ImportContext _c,
+                                          uint64_t *_sp, void *_m)
+{
+    (void)_c; (void)_m;
+    struct yos_exec_ctx *ctx = PY_CTX(rt);
+    PyObject *t = py_handles_resolve(ctx, (uint32_t)_sp[1]);
+    int idx = (int)_sp[2];
+    if (!t) { _sp[0] = 0; return NULL; }
+    PyThreadState *prev = py_swap_in(ctx);
+    PyObject *r = PyTuple_GetItem(t, (Py_ssize_t)idx);
+    py_swap_out(prev);
+    _sp[0] = (uint64_t)py_wrap_borrowed(ctx, r);
+    return NULL;
+}
+
+/* env.PyTuple_SetItem — i32(tuple_h, int idx, item_h). STEALS ref. */
+static const void *m3_yos_PyTuple_SetItem(IM3Runtime rt, IM3ImportContext _c,
+                                          uint64_t *_sp, void *_m)
+{
+    (void)_c; (void)_m;
+    struct yos_exec_ctx *ctx = PY_CTX(rt);
+    PyObject *t = py_handles_resolve(ctx, (uint32_t)_sp[1]);
+    int idx = (int)_sp[2];
+    uint32_t h_item = (uint32_t)_sp[3];
+    PyObject *item = py_handles_release(ctx, h_item);
+    if (!t || !item) { _sp[0] = (uint64_t)(uint32_t)-1; return NULL; }
+    PyThreadState *prev = py_swap_in(ctx);
+    int rc = PyTuple_SetItem(t, (Py_ssize_t)idx, item);
+    py_swap_out(prev);
+    _sp[0] = (uint64_t)(uint32_t)rc;
+    return NULL;
+}
+
+/* ── scalars ───────────────────────────────────────────────────── */
+
+/* env.PyLong_FromLongLong — i32(i64 v). */
+static const void *m3_yos_PyLong_FromLongLong(IM3Runtime rt, IM3ImportContext _c,
+                                              uint64_t *_sp, void *_m)
+{
+    (void)_c; (void)_m;
+    struct yos_exec_ctx *ctx = PY_CTX(rt);
+    long long v = (long long)_sp[1];
+    PyThreadState *prev = py_swap_in(ctx);
+    PyObject *r = PyLong_FromLongLong(v);
+    py_swap_out(prev);
+    _sp[0] = PY_WRAP_NEW(ctx, r);
+    return NULL;
+}
+
+/* env.PyLong_AsLongLong — i64(obj_h). */
+static const void *m3_yos_PyLong_AsLongLong(IM3Runtime rt, IM3ImportContext _c,
+                                            uint64_t *_sp, void *_m)
+{
+    (void)_c; (void)_m;
+    struct yos_exec_ctx *ctx = PY_CTX(rt);
+    PyObject *o = py_handles_resolve(ctx, (uint32_t)_sp[1]);
+    if (!o) { _sp[0] = 0; return NULL; }
+    PyThreadState *prev = py_swap_in(ctx);
+    long long v = PyLong_AsLongLong(o);
+    py_swap_out(prev);
+    _sp[0] = (uint64_t)v;
+    return NULL;
+}
+
+/* env.PyFloat_FromDouble — i32(f64). */
+static const void *m3_yos_PyFloat_FromDouble(IM3Runtime rt, IM3ImportContext _c,
+                                             uint64_t *_sp, void *_m)
+{
+    (void)_c; (void)_m;
+    struct yos_exec_ctx *ctx = PY_CTX(rt);
+    double v; memcpy(&v, &_sp[1], sizeof(double));
+    PyThreadState *prev = py_swap_in(ctx);
+    PyObject *r = PyFloat_FromDouble(v);
+    py_swap_out(prev);
+    _sp[0] = PY_WRAP_NEW(ctx, r);
+    return NULL;
+}
+
+/* env.PyFloat_AsDouble — f64(obj_h). */
+static const void *m3_yos_PyFloat_AsDouble(IM3Runtime rt, IM3ImportContext _c,
+                                           uint64_t *_sp, void *_m)
+{
+    (void)_c; (void)_m;
+    struct yos_exec_ctx *ctx = PY_CTX(rt);
+    PyObject *o = py_handles_resolve(ctx, (uint32_t)_sp[1]);
+    if (!o) { double z = 0.0; memcpy(&_sp[0], &z, sizeof z); return NULL; }
+    PyThreadState *prev = py_swap_in(ctx);
+    double v = PyFloat_AsDouble(o);
+    py_swap_out(prev);
+    memcpy(&_sp[0], &v, sizeof(v));
+    return NULL;
+}
+
+/* env.PyBool_FromLong — i32(int v). */
+static const void *m3_yos_PyBool_FromLong(IM3Runtime rt, IM3ImportContext _c,
+                                          uint64_t *_sp, void *_m)
+{
+    (void)_c; (void)_m;
+    struct yos_exec_ctx *ctx = PY_CTX(rt);
+    int v = (int)_sp[1];
+    /* Bypass the host call — bool is a singleton. */
+    _sp[0] = v ? YOS_PY_HANDLE_TRUE : YOS_PY_HANDLE_FALSE;
+    return NULL;
+}
+
+/* ── strings ───────────────────────────────────────────────────── */
+
+/* env.PyUnicode_FromString — i32(str_off). New ref. */
+static const void *m3_yos_PyUnicode_FromString(IM3Runtime rt, IM3ImportContext _c,
+                                               uint64_t *_sp, void *_m)
+{
+    (void)_c; (void)_m;
+    struct yos_exec_ctx *ctx = PY_CTX(rt);
+    const char *s = guest_cstr_py(ctx, (uint32_t)_sp[1]);
+    if (!s) { _sp[0] = 0; return NULL; }
+    PyThreadState *prev = py_swap_in(ctx);
+    PyObject *r = PyUnicode_FromString(s);
+    py_swap_out(prev);
+    _sp[0] = PY_WRAP_NEW(ctx, r);
+    return NULL;
+}
+
+/* env.PyUnicode_FromStringAndSize — i32(buf_off, int size). */
+static const void *m3_yos_PyUnicode_FromStringAndSize(IM3Runtime rt, IM3ImportContext _c,
+                                                      uint64_t *_sp, void *_m)
+{
+    (void)_c; (void)_m;
+    struct yos_exec_ctx *ctx = PY_CTX(rt);
+    uint32_t off = (uint32_t)_sp[1];
+    int      sz  = (int)_sp[2];
+    const char *s = sz ? (const char *)guest_buf_ro_py(ctx, off, (uint32_t)sz) : "";
+    if (sz > 0 && !s) { _sp[0] = 0; return NULL; }
+    PyThreadState *prev = py_swap_in(ctx);
+    PyObject *r = PyUnicode_FromStringAndSize(s, (Py_ssize_t)sz);
+    py_swap_out(prev);
+    _sp[0] = PY_WRAP_NEW(ctx, r);
+    return NULL;
+}
+
+/* env.PyUnicode_AsUTF8AndSize — i32(obj_h, size_off).
+ * Host returns const char * into Python-managed storage. Copy into
+ * guest scratch and return offset. size_off is uint32_t *. */
+static const void *m3_yos_PyUnicode_AsUTF8AndSize(IM3Runtime rt, IM3ImportContext _c,
+                                                  uint64_t *_sp, void *_m)
+{
+    (void)_c; (void)_m;
+    struct yos_exec_ctx *ctx = PY_CTX(rt);
+    PyObject *o = py_handles_resolve(ctx, (uint32_t)_sp[1]);
+    uint32_t size_off = (uint32_t)_sp[2];
+    if (!o) { _sp[0] = 0; return NULL; }
+    PyThreadState *prev = py_swap_in(ctx);
+    Py_ssize_t sz = 0;
+    const char *s = PyUnicode_AsUTF8AndSize(o, &sz);
+    py_swap_out(prev);
+    if (!s) { _sp[0] = 0; return NULL; }
+    if (size_off) {
+        uint32_t *lp = (uint32_t *)guest_buf_rw_py(ctx, size_off, sizeof(uint32_t));
+        if (lp) *lp = (uint32_t)sz;
+    }
+    _sp[0] = (uint64_t)libpython_stash_string(ctx, s, (size_t)sz);
+    return NULL;
+}
+
+/* ── import ────────────────────────────────────────────────────── */
+
+/* env.PyImport_ImportModule — i32(name_off). New ref. */
+static const void *m3_yos_PyImport_ImportModule(IM3Runtime rt, IM3ImportContext _c,
+                                                uint64_t *_sp, void *_m)
+{
+    (void)_c; (void)_m;
+    struct yos_exec_ctx *ctx = PY_CTX(rt);
+    const char *name = guest_cstr_py(ctx, (uint32_t)_sp[1]);
+    if (!name) { _sp[0] = 0; return NULL; }
+    PyThreadState *prev = py_swap_in(ctx);
+    PyObject *r = PyImport_ImportModule(name);
+    py_swap_out(prev);
+    _sp[0] = PY_WRAP_NEW(ctx, r);
+    return NULL;
+}
+
+/* env.PyImport_AddModule — i32(name_off). BORROWED. */
+static const void *m3_yos_PyImport_AddModule(IM3Runtime rt, IM3ImportContext _c,
+                                             uint64_t *_sp, void *_m)
+{
+    (void)_c; (void)_m;
+    struct yos_exec_ctx *ctx = PY_CTX(rt);
+    const char *name = guest_cstr_py(ctx, (uint32_t)_sp[1]);
+    if (!name) { _sp[0] = 0; return NULL; }
+    PyThreadState *prev = py_swap_in(ctx);
+    PyObject *r = PyImport_AddModule(name);
+    py_swap_out(prev);
+    _sp[0] = (uint64_t)py_wrap_borrowed(ctx, r);
+    return NULL;
+}
+
+/* env.PyModule_GetDict — i32(module_h). BORROWED. */
+static const void *m3_yos_PyModule_GetDict(IM3Runtime rt, IM3ImportContext _c,
+                                           uint64_t *_sp, void *_m)
+{
+    (void)_c; (void)_m;
+    struct yos_exec_ctx *ctx = PY_CTX(rt);
+    PyObject *o = py_handles_resolve(ctx, (uint32_t)_sp[1]);
+    if (!o) { _sp[0] = 0; return NULL; }
+    PyThreadState *prev = py_swap_in(ctx);
+    PyObject *r = PyModule_GetDict(o);
+    py_swap_out(prev);
+    _sp[0] = (uint64_t)py_wrap_borrowed(ctx, r);
+    return NULL;
+}
+
+/* ── error ─────────────────────────────────────────────────────── */
+
+/* env.PyErr_Occurred — i32(). BORROWED (or NULL). */
+static const void *m3_yos_PyErr_Occurred(IM3Runtime rt, IM3ImportContext _c,
+                                         uint64_t *_sp, void *_m)
+{
+    (void)_c; (void)_m;
+    struct yos_exec_ctx *ctx = PY_CTX(rt);
+    PyThreadState *prev = py_swap_in(ctx);
+    PyObject *r = PyErr_Occurred();
+    py_swap_out(prev);
+    /* Don't bump refcount — PyErr_Occurred is documented as borrowed
+     * and the exception type is alive for the lifetime of the
+     * process. We wrap WITHOUT inc-ref since the handle is intended
+     * as identity-only (guest does `if (PyErr_Occurred()) ...`). */
+    _sp[0] = r ? (uint64_t)py_handles_wrap(ctx, r) : 0;
+    return NULL;
+}
+
+/* env.PyErr_Clear — v(). */
+static const void *m3_yos_PyErr_Clear(IM3Runtime rt, IM3ImportContext _c,
+                                      uint64_t *_sp, void *_m)
+{
+    (void)_sp; (void)_c; (void)_m;
+    struct yos_exec_ctx *ctx = PY_CTX(rt);
+    PyThreadState *prev = py_swap_in(ctx);
+    PyErr_Clear();
+    py_swap_out(prev);
+    return NULL;
+}
+
+/* env.PyErr_Print — v(). */
+static const void *m3_yos_PyErr_Print(IM3Runtime rt, IM3ImportContext _c,
+                                      uint64_t *_sp, void *_m)
+{
+    (void)_sp; (void)_c; (void)_m;
+    struct yos_exec_ctx *ctx = PY_CTX(rt);
+    PyThreadState *prev = py_swap_in(ctx);
+    PyErr_Print();
+    py_swap_out(prev);
+    return NULL;
+}
+
+/* env.PyErr_SetString — v(exc_h, msg_off). */
+static const void *m3_yos_PyErr_SetString(IM3Runtime rt, IM3ImportContext _c,
+                                          uint64_t *_sp, void *_m)
+{
+    (void)_c; (void)_m;
+    struct yos_exec_ctx *ctx = PY_CTX(rt);
+    PyObject *type = py_handles_resolve(ctx, (uint32_t)_sp[0]);
+    const char *msg = guest_cstr_py(ctx, (uint32_t)_sp[1]);
+    if (!type || !msg) return NULL;
+    PyThreadState *prev = py_swap_in(ctx);
+    PyErr_SetString(type, msg);
+    py_swap_out(prev);
+    return NULL;
+}
+
+/* env.PyErr_ExceptionMatches — i32(exc_h). */
+static const void *m3_yos_PyErr_ExceptionMatches(IM3Runtime rt, IM3ImportContext _c,
+                                                 uint64_t *_sp, void *_m)
+{
+    (void)_c; (void)_m;
+    struct yos_exec_ctx *ctx = PY_CTX(rt);
+    PyObject *exc = py_handles_resolve(ctx, (uint32_t)_sp[1]);
+    if (!exc) { _sp[0] = 0; return NULL; }
+    PyThreadState *prev = py_swap_in(ctx);
+    int rc = PyErr_ExceptionMatches(exc);
+    py_swap_out(prev);
+    _sp[0] = (uint64_t)(uint32_t)rc;
+    return NULL;
+}
+
+/* ── eval ──────────────────────────────────────────────────────── */
+
+/* env.PyRun_String — i32(str_off, int start, globals_h, locals_h).
+ * Py_eval_input = 258, Py_file_input = 257, Py_single_input = 256.
+ * New ref result. */
+static const void *m3_yos_PyRun_String(IM3Runtime rt, IM3ImportContext _c,
+                                       uint64_t *_sp, void *_m)
+{
+    (void)_c; (void)_m;
+    struct yos_exec_ctx *ctx = PY_CTX(rt);
+    const char *s = guest_cstr_py(ctx, (uint32_t)_sp[1]);
+    int start = (int)_sp[2];
+    PyObject *g = (uint32_t)_sp[3] ? py_handles_resolve(ctx, (uint32_t)_sp[3]) : NULL;
+    PyObject *l = (uint32_t)_sp[4] ? py_handles_resolve(ctx, (uint32_t)_sp[4]) : NULL;
+    if (!s) { _sp[0] = 0; return NULL; }
+    PyThreadState *prev = py_swap_in(ctx);
+    /* If globals/locals not provided, run inside __main__ dict. */
+    if (!g) {
+        PyObject *m = PyImport_AddModule("__main__");
+        g = m ? PyModule_GetDict(m) : NULL;
+    }
+    if (!l) l = g;
+    PyObject *r = (g && l) ? PyRun_String(s, start, g, l) : NULL;
+    py_swap_out(prev);
+    _sp[0] = PY_WRAP_NEW(ctx, r);
+    return NULL;
+}
+
 /* Public entry point — called from main.c during import linkage. */
 void yos_libpython_link(IM3Module mod)
 {
     if (!mod) return;
-    /* m3 link signatures: 'v'=void, 'i'=i32, 'I'=i64, 'f'=f32, 'F'=f64.
-     * Format is "<ret>(<args>)" — i(i) = i32 fn(i32). */
+    /* The original three lifecycle bridges. */
     m3_LinkRawFunction(mod, "env", "Py_Initialize",    "v()",  m3_yos_Py_Initialize);
     m3_LinkRawFunction(mod, "env", "Py_Finalize",      "v()",  m3_yos_Py_Finalize);
     m3_LinkRawFunction(mod, "env", "PyRun_SimpleString","i(i)", m3_yos_PyRun_SimpleString);
+
+    /* Refcount control. */
+    m3_LinkRawFunction(mod, "env", "Py_IncRef", "v(i)", m3_yos_Py_IncRef);
+    m3_LinkRawFunction(mod, "env", "Py_DecRef", "v(i)", m3_yos_Py_DecRef);
+
+    /* PyObject — attr / type / call / str / len. */
+    m3_LinkRawFunction(mod, "env", "PyObject_GetAttrString", "i(ii)",  m3_yos_PyObject_GetAttrString);
+    m3_LinkRawFunction(mod, "env", "PyObject_SetAttrString", "i(iii)", m3_yos_PyObject_SetAttrString);
+    m3_LinkRawFunction(mod, "env", "PyObject_HasAttrString", "i(ii)",  m3_yos_PyObject_HasAttrString);
+    m3_LinkRawFunction(mod, "env", "PyObject_Str",           "i(i)",   m3_yos_PyObject_Str);
+    m3_LinkRawFunction(mod, "env", "PyObject_Repr",          "i(i)",   m3_yos_PyObject_Repr);
+    m3_LinkRawFunction(mod, "env", "PyObject_Length",        "i(i)",   m3_yos_PyObject_Length);
+    m3_LinkRawFunction(mod, "env", "PyObject_IsTrue",        "i(i)",   m3_yos_PyObject_IsTrue);
+    m3_LinkRawFunction(mod, "env", "PyObject_Type",          "i(i)",   m3_yos_PyObject_Type);
+    m3_LinkRawFunction(mod, "env", "PyObject_Call",          "i(iii)", m3_yos_PyObject_Call);
+    m3_LinkRawFunction(mod, "env", "PyObject_CallObject",    "i(ii)",  m3_yos_PyObject_CallObject);
+
+    /* Dict / List / Tuple. */
+    m3_LinkRawFunction(mod, "env", "PyDict_New",            "i()",     m3_yos_PyDict_New);
+    m3_LinkRawFunction(mod, "env", "PyDict_SetItemString",  "i(iii)",  m3_yos_PyDict_SetItemString);
+    m3_LinkRawFunction(mod, "env", "PyDict_GetItemString",  "i(ii)",   m3_yos_PyDict_GetItemString);
+    m3_LinkRawFunction(mod, "env", "PyDict_Size",           "i(i)",    m3_yos_PyDict_Size);
+    m3_LinkRawFunction(mod, "env", "PyList_New",            "i(i)",    m3_yos_PyList_New);
+    m3_LinkRawFunction(mod, "env", "PyList_Append",         "i(ii)",   m3_yos_PyList_Append);
+    m3_LinkRawFunction(mod, "env", "PyList_Size",           "i(i)",    m3_yos_PyList_Size);
+    m3_LinkRawFunction(mod, "env", "PyList_GetItem",        "i(ii)",   m3_yos_PyList_GetItem);
+    m3_LinkRawFunction(mod, "env", "PyList_SetItem",        "i(iii)",  m3_yos_PyList_SetItem);
+    m3_LinkRawFunction(mod, "env", "PyTuple_New",           "i(i)",    m3_yos_PyTuple_New);
+    m3_LinkRawFunction(mod, "env", "PyTuple_Size",          "i(i)",    m3_yos_PyTuple_Size);
+    m3_LinkRawFunction(mod, "env", "PyTuple_GetItem",       "i(ii)",   m3_yos_PyTuple_GetItem);
+    m3_LinkRawFunction(mod, "env", "PyTuple_SetItem",       "i(iii)",  m3_yos_PyTuple_SetItem);
+
+    /* Scalars + strings. */
+    m3_LinkRawFunction(mod, "env", "PyLong_FromLongLong",          "i(I)",   m3_yos_PyLong_FromLongLong);
+    m3_LinkRawFunction(mod, "env", "PyLong_AsLongLong",            "I(i)",   m3_yos_PyLong_AsLongLong);
+    m3_LinkRawFunction(mod, "env", "PyFloat_FromDouble",           "i(F)",   m3_yos_PyFloat_FromDouble);
+    m3_LinkRawFunction(mod, "env", "PyFloat_AsDouble",             "F(i)",   m3_yos_PyFloat_AsDouble);
+    m3_LinkRawFunction(mod, "env", "PyBool_FromLong",              "i(i)",   m3_yos_PyBool_FromLong);
+    m3_LinkRawFunction(mod, "env", "PyUnicode_FromString",         "i(i)",   m3_yos_PyUnicode_FromString);
+    m3_LinkRawFunction(mod, "env", "PyUnicode_FromStringAndSize",  "i(ii)",  m3_yos_PyUnicode_FromStringAndSize);
+    m3_LinkRawFunction(mod, "env", "PyUnicode_AsUTF8AndSize",      "i(ii)",  m3_yos_PyUnicode_AsUTF8AndSize);
+
+    /* Import / module. */
+    m3_LinkRawFunction(mod, "env", "PyImport_ImportModule", "i(i)", m3_yos_PyImport_ImportModule);
+    m3_LinkRawFunction(mod, "env", "PyImport_AddModule",    "i(i)", m3_yos_PyImport_AddModule);
+    m3_LinkRawFunction(mod, "env", "PyModule_GetDict",      "i(i)", m3_yos_PyModule_GetDict);
+
+    /* Error. */
+    m3_LinkRawFunction(mod, "env", "PyErr_Occurred",          "i()",   m3_yos_PyErr_Occurred);
+    m3_LinkRawFunction(mod, "env", "PyErr_Clear",             "v()",   m3_yos_PyErr_Clear);
+    m3_LinkRawFunction(mod, "env", "PyErr_Print",             "v()",   m3_yos_PyErr_Print);
+    m3_LinkRawFunction(mod, "env", "PyErr_SetString",         "v(ii)", m3_yos_PyErr_SetString);
+    m3_LinkRawFunction(mod, "env", "PyErr_ExceptionMatches",  "i(i)",  m3_yos_PyErr_ExceptionMatches);
+
+    /* Eval. */
+    m3_LinkRawFunction(mod, "env", "PyRun_String", "i(iiii)", m3_yos_PyRun_String);
+}
+
+/* Per-ctx teardown — called from yos's proc shutdown. Releases all
+ * still-live PyObject handles for this guest. Py_DecRef them under
+ * the guest's tstate so the per-subinterpreter GC sees them. */
+void yos_libpython_ctx_free(struct yos_exec_ctx *ctx)
+{
+    if (!ctx || !ctx->py_handles) return;
+    PyThreadState *prev = py_swap_in(ctx);
+    for (uint32_t i = YOS_PY_HANDLE_FIRST_FREE; i < ctx->py_handles_cap; ++i) {
+        PyObject *o = (PyObject *)ctx->py_handles[i];
+        if (o) Py_DecRef(o);
+        ctx->py_handles[i] = NULL;
+    }
+    py_swap_out(prev);
+    free(ctx->py_handles);
+    ctx->py_handles = NULL;
+    ctx->py_handles_cap = 0;
 }
