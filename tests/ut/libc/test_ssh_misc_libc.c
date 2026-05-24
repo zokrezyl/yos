@@ -82,12 +82,30 @@ void _start(void) {
     if (atoi("abc") != 0)        { say("FAIL: atoi(\"abc\")\n"); _exit(3); }
     if (atoi("100rest") != 100)  { say("FAIL: atoi(\"100rest\")\n"); _exit(4); }
 
-    /* timingsafe_bcmp. */
+    /* timingsafe_bcmp. The contract: returns 0 iff the two buffers
+     * are byte-identical for `n` bytes, non-zero otherwise. Linux
+     * glibc has no native timingsafe_bcmp; codegen used to stub it
+     * with ENOSYS / return -1 which made ssh's MAC verifier think
+     * every packet's tag was wrong — exactly the symptom
+     * "ssh_dispatch_run_fatal: ... message authentication code
+     * incorrect" the moment encryption activates. Same stub broke
+     * ssh-keygen's "-----BEGIN SSH SIGNATURE-----" magic check. */
     const char *a = "openssh!!";
     const char *b = "openssh!!";
     const char *c = "openssh!?";
     if (timingsafe_bcmp(a, b, 9) != 0) { say("FAIL: tsb equal\n"); _exit(5); }
     if (timingsafe_bcmp(a, c, 9) == 0) { say("FAIL: tsb differ\n"); _exit(6); }
+    /* Empty-range comparison is always equal. */
+    if (timingsafe_bcmp(a, c, 0) != 0) { say("FAIL: tsb n=0\n"); _exit(30); }
+    /* Pin the exact OpenSSH call-site signature: comparing the
+     * "-----BEGIN SSH SIGNATURE-----" magic against itself must
+     * report equal (=0). This is the call ssh-keygen makes when
+     * parsing a sig file. */
+    const char *magic = "-----BEGIN SSH SIGNATURE-----";
+    if (timingsafe_bcmp(magic, magic, 29) != 0) {
+        say("FAIL: tsb on sshsig magic\n");
+        _exit(31);
+    }
 
     /* memcmp tracks the byte-level diff. */
     if (memcmp(a, b, 9) != 0) { say("FAIL: memcmp equal\n"); _exit(7); }

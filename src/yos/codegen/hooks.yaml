@@ -185,6 +185,17 @@ custom_proc:
   # to confirm the host key). Hand-bridge opens /dev/tty, turns off
   # echo, reads the line, restores termios.
   - readpassphrase
+  # impl/posix.c — timingsafe_bcmp(3) / timingsafe_memcmp(3) are
+  # OpenBSD constant-time comparison primitives. glibc has neither;
+  # darwin libSystem has bcmp but not memcmp. Codegen stubs both with
+  # ENOSYS / return -1 on Linux, which makes ssh's MAC verifier think
+  # every received packet's tag mismatches — visible as
+  # "ssh_dispatch_run_fatal: ... message authentication code incorrect"
+  # the moment encryption starts, and as ssh-keygen "missing header"
+  # on every sig file. Real impls in impl/posix.c run a constant-time
+  # loop in linear memory.
+  - timingsafe_bcmp
+  - timingsafe_memcmp
   # impl/pty.c — pseudo-terminal allocation chain telnetd needs to
   # set up a session. Codegen leaves these as ENOSYS stubs which
   # makes telnetd write "All network ports in use" and exit.

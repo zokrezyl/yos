@@ -1872,6 +1872,55 @@ uint32_t yos_getservbyport(struct yos_exec_ctx *ctx, int32_t port_net,
     return pack_servent(ctx, ctx, se);
 }
 
+/* timingsafe_bcmp(3) / timingsafe_memcmp(3) — OpenBSD libc primitives
+ * ssh uses for MAC verification (constant-time, no timing side
+ * channel). Not in glibc; not in darwin host libc either except for
+ * timingsafe_bcmp which is in libSystem. The codegen stubs both with
+ * ENOSYS / return -1, so every MAC check on Linux fails — visible as
+ *   "ssh_dispatch_run_fatal: Connection to UNKNOWN port 0:
+ *    message authentication code incorrect"
+ * the first time the client tries to decrypt a server packet, and
+ * as ssh-keygen's
+ *   "Couldn't parse signature: missing header"
+ * when checking a sig file's "-----BEGIN SSH SIGNATURE-----" magic.
+ *
+ * Hand-bridge both as small constant-time loops over wasm memory. */
+int32_t yos_timingsafe_bcmp(struct yos_exec_ctx *ctx, uint32_t a_off,
+                            uint32_t b_off, uint32_t n)
+{
+    if (!a_off || !b_off || n == 0) return 0;
+    if (a_off + n > ctx->memory_size || b_off + n > ctx->memory_size)
+        return 1;
+    const uint8_t *a = ctx->memory + a_off;
+    const uint8_t *b = ctx->memory + b_off;
+    uint8_t r = 0;
+    for (uint32_t i = 0; i < n; i++) r |= (uint8_t)(a[i] ^ b[i]);
+    /* Contract: 0 iff equal, non-zero iff different. Don't compress
+     * the running OR — the optimiser would early-exit on first diff. */
+    return r != 0;
+}
+
+int32_t yos_timingsafe_memcmp(struct yos_exec_ctx *ctx, uint32_t a_off,
+                              uint32_t b_off, uint32_t n)
+{
+    if (!a_off || !b_off || n == 0) return 0;
+    if (a_off + n > ctx->memory_size || b_off + n > ctx->memory_size)
+        return 0;
+    const uint8_t *a = ctx->memory + a_off;
+    const uint8_t *b = ctx->memory + b_off;
+    /* OpenBSD-style constant-time memcmp: accumulate the first-differing
+     * byte's sign into `res`; mask off subsequent updates with `done`.
+     * Loop runs the full length on every call — no early exit. */
+    int res = 0, done = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        int diff = (int)a[i] - (int)b[i];
+        int mask = done - 1;        /* all-ones while done==0, zero after */
+        res |= diff & mask;
+        done |= ((diff != 0) ? 1 : 0);
+    }
+    return res;
+}
+
 /* readpassphrase(3) — BSD libc function ssh / sshd / ssh-add use to
  * prompt the user for a key passphrase. Not in glibc; on darwin it's
  * in libSystem but the host-API extractor doesn't pick it up either,
