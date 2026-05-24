@@ -611,50 +611,55 @@ static int main_get_asyncify_state(IM3Runtime rt);
  * don't print the scary backtrace each time. */
 static m3ApiRawFunction(m3_yos_stack_chk_fail)
 {
-    /* The canary check fires at function exit when the per-frame
-     * canary slot doesn't match __stack_chk_guard. In practice on yos
-     * this is overwhelmingly a false positive: the guest libc's
-     * thread-struct slot at memory[0..3] (or similar low-address
-     * lookup tables) gets rewritten by long-lived libc functions
-     * straddling the smash, and the canary "check" trips at a frame
-     * exit that's nowhere near the actual write.
+    /* env.__stack_chk_fail: clang's stack-protector emits a call here
+     * when the canary at function entry doesn't match at function
+     * exit. On wasm32, clang has no `__stack_chk_guard` global to
+     * compare against — its default scheme is to read the canary
+     * value from `*(int *)0` (i.e. memory[0..3]). That same slot is
+     * what most wasm libcs use for thread-local bookkeeping, so any
+     * libc call that touches it between function entry and exit
+     * trips a guaranteed false-positive canary smash.
      *
-     * The previous behaviour was to trap with a 256-entry ring dump
-     * which obliterated whatever output the guest had just produced —
-     * `ssh nixem ls` printed every file name from the remote and then
-     * dumped a scary "main trapped" message on top of it. ssh's work
-     * is genuinely done by the time main returns; whatever clobber
-     * the canary detected happened earlier and didn't actually break
-     * the visible behaviour.
+     * The fix lives in each wasm-pkg's build flags:
+     *   - openssh/default.nix passes  --without-stackprotect
+     *   - build-tools/wasm-pkg/configs/nvim/build.sh patches  -fno-stack-protector
+     *   - build-tools/wasm-pkg/configs/lua/build.sh passes    -fno-stack-protector
+     * Add the same to any new wasm package you bring up. If you see
+     * this trap, the package needs the equivalent flag.
      *
-     * Default behaviour now: log a single-line warning to stderr and
-     * call host _Exit(0). The guest's stdout has already been
-     * flushed (every guest `write(1, ...)` goes through yos_write
-     * which writes synchronously to the host fd) so the user keeps
-     * the output. YOS_STACK_CHK_DEBUG=1 re-enables the loud dump for
-     * actually debugging which bridge corrupted memory. */
-    struct yos_exec_ctx *ctx =
-        (struct yos_exec_ctx *)m3_GetUserData(runtime);
-    if (getenv("YOS_STACK_CHK_DEBUG")) {
-        fprintf(stderr,
-            "yos: __stack_chk_fail() — guest stack canary corrupted\n"
-            "yos: last bridge before trap: %s\n",
-            yos_brg_last_call ? yos_brg_last_call : "(none)");
+     * YOS_STACK_CHK_IGNORE=1 silences (m3ApiSuccess; the next opcode
+     * is `unreachable` because clang knows we're noreturn, so the
+     * caller still traps — useful only as a debug aid). */
+    static int warned = 0;
+    if (getenv("YOS_STACK_CHK_IGNORE")) {
+        if (!warned) {
+            fprintf(stderr,
+                "yos: __stack_chk_fail (IGNORED — last bridge: %s)\n",
+                yos_brg_last_call ? yos_brg_last_call : "(none)");
+            warned = 1;
+        }
+        m3ApiSuccess();
+    }
+    fprintf(stderr,
+        "yos: __stack_chk_fail() — guest stack canary corrupted\n"
+        "yos: last bridge before trap: %s\n"
+        "yos: this is almost always a false positive from wasm-clang's\n"
+        "yos: default `-fstack-protector` scheme (reads canary from\n"
+        "yos: memory[0..3], which libc reuses); rebuild this package\n"
+        "yos: with `-fno-stack-protector` to silence the trap.\n",
+        yos_brg_last_call ? yos_brg_last_call : "(none)");
+    {
+        struct yos_exec_ctx *ctx =
+            (struct yos_exec_ctx *)m3_GetUserData(runtime);
         if (ctx) {
             uint32_t mem_size = 0;
             ctx->memory = m3_GetMemory(runtime, &mem_size, 0);
             ctx->memory_size = mem_size;
         }
         yos_brg_dump_ring(stderr, 256, ctx);
-    } else {
-        fprintf(stderr,
-            "yos: __stack_chk_fail (canary mismatch at frame exit — "
-            "guest output above is intact; set YOS_STACK_CHK_DEBUG=1 "
-            "for a bridge ring-dump)\n");
     }
     fflush(stderr);
-    fflush(stdout);
-    _Exit(0);
+    m3ApiTrap("__stack_chk_fail");
 }
 
 /* env.abort: nvim/libuv calls abort() on lots of unrecoverable paths
@@ -1302,6 +1307,14 @@ void yos_link_imports(IM3Module module, struct yos_exec_ctx *ctx)
      * We implement the compiler-rt-style __*tf* helpers in the host. */
     extern void yos_f128_link (IM3Module mod);
     yos_f128_link (module);
+
+    /* Soft-int128 builtins (__multi3, __ashlti3, __divti3, …). clang
+     * emits these whenever the guest does 128-bit integer arithmetic;
+     * openssh's client_loop ends up calling __multi3 / __ashlti3 in
+     * its session-counter timekeeping. Without these the wasm module
+     * fails to instantiate with "unresolved import env.__multi3". */
+    extern void yos_i128_link (IM3Module mod);
+    yos_i128_link (module);
 
     /* clang renames user main(int, char**) to __main_argc_argv and
      * emits a wrapper main(void) that's exported. Our crt1's call to

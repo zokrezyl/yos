@@ -312,9 +312,20 @@ stdenv.mkDerivation rec {
         --without-pam --without-selinux --without-libedit \
         --without-libcrypt --without-ldns --without-kerberos5 \
         --without-shadow --without-audit --without-sandbox \
+        --without-stackprotect \
         --disable-utmp --disable-wtmp --disable-lastlog \
         --disable-pututline --disable-pututxline --disable-strip \
         --without-privsep-user
+    # --without-stackprotect: clang's -fstack-protector for wasm32
+    # emits a canary load from memory[0..3], which on wasm-clang is
+    # the same slot wasm-libc uses for thread-state bookkeeping —
+    # any libc call between function entry and exit can change that
+    # word and trip a false-positive canary smash at frame exit
+    # ("__stack_chk_fail" in ssh's main when the remote command is
+    # otherwise done). wasm already bounds-checks every memory
+    # access; the canary adds nothing here. Same workaround applies
+    # to neovim — see build-tools/wasm-pkg/configs/nvim/build.sh
+    # patch 4b.
     runHook postConfigure
   '';
 

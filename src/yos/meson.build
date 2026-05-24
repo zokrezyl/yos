@@ -193,6 +193,7 @@ yos_runtime_sources = files(
   'impl/libc/callback.c',
   'impl/libc/cv_trace.c',
   'impl/libc/f128.c',
+  'impl/libc/i128.c',
   'impl/libc/freebsd_userland.c',
   'impl/libc/fmtcheck_freebsd.c',
   'impl/libc/kqueue.c',
