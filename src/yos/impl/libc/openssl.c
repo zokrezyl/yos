@@ -548,8 +548,9 @@ static const void *m3_yos_SSL_CTX_new(IM3Runtime rt, IM3ImportContext _c,
 static const void *m3_yos_SSL_CTX_free(IM3Runtime rt, IM3ImportContext _c,
                                        uint64_t *_sp, void *_m)
 {
+    /* "v(i)" — args at sp[0]; see comment above BR_RETPTR_NOARG. */
     (void)_c; (void)_m;
-    uint32_t h = (uint32_t)_sp[1];
+    uint32_t h = (uint32_t)_sp[0];
     SSL_CTX *sctx = (SSL_CTX *)ssl_handles_release(CTX(rt), h);
     ydebug("SSL_CTX_free(h=%u, p=%p)\n", h, (void *)sctx);
     if (sctx) SSL_CTX_free(sctx);
@@ -568,12 +569,12 @@ static const void *m3_yos_SSL_new(IM3Runtime rt, IM3ImportContext _c,
     return NULL;
 }
 
-/* env.SSL_free — void(ssl_handle) */
+/* env.SSL_free — void(ssl_handle). "v(i)" → arg at sp[0]. */
 static const void *m3_yos_SSL_free(IM3Runtime rt, IM3ImportContext _c,
                                    uint64_t *_sp, void *_m)
 {
     (void)_c; (void)_m;
-    SSL *ssl = (SSL *)ssl_handles_release(CTX(rt), (uint32_t)_sp[1]);
+    SSL *ssl = (SSL *)ssl_handles_release(CTX(rt), (uint32_t)_sp[0]);
     if (ssl) SSL_free(ssl);
     return NULL;
 }
@@ -2019,8 +2020,15 @@ static const void *m3_yos_EVP_MD_CTX_new(IM3Runtime rt, IM3ImportContext _c,
 static const void *m3_yos_EVP_MD_CTX_free(IM3Runtime rt, IM3ImportContext _c,
                                           uint64_t *_sp, void *_m)
 {
+    /* "v(i)" — args at sp[0] (not sp[1]; see comment above BR_RETPTR_NOARG).
+     * Reading sp[1] before this fix gave a stale value from an earlier
+     * bridge return slot, which on linux happened to fall in-range of
+     * ctx->ssl_handles, so ssl_handles_release returned the WRONG host
+     * EVP_MD_CTX *. The subsequent host EVP_MD_CTX_free called
+     * EVP_PKEY_CTX_free on that mismatched object's .pctx field —
+     * SIGSEGV inside libcrypto right after "Authenticating to ...". */
     (void)_c; (void)_m;
-    EVP_MD_CTX *mc = (EVP_MD_CTX *)ssl_handles_release(CTX(rt), (uint32_t)_sp[1]);
+    EVP_MD_CTX *mc = (EVP_MD_CTX *)ssl_handles_release(CTX(rt), (uint32_t)_sp[0]);
     if (mc) EVP_MD_CTX_free(mc);
     return NULL;
 }
