@@ -123,7 +123,23 @@ class TypeRegistry:
         return (c.spelling, int(c.kind.value))
 
     def register(self, ct, root_markers: list[str]) -> str:
-        kind = ct.kind
+        # Newer libclang (Apple's clang 16 ships kind 32 = _Float16; clang
+        # 17 ships kind 39 = BFloat16; kind 40 = Ibm128) exposes TypeKind
+        # ids the python clang bindings in the venv don't know about yet
+        # — accessing ct.kind then raises ValueError. Treat any unknown
+        # kind as an opaque byte blob of the right size; layout-driven
+        # comparison still works on it. We just lose the type name.
+        try:
+            kind = ct.kind
+        except ValueError:
+            uid = self._new_uid()
+            self.types[uid] = {
+                'kind': 'opaque',
+                'size': ct.get_size(),
+                'is_const': ct.is_const_qualified(),
+                'header': '',
+            }
+            return uid
 
         # Forward through elaborated wrappers without allocating a uid.
         if kind == TypeKind.ELABORATED:

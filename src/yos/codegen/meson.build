@@ -47,6 +47,12 @@ api_top_headers = [
   'pwd.h', 'grp.h', 'regex.h', 'search.h',
   'setjmp.h', 'assert.h', 'sched.h',
   'termios.h', 'utime.h',
+  # readpassphrase(3): BSD libc, declared in <readpassphrase.h>. ssh
+  # / sshd / ssh-add prompt for key passphrases through this; without
+  # the header in the walk the wasm guest's import declaration never
+  # makes it into guest-api.yaml and bridge.py emits no body — the
+  # module then fails to load with "unresolved import env.readpassphrase".
+  'readpassphrase.h',
 ]
 
 # Public subdir umbrellas. Listed by *filename*, not by *directory* —
@@ -258,11 +264,33 @@ yos_inc       = include_directories('../../..' / 'include')
 
 yos_impl_inc  = include_directories('..')
 
+# iOS sim: redirect the 6 libc symbols Apple marks `unavailable` in
+# the iPhoneSimulator SDK (system, drem, finite, gamma, significand,
+# clock_settime) to dlsym-backed forwarders. The codegen-emitted
+# bridges call those names directly, so we `-include` a shim header
+# only when building the bridge TU, and link in ios-unblock.c. See
+# build-tools/ios/ios-unblock.{h,c}.
+api_bridge_extra_sources = []
+api_bridge_extra_c_args  = []
+if get_option('ios_unblock')
+  ios_unblock_hdr = meson.project_source_root() / 'build-tools' / 'ios' / 'ios-unblock.h'
+  ios_unblock_src = files(meson.project_source_root() / 'build-tools' / 'ios' / 'ios-unblock.c')
+  api_bridge_extra_c_args += ['-include', ios_unblock_hdr]
+  api_bridge_extra_sources += ios_unblock_src
+endif
+if get_option('tvos_unblock')
+  tvos_unblock_hdr = meson.project_source_root() / 'build-tools' / 'tvos' / 'tvos-unblock.h'
+  tvos_unblock_src = files(meson.project_source_root() / 'build-tools' / 'tvos' / 'tvos-unblock.c')
+  api_bridge_extra_c_args += ['-include', tvos_unblock_hdr]
+  api_bridge_extra_sources += tvos_unblock_src
+endif
+
 api_bridge_lib = static_library(
   'yos_api_bridge',
   api_bridge_outputs[1],         # yos_bridge.c
   api_generate_outputs[1],       # yos_remap.c
   api_struct_convert_outputs[1], # yos_struct_convert.c
+  api_bridge_extra_sources,
   include_directories : [yos_types_inc, yos_inc, yos_impl_inc],
   dependencies        : [wasm3_dep],
   c_args : [
@@ -275,7 +303,7 @@ api_bridge_lib = static_library(
     '-Wno-int-conversion',
     '-Wno-unused-parameter',
     '-Wno-unused-variable',
-  ],
+  ] + api_bridge_extra_c_args,
   install : false,
 )
 

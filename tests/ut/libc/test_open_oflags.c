@@ -16,7 +16,7 @@
  *   saw uninitialised garbage for O_CLOEXEC and O_NONBLOCK), which
  *   silently broke libuv's pipe-style fds for nvim's IPC channel
  *   (tmp/nvim-runtime-issues.md). This test pins the host-O_* mapping
- *   in src/yos/impl/vfs.c:oflags_fb_to_lx and the #ifndef O_DIRECT/
+ *   in src/yos/impl/io/io.c:oflags_fb_to_lx and the #ifndef O_DIRECT/
  *   O_PATH guards for darwin's missing macros.
  *
  *   The mode 0600 below is a conservative perm — we don't want to leak
@@ -28,7 +28,7 @@
 typedef unsigned int  size_t;
 typedef int           ssize_t;
 
-/* FreeBSD O_* numeric values — mirrors src/yos/impl/vfs.c FB_O_*. */
+/* FreeBSD O_* numeric values — mirrors src/yos/impl/io/io.c FB_O_*. */
 #define FB_O_RDWR         2
 #define FB_O_NONBLOCK     0x00000004
 #define FB_O_CREAT        0x00000200

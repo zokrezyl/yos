@@ -7,6 +7,11 @@
 # Output: <build>/sysroot/usr/include -> symlink to FreeBSD's curated
 # usr/include tree. Meson invokes us; <build> is meson.project_build_root().
 set -euo pipefail
+
+# Apple's /usr/bin/clang has no wasm32 backend; use the wasm-clang
+# shim (honours $YOS_WASM_CLANG) so this works outside nix-develop too.
+WASM_CLANG="${YOS_WASM_CLANG:-$(dirname "$0")/../wasm-clang}"
+
 freebsd_in="$(readlink -f "$1")"   # absolutise — the symlink we make below
                                     # would otherwise be relative to the
                                     # sysroot dir and dangle.
@@ -27,7 +32,7 @@ mkdir -p "$sysroot_out/usr/lib"
 empty_o="$sysroot_out/usr/lib/.empty.o"
 empty_c="$sysroot_out/usr/lib/.empty.c"
 : > "$empty_c"
-clang -target wasm32-unknown-unknown -nostdlib -c "$empty_c" -o "$empty_o" \
+"$WASM_CLANG" -target wasm32-unknown-unknown -nostdlib -c "$empty_c" -o "$empty_o" \
     || { echo "skel.sh: clang failed compiling empty stub" >&2; exit 1; }
 
 # yos_libc_init.o — FreeBSD's _DefaultRuneLocale ctype table, compiled
@@ -38,7 +43,7 @@ clang -target wasm32-unknown-unknown -nostdlib -c "$empty_c" -o "$empty_o" \
 # the runetype table reads as 0xff (uninit memory) → isspace('y')→true.
 yos_libc_init_o="$sysroot_out/usr/lib/.yos_libc_init.o"
 yos_libc_init_c="$(dirname "$0")/../wasm-pkg/configs/nvim/yos_libc_init.c"
-clang -target wasm32-unknown-unknown -nostdlib -nostdinc \
+"$WASM_CLANG" -target wasm32-unknown-unknown -nostdlib -nostdinc \
       --sysroot="$sysroot_out" \
       -isystem "$sysroot_out/usr/include" \
       -O2 -c "$yos_libc_init_c" -o "$yos_libc_init_o" \
@@ -128,7 +133,7 @@ void _start(void) {
     exit(rc);
 }
 EOF
-clang -target wasm32-unknown-unknown -nostdlib -O2 -c "$crt1_c" -o "$crt1_o" \
+"$WASM_CLANG" -target wasm32-unknown-unknown -nostdlib -O2 -c "$crt1_c" -o "$crt1_o" \
     || { echo "skel.sh: clang failed compiling crt1" >&2; exit 1; }
 rm -f "$crt1_c"
 

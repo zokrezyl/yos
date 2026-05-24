@@ -58,18 +58,26 @@ def _umbrella_libexec(repo: str) -> str | None:
     return None
 
 
-def _expected_user_group():
-    uid, gid = os.getuid(), os.getgid()
+def _resolve_uid_gid_name(path):
+    """Return (uname, gname) for `path` based on the file's ACTUAL
+    uid/gid, not the process's. On macOS the tempdir under
+    /var/folders/.../T has the sgid bit set, so files created
+    there inherit the group of T (often 'wheel'), not the process's
+    primary group ('staff'). Reading per-file stat picks up whatever
+    the kernel actually wrote. Falls back to the numeric id when
+    NSS doesn't resolve the name (rare on darwin's DirectoryServices
+    where /etc/passwd often lacks regular users)."""
+    st = os.stat(path)
     try:
         import pwd
-        uname = pwd.getpwuid(uid).pw_name
+        uname = pwd.getpwuid(st.st_uid).pw_name
     except KeyError:
-        uname = str(uid)
+        uname = str(st.st_uid)
     try:
         import grp
-        gname = grp.getgrgid(gid).gr_name
+        gname = grp.getgrgid(st.st_gid).gr_name
     except KeyError:
-        gname = str(gid)
+        gname = str(st.st_gid)
     return uname, gname
 
 
@@ -152,6 +160,14 @@ def main():
         env["LANG"] = "C"
         env["LC_ALL"] = "C"
         cmd = [yos, zsh, "-fc", f"cd '{td}' && ls -alrt"]
+        # Capture per-file uid/gid BEFORE the subprocess starts (which
+        # would close `td`'s context if we waited). See
+        # _resolve_uid_gid_name's docstring for why we can't use
+        # os.getgid() instead.
+        expected_ug = {
+            name: _resolve_uid_gid_name(os.path.join(td, name))
+            for name in ("alpha.txt", "bravo.sh", "subdir", "link2alpha")
+        }
         r = subprocess.run(cmd, env=env, capture_output=True, timeout=30)
 
     if r.returncode != 0:
@@ -161,7 +177,6 @@ def main():
         sys.exit(1)
 
     out = r.stdout.decode(errors="replace")
-    uname, gname = _expected_user_group()
 
     problems = []
     lines = out.splitlines()
@@ -224,10 +239,11 @@ def main():
             continue
         if row["mode"] != mode:
             problems.append(f"{name}: mode={row['mode']!r} want={mode!r}")
-        if row["user"] != uname:
-            problems.append(f"{name}: user={row['user']!r} want={uname!r}")
-        if row["group"] != gname:
-            problems.append(f"{name}: group={row['group']!r} want={gname!r}")
+        want_u, want_g = expected_ug.get(name, (None, None))
+        if want_u and row["user"] != want_u:
+            problems.append(f"{name}: user={row['user']!r} want={want_u!r}")
+        if want_g and row["group"] != want_g:
+            problems.append(f"{name}: group={row['group']!r} want={want_g!r}")
         want_sz = want_size.get(name)
         if want_sz is not None and int(row["size"]) != want_sz:
             problems.append(f"{name}: size={row['size']!r} want={want_sz!r}")

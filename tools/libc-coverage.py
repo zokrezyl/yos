@@ -50,7 +50,7 @@ def collect_extra_link_names(bridge_c_path):
     impl/freebsd_userland.c, impl/proc.c's m3_execvp etc.) PLUS the
     auto-generated yos_bridge.c. The latter is critical because many
     bridges (write, read, open, …) have their implementations in
-    impl/vfs.c — they don't appear as yos_<name> bodies inside
+    impl/io/io.c — they don't appear as yos_<name> bodies inside
     yos_bridge.c itself, only as m3_LinkRawFunction → m3w_<name> →
     yos_<name>() call sites. Without scanning the bridge C the
     aggregator misclassifies those names as 'missing'."""

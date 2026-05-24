@@ -115,11 +115,20 @@ zsh_int_tests = {
   # owner + group + size + -t ordering) on lines we know the exact
   # value for — catches strmode / user_from_uid / group_from_gid /
   # struct stat layout regressions before they look like "ls output
-  # is mangled" to the user. Also pins the absence of the
-  # 'yos-tool: ./X: Success' fts info-leak warning that's still
-  # surfacing on the first entry of large directories.
+  # is mangled" to the user.
+  #
+  # The 'yos-tool: ./X: Undefined error: 0' fts info-leak that this
+  # test caught earlier is FIXED — the regression net for that
+  # specific bug now lives in tests/ut/libc/test_lpathconf_errno.c
+  # (the bridge contract: yos_lpathconf must set wasm errno on
+  # failure). Re-running the integration test directly passes.
+  #
+  # The test now stat()s each file individually for its expected
+  # uid/gid (was using os.getgid() — wrong on macOS where /var/folders
+  # tempdirs carry the sgid bit and inherit 'wheel' onto new files
+  # rather than the process's primary group). xfail:false.
   'ls-output'           : {'src' : files('test_ls_output.py'),
-                           'xfail' : true},
+                           'xfail' : false},
 }
 
 # Pty-driven tests with hard-coded timing windows; run serially so
@@ -161,3 +170,19 @@ foreach name, cfg : zsh_int_tests
        is_parallel : not _serial_zsh.get(name, false),
        timeout : 30)
 endforeach
+
+# tvOS-only round-trip test: drives a wasm zsh on a paired Apple TV
+# over telnet. Skipped automatically (exit 0 with "SKIP: ...") when
+# YOS_TVOS_LAN_IP isn't set or the device isn't reachable, so it's
+# safe to keep in the default suite — it's a no-op on CI / hosts
+# without a tvOS device. Set YOS_TVOS_LAN_IP=192.168.1.9 (or use
+# build-tools/tvos/deploy.sh which gives the IP in its banner) to
+# enable the live-device check.
+test('zsh-tvos-telnet',
+     py3,
+     args : files('test_tvos_telnet.py'),
+     suite : 'integration-zsh',
+     env : zsh_int_env,
+     should_fail : false,
+     is_parallel : false,
+     timeout : 60)

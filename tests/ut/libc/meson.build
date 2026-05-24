@@ -47,6 +47,7 @@ libc_tests = [
   'test_socketpair_flags',
   'test_fcntl_dupfd_cloexec',
   'test_dup2_pipe_pair',
+  'test_closefrom_preserves_stdio',
   'test_socketpair_sotype_isatty',
   'test_kqueue_evfilt_read',
   'test_ioctl_fionbio',
@@ -90,6 +91,77 @@ libc_tests = [
   # glibc has no equivalent and the codegen ENOSYS stub left every
   # ls -l line with a blank mode column.
   'test_strmode',
+  # yos_lpathconf bridge errno contract — pins the fix for the fts
+  # info-leak ls printed before yos_lpathconf called yos_errno_neg
+  # ("./<file>: Undefined error: 0"). See impl/libc/posix.c::yos_lpathconf.
+  'test_lpathconf_errno',
+  # fopen → fileno → fstat round-trip. Pre-fix yos_fileno returned
+  # the host fd, which couldn't be looked up in ctx->fd_map; every
+  # subsequent fstat/read/fcntl EBADF'd. ssh's "fstat /Users/.../
+  # .ssh/config: Bad file descriptor" pinned by this test.
+  'test_fopen_fileno_fstat',
+  # lstat on a symlink: AT_SYMLINK_NOFOLLOW must be translated to
+  # the host's bit (FreeBSD 0x200 → darwin 0x20) so the call
+  # doesn't collapse to stat(). And the result's mode bits must be
+  # normalised to 0777 (FreeBSD contract) regardless of what the
+  # host lstat returns. ls used to display symlinks as regular
+  # files because both pieces were broken.
+  'test_symlink_lstat_perms',
+  # user_from_uid + group_from_gid must use SEPARATE wasm scratch
+  # buffers. ls's `printf("%s %s", uname, gname)` evaluated both
+  # before printf; pre-fix they wrote into one shared buffer and
+  # ls displayed `staff staff` for every file.
+  'test_pwd_user_group_distinct',
+  # getline(): reads lines from a FILE* — used by ssh's config
+  # parser. Was stubbed -ENOSYS; ssh got zero lines from
+  # ~/.ssh/config and tried to DNS-resolve every Host alias.
+  'test_getline_basic',
+  # ssh libc-surface pins. The ytrace of `ssh nixem` shows 47 distinct
+  # libc imports; the entries below cover the non-trivial ones (BSD
+  # string ops, secret scrubbing, address resolution, host/services
+  # DB, randomness, set-uid detection). The pure mem/str passthroughs
+  # are covered by test_libc_coverage and test_write_passthrough.
+  'test_ssh_explicit_bzero',
+  'test_ssh_str_bsd',
+  'test_ssh_arc4random_buf',
+  'test_ssh_getaddrinfo_localhost',
+  'test_ssh_gethostname',
+  'test_ssh_issetugid',
+  'test_ssh_getservbyname',
+  'test_ssh_ppoll',
+  # /dev/null pollability — darwin returns POLLNVAL where Linux
+  # returns POLLIN. ssh dups stdin and polls it; when stdin is
+  # /dev/null (cron, non-interactive shells, `ssh host cmd </dev/null`),
+  # the POLLNVAL trips ssh's fatal "invalid rfd pollfd[N]" check.
+  # yos_poll detects regular-file / /dev/null fds via fstat and
+  # synthesises POLLIN|POLLOUT.
+  'test_ssh_poll_dev_null',
+  # dup/dup2/close cycle ssh runs against stdio when setting up its
+  # session channel. A bug where close on the source kills the dup
+  # poisons every subsequent write to the session.
+  'test_ssh_dup_stdio',
+  # socket → bind → listen → connect → accept → getsockname /
+  # getpeername / setsockopt / getsockopt. The same dance ssh runs
+  # to set up its TCP connection. Pins the darwin sockaddr family
+  # byte position (sa_family @ byte 1, not @ uint16 little-endian
+  # @0/1 like Linux).
+  'test_ssh_socket_loopback',
+  # sigaction + sigprocmask round-trip on the FreeBSD 16-byte
+  # sigset_t. ssh wraps every channel-loop iteration in these.
+  'test_ssh_sigaction_mask',
+  # atoi / timingsafe_bcmp / memcmp / memmove / memchr / umask /
+  # getpid / getuid / time / clock_gettime / setlocale.
+  'test_ssh_misc_libc',
+  # strlen/strcmp/strncmp/str*casecmp/strchr/strrchr/strcpy.
+  'test_ssh_string_basic',
+  # malloc/calloc/realloc/free contracts ssh leans on for channel
+  # state and packet buffers.
+  'test_ssh_alloc_basic',
+  # readpassphrase(3) — BSD libc, not in glibc, missed by the darwin
+  # host-API extractor. ssh / sshd / ssh-add prompt for key passphrases
+  # through this and trap with "unresolved import env.readpassphrase"
+  # without the hand bridge.
+  'test_ssh_readpassphrase',
 ]
 
 # Path to the generator's output dir, exposed by src/yos/codegen.

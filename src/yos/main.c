@@ -20,10 +20,12 @@
 #include "yos/types.h"
 #include <yos/ytrace/ytrace.h>
 #include <yos/yperf/yperf.h>
+#ifdef YOS_HAVE_YCTL
 #include <yos/yctl/yctl.h>
+#endif
 #include "yos/vfs/mount.h"
 #include "yos/vfs/procfs.h"
-#include "impl/pthread.h"
+#include "impl/proc/pthread.h"
 
 /* Legacy yos-private number-indexed dispatcher REMOVED — see CLAUDE.md
  * non-negotiable #5. The wasm guest must import each libc function by
@@ -52,6 +54,12 @@ extern int32_t yos_vsprintf(struct yos_exec_ctx *ctx,
                             uint32_t dst, uint32_t fmt, uint32_t va);
 extern int32_t yos_vsnprintf(struct yos_exec_ctx *ctx,
                              uint32_t dst, uint32_t n, uint32_t fmt, uint32_t va);
+extern int32_t yos_scanf  (struct yos_exec_ctx *ctx,
+                           uint32_t fmt, uint32_t va);
+extern int32_t yos_fscanf (struct yos_exec_ctx *ctx,
+                           uint32_t fp, uint32_t fmt, uint32_t va);
+extern int32_t yos_sscanf (struct yos_exec_ctx *ctx,
+                           uint32_t src, uint32_t fmt, uint32_t va);
 
 /* exec family — must trap to unwind out of wasm so the host's exec
  * pump can load the new module. yos_execve* set exec_pending=1 and
@@ -144,6 +152,32 @@ static m3ApiRawFunction(m3_vsprintf) {
     struct yos_exec_ctx *ctx = (struct yos_exec_ctx *)m3_GetUserData(runtime);
     pfx_refresh(runtime, ctx);
     m3ApiReturn(yos_vsprintf(ctx, dst, fmt, va));
+}
+static m3ApiRawFunction(m3_scanf) {
+    m3ApiReturnType(int32_t);
+    m3ApiGetArg(uint32_t, fmt); m3ApiGetArg(uint32_t, va);
+    struct yos_exec_ctx *ctx = (struct yos_exec_ctx *)m3_GetUserData(runtime);
+    pfx_refresh(runtime, ctx);
+    PFX_TRACE("scanf");
+    m3ApiReturn(yos_scanf(ctx, fmt, va));
+}
+static m3ApiRawFunction(m3_fscanf) {
+    m3ApiReturnType(int32_t);
+    m3ApiGetArg(uint32_t, fp); m3ApiGetArg(uint32_t, fmt);
+    m3ApiGetArg(uint32_t, va);
+    struct yos_exec_ctx *ctx = (struct yos_exec_ctx *)m3_GetUserData(runtime);
+    pfx_refresh(runtime, ctx);
+    PFX_TRACE("fscanf");
+    m3ApiReturn(yos_fscanf(ctx, fp, fmt, va));
+}
+static m3ApiRawFunction(m3_sscanf) {
+    m3ApiReturnType(int32_t);
+    m3ApiGetArg(uint32_t, src); m3ApiGetArg(uint32_t, fmt);
+    m3ApiGetArg(uint32_t, va);
+    struct yos_exec_ctx *ctx = (struct yos_exec_ctx *)m3_GetUserData(runtime);
+    pfx_refresh(runtime, ctx);
+    PFX_TRACE("sscanf");
+    m3ApiReturn(yos_sscanf(ctx, src, fmt, va));
 }
 static m3ApiRawFunction(m3_vsnprintf) {
     m3ApiReturnType(int32_t);
@@ -317,15 +351,13 @@ const char *yos_brg_last_call = "<none>";
  * channel_job_start path — the parent and the asyncify-fork "child"
  * both run host glibc concurrently, and any FILE-table or stdio
  * race shows up as a smashed canary later. */
-#define YOS_BRG_RING 1024
-struct yos_brg_rec {
-    const char *name;
-    pid_t       tid;
-    uint64_t    seq;
-    uint64_t    args[4];          /* up to 4 first wasm-ABI args (raw u32 widened) */
-};
-static struct yos_brg_rec yos_brg_ring[YOS_BRG_RING];
-static _Atomic uint64_t   yos_brg_ring_seq = 0;
+/* Bridge call-ring + its sequence counter + last-call-name pointer:
+ * defined here, declared in impl/main-internal.h so the platform
+ * crash handlers (main-macos.c) can dump it without duplicating the
+ * structure layout. */
+#include "impl/main-internal.h"
+struct yos_brg_rec yos_brg_ring[YOS_BRG_RING];
+_Atomic uint64_t   yos_brg_ring_seq = 0;
 /* Most-recently-recorded slot, so per-bridge `_sp` peeks land in the
  * right slot. yos_brg_record advances the global sequence and
  * stores its index here for the bridge to fill in args. */
@@ -555,288 +587,9 @@ void yos_brg_dump_handler(int sig)
     (void)close(fd);
 }
 
-#ifdef __APPLE__
-/* ── Darwin Mach exception handler ──────────────────────────────────
- *
- * On macOS, synchronous CPU faults (illegal instruction, bad access,
- * arithmetic) are routed through the Mach exception subsystem BEFORE
- * the BSD signal layer ever runs. If no Mach handler is registered,
- * the kernel hands the exception to ReportCrash and the process dies
- * with the BSD signal recorded in waitpid(2)'s status, but our POSIX
- * sigaction handler is never invoked — we get no register dump, no
- * faulting PC, no diagnostic at all.
- *
- * Catching it requires:
- *   1. A Mach port to receive exception messages on
- *   2. task_set_exception_ports() to route synchronous faults there
- *   3. A dedicated thread that mach_msg-loops on the port, dumps the
- *      faulting thread's register state, then _exit()s.
- */
-
-#include <mach/mach.h>
-#include <mach/exception_types.h>
-#include <mach/thread_status.h>
-#include <pthread.h>
-#include <dlfcn.h>
-
-/* Layout of an EXCEPTION_DEFAULT|MACH_EXCEPTION_CODES request, mirrors
- * what MIG would generate from mach_exc.defs. We avoid pulling in MIG
- * so the build doesn't need a generated stub library. */
-typedef struct {
-    mach_msg_header_t           Head;
-    mach_msg_body_t             msgh_body;
-    mach_msg_port_descriptor_t  thread;
-    mach_msg_port_descriptor_t  task;
-    NDR_record_t                NDR;
-    exception_type_t            exception;
-    mach_msg_type_number_t      codeCnt;
-    int64_t                     code[2];
-    char                        pad[64];   /* trailer + slack */
-} yos_mach_exc_request_t;
-
-static mach_port_t yos_mach_exc_port = MACH_PORT_NULL;
-
-static void yos_mach_dump_crash(int sig, exception_type_t exc,
-                                int64_t code0, int64_t code1,
-                                mach_port_t thread)
-{
-    int fd = open("/tmp/yos-host-crash.log",
-                  O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    if (fd < 0) return;
-    char buf[1024];
-    int n = snprintf(buf, sizeof buf,
-                     "yos: HOST CRASH (mach) signal=%d exc=%d "
-                     "code0=0x%llx code1=0x%llx last_bridge=%s\n",
-                     sig, (int)exc,
-                     (long long)code0, (long long)code1,
-                     yos_brg_last_call ? yos_brg_last_call : "<none>");
-    if (n > 0) (void)!write(fd, buf, (size_t)n);
-
-    /* Resolve faulting address (code1) via dladdr — tells us which dylib
-     * / function the crashing thread was inside. */
-    {
-        Dl_info dli;
-        if (code1 && dladdr((void *)(uintptr_t)code1, &dli)) {
-            n = snprintf(buf, sizeof buf,
-                         "  code1.dli: file=%s sym=%s sym_addr=%p base=%p\n",
-                         dli.dli_fname ? dli.dli_fname : "?",
-                         dli.dli_sname ? dli.dli_sname : "?",
-                         dli.dli_saddr, dli.dli_fbase);
-            if (n > 0) (void)!write(fd, buf, (size_t)n);
-        }
-    }
-
-#if defined(__x86_64__)
-    x86_thread_state64_t st;
-    mach_msg_type_number_t cnt = x86_THREAD_STATE64_COUNT;
-    if (thread_get_state(thread, x86_THREAD_STATE64,
-                         (thread_state_t)&st, &cnt) == KERN_SUCCESS) {
-        n = snprintf(buf, sizeof buf,
-            "  rip=0x%llx rflags=0x%llx\n"
-            "  rsp=0x%llx rbp=0x%llx\n"
-            "  rax=0x%llx rbx=0x%llx rcx=0x%llx rdx=0x%llx\n"
-            "  rdi=0x%llx rsi=0x%llx  r8=0x%llx  r9=0x%llx\n"
-            "  r10=0x%llx r11=0x%llx r12=0x%llx r13=0x%llx\n"
-            "  r14=0x%llx r15=0x%llx\n",
-            (unsigned long long)st.__rip, (unsigned long long)st.__rflags,
-            (unsigned long long)st.__rsp, (unsigned long long)st.__rbp,
-            (unsigned long long)st.__rax, (unsigned long long)st.__rbx,
-            (unsigned long long)st.__rcx, (unsigned long long)st.__rdx,
-            (unsigned long long)st.__rdi, (unsigned long long)st.__rsi,
-            (unsigned long long)st.__r8,  (unsigned long long)st.__r9,
-            (unsigned long long)st.__r10, (unsigned long long)st.__r11,
-            (unsigned long long)st.__r12, (unsigned long long)st.__r13,
-            (unsigned long long)st.__r14, (unsigned long long)st.__r15);
-        if (n > 0) (void)!write(fd, buf, (size_t)n);
-
-        /* Dump 32 bytes at faulting PC, useful to spot a 0xCC int3 or
-         * a 0x0f 0x0b ud2 (clang's __builtin_trap). */
-        unsigned char ib[32];
-        if (st.__rip) {
-            vm_size_t got = 0;
-            kern_return_t kr = vm_read_overwrite(
-                mach_task_self(), (vm_address_t)st.__rip,
-                sizeof ib, (vm_address_t)ib, &got);
-            if (kr == KERN_SUCCESS && got > 0) {
-                int off = snprintf(buf, sizeof buf, "  bytes@rip:");
-                for (vm_size_t i = 0; i < got && off + 4 < (int)sizeof buf; i++) {
-                    off += snprintf(buf + off, sizeof buf - off,
-                                    " %02x", ib[i]);
-                }
-                if (off + 1 < (int)sizeof buf) buf[off++] = '\n';
-                (void)!write(fd, buf, (size_t)off);
-            }
-        }
-        /* Resolve RIP and RAX through dladdr too — pinpoint the
-         * crashing function and the indirect-call target. */
-        Dl_info dli;
-        if (st.__rip && dladdr((void *)(uintptr_t)st.__rip, &dli)) {
-            n = snprintf(buf, sizeof buf,
-                         "  rip.dli: file=%s sym=%s sym_addr=%p base=%p off=0x%lx\n",
-                         dli.dli_fname ? dli.dli_fname : "?",
-                         dli.dli_sname ? dli.dli_sname : "?",
-                         dli.dli_saddr, dli.dli_fbase,
-                         (unsigned long)((uintptr_t)st.__rip
-                             - (uintptr_t)dli.dli_saddr));
-            if (n > 0) (void)!write(fd, buf, (size_t)n);
-        }
-        if (st.__rax && dladdr((void *)(uintptr_t)st.__rax, &dli)) {
-            n = snprintf(buf, sizeof buf,
-                         "  rax.dli: file=%s sym=%s sym_addr=%p base=%p\n",
-                         dli.dli_fname ? dli.dli_fname : "?",
-                         dli.dli_sname ? dli.dli_sname : "?",
-                         dli.dli_saddr, dli.dli_fbase);
-            if (n > 0) (void)!write(fd, buf, (size_t)n);
-        }
-    }
-#elif defined(__arm64__) || defined(__aarch64__)
-    arm_thread_state64_t st;
-    mach_msg_type_number_t cnt = ARM_THREAD_STATE64_COUNT;
-    if (thread_get_state(thread, ARM_THREAD_STATE64,
-                         (thread_state_t)&st, &cnt) == KERN_SUCCESS) {
-        n = snprintf(buf, sizeof buf,
-            "  pc=0x%llx sp=0x%llx fp=0x%llx lr=0x%llx cpsr=0x%x\n",
-            (unsigned long long)__darwin_arm_thread_state64_get_pc(st),
-            (unsigned long long)__darwin_arm_thread_state64_get_sp(st),
-            (unsigned long long)__darwin_arm_thread_state64_get_fp(st),
-            (unsigned long long)__darwin_arm_thread_state64_get_lr(st),
-            (unsigned)st.__cpsr);
-        if (n > 0) (void)!write(fd, buf, (size_t)n);
-        for (int i = 0; i < 29; i += 4) {
-            n = snprintf(buf, sizeof buf,
-                "  x%02d=0x%llx x%02d=0x%llx x%02d=0x%llx x%02d=0x%llx\n",
-                i,   (unsigned long long)st.__x[i],
-                i+1, (unsigned long long)st.__x[i+1],
-                i+2, (unsigned long long)st.__x[i+2],
-                i+3, (unsigned long long)st.__x[i+3]);
-            if (n > 0) (void)!write(fd, buf, (size_t)n);
-        }
-    }
-#endif
-
-    /* Dump the recent bridge ring — tells us which libc bridge the
-     * guest had just called. */
-    uint64_t end = atomic_load(&yos_brg_ring_seq);
-    int dump = 30;
-    if ((uint64_t)dump > end) dump = (int)end;
-    for (int i = 0; i < dump; i++) {
-        uint64_t s = end - 1 - i;
-        struct yos_brg_rec *r = &yos_brg_ring[s % YOS_BRG_RING];
-        n = snprintf(buf, sizeof buf,
-                     "  #%d tid=%d %-14s a0=%lx a1=%lx a2=%lx a3=%lx\n",
-                     (int)(end - r->seq), (int)r->tid,
-                     r->name ? r->name : "?",
-                     (unsigned long)r->args[0],
-                     (unsigned long)r->args[1],
-                     (unsigned long)r->args[2],
-                     (unsigned long)r->args[3]);
-        if (n > 0) (void)!write(fd, buf, (size_t)n);
-    }
-    fsync(fd);
-    (void)close(fd);
-}
-
-static void *yos_mach_exc_thread(void *arg)
-{
-    (void)arg;
-    /* Don't let this thread itself be caught by our own port — would
-     * deadlock. Set its per-thread exception ports to MACH_PORT_NULL
-     * so it falls back to system default (kills process). */
-    thread_set_exception_ports(mach_thread_self(),
-        EXC_MASK_BAD_INSTRUCTION | EXC_MASK_BAD_ACCESS |
-            EXC_MASK_ARITHMETIC | EXC_MASK_BREAKPOINT,
-        MACH_PORT_NULL,
-        EXCEPTION_DEFAULT, THREAD_STATE_NONE);
-
-    for (;;) {
-        yos_mach_exc_request_t req;
-        kern_return_t kr = mach_msg(&req.Head,
-                                    MACH_RCV_MSG | MACH_RCV_LARGE,
-                                    0,
-                                    sizeof req,
-                                    yos_mach_exc_port,
-                                    MACH_MSG_TIMEOUT_NONE,
-                                    MACH_PORT_NULL);
-        if (kr != KERN_SUCCESS) continue;
-
-        int sig = SIGILL;
-        switch (req.exception) {
-        case EXC_BAD_INSTRUCTION: sig = SIGILL;  break;
-        case EXC_BAD_ACCESS:      sig = SIGSEGV; break;
-        case EXC_ARITHMETIC:      sig = SIGFPE;  break;
-        case EXC_BREAKPOINT:      sig = SIGTRAP; break;
-        default:                  sig = SIGILL;  break;
-        }
-        yos_mach_dump_crash(sig, req.exception,
-                            req.code[0], req.code[1],
-                            req.thread.name);
-        _exit(128 + sig);
-    }
-    return NULL;
-}
-
-static void yos_mach_install_exc_handler(void)
-{
-    int dbg = open("/tmp/yos-startup.log",
-                   O_WRONLY | O_CREAT | O_APPEND, 0644);
-    char b[256];
-
-    kern_return_t kr = mach_port_allocate(mach_task_self(),
-                                          MACH_PORT_RIGHT_RECEIVE,
-                                          &yos_mach_exc_port);
-    if (kr != KERN_SUCCESS) {
-        if (dbg >= 0) {
-            int n = snprintf(b, sizeof b,
-                             "mach_port_allocate failed: %d\n", kr);
-            (void)!write(dbg, b, (size_t)n);
-            (void)close(dbg);
-        }
-        return;
-    }
-    kr = mach_port_insert_right(mach_task_self(), yos_mach_exc_port,
-                                yos_mach_exc_port,
-                                MACH_MSG_TYPE_MAKE_SEND);
-    if (kr != KERN_SUCCESS) {
-        if (dbg >= 0) {
-            int n = snprintf(b, sizeof b,
-                             "mach_port_insert_right failed: %d\n", kr);
-            (void)!write(dbg, b, (size_t)n);
-            (void)close(dbg);
-        }
-        return;
-    }
-    kr = task_set_exception_ports(mach_task_self(),
-        EXC_MASK_BAD_INSTRUCTION | EXC_MASK_BAD_ACCESS |
-            EXC_MASK_ARITHMETIC | EXC_MASK_BREAKPOINT,
-        yos_mach_exc_port,
-        EXCEPTION_DEFAULT | MACH_EXCEPTION_CODES,
-        THREAD_STATE_NONE);
-    if (kr != KERN_SUCCESS) {
-        if (dbg >= 0) {
-            int n = snprintf(b, sizeof b,
-                             "task_set_exception_ports failed: %d\n", kr);
-            (void)!write(dbg, b, (size_t)n);
-            (void)close(dbg);
-        }
-        return;
-    }
-
-    pthread_attr_t attr;
-    pthread_attr_init(&attr);
-    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
-    pthread_t t;
-    int rc = pthread_create(&t, &attr, yos_mach_exc_thread, NULL);
-    pthread_attr_destroy(&attr);
-
-    if (dbg >= 0) {
-        int n = snprintf(b, sizeof b,
-                         "yos-mach-exc installed pthread_create=%d port=%u\n",
-                         rc, (unsigned)yos_mach_exc_port);
-        (void)!write(dbg, b, (size_t)n);
-        (void)close(dbg);
-    }
-}
-#endif /* __APPLE__ */
+/* Mach exception port handler + sigaltstack helper: declarations in
+ * impl/main-internal.h; implementations in impl/main-{macos,linux,
+ * darwin-app}.c — meson selects the right slice per host. */
 
 static int main_get_asyncify_state(IM3Runtime rt);
 
@@ -858,6 +611,25 @@ static int main_get_asyncify_state(IM3Runtime rt);
  * don't print the scary backtrace each time. */
 static m3ApiRawFunction(m3_yos_stack_chk_fail)
 {
+    /* env.__stack_chk_fail: clang's stack-protector emits a call here
+     * when the canary at function entry doesn't match at function
+     * exit. On wasm32, clang has no `__stack_chk_guard` global to
+     * compare against — its default scheme is to read the canary
+     * value from `*(int *)0` (i.e. memory[0..3]). That same slot is
+     * what most wasm libcs use for thread-local bookkeeping, so any
+     * libc call that touches it between function entry and exit
+     * trips a guaranteed false-positive canary smash.
+     *
+     * The fix lives in each wasm-pkg's build flags:
+     *   - openssh/default.nix passes  --without-stackprotect
+     *   - build-tools/wasm-pkg/configs/nvim/build.sh patches  -fno-stack-protector
+     *   - build-tools/wasm-pkg/configs/lua/build.sh passes    -fno-stack-protector
+     * Add the same to any new wasm package you bring up. If you see
+     * this trap, the package needs the equivalent flag.
+     *
+     * YOS_STACK_CHK_IGNORE=1 silences (m3ApiSuccess; the next opcode
+     * is `unreachable` because clang knows we're noreturn, so the
+     * caller still traps — useful only as a debug aid). */
     static int warned = 0;
     if (getenv("YOS_STACK_CHK_IGNORE")) {
         if (!warned) {
@@ -870,7 +642,11 @@ static m3ApiRawFunction(m3_yos_stack_chk_fail)
     }
     fprintf(stderr,
         "yos: __stack_chk_fail() — guest stack canary corrupted\n"
-        "yos: last bridge before trap: %s\n",
+        "yos: last bridge before trap: %s\n"
+        "yos: this is almost always a false positive from wasm-clang's\n"
+        "yos: default `-fstack-protector` scheme (reads canary from\n"
+        "yos: memory[0..3], which libc reuses); rebuild this package\n"
+        "yos: with `-fno-stack-protector` to silence the trap.\n",
         yos_brg_last_call ? yos_brg_last_call : "(none)");
     {
         struct yos_exec_ctx *ctx =
@@ -1532,6 +1308,14 @@ void yos_link_imports(IM3Module module, struct yos_exec_ctx *ctx)
     extern void yos_f128_link (IM3Module mod);
     yos_f128_link (module);
 
+    /* Soft-int128 builtins (__multi3, __ashlti3, __divti3, …). clang
+     * emits these whenever the guest does 128-bit integer arithmetic;
+     * openssh's client_loop ends up calling __multi3 / __ashlti3 in
+     * its session-counter timekeeping. Without these the wasm module
+     * fails to instantiate with "unresolved import env.__multi3". */
+    extern void yos_i128_link (IM3Module mod);
+    yos_i128_link (module);
+
     /* clang renames user main(int, char**) to __main_argc_argv and
      * emits a wrapper main(void) that's exported. Our crt1's call to
      * main(argc, argv) therefore becomes env.__main_argc_argv. Bind
@@ -1548,6 +1332,9 @@ void yos_link_imports(IM3Module module, struct yos_exec_ctx *ctx)
     m3_LinkRawFunction(module, "env", "vfprintf",  "i(iii)",  m3_vfprintf);
     m3_LinkRawFunction(module, "env", "vsprintf",  "i(iii)",  m3_vsprintf);
     m3_LinkRawFunction(module, "env", "vsnprintf", "i(iiii)", m3_vsnprintf);
+    m3_LinkRawFunction(module, "env", "scanf",     "i(ii)",   m3_scanf);
+    m3_LinkRawFunction(module, "env", "fscanf",    "i(iii)",  m3_fscanf);
+    m3_LinkRawFunction(module, "env", "sscanf",    "i(iii)",  m3_sscanf);
 
     /* Per-ctx libc-globals isolation (build-tools/libbridge/policies/libc.yaml).
      *
@@ -1577,9 +1364,14 @@ void yos_link_imports(IM3Module module, struct yos_exec_ctx *ctx)
 
     /* libpython 3.12 — env.Py_Initialize / Py_Finalize / PyRun_SimpleString.
      * The yos host links against libpython3.12.so; the wasm guest is a
-     * tiny driver that imports these names. See impl/libpython.c. */
+     * tiny driver that imports these names. See impl/libpython.c.
+     * When the build is configured with -Dwith_libpython=disabled (e.g.
+     * iOS sim where libpython3.12 isn't in the SDK), the symbol isn't
+     * compiled in; guests calling Py_* see unresolved-import traps. */
+#ifdef YOS_HAVE_LIBPYTHON
     extern void yos_libpython_link(IM3Module mod);
     yos_libpython_link(module);
+#endif
 
     /* Auto-generated bridges for the FreeBSD-libc-name import surface.
      * For guests that import each libc fn by name (env.write, env.read,
@@ -1793,7 +1585,26 @@ static int load_wasm_module(struct yos_exec_ctx *ctx, IM3Environment env,
      * A guest that needs more than its declared initial can still
      * memory.grow() up to maxPages at runtime — wasm3 handles that. */
     extern M3Result ResizeMemory(IM3Runtime, uint32_t);
+    /* Honour an env override so tvOS / iOS app-bundle builds (where
+     * the per-process address-space budget is much tighter than a
+     * desktop's) can shrink the default. Each fork allocates a fresh
+     * linear-memory blob; on a tvOS app a few outstanding telnet
+     * connections multiplied by 256 MiB hits the jetsam ceiling and
+     * ResizeMemory starts failing with "have 131072, need
+     * 268435456" — every later fork then traps inside asyncify's
+     * rewind. 1024 pages = 64 MiB is enough for zsh + the runit
+     * supervisor and small enough that 8+ live forks still fit. */
     uint32_t resize_pages = 4096;
+    {
+        const char *env_pages = getenv("YOS_WASM_PAGES");
+        if (env_pages && *env_pages) {
+            char *e = NULL;
+            unsigned long v = strtoul(env_pages, &e, 10);
+            if (e && *e == '\0' && v > 0 && v <= 65536u) {
+                resize_pages = (uint32_t)v;
+            }
+        }
+    }
     if (module->memoryInfo.maxPages > 0 &&
         module->memoryInfo.maxPages < resize_pages) {
         resize_pages = module->memoryInfo.maxPages;
@@ -1876,8 +1687,32 @@ static void free_exec_argv(struct yos_exec_ctx *ctx)
 
 extern char **environ;
 
+/* When YOS_AS_LIBRARY is set (tvOS / iOS app-bundle builds), the
+ * binary's actual main() is provided by build-tools/tvos/launcher.m
+ * (or similar) — it spins up the app shell on the system thread and
+ * pthread_create's a worker that calls into here. We expose this
+ * entry as yos_main() in that mode. CLI builds keep the standard
+ * `main()` symbol. */
+#ifdef YOS_AS_LIBRARY
+int yos_main(int argc, char **argv)
+#else
 int main(int argc, char **argv)
+#endif
 {
+    /* ── early env override ──────────────────────────────────────────
+     * Some launchers (notably `xcrun simctl spawn` on iOS simulators)
+     * overwrite PATH with their own runtime sysroot before our binary
+     * ever sees the caller's value, and there is no flag to opt out.
+     * Honour a YOS_PATH escape hatch: if set, treat it as the
+     * authoritative PATH for the rest of this process (and so for the
+     * wasm guests we exec). Cheap, contained, no-op when unset. */
+    {
+        const char *forced_path = getenv("YOS_PATH");
+        if (forced_path && *forced_path) {
+            setenv("PATH", forced_path, 1);
+        }
+    }
+
     /* ── server-mode flags ───────────────────────────────────────────
      *
      * Strip yos-host options from the front of argv BEFORE the wasm
@@ -1978,6 +1813,12 @@ int main(int argc, char **argv)
     if (g_log_dir) setenv("LOG_DIR", g_log_dir, 1);
 
     if (g_daemon) {
+#if defined(YOS_AS_LIBRARY)
+        /* App-bundle builds (tvOS / iOS) have no controlling terminal
+         * to detach from and the host's fork(2) is sandbox-blocked.
+         * Bundle lifecycle is owned by the OS; --daemon is a no-op. */
+        fprintf(stderr, "yos: --daemon ignored in app-bundle build\n");
+#else
         /* Classic double-fork. Detach from the controlling tty, lose
          * session leadership, redirect stdio to <log-dir>/yos-server.log,
          * write the second-fork PID to <log-dir>/yos-server.pid so
@@ -2027,24 +1868,26 @@ int main(int argc, char **argv)
             (void)!write(pfd, buf, (size_t)n);
             close(pfd);
         }
+#endif
     }
     (void)g_server;  /* reserved — future runit-aware behaviour */
 
     /* Crash diagnostics. The crashing thread on darwin can have a
      * corrupted stack (e.g. wasm3 jumped into garbage) — install a
      * sigaltstack so the handler has somewhere safe to run. Use
-     * SA_ONSTACK + SA_SIGINFO to also receive the faulting address. */
+     * SA_ONSTACK + SA_SIGINFO to also receive the faulting address.
+     *
+     * tvOS marks sigaltstack(3) unavailable to apps; skip it there.
+     * The crash handler still runs on the thread's regular stack —
+     * less robust but the bundle's process gets killed by the OS
+     * anyway on any unhandled fault. */
     {
         extern void yos_host_crash_handler_si(int, siginfo_t *, void *);
         /* glibc 2.34+ made SIGSTKSZ a sysconf() call (not a constant),
          * so it can't size a static array. 64 KiB is well above
          * MINSIGSTKSZ on every platform we target. */
         static char altstack_buf[64 * 1024];
-        stack_t ss = {0};
-        ss.ss_sp = altstack_buf;
-        ss.ss_size = sizeof altstack_buf;
-        ss.ss_flags = 0;
-        sigaltstack(&ss, NULL);
+        yos_main_install_altstack(altstack_buf, sizeof altstack_buf);
         struct sigaction sa = {0};
         sa.sa_sigaction = yos_host_crash_handler_si;
         sa.sa_flags = SA_SIGINFO | SA_ONSTACK | SA_RESETHAND;
@@ -2068,13 +1911,13 @@ int main(int argc, char **argv)
         pthread_sigmask(SIG_UNBLOCK, &unblock, NULL);
     }
 
-#ifdef __APPLE__
     /* Darwin: synchronous CPU faults are routed through Mach exception
-     * ports BEFORE BSD signals. Install a Mach handler so we get a
-     * register dump on SIGILL/SIGSEGV/SIGFPE — the POSIX handler above
-     * never fires for those on darwin. */
+     * ports BEFORE BSD signals. The macOS slice (impl/main-macos.c)
+     * installs a Mach handler so we get a register dump on SIGILL/
+     * SIGSEGV/SIGFPE — the POSIX handler above never fires for those
+     * on darwin. Linux and sandboxed-app slices (impl/main-linux.c,
+     * impl/main-darwin-app.c) provide a no-op stub. */
     yos_mach_install_exc_handler();
-#endif
 
     /* SIGUSR1 → dump the bridge ring buffer (with tid per call) to
      * /tmp/yos-host-ring.log. Lets us peek at what each thread is
@@ -2129,20 +1972,33 @@ int main(int argc, char **argv)
         g_runtime.envp = environ;
     }
 
-    /* Initialize VFS mount table and mount /proc */
+    /* Initialize VFS mount table. The mount infrastructure stays —
+     * we keep it for future devfs/ramfs/etc. — but the /proc mount
+     * is GONE by default. FreeBSD doesn't ship /proc; procfs(5) is
+     * a disabled-by-default Linux-compat shim. yos's process-list
+     * surface is sysctl(KERN_PROC_*) in impl/libc/sysctl.c, which is
+     * what the FreeBSD-shaped libc actually calls. The procfs synth
+     * backend in src/yos/vfs/procfs.c stays available; a guest that
+     * really wants Linux semantics can register it via an explicit
+     * mount once we expose mount(2). */
     static struct yos_mount_table mount_table;
     yos_mount_table_init(&mount_table);
-    yos_mount_add(&mount_table, "/proc", &yos_procfs_ops);
     g_runtime.mount_table = &mount_table;
 
     /* yctl: spin up the introspection/control daemon if --yctl-socket
      * was given. The accept loop runs on a detached host pthread; failure
      * to bind is loud but non-fatal — yos itself still runs the guest. */
     if (g_yctl_sock) {
+#ifdef YOS_HAVE_YCTL
         if (yctl_start(&g_runtime, g_yctl_sock) != 0) {
             fprintf(stderr, "yos: yctl: bind %s failed: %s\n",
                     g_yctl_sock, strerror(errno));
         }
+#else
+        fprintf(stderr,
+                "yos: yctl support not compiled in (with_yctl=disabled); "
+                "ignoring --yctl-socket %s\n", g_yctl_sock);
+#endif
     }
 
     /* Idle mode: --yctl-socket given but no wasm program. Daemon is

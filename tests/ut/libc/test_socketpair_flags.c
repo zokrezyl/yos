@@ -17,7 +17,7 @@
  *   socketpair on darwin returned EINVAL for the FreeBSD-flavored type
  *   bits, which silently broke the IPC pipe and made the server exit
  *   with `eof=true` shortly after startup. This test pins the workaround
- *   in src/yos/impl/vfs.c:yos_vfs_socketpair.
+ *   in src/yos/impl/io/io.c:yos_vfs_socketpair.
  *
  * Expected: exit 0, stdout contains "socketpair ok", stdout contains "flags ok".
  */
