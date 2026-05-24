@@ -177,6 +177,14 @@ custom_proc:
   # compiled 22 with no diagnostic.
   - getservbyname
   - getservbyport
+  # impl/posix.c — readpassphrase(3) is OpenBSD libc; not in glibc and
+  # invisible to the darwin host-API extractor, so codegen leaves it
+  # unresolved and ssh / ssh-add / sshd trap on `unresolved import
+  # env.readpassphrase` the first time a key passphrase is needed
+  # (e.g. when the local known_hosts is incomplete and ssh prompts
+  # to confirm the host key). Hand-bridge opens /dev/tty, turns off
+  # echo, reads the line, restores termios.
+  - readpassphrase
   # impl/pty.c — pseudo-terminal allocation chain telnetd needs to
   # set up a session. Codegen leaves these as ENOSYS stubs which
   # makes telnetd write "All network ports in use" and exit.

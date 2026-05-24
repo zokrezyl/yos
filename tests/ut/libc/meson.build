@@ -157,6 +157,11 @@ libc_tests = [
   # malloc/calloc/realloc/free contracts ssh leans on for channel
   # state and packet buffers.
   'test_ssh_alloc_basic',
+  # readpassphrase(3) — BSD libc, not in glibc, missed by the darwin
+  # host-API extractor. ssh / sshd / ssh-add prompt for key passphrases
+  # through this and trap with "unresolved import env.readpassphrase"
+  # without the hand bridge.
+  'test_ssh_readpassphrase',
 ]
 
 # Path to the generator's output dir, exposed by src/yos/codegen.

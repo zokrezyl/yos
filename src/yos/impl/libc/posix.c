@@ -152,22 +152,55 @@ static int sol_fb_to_lx(int level)
 }
 static int soopt_fb_to_lx(int level, int opt)
 {
-    if (level != 0xffff) return opt;
-    switch (opt) {
-    case 0x1008: return SO_TYPE;
-    case 0x1007: return SO_ERROR;
-    case 0x0004: return SO_REUSEADDR;
-    case 0x0008: return SO_KEEPALIVE;
-    case 0x0020: return SO_BROADCAST;
-    case 0x0080: return SO_LINGER;
-    case 0x1001: return SO_SNDBUF;
-    case 0x1002: return SO_RCVBUF;
-    case 0x1005: return SO_SNDTIMEO;
-    case 0x1006: return SO_RCVTIMEO;
-    case 0x0100: return SO_OOBINLINE;
-    case 0x0002: return SO_ACCEPTCONN;
-    default:     return opt;
+    if (level == 0xffff) {
+        /* SOL_SOCKET options — same mapping table. */
+        switch (opt) {
+        case 0x1008: return SO_TYPE;
+        case 0x1007: return SO_ERROR;
+        case 0x0004: return SO_REUSEADDR;
+        case 0x0008: return SO_KEEPALIVE;
+        case 0x0020: return SO_BROADCAST;
+        case 0x0080: return SO_LINGER;
+        case 0x1001: return SO_SNDBUF;
+        case 0x1002: return SO_RCVBUF;
+        case 0x1005: return SO_SNDTIMEO;
+        case 0x1006: return SO_RCVTIMEO;
+        case 0x0100: return SO_OOBINLINE;
+        case 0x0002: return SO_ACCEPTCONN;
+        default:     return opt;
+        }
     }
+    /* IPPROTO_IP = 0. The option numbers diverge between FreeBSD and
+     * Linux. ssh's connect path calls setsockopt(IPPROTO_IP, IP_TOS=3
+     * (FreeBSD), 0x10) — on Linux that opt number is IP_HDRINCL, which
+     * silently rejects the call and ssh prints the noisy
+     * "setsockopt socket N IP_TOS 16: No message of desired type"
+     * warning. Translate the handful of IPv4 options ssh actually
+     * sets. Darwin/BSD hosts match FreeBSD, so the table is no-op
+     * there. */
+    if (level == 0 /* IPPROTO_IP */) {
+#if defined(__linux__)
+        switch (opt) {
+        case 1:  return 4;   /* FB IP_OPTIONS    → LX IP_OPTIONS    (=4) */
+        case 2:  return 3;   /* FB IP_HDRINCL    → LX IP_HDRINCL    (=3) */
+        case 3:  return 1;   /* FB IP_TOS        → LX IP_TOS        (=1) */
+        case 4:  return 2;   /* FB IP_TTL        → LX IP_TTL        (=2) */
+        case 5:  return 6;   /* FB IP_RECVOPTS   → LX IP_RECVOPTS   (=6) */
+        case 6:  return 7;   /* FB IP_RECVRETOPTS→ LX IP_RETOPTS    (=7) */
+        case 7:  return 8;   /* FB IP_RECVDSTADDR→ LX IP_PKTINFO    (=8, closest) */
+        case 9:  return 32;  /* FB IP_MULTICAST_IF  → LX IP_MULTICAST_IF (=32) */
+        case 10: return 33;  /* FB IP_MULTICAST_TTL → LX IP_MULTICAST_TTL (=33) */
+        case 11: return 34;  /* FB IP_MULTICAST_LOOP→ LX IP_MULTICAST_LOOP (=34) */
+        case 12: return 35;  /* FB IP_ADD_MEMBERSHIP → LX IP_ADD_MEMBERSHIP (=35) */
+        case 13: return 36;  /* FB IP_DROP_MEMBERSHIP→ LX IP_DROP_MEMBERSHIP (=36) */
+        default: return opt;
+        }
+#else
+        /* darwin / FreeBSD: same numbering as the FreeBSD wasm guest. */
+        return opt;
+#endif
+    }
+    return opt;
 }
 
 int32_t yos_getsockopt(struct yos_exec_ctx *ctx, int32_t wfd, int32_t level,
@@ -1743,4 +1776,104 @@ uint32_t yos_getservbyport(struct yos_exec_ctx *ctx, int32_t port_net,
                         ? (const char *)(ctx->memory + proto_off) : NULL;
     struct servent *se = getservbyport((int)port_net, proto);
     return pack_servent(ctx, ctx, se);
+}
+
+/* readpassphrase(3) — BSD libc function ssh / sshd / ssh-add use to
+ * prompt the user for a key passphrase. Not in glibc; on darwin it's
+ * in libSystem but the host-API extractor doesn't pick it up either,
+ * so it lands as an unresolved env import the first time ssh meets
+ * an encrypted host-key entry. Hand-bridge the OpenBSD-derived
+ * implementation: open /dev/tty, save termios, disable echo, read a
+ * line, restore termios, return buf.
+ */
+#include <ctype.h>
+
+#define FBSD_RPP_ECHO_OFF    0x00
+#define FBSD_RPP_ECHO_ON     0x01
+#define FBSD_RPP_REQUIRE_TTY 0x02
+#define FBSD_RPP_FORCELOWER  0x04
+#define FBSD_RPP_FORCEUPPER  0x08
+#define FBSD_RPP_SEVENBIT    0x10
+#define FBSD_RPP_STDIN       0x20
+
+uint32_t yos_readpassphrase(struct yos_exec_ctx *ctx,
+                            uint32_t prompt_off, uint32_t buf_off,
+                            uint32_t bufsize, int32_t flags)
+{
+    if (!buf_off || bufsize == 0 ||
+        buf_off + bufsize > ctx->memory_size)
+        return 0;
+
+    char *buf = (char *)(ctx->memory + buf_off);
+    const char *prompt =
+        (prompt_off && prompt_off < ctx->memory_size)
+        ? (const char *)(ctx->memory + prompt_off) : "";
+
+    /* Pick input/output fds. Default is /dev/tty (so the read works
+     * even when stdin is a pipe — which is how ssh invokes us inside
+     * a fork+execve chain). RPP_STDIN forces the stdin fallback. */
+    int input  = -1;
+    int output = -1;
+    int input_opened = 0;
+    if (!(flags & FBSD_RPP_STDIN)) {
+        input = open("/dev/tty", O_RDWR | O_CLOEXEC);
+        if (input >= 0) {
+            output = input;
+            input_opened = 1;
+        }
+    }
+    if (input < 0) {
+        if (flags & FBSD_RPP_REQUIRE_TTY) {
+            errno = ENOTTY;
+            return 0;
+        }
+        /* Fall back to host stderr/stdin via the guest's wfd 0/2 → host
+         * fd mapping. yos remaps these at startup to host fd >= 3
+         * dups of the original 0/1/2 so close in the guest can't
+         * trample our prompt sink. */
+        input  = ctx->fd_map[0] >= 0 ? ctx->fd_map[0] : 0;
+        output = ctx->fd_map[2] >= 0 ? ctx->fd_map[2] : 2;
+    }
+
+    /* Disable echo on the input descriptor while we read. On a fd
+     * that isn't a tty (RPP_STDIN through a pipe), tcgetattr fails
+     * and we just read as-is. */
+    struct termios save_t, new_t;
+    int restore = 0;
+    if (tcgetattr(input, &save_t) == 0) {
+        new_t = save_t;
+        if (!(flags & FBSD_RPP_ECHO_ON))
+            new_t.c_lflag &= ~(tcflag_t)(ECHO | ECHONL);
+        new_t.c_lflag |= ICANON;
+        new_t.c_iflag |= ICRNL;
+        if (tcsetattr(input, TCSAFLUSH, &new_t) == 0)
+            restore = 1;
+    }
+
+    /* Emit the prompt. */
+    if (prompt && prompt[0])
+        (void)!write(output, prompt, strlen(prompt));
+
+    /* Read a line, char by char, until newline / EOF / buf full. */
+    size_t i = 0;
+    char c;
+    for (;;) {
+        ssize_t n = read(input, &c, 1);
+        if (n <= 0) break;
+        if (c == '\n' || c == '\r') break;
+        if (flags & FBSD_RPP_SEVENBIT) c &= 0x7f;
+        if (flags & FBSD_RPP_FORCELOWER) c = (char)tolower((unsigned char)c);
+        if (flags & FBSD_RPP_FORCEUPPER) c = (char)toupper((unsigned char)c);
+        if (i + 1 < bufsize) buf[i++] = c;
+    }
+    buf[i] = '\0';
+
+    /* Restore termios and echo the newline the user couldn't see. */
+    if (restore) {
+        (void)tcsetattr(input, TCSAFLUSH, &save_t);
+        if (!(flags & FBSD_RPP_ECHO_ON))
+            (void)!write(output, "\n", 1);
+    }
+    if (input_opened) close(input);
+    return buf_off;
 }

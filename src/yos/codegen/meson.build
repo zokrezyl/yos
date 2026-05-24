@@ -47,6 +47,12 @@ api_top_headers = [
   'pwd.h', 'grp.h', 'regex.h', 'search.h',
   'setjmp.h', 'assert.h', 'sched.h',
   'termios.h', 'utime.h',
+  # readpassphrase(3): BSD libc, declared in <readpassphrase.h>. ssh
+  # / sshd / ssh-add prompt for key passphrases through this; without
+  # the header in the walk the wasm guest's import declaration never
+  # makes it into guest-api.yaml and bridge.py emits no body — the
+  # module then fails to load with "unresolved import env.readpassphrase".
+  'readpassphrase.h',
 ]
 
 # Public subdir umbrellas. Listed by *filename*, not by *directory* —
