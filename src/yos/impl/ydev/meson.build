@@ -1,11 +1,18 @@
-# ydev — cross-platform device abstraction (camera/audio/sensors/location).
+# ydev — cross-platform device abstraction (camera/sensors/location)
+# + audio via miniaudio.
 #
 # Builds a small static library `libydev.a`:
 #   - core (this dir): vfd ring + self-pipe primitive, perm cache, strerror,
 #                      NV12->I420 helper. Platform-agnostic.
-#   - backend (../../platform/{apple,android,linux}): per-host capture and
-#                      permission glue. The right backend is picked by
-#                      host_os; only that one is compiled.
+#   - audio (this dir, audio_miniaudio.c + miniaudio_impl.c): one cross-
+#                      platform audio backend. miniaudio (Unlicense/MIT-0)
+#                      dispatches at runtime to CoreAudio on Apple, AAudio
+#                      + OpenSL on Android, ALSA / PulseAudio / JACK /
+#                      PipeWire on Linux (dlopen, no LGPL link-time deps).
+#   - backend (../../platform/{apple,android,linux}): per-host camera,
+#                      sensor, location, permission glue. The right
+#                      backend is picked by host_os; only that one is
+#                      compiled.
 #
 # Public headers live in include/yos/ydev/. Anyone (including the camera
 # server) can link libydev without pulling in wasm3 or the yos runtime.
@@ -21,12 +28,11 @@ ydev_core_sources = files(
   'perm.c',
   'error.c',
   'convert.c',
+  'audio_miniaudio.c',     # cross-platform audio impl, builds everywhere
+  'miniaudio_impl.c',      # MA_IMPLEMENTATION TU
 )
 
-# Per-host backend source list. Apple sources are .m (Objective-C); meson
-# compiles them with the ObjC frontend automatically. ARC is enabled via
-# -fobjc-arc; the .m bodies still use CFRetain/CFRelease for the CF types
-# we actually own (CVPixelBufferRef).
+# Per-host backend source list (no audio — that's miniaudio above).
 ydev_backend_sources = []
 ydev_backend_args    = []
 ydev_backend_deps    = []
@@ -36,62 +42,63 @@ if host_os == 'darwin'
   ydev_backend_sources += files(
     '../../platform/apple/camera_av.m',
     '../../platform/apple/perm_apple.m',
-    '../../platform/apple/audio_apple.m',
     '../../platform/apple/sensor_apple.m',
     '../../platform/apple/location_apple.m',
   )
   ydev_backend_args += ['-fobjc-arc']
-  # CoreLocation is Foundation-adjacent on iOS but a separate framework
-  # everywhere. CoreMotion is iOS-only; perm_apple.m gates it with
-  # TARGET_OS_IOS so we still link the framework only where it exists.
+  # AVFoundation: needed by camera_av.m for AVCaptureSession + by
+  # miniaudio for CoreAudio AudioUnit binding (it goes via
+  # AudioToolbox/CoreAudio frameworks too).
   ydev_backend_link += [
     '-framework', 'Foundation',
     '-framework', 'AVFoundation',
     '-framework', 'CoreMedia',
     '-framework', 'CoreVideo',
     '-framework', 'CoreFoundation',
+    '-framework', 'CoreAudio',
+    '-framework', 'AudioToolbox',
+    '-framework', 'CoreLocation',
   ]
-  if not is_ios_app and not is_tvos_app
-    ydev_backend_link += ['-framework', 'CoreLocation']
-  else
-    ydev_backend_link += ['-framework', 'CoreLocation']
-  endif
   if is_ios_app
-    ydev_backend_link += ['-framework', 'CoreMotion']
+    ydev_backend_link += ['-framework', 'CoreMotion', '-framework', 'AVFAudio']
   endif
 elif host_os == 'linux'
   ydev_backend_sources += files(
     '../../platform/linux/camera_linux.c',
-    '../../platform/linux/audio_linux.c',
     '../../platform/linux/sensor_linux.c',
     '../../platform/linux/location_linux.c',
     '../../platform/linux/perm_linux.c',
   )
-  alsa_dep = dependency('alsa', required: true)
-  ydev_backend_deps += [alsa_dep]
+  # miniaudio loads alsa/pulse/jack/pipewire via dlopen at runtime — no
+  # compile-time deps. We just need libdl + libm + libpthread (all in
+  # libc on glibc, threads already in yos_common_deps).
+  ydev_backend_link += ['-ldl']
 elif host_os == 'android'
   ydev_backend_sources += files(
     '../../platform/android/camera_android.c',
-    '../../platform/android/audio_android.c',
     '../../platform/android/sensor_android.c',
     '../../platform/android/location_android.c',
     '../../platform/android/perm_android.c',
   )
-  # NDK frameworks: link the libs the backends call into.
+  # NDK frameworks for camera/sensor/location/log. miniaudio links
+  # AAudio + OpenSL ES dynamically — declare them explicitly so the
+  # NDK linker resolves the symbols miniaudio_impl.c references.
   ydev_backend_link += [
-    '-lcamera2ndk',  # ACameraManager + ACameraDevice + AImageReader callers
-    '-lmediandk',    # AImageReader, AImage
-    '-laaudio',      # AAudio
-    '-landroid',     # ASensorManager + ALooper
-    '-llog',         # __android_log_print
+    '-lcamera2ndk',
+    '-lmediandk',
+    '-laaudio',
+    '-lOpenSLES',
+    '-landroid',
+    '-llog',
   ]
 else
   error('ydev: unsupported host OS: ' + host_os)
 endif
 
 ydev_inc = include_directories(
-  '../../..',          # so '#include <yos/ydev/...>' resolves via ../include
+  '../../..',                              # `<yos/ydev/...>` via ../include
   '../../../../include',
+  '../../../../build-tools/miniaudio',     # `miniaudio.h`
   '.',
 )
 
