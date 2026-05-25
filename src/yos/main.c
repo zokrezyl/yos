@@ -1257,6 +1257,9 @@ void yos_link_imports(IM3Module module, struct yos_exec_ctx *ctx)
     yos_strto_link(module);
     extern void yos_kqueue_link(IM3Module mod);
     yos_kqueue_link(module);
+    /* ydev — env.ydev_* bridges for camera/audio/sensors/location. */
+    extern void yos_ydev_link(IM3Module mod, struct yos_exec_ctx *c);
+    yos_ydev_link(module, ctx);
     m3_LinkRawFunction(module, "env", "setjmp", "i(i)", m3_setjmp);
     m3_LinkRawFunction(module, "env", "longjmp", "v(ii)", m3_longjmp);
     m3_LinkRawFunction(module, "env", "_setjmp", "i(i)", m3_setjmp);
