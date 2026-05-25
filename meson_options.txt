@@ -45,6 +45,12 @@ option('with_openssl',
   description : 'openssl host bridges (env.SSL_*, env.EVP_*, env.RAND_*, env.ERR_*). Requires host libssl + libcrypto. Disable to drop the dep; guests calling these get unresolved-import traps at load time.',
 )
 
+option('with_liblua',
+  type        : 'feature',
+  value       : 'auto',
+  description : 'liblua-5.1 host bridges (env.lua_*, env.luaL_*). Requires host liblua-5.1 (pkg-config: lua-5.1 / lua5.1 / lua). Disable to drop the dep; guests calling lua_* get unresolved-import traps at load time.',
+)
+
 option('ios_unblock',
   type        : 'boolean',
   value       : false,

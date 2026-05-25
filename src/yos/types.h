@@ -216,6 +216,16 @@ struct yos_exec_ctx {
      *   See impl/libpython.c. */
     void *py_tstate;
 
+    /* PyObject handle table — same shape as ssl_handles[] /
+     * lua_handles[]. Every PyObject * the bridge surface passes back
+     * to the guest is wrapped here and the guest holds an i32
+     * handle. Per-subinterpreter isolation guarantees that handles
+     * across different guests cannot collide: each guest's
+     * PyObject*'s are allocated inside its own PyInterpreterState
+     * arena. See policies/python.yaml. */
+    void   **py_handles;
+    uint32_t py_handles_cap;
+
     /* openssl per-guest state. yos's host openssl is shared across every
      * guest (one libcrypto/libssl in the address space), but each guest's
      * SSL_CTX, SSL, EVP_MD_CTX, BIO, ... must be isolated — guest A's
@@ -237,6 +247,23 @@ struct yos_exec_ctx {
      * build-tools/libbridge/policies/openssl.yaml. */
     void   **ssl_handles;
     uint32_t ssl_handles_cap;
+
+    /* liblua per-guest state. Each guest gets its own lua_State *
+     * (from luaL_newstate at first env.luaL_newstate). lua's design
+     * is the cleanest possible embedding case: there are NO mutable
+     * file-scope globals in liblua, every API takes lua_State *L
+     * explicitly, all per-instance state lives inside L. So the
+     * bridge just resolves the i32 handle the guest holds back to
+     * the host lua_State *.
+     *
+     * lua_handles[1] is the main state for this guest;
+     * lua_handles[N>1] hold coroutine lua_State *'s created via
+     * lua_newthread (those share globals/registry with the main
+     * state but have their own stacks). Slot 0 reserved.
+     *
+     * See impl/libc/liblua.c and policies/lua.yaml. */
+    void   **lua_handles;
+    uint32_t lua_handles_cap;
 
     /* "Did this ctx write to stderr (wfd=2) since the last failed exec?"
      * Used by yos_exit to detect a forked child that died after exec

@@ -241,6 +241,22 @@ LDFLAGS_W="-Wl,--no-entry -Wl,--export=_start -Wl,--export-all \
     -Wl,--allow-undefined -Wl,--stack-first -Wl,-z,stack-size=1048576 \
     $WASM_SYSROOT/usr/lib/crt1.o $LIBC_INIT_O"
 
+# nvim's wasm-side lua_* / luaL_* references should resolve as wasm
+# imports against yos's host-bridged liblua (src/yos/impl/libc/liblua.c)
+# rather than being statically linked from the wasm32 lua-5.1.5 build.
+# Stand up an EMPTY archive and point CMake's LUA_LIBRARY at it; the
+# wasm32 lua headers stay (compile-time only). wasm-ld with
+# --allow-undefined then emits env.lua_* imports for every undefined
+# reference, exactly the way ssh.wasm imports env.SSL_*.
+#
+# lpeg / lua-mpack / luv stay as real wasm32 archives — they don't
+# DEFINE the lua_* symbols, they only REFERENCE them, so each of those
+# references also becomes an env import once liblua's bodies are gone.
+EMPTY_LUA="$BLD/empty-liblua.a"
+mkdir -p "$BLD"
+echo "" | "$WASM_CC" -target wasm32-unknown-unknown -c -x c - -o "$BLD/empty-liblua.o"
+llvm-ar rcs "$EMPTY_LUA" "$BLD/empty-liblua.o"
+
 cmake "$SRC" \
     -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
     -DCMAKE_SYSTEM_NAME=Linux \
@@ -263,8 +279,8 @@ cmake "$SRC" \
     -DENABLE_LIBINTL=OFF \
     -DENABLE_LIBICONV=OFF \
     -DLUA_INCLUDE_DIR="$LUA_P/include" \
-    -DLUA_LIBRARY="$LUA_P/lib/liblua.a" \
-    -DLUA_LIBRARIES="$LUA_P/lib/liblua.a" \
+    -DLUA_LIBRARY="$EMPTY_LUA" \
+    -DLUA_LIBRARIES="$EMPTY_LUA" \
     -DLUA_MATH_LIBRARY="" \
     -DCMAKE_DL_LIBS="" \
     -DLUA_PRG="$HOST_HELPER" \

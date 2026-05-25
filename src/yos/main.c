@@ -1386,6 +1386,16 @@ void yos_link_imports(IM3Module module, struct yos_exec_ctx *ctx)
     yos_openssl_link(module);
 #endif
 
+    /* liblua-5.1 — env.lua_*, env.luaL_*. The host yos links host
+     * liblua-5.1; the wasm guest imports these names and yos resolves
+     * them via per-ctx lua_State handles in ctx->lua_handles[]. See
+     * impl/libc/liblua.c. When -Dwith_liblua=disabled, the symbol
+     * isn't compiled in and lua_* imports trap unresolved. */
+#ifdef YOS_HAVE_LIBLUA
+    extern void yos_liblua_link(IM3Module mod);
+    yos_liblua_link(module);
+#endif
+
     /* Auto-generated bridges for the FreeBSD-libc-name import surface.
      * For guests that import each libc fn by name (env.write, env.read,
      * env.exit, …) instead of going through __yos_syscall. Bridges
