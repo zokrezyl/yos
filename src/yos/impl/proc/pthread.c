@@ -252,13 +252,25 @@ worker_main (void * arg)
         if (master_ctx) {
             /* Wire the sibling's userdata to the SAME ctx as the
              * master — guest threads share memory + fd table + proc
-             * table, so syscalls dispatch through one ctx. Save the
-             * runtime pointer first so we don't clobber master's. */
-            void *saved_rt = master_ctx->runtime;
-            master_ctx->runtime = rt;
+             * table, so syscalls dispatch through one ctx.
+             *
+             * We must NOT mutate master_ctx->runtime here, even
+             * "temporarily and restore" — the master's wasm thread
+             * is concurrently running and may dereference
+             * master_ctx->runtime in any bridge (e.g. env.fork →
+             * yos_fork reads it for m3_FindFunction on
+             * "asyncify_get_state"). Pointing it at our half-loaded
+             * sibling runtime mid-setup surfaced as a SIGSEGV in
+             * m3_FindFunction (functions[i].import.moduleUtf8 deref,
+             * because our sibling's Module_AddFunction was still
+             * in-flight: numFunctions++ done, functions realloc
+             * pending). The link path doesn't need ctx->runtime to
+             * be the sibling's — yos_link_imports just calls
+             * m3_LinkRawFunctionEx (module, ..., ctx) and the lazy
+             * pthread_host_create is skipped because the master
+             * already owns one. So leave master_ctx->runtime alone. */
             rt->userdata = master_ctx;
             yos_link_imports (mod, master_ctx);
-            master_ctx->runtime = saved_rt;
         }
     }
 

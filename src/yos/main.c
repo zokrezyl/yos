@@ -1522,6 +1522,15 @@ static void host_signal_dispatcher(int host_sig)
     if (fbsd > 0) yos_signal_set_pending(fbsd);
 }
 
+/* No-op handler for the SIGUSR2 side-channel. deliver_to_proc uses
+ * pthread_kill(target, SIGUSR2) to wake a host thread that's blocked
+ * in read/usleep/etc., so the target's next bridge call enters
+ * yos_signal_pump and notices a SIGKILL bit in ctx->sig_pending. The
+ * actual signal carries no info — its sole job is to cause EINTR.
+ * Without an installed handler, default disposition is TERMINATE,
+ * and a single chaos-test SIGKILL takes down the whole yos --server. */
+static void host_sigusr2_wake(int sig) { (void)sig; }
+
 static void yos_install_host_signal_handlers(void)
 {
     /* No SA_RESTART. We DO want blocking reads/writes to return
@@ -1538,6 +1547,13 @@ static void yos_install_host_signal_handlers(void)
     for (size_t i = 0; i < sizeof sigs / sizeof sigs[0]; i++) {
         sigaction(sigs[i], &sa, NULL);
     }
+    /* SIGUSR2 is the inter-thread wake used by deliver_to_proc.
+     * Install a no-op handler so it just interrupts blocking
+     * syscalls instead of terminating the process. */
+    struct sigaction sa_usr2 = { .sa_handler = host_sigusr2_wake,
+                                 .sa_flags   = 0 };
+    sigemptyset(&sa_usr2.sa_mask);
+    sigaction(SIGUSR2, &sa_usr2, NULL);
 }
 
 /* Load and prepare a wasm module. Returns 0 on success. */
@@ -2010,17 +2026,21 @@ int main(int argc, char **argv)
         g_runtime.envp = environ;
     }
 
-    /* Initialize VFS mount table. The mount infrastructure stays —
-     * we keep it for future devfs/ramfs/etc. — but the /proc mount
-     * is GONE by default. FreeBSD doesn't ship /proc; procfs(5) is
-     * a disabled-by-default Linux-compat shim. yos's process-list
-     * surface is sysctl(KERN_PROC_*) in impl/libc/sysctl.c, which is
-     * what the FreeBSD-shaped libc actually calls. The procfs synth
-     * backend in src/yos/vfs/procfs.c stays available; a guest that
-     * really wants Linux semantics can register it via an explicit
-     * mount once we expose mount(2). */
+    /* Initialize VFS mount table. /proc stays mounted by default
+     * because guest libraries (and tests) routinely ask for
+     * `/proc/self/exe` to discover their own image path. Without
+     * the mount, yos_readlink falls through to the HOST's
+     * readlink("/proc/self/exe") and returns the path to the yos
+     * NATIVE binary — perf-stress's fork+execve test then tries to
+     * re-exec that binary and ENOEXECs, because yos isn't a wasm
+     * file. FreeBSD doesn't ship /proc by default but its
+     * procfs(5) is well known and many ports rely on it; the
+     * mount is cheap (one entry) and the synth backend is
+     * already linked. */
     static struct yos_mount_table mount_table;
     yos_mount_table_init(&mount_table);
+    extern const struct yos_file_operations yos_procfs_ops;
+    yos_mount_add(&mount_table, "/proc", &yos_procfs_ops);
     g_runtime.mount_table = &mount_table;
 
     /* yctl: spin up the introspection/control daemon if --yctl-socket

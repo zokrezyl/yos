@@ -1323,8 +1323,26 @@ void yos_fork_pump(struct yos_exec_ctx *ctx)
         fork_thread_arg->argv = ctx->argv;
         fork_thread_arg->envc = ctx->envc;
         fork_thread_arg->envp = ctx->envp;
-        fork_thread_arg->wasm_bytes = ctx->wasm_bytes;
+        /* Give the child its OWN copy of wasm_bytes. Sharing the
+         * parent's buffer caused intermittent SIGSEGV in
+         * m3_FindFunction (functions[i].import.moduleUtf8 deref) on
+         * a child's later fork(): module->functions ended up NULL
+         * because wasm3's parse/load kept pointers into the shared
+         * wasm bytecode buffer and concurrent sibling forks raced on
+         * its allocator path. Private buffers per fork isolate
+         * wasm3's module state. */
         fork_thread_arg->wasm_bytes_size = ctx->wasm_bytes_size;
+        fork_thread_arg->wasm_bytes = malloc(ctx->wasm_bytes_size);
+        if (!fork_thread_arg->wasm_bytes) {
+            munmap(mem_copy, mem_size);
+            free(wasm_globals_copy);
+            free(fork_thread_arg);
+            struct yos_proc *child = yos_proc_find(ctx->rt, ctx->fork_return);
+            if (child) child->state = YOS_PROC_FREE;
+            return;
+        }
+        memcpy(fork_thread_arg->wasm_bytes, ctx->wasm_bytes,
+               ctx->wasm_bytes_size);
         /* F_DUPFD each parent host fd RIGHT NOW, in the parent
          * thread, before the child thread runs and before the
          * parent's wasm code resumes (asyncify_start_rewind, below).
@@ -2482,8 +2500,19 @@ void yos_vfork_pump(struct yos_exec_ctx *ctx)
         fork_thread_arg->argv = ctx->argv;
         fork_thread_arg->envc = ctx->envc;
         fork_thread_arg->envp = ctx->envp;
-        fork_thread_arg->wasm_bytes = ctx->wasm_bytes;
+        /* Private wasm_bytes per fork — see fork path for rationale. */
         fork_thread_arg->wasm_bytes_size = ctx->wasm_bytes_size;
+        fork_thread_arg->wasm_bytes = malloc(ctx->wasm_bytes_size);
+        if (!fork_thread_arg->wasm_bytes) {
+            munmap(mem_copy, mem_size);
+            free(wasm_globals_copy);
+            free(fork_thread_arg);
+            struct yos_proc *child = yos_proc_find(ctx->rt, ctx->fork_return);
+            if (child) child->state = YOS_PROC_FREE;
+            return;
+        }
+        memcpy(fork_thread_arg->wasm_bytes, ctx->wasm_bytes,
+               ctx->wasm_bytes_size);
         /* Same stable-snapshot reasoning as in the fork path above —
          * dup parent's host fds NOW so the child sees what was open
          * at vfork time, not what's open whenever its dup loop runs. */
