@@ -1064,7 +1064,7 @@ static void *fork_thread_func(void *arg)
     pthread_cond_broadcast(&child_ctx->rt->any_exit_cond);
     pthread_mutex_unlock(&child_ctx->rt->proc_lock);
 
-    ydebug("child pid=%d exited\n", child_ctx->proc->pid);
+    ydebug("child pid=%d exited (post-m3_CallV cleanup)\n", child_ctx->proc->pid);
 
     m3_FreeRuntime(rt);
     m3_FreeEnvironment(env);
@@ -1436,10 +1436,6 @@ void yos_fork_pump(struct yos_exec_ctx *ctx)
         pthread_t t;
         int r = pthread_create(&t, NULL, fork_thread_func, fork_thread_arg);
         if (r != 0) {
-            /* Child thread never started — close every dup we just
-             * stashed in fork_thread_arg before discarding it. Without
-             * this, pthread_create EAGAIN (or any other transient
-             * failure) burns ~stdio_dup_count host fds. */
             release_parent_dups(fork_thread_arg);
             munmap(mem_copy, fork_thread_arg->memory_size);
             free(wasm_globals_copy);
