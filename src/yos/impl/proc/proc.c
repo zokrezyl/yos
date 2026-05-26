@@ -1423,7 +1423,15 @@ void yos_fork_pump(struct yos_exec_ctx *ctx)
 
         /* Spawn child thread detached so the parent resumes concurrently.
          * Child lifetime is tracked via yos_proc state (RUNNING/ZOMBIE);
-         * waitpid reaps via the process table, not via pthread_join. */
+         * waitpid reaps via the process table, not via pthread_join.
+         * NOTE: this currently LEAKS the child's m3 runtime + linear
+         * memory (~256 MiB VSZ / fork) — we can't safely m3_FreeRuntime
+         * from the dying child's yos_exit (wasm3 interpreter is on the
+         * stack, Runtime_Release asserts numActiveCodePages==0) AND
+         * deferring it to the parent's waitpid races with the child's
+         * pthread_exit tail (TLS dtors etc. corrupt the heap). Until a
+         * dedicated reaper thread with a wait-for-fully-terminated
+         * primitive exists, accept the leak. */
         child_proc->state = YOS_PROC_RUNNING;
         pthread_t t;
         int r = pthread_create(&t, NULL, fork_thread_func, fork_thread_arg);
