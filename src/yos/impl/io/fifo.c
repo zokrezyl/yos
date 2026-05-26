@@ -63,11 +63,12 @@ struct fifo_entry {
     struct fifo_entry *next;
 };
 
-static pthread_mutex_t   g_fifo_lock = PTHREAD_MUTEX_INITIALIZER;
-static struct fifo_entry *g_fifo_head;
+/* g_fifo_lock and g_fifo_head removed; list head now lives on
+ * ctx->fifo_head (types.h). No process-wide mutex needed because
+ * each ctx is the sole accessor of its own list. */
 
-static struct fifo_entry *fifo_lookup_locked(const char *path) {
-    for (struct fifo_entry *e = g_fifo_head; e; e = e->next)
+static struct fifo_entry *fifo_lookup_locked(struct yos_exec_ctx *ctx, const char *path) {
+    for (struct fifo_entry *e = (struct fifo_entry *)ctx->fifo_head; e; e = e->next)
         if (strcmp(e->path, path) == 0) return e;
     return NULL;
 }
@@ -76,10 +77,9 @@ static struct fifo_entry *fifo_lookup_locked(const char *path) {
  * Returns -1 with errno=0 when path is NOT a registered FIFO (caller
  * falls through to host open). On hit, returns a host fd (dup of the
  * appropriate internal end) and the caller wraps it in yos_fd_alloc. */
-int yos_fifo_try_open(const char *path, int flags) {
-    pthread_mutex_lock(&g_fifo_lock);
-    struct fifo_entry *e = fifo_lookup_locked(path);
-    if (!e) { pthread_mutex_unlock(&g_fifo_lock); errno = 0; return -1; }
+int yos_fifo_try_open(struct yos_exec_ctx *ctx, const char *path, int flags) {
+    struct fifo_entry *e = fifo_lookup_locked(ctx, path);
+    if (!e) { errno = 0; return -1; }
 
     int access = flags & O_ACCMODE;
     int src;
@@ -98,7 +98,6 @@ int yos_fifo_try_open(const char *path, int flags) {
     }
     int dupcmd = (flags & O_CLOEXEC) ? F_DUPFD_CLOEXEC : F_DUPFD;
     int dup = fcntl(src, dupcmd, 0);
-    pthread_mutex_unlock(&g_fifo_lock);
     if (dup < 0) return -1;
     /* Real FIFO open() ignores O_TRUNC / O_APPEND / O_CREAT — we do too. */
     return dup;
@@ -113,14 +112,12 @@ int32_t yos_mkfifo(struct yos_exec_ctx *ctx, uint32_t path_off, uint16_t mode)
                       ? (const char *)(ctx->memory + path_off) : NULL;
     if (!raw) return yos_errno_neg(ctx, EFAULT);
     const char *path = yos_path_resolve(ctx, raw);
-
-    pthread_mutex_lock(&g_fifo_lock);
     /* Real POSIX mkfifo on an existing path returns EEXIST. But on
      * respawn / restart loops we'd otherwise leak the old pipe pair
      * forever and fail every subsequent open() on stale registry. So
      * if the entry already exists, tear it down and re-create. */
     {
-        struct fifo_entry **link = &g_fifo_head;
+        struct fifo_entry **link = (struct fifo_entry **)&ctx->fifo_head;
         while (*link) {
             if (strcmp((*link)->path, path) == 0) {
                 struct fifo_entry *old = *link;
@@ -138,11 +135,12 @@ int32_t yos_mkfifo(struct yos_exec_ctx *ctx, uint32_t path_off, uint16_t mode)
 
     /* Marker file so stat()/access() at the path see something. We
      * don't carry FIFO semantics in the filesystem layer, just the
-     * placeholder. Mode bits applied where the kernel allows. */
-    int marker = open(path, O_WRONLY | O_CREAT | O_EXCL, (mode_t)(mode & 0777));
+     * placeholder. Mode bits applied where the kernel allows; the
+     * per-ctx umask is masked in software since host umask is 0. */
+    int marker = open(path, O_WRONLY | O_CREAT | O_EXCL,
+                      (mode_t)((mode & 0777) & ~ctx->umask));
     if (marker < 0) {
         int saved = errno;
-        pthread_mutex_unlock(&g_fifo_lock);
         return yos_errno_neg(ctx, saved);
     }
     close(marker);
@@ -151,22 +149,19 @@ int32_t yos_mkfifo(struct yos_exec_ctx *ctx, uint32_t path_off, uint16_t mode)
     if (pipe(p) < 0) {
         int saved = errno;
         unlink(path);
-        pthread_mutex_unlock(&g_fifo_lock);
         return yos_errno_neg(ctx, saved);
     }
 
     struct fifo_entry *e = (struct fifo_entry *)malloc(sizeof *e);
     if (!e) {
         close(p[0]); close(p[1]); unlink(path);
-        pthread_mutex_unlock(&g_fifo_lock);
         return yos_errno_neg(ctx, ENOMEM);
     }
     e->path = strdup(path);
     e->rfd  = p[0];
     e->wfd  = p[1];
-    e->next = g_fifo_head;
-    g_fifo_head = e;
-    pthread_mutex_unlock(&g_fifo_lock);
+    e->next = (struct fifo_entry *)ctx->fifo_head;
+    ctx->fifo_head = e;
 
     ydebug("fifo: registered %s (rfd=%d wfd=%d)\n", path, e->rfd, e->wfd);
     return 0;
@@ -228,9 +223,8 @@ int32_t yos_mkfifoat(struct yos_exec_ctx *ctx, int32_t dfd,
 int32_t yos_mkfifo_path(struct yos_exec_ctx *ctx, const char *path,
                         uint32_t mode)
 {
-    pthread_mutex_lock(&g_fifo_lock);
     {
-        struct fifo_entry **link = &g_fifo_head;
+        struct fifo_entry **link = (struct fifo_entry **)&ctx->fifo_head;
         while (*link) {
             if (strcmp((*link)->path, path) == 0) {
                 struct fifo_entry *old = *link;
@@ -246,7 +240,6 @@ int32_t yos_mkfifo_path(struct yos_exec_ctx *ctx, const char *path,
     int marker = open(path, O_WRONLY | O_CREAT | O_EXCL, (mode_t)(mode & 0777));
     if (marker < 0) {
         int saved = errno;
-        pthread_mutex_unlock(&g_fifo_lock);
         return yos_errno_neg(ctx, saved);
     }
     close(marker);
@@ -254,21 +247,18 @@ int32_t yos_mkfifo_path(struct yos_exec_ctx *ctx, const char *path,
     if (pipe(p) < 0) {
         int saved = errno;
         unlink(path);
-        pthread_mutex_unlock(&g_fifo_lock);
         return yos_errno_neg(ctx, saved);
     }
     struct fifo_entry *e = (struct fifo_entry *)malloc(sizeof *e);
     if (!e) {
         close(p[0]); close(p[1]); unlink(path);
-        pthread_mutex_unlock(&g_fifo_lock);
         return yos_errno_neg(ctx, ENOMEM);
     }
     e->path = strdup(path);
     e->rfd  = p[0];
     e->wfd  = p[1];
-    e->next = g_fifo_head;
-    g_fifo_head = e;
-    pthread_mutex_unlock(&g_fifo_lock);
+    e->next = (struct fifo_entry *)ctx->fifo_head;
+    ctx->fifo_head = e;
     ydebug("fifo: registered %s (rfd=%d wfd=%d)\n", path, e->rfd, e->wfd);
     return 0;
 }
@@ -278,17 +268,14 @@ int32_t yos_mkfifo_path(struct yos_exec_ctx *ctx, const char *path,
  * this, runsv-style code does `stat(path); if ((mode & S_IFMT) !=
  * S_IFIFO) bail` and our pipe-emulated FIFO is rejected. Returns 1
  * if the path was rewritten, 0 if unknown. */
-int yos_fifo_stat_fixup(const char *path, mode_t *st_mode_out)
+int yos_fifo_stat_fixup(struct yos_exec_ctx *ctx, const char *path, mode_t *st_mode_out)
 {
     if (!path || !st_mode_out) return 0;
-    pthread_mutex_lock(&g_fifo_lock);
-    struct fifo_entry *e = fifo_lookup_locked(path);
+    struct fifo_entry *e = fifo_lookup_locked(ctx, path);
     if (e) {
         *st_mode_out = (*st_mode_out & ~S_IFMT) | S_IFIFO;
-        pthread_mutex_unlock(&g_fifo_lock);
         return 1;
     }
-    pthread_mutex_unlock(&g_fifo_lock);
     return 0;
 }
 
@@ -296,10 +283,9 @@ int yos_fifo_stat_fixup(const char *path, mode_t *st_mode_out)
  * stale entry doesn't linger forever even if the program drops the
  * placeholder file. Returns 1 if path WAS a FIFO (caller can ignore
  * any host unlink errno), 0 otherwise. */
-int yos_fifo_drop(const char *path)
+int yos_fifo_drop(struct yos_exec_ctx *ctx, const char *path)
 {
-    pthread_mutex_lock(&g_fifo_lock);
-    struct fifo_entry **link = &g_fifo_head;
+    struct fifo_entry **link = (struct fifo_entry **)&ctx->fifo_head;
     while (*link) {
         if (strcmp((*link)->path, path) == 0) {
             struct fifo_entry *e = *link;
@@ -308,12 +294,10 @@ int yos_fifo_drop(const char *path)
             close(e->wfd);
             free(e->path);
             free(e);
-            pthread_mutex_unlock(&g_fifo_lock);
             return 1;
         }
         link = &(*link)->next;
     }
-    pthread_mutex_unlock(&g_fifo_lock);
     return 0;
 }
 
@@ -346,7 +330,7 @@ int32_t yos_stat(struct yos_exec_ctx *ctx, uint32_t path_off,
     int rc = stat(path, &host_st);
     if (rc < 0) return yos_errno_neg(ctx, errno);
 
-    (void)yos_fifo_stat_fixup(path, &host_st.st_mode);
+    (void)yos_fifo_stat_fixup(ctx, path, &host_st.st_mode);
 
     if (statbuf_off && statbuf_off < ctx->memory_size)
         yos_cv_stat_fbi((uint8_t *)(ctx->memory + statbuf_off), &host_st);
@@ -367,7 +351,7 @@ int32_t yos_lstat(struct yos_exec_ctx *ctx, uint32_t path_off,
     int rc = lstat(path, &host_st);
     if (rc < 0) return yos_errno_neg(ctx, errno);
 
-    (void)yos_fifo_stat_fixup(path, &host_st.st_mode);
+    (void)yos_fifo_stat_fixup(ctx, path, &host_st.st_mode);
 
     if (statbuf_off && statbuf_off < ctx->memory_size)
         yos_cv_stat_fbi((uint8_t *)(ctx->memory + statbuf_off), &host_st);
@@ -406,7 +390,7 @@ int32_t yos_fstatat(struct yos_exec_ctx *ctx, int32_t dfd,
      * lookups the regular stat result stands, which is correct on hosts
      * where mkfifo(2) works natively (the placeholder file isn't there
      * — the real FIFO is). */
-    (void)yos_fifo_stat_fixup(path, &host_st.st_mode);
+    (void)yos_fifo_stat_fixup(ctx, path, &host_st.st_mode);
 
     if (statbuf_off && statbuf_off < ctx->memory_size)
         yos_cv_stat_fbi((uint8_t *)(ctx->memory + statbuf_off), &host_st);

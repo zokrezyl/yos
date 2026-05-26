@@ -37,24 +37,10 @@ extern uint32_t yos_malloc(struct yos_exec_ctx *ctx, uint32_t size);
 extern void     yos_free  (struct yos_exec_ctx *ctx, uint32_t off);
 extern char   **environ;
 
-#define YOS_ENV_MAX  512
-
-struct yos_env_entry {
-    uint32_t name_off;   /* offset of the name copy in wasm memory */
-    uint32_t value_off;  /* offset of the value copy */
-    uint32_t name_len;
-};
-
-struct yos_env_store {
-    struct yos_env_entry e[YOS_ENV_MAX];
-    int    count;
-    int    initialised;
-};
-
-/* One static store per process — every fork gets its own ctx but the
- * env doesn't track per-ctx. If we end up needing per-process envs,
- * move this onto struct yos_exec_ctx. */
-static struct yos_env_store g_env;
+/* The env store + YOS_ENV_MAX live on `struct yos_exec_ctx` (see
+ * types.h::env_store). Fork copies it into the child ctx; per-ctx
+ * storage is what lets parent and child have independent setenv
+ * results. */
 
 /* Copy a host string into the wasm linear memory via yos_malloc.
  * Returns the wasm offset, or 0 on failure. */
@@ -68,15 +54,13 @@ static uint32_t copy_to_wasm(struct yos_exec_ctx *ctx, const char *s)
     return off;
 }
 
-static int find_entry(const struct yos_env_store *st,
-                      struct yos_exec_ctx *ctx,
-                      const char *name)
+static int find_entry(struct yos_exec_ctx *ctx, const char *name)
 {
     size_t nlen = strlen(name);
-    for (int i = 0; i < st->count; i++) {
-        if (st->e[i].name_off == 0) continue;
-        if (st->e[i].name_len != nlen) continue;
-        if (memcmp(ctx->memory + st->e[i].name_off, name, nlen) == 0)
+    for (int i = 0; i < ctx->env_store.count; i++) {
+        if (ctx->env_store.e[i].name_off == 0) continue;
+        if (ctx->env_store.e[i].name_len != nlen) continue;
+        if (memcmp(ctx->memory + ctx->env_store.e[i].name_off, name, nlen) == 0)
             return i;
     }
     return -1;
@@ -89,7 +73,7 @@ static int find_entry(const struct yos_env_store *st,
 static void env_load_from_vec(struct yos_exec_ctx *ctx, char **vec)
 {
     if (!vec) return;
-    for (char **p = vec; *p && g_env.count < YOS_ENV_MAX; p++) {
+    for (char **p = vec; *p && ctx->env_store.count < YOS_ENV_MAX; p++) {
         const char *eq = strchr(*p, '=');
         if (!eq) continue;
         size_t nlen = (size_t)(eq - *p);
@@ -100,10 +84,10 @@ static void env_load_from_vec(struct yos_exec_ctx *ctx, char **vec)
         uint32_t name_off  = copy_to_wasm(ctx, nbuf);
         uint32_t value_off = copy_to_wasm(ctx, eq + 1);
         if (!name_off || !value_off) continue;
-        g_env.e[g_env.count].name_off  = name_off;
-        g_env.e[g_env.count].value_off = value_off;
-        g_env.e[g_env.count].name_len  = (uint32_t)nlen;
-        g_env.count++;
+        ctx->env_store.e[ctx->env_store.count].name_off  = name_off;
+        ctx->env_store.e[ctx->env_store.count].value_off = value_off;
+        ctx->env_store.e[ctx->env_store.count].name_len  = (uint32_t)nlen;
+        ctx->env_store.count++;
     }
 }
 
@@ -119,8 +103,8 @@ static void env_load_from_host(struct yos_exec_ctx *ctx)
  * (PATH, PWD, USER, TERM, etc. that telnetd and friends set). */
 static void env_init_once(struct yos_exec_ctx *ctx)
 {
-    if (g_env.initialised) return;
-    g_env.initialised = 1;
+    if (ctx->env_store.initialised) return;
+    ctx->env_store.initialised = 1;
     if (ctx && ctx->envp && ctx->envc > 0) {
         env_load_from_vec(ctx, ctx->envp);
     } else {
@@ -130,17 +114,17 @@ static void env_init_once(struct yos_exec_ctx *ctx)
 
 /* Called from the execve flow when the wasm guest replaces its
  * module: the wasm linear memory is fresh, so every wasm offset we
- * cached in g_env (name_off / value_off) is now stale. Wipe the
- * cache; the next getenv/setenv re-loads from the new ctx's envp.
- * Without this, zsh inheriting a parent telnetd's env reads back
- * garbage and traps deep inside its param-table init. */
-void yos_env_post_execve_reset(void)
+ * cached in ctx->env_store (name_off / value_off) is now stale.
+ * Wipe the cache; the next getenv/setenv re-loads from the new
+ * ctx's envp. Without this, zsh inheriting a parent telnetd's env
+ * reads back garbage and traps deep inside its param-table init. */
+void yos_env_post_execve_reset(struct yos_exec_ctx *ctx)
 {
     /* DON'T yos_free here: the offsets are into the OLD wasm memory
      * which has already been freed by m3_FreeRuntime. The allocator
      * lives inside guest memory; once that memory blob is gone, so
      * is the allocator state. Just zero the table. */
-    memset(&g_env, 0, sizeof g_env);
+    memset(&ctx->env_store, 0, sizeof ctx->env_store);
 }
 
 /* Test-only: drop all known entries and re-pull from host environ.
@@ -149,12 +133,12 @@ void yos_env_post_execve_reset(void)
 void yos_env_reload(struct yos_exec_ctx *ctx)
 {
     /* Free the wasm-side string buffers we allocated. */
-    for (int i = 0; i < g_env.count; i++) {
-        if (g_env.e[i].name_off)  yos_free(ctx, g_env.e[i].name_off);
-        if (g_env.e[i].value_off) yos_free(ctx, g_env.e[i].value_off);
+    for (int i = 0; i < ctx->env_store.count; i++) {
+        if (ctx->env_store.e[i].name_off)  yos_free(ctx, ctx->env_store.e[i].name_off);
+        if (ctx->env_store.e[i].value_off) yos_free(ctx, ctx->env_store.e[i].value_off);
     }
-    memset(&g_env, 0, sizeof g_env);
-    g_env.initialised = 1;
+    memset(&ctx->env_store, 0, sizeof ctx->env_store);
+    ctx->env_store.initialised = 1;
     env_load_from_host(ctx);
 }
 
@@ -163,11 +147,11 @@ uint32_t yos_getenv(struct yos_exec_ctx *ctx, uint32_t name_off)
     env_init_once(ctx);
     if (!name_off || name_off >= ctx->memory_size) return 0;
     const char *name = (const char *)(ctx->memory + name_off);
-    int idx = find_entry(&g_env, ctx, name);
+    int idx = find_entry(ctx, name);
     ydebug("getenv(\"%s\") -> %s (idx=%d)\n", name,
            idx >= 0 ? "found" : "NULL", idx);
     if (idx < 0) return 0;
-    return g_env.e[idx].value_off;
+    return ctx->env_store.e[idx].value_off;
 }
 
 int32_t yos_setenv(struct yos_exec_ctx *ctx, uint32_t name_off,
@@ -190,7 +174,9 @@ int32_t yos_setenv(struct yos_exec_ctx *ctx, uint32_t name_off,
      * per-process g_env store and the next exec'd child inherits
      * it for its own getenv() lookups — but the HOST'S ytrace
      * registry (process-wide, not per-ctx) never learns about the
-     * change because that lives outside the guest's env model. */
+     * change because that lives outside the guest's env model.
+     * Per-ctx env is otherwise normal; only these tracing knobs
+     * also poke host state. */
     if (strcmp(name, "YTRACE_DEFAULT_ON") == 0) {
         extern void ytrace_set_all_enabled(bool);
         bool on = (strcmp(value, "yes") == 0 || strcmp(value, "1") == 0 ||
@@ -233,19 +219,19 @@ int32_t yos_setenv(struct yos_exec_ctx *ctx, uint32_t name_off,
         setenv("YPERF_RING_SIZE", value, 1);
     }
 
-    int idx = find_entry(&g_env, ctx, name);
+    int idx = find_entry(ctx, name);
     if (idx >= 0) {
         if (!overwrite) return 0;
         /* Replace the value — keep the name slot, reallocate value. */
         uint32_t new_val = copy_to_wasm(ctx, value);
         if (!new_val) return yos_errno_neg(ctx, ENOMEM);
-        if (g_env.e[idx].value_off)
-            yos_free(ctx, g_env.e[idx].value_off);
-        g_env.e[idx].value_off = new_val;
+        if (ctx->env_store.e[idx].value_off)
+            yos_free(ctx, ctx->env_store.e[idx].value_off);
+        ctx->env_store.e[idx].value_off = new_val;
         return 0;
     }
 
-    if (g_env.count >= YOS_ENV_MAX)
+    if (ctx->env_store.count >= YOS_ENV_MAX)
         return yos_errno_neg(ctx, ENOMEM);
     uint32_t nm = copy_to_wasm(ctx, name);
     uint32_t vl = copy_to_wasm(ctx, value);
@@ -254,10 +240,10 @@ int32_t yos_setenv(struct yos_exec_ctx *ctx, uint32_t name_off,
         if (vl) yos_free(ctx, vl);
         return yos_errno_neg(ctx, ENOMEM);
     }
-    g_env.e[g_env.count].name_off  = nm;
-    g_env.e[g_env.count].value_off = vl;
-    g_env.e[g_env.count].name_len  = (uint32_t)strlen(name);
-    g_env.count++;
+    ctx->env_store.e[ctx->env_store.count].name_off  = nm;
+    ctx->env_store.e[ctx->env_store.count].value_off = vl;
+    ctx->env_store.e[ctx->env_store.count].name_len  = (uint32_t)strlen(name);
+    ctx->env_store.count++;
     return 0;
 }
 
@@ -269,29 +255,29 @@ int32_t yos_unsetenv(struct yos_exec_ctx *ctx, uint32_t name_off)
     const char *name = (const char *)(ctx->memory + name_off);
     if (!*name || strchr(name, '=') != NULL)
         return yos_errno_neg(ctx, EINVAL);
-    int idx = find_entry(&g_env, ctx, name);
+    int idx = find_entry(ctx, name);
     if (idx < 0) return 0;
-    if (g_env.e[idx].name_off)  yos_free(ctx, g_env.e[idx].name_off);
-    if (g_env.e[idx].value_off) yos_free(ctx, g_env.e[idx].value_off);
+    if (ctx->env_store.e[idx].name_off)  yos_free(ctx, ctx->env_store.e[idx].name_off);
+    if (ctx->env_store.e[idx].value_off) yos_free(ctx, ctx->env_store.e[idx].value_off);
     /* Compact: copy last entry into this slot. */
-    g_env.e[idx] = g_env.e[--g_env.count];
-    g_env.e[g_env.count].name_off  = 0;
-    g_env.e[g_env.count].value_off = 0;
-    g_env.e[g_env.count].name_len  = 0;
+    ctx->env_store.e[idx] = ctx->env_store.e[--ctx->env_store.count];
+    ctx->env_store.e[ctx->env_store.count].name_off  = 0;
+    ctx->env_store.e[ctx->env_store.count].value_off = 0;
+    ctx->env_store.e[ctx->env_store.count].name_len  = 0;
     return 0;
 }
 
 int32_t yos_clearenv(struct yos_exec_ctx *ctx)
 {
     env_init_once(ctx);
-    for (int i = 0; i < g_env.count; i++) {
-        if (g_env.e[i].name_off)  yos_free(ctx, g_env.e[i].name_off);
-        if (g_env.e[i].value_off) yos_free(ctx, g_env.e[i].value_off);
-        g_env.e[i].name_off  = 0;
-        g_env.e[i].value_off = 0;
-        g_env.e[i].name_len  = 0;
+    for (int i = 0; i < ctx->env_store.count; i++) {
+        if (ctx->env_store.e[i].name_off)  yos_free(ctx, ctx->env_store.e[i].name_off);
+        if (ctx->env_store.e[i].value_off) yos_free(ctx, ctx->env_store.e[i].value_off);
+        ctx->env_store.e[i].name_off  = 0;
+        ctx->env_store.e[i].value_off = 0;
+        ctx->env_store.e[i].name_len  = 0;
     }
-    g_env.count = 0;
+    ctx->env_store.count = 0;
     return 0;
 }
 

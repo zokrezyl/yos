@@ -63,6 +63,12 @@ int32_t yos_dup(struct yos_exec_ctx *ctx, int32_t wfd)
     }
     int new_wfd = yos_fd_alloc(ctx, new_hfd);
     if (new_wfd < 0) { close(new_hfd); return yos_errno_neg(ctx, EMFILE); }
+    /* Propagate recorded path. fts(3) under find(1) opens "." into one
+     * fd then dups it into another for stash-and-restore; without this
+     * the dup'd fd has no path, so a later fchdir on it can't update
+     * ctx->cwd. */
+    if (ctx->fd_paths[wfd])
+        ctx->fd_paths[new_wfd] = strdup(ctx->fd_paths[wfd]);
     ydebug("dup(wfd=%d hfd=%d) -> new_wfd=%d new_hfd=%d\n",
            wfd, hfd, new_wfd, new_hfd);
     return new_wfd;
@@ -422,7 +428,20 @@ int32_t yos_select(struct yos_exec_ctx *ctx, int32_t nfds,
         if (hfd > max_hfd) max_hfd = hfd;
     }
 
-    struct timeval *tv = to_off ? (struct timeval *)(ctx->memory + to_off) : NULL;
+    /* struct timeval on FreeBSD wasm32 is 8 bytes (32-bit time_t +
+     * 32-bit suseconds_t). On macOS/Linux x86_64 host it's 16 bytes
+     * (64-bit time_t + 32-bit suseconds_t + 4 bytes padding).
+     * Treating the wasm-memory bytes directly as `struct timeval *`
+     * makes the host read 8 bytes of garbage as the high 32 bits of
+     * tv_sec, often producing tv_sec = -1 → EINVAL from select.
+     * Convert via the codegen-emitted cv_timeval_w2h. */
+    extern void cv_timeval_w2h(struct timeval *h, const uint8_t *w);
+    struct timeval host_tv;
+    struct timeval *tv = NULL;
+    if (to_off) {
+        cv_timeval_w2h(&host_tv, ctx->memory + to_off);
+        tv = &host_tv;
+    }
     int rc = select(max_hfd + 1, &hr, &hw, &he, tv);
     if (rc < 0) return yos_errno_neg(ctx, errno);
 
@@ -946,7 +965,33 @@ int32_t yos_fchdir(struct yos_exec_ctx *ctx, int32_t wfd)
 {
     int hfd = yos_fd_get(ctx, wfd);
     if (hfd < 0) return yos_errno_neg(ctx, EBADF);
-    return yos_errno_check(ctx, fchdir(hfd));
+
+    /* Verify it's actually a directory before committing — fchdir on
+     * a non-dir fd must return ENOTDIR. */
+    struct stat st;
+    if (fstat(hfd, &st) < 0) return yos_errno_neg(ctx, errno);
+    if (!S_ISDIR(st.st_mode)) return yos_errno_neg(ctx, ENOTDIR);
+
+    /* Update ctx->cwd from the path recorded at open-time. yos's
+     * fd table tracks (wfd → host_fd, absolute_path); every open /
+     * openat / opendir populates it. We DELIBERATELY skip host
+     * fchdir() — yos's pthread-per-ctx model shares host cwd across
+     * guests, and a real fchdir would silently move every other
+     * guest's relative paths. Same compromise yos_chdir made.
+     *
+     * If no path was recorded (e.g. fd came from socket, pipe,
+     * fcntl-dup, accept) we have nothing to set cwd to — fchdir on
+     * a non-recorded fd returns 0 but leaves ctx->cwd unchanged. */
+    if (wfd >= 0 && wfd < YOS_FD_MAX && ctx->fd_paths[wfd]) {
+        strncpy(ctx->cwd, ctx->fd_paths[wfd], PATH_MAX - 1);
+        ctx->cwd[PATH_MAX - 1] = '\0';
+        ydebug("fchdir(wfd=%d hfd=%d) → ctx->cwd=\"%s\"\n",
+               wfd, hfd, ctx->cwd);
+    } else {
+        ydebug("fchdir(wfd=%d hfd=%d) — no recorded path; cwd unchanged\n",
+               wfd, hfd);
+    }
+    return 0;
 }
 
 /* ── pread / pwrite (host has same signature, just need fd remap) ── */
@@ -989,8 +1034,14 @@ int32_t yos_issetugid(struct yos_exec_ctx *ctx) { (void)ctx; return 0; }
 
 uint32_t yos_umask(struct yos_exec_ctx *ctx, uint32_t mask)
 {
-    (void)ctx;
-    return (uint32_t)umask((mode_t)mask);
+    /* Per-ctx umask: store in ctx, return previous. The host process
+     * umask is forced to 0 at startup (main.c) so file-creating
+     * bridges apply masking in software via ctx->umask — that lets
+     * concurrent yos guests each have their own umask without
+     * stomping the shared host-process value. */
+    uint32_t prev = (uint32_t)ctx->umask;
+    ctx->umask = (unsigned short)(mask & 0777);
+    return prev;
 }
 
 int32_t yos_sync(struct yos_exec_ctx *ctx)
@@ -1000,12 +1051,47 @@ int32_t yos_sync(struct yos_exec_ctx *ctx)
     return 0;
 }
 
+/* sysconf returns `long` on the host (64-bit on macOS/Linux x86_64).
+ * wasm32 long is 32-bit; the auto-passthrough bridge truncates the
+ * top 32 bits and turns LONG_MAX (which darwin returns for unbounded
+ * limits like _SC_OPEN_MAX) into -1, breaking shells and runtimes
+ * that probe sysconf at startup.
+ *
+ * Two-step fix here: clamp the host result into int32 range, and
+ * map -1+errno through the standard errno helper so the guest sees
+ * a real ENOSYS for unsupported names. The FreeBSD _SC_* constants
+ * mostly match darwin's (both are BSD-derived) so we forward the
+ * name as-is; if Linux glibc renumbering shows up, add a remap
+ * table here. */
+int32_t yos_sysconf(struct yos_exec_ctx *ctx, int32_t name)
+{
+    errno = 0;
+    long r = sysconf((int)name);
+    if (r < 0) {
+        /* sysconf returns -1 with errno=0 to mean "unlimited / not
+         * specifically configured", and -1 with errno != 0 for a
+         * real error. POSIX says callers must check errno to
+         * distinguish; wasm guests do the same, so propagate. */
+        if (errno != 0) return yos_errno_neg(ctx, errno);
+        return -1;
+    }
+    if (r > 0x7fffffffL) return 0x7fffffff;
+    return (int32_t)r;
+}
+
 /* ── signals ──────────────────────────────────────────────────────── */
 
 int32_t yos_raise(struct yos_exec_ctx *ctx, int32_t sig)
 {
-    (void)ctx;
-    return yos_errno_check(ctx, raise(sig));
+    /* raise() == kill(getpid(), sig). Going through host raise()
+     * delivers a real host SIGUSR1/etc. which yos doesn't route to
+     * the wasm-side handler (only the few signals installed by
+     * yos_install_host_signal_handlers get forwarded). Route through
+     * yos_kill instead so the per-ctx sig_handlers[] table is
+     * consulted and yos_signal_pump fires the registered handler. */
+    if (!ctx || !ctx->proc) return yos_errno_neg(ctx, EINVAL);
+    extern int32_t yos_kill(struct yos_exec_ctx *, int32_t, int32_t);
+    return yos_kill(ctx, ctx->proc->pid, sig);
 }
 
 int32_t yos_killpg(struct yos_exec_ctx *ctx, int32_t pgrp, int32_t sig)
@@ -1151,8 +1237,10 @@ int cc_fb_to_lx(int fb_idx)
  * line editing). The wasm guest may then tcsetattr to switch the
  * line discipline; we silently accept those and remember the last
  * struct so subsequent tcgetattr round-trips are stable. */
-static struct termios g_fake_pty_termios;
-static int            g_fake_pty_termios_init;
+/* Per-ctx (ctx->fake_pty_termios is opaque bytes wide enough for
+ * struct termios — see types.h). Used to be a process-wide pair of
+ * statics; two telnet sessions both calling tcsetattr would clobber
+ * each other's PTY line-discipline state. */
 
 static void fake_pty_termios_defaults(struct termios *t)
 {
@@ -1196,11 +1284,11 @@ int32_t yos_tcgetattr(struct yos_exec_ctx *ctx, int32_t wfd, uint32_t t_off)
      * picks the no-tty code path and runs without a prompt. */
     extern int yos_pty_is_pty_fd(int hfd);
     if (yos_pty_is_pty_fd(hfd)) {
-        if (!g_fake_pty_termios_init) {
-            fake_pty_termios_defaults(&g_fake_pty_termios);
-            g_fake_pty_termios_init = 1;
+        if (!ctx->fake_pty_termios_init) {
+            fake_pty_termios_defaults((struct termios *)ctx->fake_pty_termios);
+            ctx->fake_pty_termios_init = 1;
         }
-        termios_lx_to_fb(ctx->memory + t_off, &g_fake_pty_termios);
+        termios_lx_to_fb(ctx->memory + t_off, (struct termios *)ctx->fake_pty_termios);
         return 0;
     }
 
@@ -1225,15 +1313,15 @@ int32_t yos_tcsetattr(struct yos_exec_ctx *ctx, int32_t wfd,
     extern int yos_pty_is_pty_fd(int hfd);
     extern int yos_pty_set_onlcr(int hfd, int on);
     if (yos_pty_is_pty_fd(hfd)) {
-        if (!g_fake_pty_termios_init) {
-            fake_pty_termios_defaults(&g_fake_pty_termios);
-            g_fake_pty_termios_init = 1;
+        if (!ctx->fake_pty_termios_init) {
+            fake_pty_termios_defaults((struct termios *)ctx->fake_pty_termios);
+            ctx->fake_pty_termios_init = 1;
         }
-        termios_fb_to_lx(&g_fake_pty_termios, ctx->memory + t_off);
+        termios_fb_to_lx((struct termios *)ctx->fake_pty_termios, ctx->memory + t_off);
         /* Sync ONLCR to the pty-entry so master reads emit CRLF when
          * the guest leaves the slave in cooked mode (default) and
          * raw LF when the guest cleared the bit (cfmakeraw etc.). */
-        yos_pty_set_onlcr(hfd, !!(g_fake_pty_termios.c_oflag & ONLCR));
+        yos_pty_set_onlcr(hfd, !!(((struct termios *)ctx->fake_pty_termios)->c_oflag & ONLCR));
         (void)actions;
         return 0;
     }

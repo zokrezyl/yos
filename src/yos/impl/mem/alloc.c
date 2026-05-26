@@ -171,11 +171,52 @@ void yos_free(struct yos_exec_ctx *ctx, uint32_t off)
         pthread_mutex_unlock(&g_alloc_lock);
         return;
     }
-    /* Push onto front of free list. No coalescing for now — fine for
-     * short-lived processes; if fragmentation becomes a problem we
-     * can add adjacent-block merging here in O(n). */
-    blk_set_next(ctx, blk_off, ctx->alloc_free_head);
-    ctx->alloc_free_head = blk_off;
+    /* Insert into the free list sorted by ascending address, coalescing
+     * with any adjacent free blocks. Without this, every alloc/free
+     * cycle grew the free list by one node; for tools that allocate
+     * + free many small buffers (find(1) does ~5 per directory entry
+     * for fts path bookkeeping), the list reached hundreds of thousands
+     * of nodes after a few hundred thousand entries. First-fit walked
+     * the whole list on every malloc → ~O(N²) cumulative slowdown —
+     * find's throughput collapsed from ~500k entries/sec to <2k/sec
+     * past the 350k-entry mark.
+     *
+     * Sorted insert + coalesce keeps the list to roughly the number
+     * of distinct free regions (typically a few dozen for steady-
+     * state workloads), so malloc stays fast indefinitely.
+     *
+     * Cost: O(N) walk on free to find the insertion point. Acceptable
+     * because the list size now stays small. If this ever becomes a
+     * bottleneck the next step is segregated lists by size class. */
+    uint32_t prev = 0;
+    uint32_t cur  = ctx->alloc_free_head;
+    while (cur && cur < blk_off) {
+        prev = cur;
+        cur  = blk_next(ctx, cur);
+    }
+    /* Try coalescing with the previous block (prev + prev->size == blk). */
+    if (prev) {
+        uint32_t prev_sz = blk_size(ctx, prev);
+        if (prev + prev_sz == blk_off) {
+            blk_set_size(ctx, prev, prev_sz + sz);
+            blk_off = prev;
+            sz      = prev_sz + sz;
+            /* Don't double-link `blk` — it's now merged into prev. */
+        } else {
+            blk_set_next(ctx, prev, blk_off);
+            blk_set_next(ctx, blk_off, cur);
+        }
+    } else {
+        blk_set_next(ctx, blk_off, cur);
+        ctx->alloc_free_head = blk_off;
+    }
+    /* Try coalescing with the next block (blk + blk->size == cur). */
+    if (cur && blk_off + sz == cur) {
+        uint32_t cur_sz   = blk_size(ctx, cur);
+        uint32_t cur_next = blk_next(ctx, cur);
+        blk_set_size(ctx, blk_off, sz + cur_sz);
+        blk_set_next(ctx, blk_off, cur_next);
+    }
     pthread_mutex_unlock(&g_alloc_lock);
 }
 

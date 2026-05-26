@@ -44,6 +44,13 @@ custom_proc:
   - issetugid
   - raise
   - killpg
+  # sysconf — host darwin returns LONG_MAX for unbounded limits (e.g.
+  # _SC_OPEN_MAX = 9223372036854775807). The auto-bridge truncates
+  # the host `long` to wasm32 `long` (32-bit) and the guest sees -1,
+  # which it can't distinguish from a real error. impl/libc/posix.c
+  # yos_sysconf clamps to INT32_MAX and routes errno through
+  # yos_errno_neg.
+  - sysconf
   # impl/posix.c — socket-side bridges that need wfd→hfd translation.
   # The auto-bridge passes the wasm fd straight through to host
   # bind/listen/etc. which then sees an unrelated fd or EBADF.

@@ -372,6 +372,16 @@ typedef struct {
     uint32_t alloc_lo;
     uint32_t alloc_hi;
     uint32_t alloc_free_head;
+    /* mmap cursor for anonymous mmap2 carving (impl/mem/mem.c). Without
+     * this in the snapshot, the child's mmap_top stays at calloc'd 0
+     * (or re-initialises to memory_size/2), and the child's first
+     * mmap returns the SAME wasm address parent's first mmap returned
+     * — clobbering parent's region byte-for-byte. */
+    uint32_t mmap_top;
+    /* Free list — body lives in wasm linear memory (rides on the
+     * memory snapshot), but the per-ctx bookmarks are host-side. */
+    struct yos_free_region free_list[YOS_MAX_FREE_REGIONS];
+    int free_count;
     int argc;
     char **argv;
     int envc;
@@ -401,8 +411,36 @@ typedef struct {
      * function-table indices, and the child runs the same wasm
      * binary post-fork (asyncify rewind) so the table is identical. */
     uint32_t parent_sig_handlers[32];
+    uint32_t parent_sig_ignore_mask;
     uint32_t parent_sig_mask;
     uint32_t parent_sig_pending;
+    /* Per-ctx locale name. host setlocale() is process-wide; we keep
+     * the FreeBSD-libc query view per-ctx via ctx->locale_name. */
+    char     parent_locale_name[64];
+    /* Per-ctx FILE* table. We dup the underlying host FILE* into
+     * child-owned FILE*s via fdopen(dup(fileno)) so each side's
+     * fclose only affects its own copy. file_dup_fps[] holds the
+     * already-dup'd child FILE*s (allocated in yos_fork_pump); the
+     * child thread just copies them into child_ctx->file_slots. */
+    void    *parent_file_dup_fps[256];
+    int32_t  parent_file_dup_wfds[256];
+    char     parent_file_modes[256][8];
+    /* Parent's env_store. Holds wasm-memory offsets into env name
+     * and value strings. The strings themselves live in the wasm
+     * linear memory and are copied by the memory snapshot/restore;
+     * we just need the index table copied here so the child sees
+     * the same env entries the parent had at fork time. Without
+     * this, child's setenv mutations leak back into the parent's
+     * shared env_store. */
+    struct {
+        struct yos_env_entry e[YOS_ENV_MAX];
+        int    count;
+        int    initialised;
+    } parent_env_store;
+    /* Parent's umask. The host kernel's per-process umask is shared
+     * across every yos guest (they're host pthreads of one process),
+     * so child's umask() would leak back into parent without this. */
+    unsigned short parent_umask;
 } fork_thread_arg_t;
 
 static void *fork_thread_func(void *arg)
@@ -417,10 +455,28 @@ static void *fork_thread_func(void *arg)
     if (fork_thread_arg->proc && fork_thread_arg->proc->comm[0])
         yos_ytrace_set_comm(fork_thread_arg->proc->comm);
 
+    /* Serialise the wasm3 module-load path across concurrent forks.
+     * yos's fork model spawns a host pthread that calls
+     * m3_NewEnvironment / m3_NewRuntime / m3_ParseModule /
+     * m3_LoadModule. When two ctxs fork at the same wall-clock
+     * time (e.g. two perf-stresses in two telnet sessions under
+     * `yos --server`), the second host thread's load races with
+     * the first in wasm3 internals and crashes the host process
+     * with SIGSEGV inside m3Error. The crash dump consistently
+     * shows last_bridge=fork after a mid-test wait3 phase.
+     *
+     * Until the wasm3 source is audited for thread-safety, lock
+     * around the full setup. Module load is fast (sub-ms) so
+     * concurrent fork throughput barely suffers; correctness
+     * comes first. */
+    static pthread_mutex_t fork_setup_lock = PTHREAD_MUTEX_INITIALIZER;
+    pthread_mutex_lock(&fork_setup_lock);
+
     /* Create new wasm3 environment and runtime for child */
     IM3Environment env = m3_NewEnvironment();
     IM3Runtime rt = m3_NewRuntime(env, 64 * 1024, NULL);
     if (!rt) {
+        pthread_mutex_unlock(&fork_setup_lock);
         munmap(fork_thread_arg->memory_snapshot, fork_thread_arg->memory_size);
         free(fork_thread_arg->wasm_globals);
         free(fork_thread_arg);
@@ -430,6 +486,7 @@ static void *fork_thread_func(void *arg)
     /* Create child exec context */
     struct yos_exec_ctx *child_ctx = calloc(1, sizeof(struct yos_exec_ctx));
     if (!child_ctx) {
+        pthread_mutex_unlock(&fork_setup_lock);
         m3_FreeRuntime(rt);
         m3_FreeEnvironment(env);
         munmap(fork_thread_arg->memory_snapshot, fork_thread_arg->memory_size);
@@ -455,6 +512,13 @@ static void *fork_thread_func(void *arg)
     child_ctx->alloc_lo        = fork_thread_arg->alloc_lo;
     child_ctx->alloc_hi        = fork_thread_arg->alloc_hi;
     child_ctx->alloc_free_head = fork_thread_arg->alloc_free_head;
+    /* Inherit mmap cursor + free list so child's next mmap2 carves
+     * AFTER the parent's existing mmap regions, not at the same
+     * starting address. */
+    child_ctx->mmap_top   = fork_thread_arg->mmap_top;
+    child_ctx->free_count = fork_thread_arg->free_count;
+    memcpy(child_ctx->free_list, fork_thread_arg->free_list,
+           sizeof(child_ctx->free_list));
     child_ctx->asyncify_ptr = fork_thread_arg->asyncify_ptr;
     child_ctx->sj_discard_ptr  = fork_thread_arg->sj_discard_ptr;
     /* TODO(setjmp-refactor): copy parent's sj_slots[] into child. */
@@ -498,8 +562,28 @@ static void *fork_thread_func(void *arg)
     /* POSIX fork: child inherits parent's full signal state. */
     memcpy(child_ctx->sig_handlers, fork_thread_arg->parent_sig_handlers,
            sizeof(child_ctx->sig_handlers));
+    child_ctx->sig_ignore_mask = fork_thread_arg->parent_sig_ignore_mask;
     child_ctx->sig_mask    = fork_thread_arg->parent_sig_mask;
     child_ctx->sig_pending = fork_thread_arg->parent_sig_pending;
+    memcpy(child_ctx->locale_name, fork_thread_arg->parent_locale_name,
+           sizeof(child_ctx->locale_name));
+    /* Inherit per-ctx FILE* table. yos_fork_pump pre-dup'd each
+     * live parent FILE* via fdopen(dup(fileno(...))) so the child
+     * gets independent host FILE*s — fclose on one side doesn't
+     * affect the other. */
+    for (int i = 0; i < 256; i++) {
+        child_ctx->file_slots[i] = fork_thread_arg->parent_file_dup_fps[i];
+        child_ctx->file_wfds[i]  = fork_thread_arg->parent_file_dup_wfds[i];
+        memcpy(child_ctx->file_modes[i], fork_thread_arg->parent_file_modes[i],
+               sizeof(child_ctx->file_modes[i]));
+    }
+    /* POSIX fork: child inherits the env at the moment of fork.
+     * Subsequent setenv/unsetenv calls in either side stay local
+     * to that ctx. */
+    memcpy(&child_ctx->env_store, &fork_thread_arg->parent_env_store,
+           sizeof(child_ctx->env_store));
+    /* POSIX fork: child inherits parent's umask. */
+    child_ctx->umask = fork_thread_arg->parent_umask;
     pthread_mutex_init(&child_ctx->mem_lock, NULL);
 
     rt->userdata = child_ctx;
@@ -508,6 +592,7 @@ static void *fork_thread_func(void *arg)
     IM3Module mod;
     M3Result res = m3_ParseModule(env, &mod, fork_thread_arg->wasm_bytes, fork_thread_arg->wasm_bytes_size);
     if (res) {
+        pthread_mutex_unlock(&fork_setup_lock);
         free(child_ctx);
         m3_FreeRuntime(rt);
         m3_FreeEnvironment(env);
@@ -519,6 +604,7 @@ static void *fork_thread_func(void *arg)
 
     res = m3_LoadModule(rt, mod);
     if (res) {
+        pthread_mutex_unlock(&fork_setup_lock);
         free(child_ctx);
         m3_FreeRuntime(rt);
         m3_FreeEnvironment(env);
@@ -527,6 +613,11 @@ static void *fork_thread_func(void *arg)
         free(fork_thread_arg);
         return NULL;
     }
+
+    /* Module loaded; release the setup lock so the next concurrent
+     * fork can start its own setup in parallel with our child's
+     * runtime initialisation below. */
+    pthread_mutex_unlock(&fork_setup_lock);
 
     child_ctx->module = mod;
 
@@ -678,12 +769,12 @@ static void *fork_thread_func(void *arg)
          * pointer-into-memory) is now stale. Reset before any guest
          * code runs that could read those caches. */
         {
-            extern void yos_env_post_execve_reset(void);
-            extern void yos_pwd_post_execve_reset(void);
-            extern void yos_freebsd_userland_post_execve_reset(void);
-            yos_env_post_execve_reset();
-            yos_pwd_post_execve_reset();
-            yos_freebsd_userland_post_execve_reset();
+            extern void yos_env_post_execve_reset(struct yos_exec_ctx *);
+            extern void yos_pwd_post_execve_reset(struct yos_exec_ctx *);
+            extern void yos_freebsd_userland_post_execve_reset(struct yos_exec_ctx *);
+            yos_env_post_execve_reset(child_ctx);
+            yos_pwd_post_execve_reset(child_ctx);
+            yos_freebsd_userland_post_execve_reset(child_ctx);
         }
 
         child_ctx->argc = child_ctx->exec_argc;
@@ -1165,6 +1256,10 @@ void yos_fork_pump(struct yos_exec_ctx *ctx)
         fork_thread_arg->heap_end = ctx->heap_end;
         fork_thread_arg->alloc_lo        = ctx->alloc_lo;
         fork_thread_arg->alloc_hi        = ctx->alloc_hi;
+        fork_thread_arg->mmap_top        = ctx->mmap_top;
+        fork_thread_arg->free_count      = ctx->free_count;
+        memcpy(fork_thread_arg->free_list, ctx->free_list,
+               sizeof(fork_thread_arg->free_list));
         fork_thread_arg->alloc_free_head = ctx->alloc_free_head;
         fork_thread_arg->argc = ctx->argc;
         fork_thread_arg->argv = ctx->argv;
@@ -1209,8 +1304,46 @@ void yos_fork_pump(struct yos_exec_ctx *ctx)
                sizeof(fork_thread_arg->parent_cwd));
         memcpy(fork_thread_arg->parent_sig_handlers, ctx->sig_handlers,
                sizeof(fork_thread_arg->parent_sig_handlers));
+        fork_thread_arg->parent_sig_ignore_mask = ctx->sig_ignore_mask;
         fork_thread_arg->parent_sig_mask    = ctx->sig_mask;
         fork_thread_arg->parent_sig_pending = ctx->sig_pending;
+        memcpy(fork_thread_arg->parent_locale_name, ctx->locale_name,
+               sizeof(fork_thread_arg->parent_locale_name));
+        /* Dup each live parent FILE* so the child gets an
+         * independent host FILE* on each inherited slot. Without
+         * this, child fclose closes the underlying host file and
+         * subsequent parent fputs/fwrite/fclose ENOENT/EBADF/
+         * crashes on the freed FILE*. */
+        for (int i = 0; i < 256; i++) {
+            FILE *parent_fp = (FILE *)ctx->file_slots[i];
+            fork_thread_arg->parent_file_dup_fps[i]  = NULL;
+            fork_thread_arg->parent_file_dup_wfds[i] = -1;
+            fork_thread_arg->parent_file_modes[i][0] = '\0';
+            if (!parent_fp) continue;
+            int phfd = fileno(parent_fp);
+            if (phfd < 0) continue;
+            int chfd = fcntl(phfd, F_DUPFD_CLOEXEC, 0);
+            if (chfd < 0) chfd = fcntl(phfd, F_DUPFD, 0);
+            if (chfd < 0) continue;
+            const char *mode = ctx->file_modes[i][0]
+                               ? ctx->file_modes[i] : "r+";
+            FILE *cfp = fdopen(chfd, mode);
+            if (!cfp) { close(chfd); continue; }
+            fork_thread_arg->parent_file_dup_fps[i]  = cfp;
+            fork_thread_arg->parent_file_dup_wfds[i] = ctx->file_wfds[i];
+            size_t n = strlen(mode);
+            if (n >= sizeof(fork_thread_arg->parent_file_modes[i]))
+                n = sizeof(fork_thread_arg->parent_file_modes[i]) - 1;
+            memcpy(fork_thread_arg->parent_file_modes[i], mode, n);
+            fork_thread_arg->parent_file_modes[i][n] = '\0';
+        }
+        /* env_store: copy the parent's index table so the child sees
+         * the same env entries at fork time. The string bodies live
+         * in wasm linear memory and ride along with the memory
+         * snapshot, so the offsets remain valid. */
+        memcpy(&fork_thread_arg->parent_env_store, &ctx->env_store,
+               sizeof(fork_thread_arg->parent_env_store));
+        fork_thread_arg->parent_umask = ctx->umask;
 
         /* Spawn child thread detached so the parent resumes concurrently.
          * Child lifetime is tracked via yos_proc state (RUNNING/ZOMBIE);
@@ -1312,16 +1445,25 @@ int32_t yos_waitpid(struct yos_exec_ctx *ctx, int32_t pid, uint32_t stat_addr, i
     /* Reap the zombie */
     int32_t child_pid = child->pid;
     int32_t exit_code = child->exit_code;
+    int32_t term_sig  = child->term_sig;
     child->state = YOS_PROC_FREE;
 
     pthread_mutex_unlock(&rt->proc_lock);
 
-    /* Write status: (exit_code << 8) like Linux */
+    /* POSIX-shape status word:
+     *   - if WIFSIGNALED: low 7 bits = signum, exit-status byte = 0
+     *   - if WIFEXITED  : low 7 bits = 0,      exit-status byte = code
+     * yos's deliver_to_proc / signal_pump record term_sig when a
+     * SIG_DFL-terminate signal kills the proc; otherwise the proc
+     * exited cleanly via _exit(code). */
     if (stat_addr && stat_addr < ctx->memory_size - 4) {
-        *(int32_t *)(ctx->memory + stat_addr) = (exit_code & 0xff) << 8;
+        int32_t status = term_sig ? (term_sig & 0x7f)
+                                  : ((exit_code & 0xff) << 8);
+        *(int32_t *)(ctx->memory + stat_addr) = status;
     }
 
-    ydebug("waitpid = %d (exit_code=%d)\n", child_pid, exit_code);
+    ydebug("waitpid = %d (exit_code=%d term_sig=%d)\n",
+           child_pid, exit_code, term_sig);
     return child_pid;
 }
 
@@ -1586,12 +1728,12 @@ int32_t yos_execve(struct yos_exec_ctx *ctx, uint32_t filename, uint32_t argv_pt
     /* POSIX execve: signal mask is preserved; pending signals are
      * cleared; handlers reset to SIG_DFL unless they were SIG_IGN
      * (those carry across). The wasm function-table indices recorded
-     * in sig_handlers are also no longer valid against the new
-     * module's table — only SIG_DFL(0)/SIG_IGN(1) are portable. */
-    for (int i = 0; i < 32; i++) {
-        if (ctx->sig_handlers[i] != 1u /* SIG_IGN */)
-            ctx->sig_handlers[i] = 0u /* SIG_DFL */;
-    }
+     * in sig_handlers are no longer valid against the new module's
+     * table — clear every custom handler index. SIG_IGN now lives
+     * in its own bitmask (ctx->sig_ignore_mask) so we just leave that
+     * bitmask alone; the cleared sig_handlers + retained ignore_mask
+     * together preserve the POSIX-required SIG_IGN-carry behaviour. */
+    for (int i = 0; i < 32; i++) ctx->sig_handlers[i] = 0u;
     ctx->sig_pending = 0;
     /* ctx->sig_mask intentionally preserved. */
 
@@ -1771,22 +1913,34 @@ static int deliver_to_proc(struct yos_proc *p, int sig)
         case 22: /* SIGTTOU  */
             return 0;
     }
-    /* SIGKILL is uncatchable by definition. pthread_kill(thread, 9)
-     * on Linux/FreeBSD doesn't kill the THREAD — it kills the whole
-     * HOST PROCESS (every yos guest dies, including yos itself). The
-     * symptom is "[1] killed ./tools/yos.sh ..." in the user's
-     * terminal: kill(guest_pid, SIGKILL) from any guest takes the
-     * supervisor down with it. Translate SIGKILL to a thread-local
-     * teardown: pthread_cancel the worker, mark its yos_proc as a
-     * zombie with the conventional SIGKILL exit code, and wake any
-     * waiter. The wasm guest's atexit / asyncify cleanup doesn't
-     * run, which matches real SIGKILL semantics. */
+    /* SIGKILL: route through the same per-ctx pending-signal channel
+     * as every other signal. yos_signal_pump in the target's host
+     * thread sees SIGKILL pending, marks the proc as ZOMBIE with
+     * term_sig=9, and pthread_exit()s cleanly.
+     *
+     * History: used to call pthread_cancel(p->thread) here, but
+     * pthread_cancel terminates the host thread at the NEXT
+     * cancellation point — which is typically inside libc/wasm3
+     * internals holding partially-modified state. The cancelled
+     * thread's wasm3 runtime got leaked, and worse, follow-up
+     * fork()s in other ctxs sometimes crashed in m3Error with a
+     * garbage IM3Runtime pointer (last_bridge=fork in the crash
+     * dump). Cooperative pthread_exit via signal_pump avoids the
+     * pthread_cancel hazard entirely.
+     *
+     * Side-channel pthread_kill below wakes any blocked syscall
+     * (read/usleep/etc.) with EINTR so the target's next yos_*
+     * bridge call enters signal_pump and notices the SIGKILL bit. */
     if (sig == 9 /* SIGKILL — same number on Linux & FreeBSD */) {
-        (void)pthread_cancel(p->thread);
-        p->state     = YOS_PROC_ZOMBIE;
-        p->exit_code = 9;
-        p->exited    = 1;
-        pthread_cond_broadcast(&p->wait_cond);
+        if (p->ctx_handle) {
+            struct yos_exec_ctx *target = (struct yos_exec_ctx *)p->ctx_handle;
+            __atomic_or_fetch(&target->sig_pending, 1u << 9, __ATOMIC_RELEASE);
+        }
+        /* Best-effort wake-up. If the thread hasn't been recorded
+         * yet (race: pthread_create just returned), skip — the
+         * pending bit is already set and the target will see it on
+         * its first bridge entry. */
+        if (p->thread) (void)pthread_kill(p->thread, SIGUSR2);
         return 0;
     }
     /* Set the target's per-process pending bit atomically. This is the
@@ -1830,6 +1984,19 @@ int32_t yos_kill(struct yos_exec_ctx *ctx, int32_t pid, int32_t sig)
             if (ctx->memory && ctx->errno_off)
                 *(int *)(ctx->memory + ctx->errno_off) = yos_remap_errno_h2g(-rc);
             return -1;
+        }
+        /* POSIX self-kill synchronous delivery. If the calling thread
+         * is the target, the signal must be delivered before kill()
+         * returns (unless it's blocked). yos's default model defers
+         * delivery to the next yield point inside the wasm runtime;
+         * for self-kill that "next point" is whatever syscall the
+         * guest happens to call next — which could be never if the
+         * guest sits in pure compute or checks a flag set by the
+         * handler. Pump here so kill(getpid(), sig) actually invokes
+         * the handler before returning. */
+        if (t == ctx->proc) {
+            extern void yos_signal_pump(struct yos_exec_ctx *);
+            yos_signal_pump(ctx);
         }
         return rc;
     }
@@ -1944,16 +2111,20 @@ int32_t yos_wait4(struct yos_exec_ctx *ctx, int32_t pid, uint32_t stat_addr, int
     /* Reap the zombie */
     int32_t child_pid = child->pid;
     int32_t exit_code = child->exit_code;
+    int32_t term_sig  = child->term_sig;
     child->state = YOS_PROC_FREE;
 
     pthread_mutex_unlock(&rt->proc_lock);
 
-    /* Write status: (exit_code << 8) like Linux */
+    /* POSIX-shape status word — see yos_waitpid for the same logic. */
     if (stat_addr && stat_addr < ctx->memory_size - 4) {
-        *(int32_t *)(ctx->memory + stat_addr) = (exit_code & 0xff) << 8;
+        int32_t status = term_sig ? (term_sig & 0x7f)
+                                  : ((exit_code & 0xff) << 8);
+        *(int32_t *)(ctx->memory + stat_addr) = status;
     }
 
-    ydebug("wait4 = %d (exit_code=%d)\n", child_pid, exit_code);
+    ydebug("wait4 = %d (exit_code=%d term_sig=%d)\n",
+           child_pid, exit_code, term_sig);
     return child_pid;
 }
 
@@ -2240,6 +2411,10 @@ void yos_vfork_pump(struct yos_exec_ctx *ctx)
         fork_thread_arg->heap_end = ctx->heap_end;
         fork_thread_arg->alloc_lo        = ctx->alloc_lo;
         fork_thread_arg->alloc_hi        = ctx->alloc_hi;
+        fork_thread_arg->mmap_top        = ctx->mmap_top;
+        fork_thread_arg->free_count      = ctx->free_count;
+        memcpy(fork_thread_arg->free_list, ctx->free_list,
+               sizeof(fork_thread_arg->free_list));
         fork_thread_arg->alloc_free_head = ctx->alloc_free_head;
         fork_thread_arg->argc = ctx->argc;
         fork_thread_arg->argv = ctx->argv;
@@ -2266,8 +2441,42 @@ void yos_vfork_pump(struct yos_exec_ctx *ctx)
                sizeof(fork_thread_arg->parent_cwd));
         memcpy(fork_thread_arg->parent_sig_handlers, ctx->sig_handlers,
                sizeof(fork_thread_arg->parent_sig_handlers));
+        fork_thread_arg->parent_sig_ignore_mask = ctx->sig_ignore_mask;
         fork_thread_arg->parent_sig_mask    = ctx->sig_mask;
         fork_thread_arg->parent_sig_pending = ctx->sig_pending;
+        memcpy(fork_thread_arg->parent_locale_name, ctx->locale_name,
+               sizeof(fork_thread_arg->parent_locale_name));
+        /* Dup each live parent FILE* so the child gets an
+         * independent host FILE* on each inherited slot. Without
+         * this, child fclose closes the underlying host file and
+         * subsequent parent fputs/fwrite/fclose ENOENT/EBADF/
+         * crashes on the freed FILE*. */
+        for (int i = 0; i < 256; i++) {
+            FILE *parent_fp = (FILE *)ctx->file_slots[i];
+            fork_thread_arg->parent_file_dup_fps[i]  = NULL;
+            fork_thread_arg->parent_file_dup_wfds[i] = -1;
+            fork_thread_arg->parent_file_modes[i][0] = '\0';
+            if (!parent_fp) continue;
+            int phfd = fileno(parent_fp);
+            if (phfd < 0) continue;
+            int chfd = fcntl(phfd, F_DUPFD_CLOEXEC, 0);
+            if (chfd < 0) chfd = fcntl(phfd, F_DUPFD, 0);
+            if (chfd < 0) continue;
+            const char *mode = ctx->file_modes[i][0]
+                               ? ctx->file_modes[i] : "r+";
+            FILE *cfp = fdopen(chfd, mode);
+            if (!cfp) { close(chfd); continue; }
+            fork_thread_arg->parent_file_dup_fps[i]  = cfp;
+            fork_thread_arg->parent_file_dup_wfds[i] = ctx->file_wfds[i];
+            size_t n = strlen(mode);
+            if (n >= sizeof(fork_thread_arg->parent_file_modes[i]))
+                n = sizeof(fork_thread_arg->parent_file_modes[i]) - 1;
+            memcpy(fork_thread_arg->parent_file_modes[i], mode, n);
+            fork_thread_arg->parent_file_modes[i][n] = '\0';
+        }
+        memcpy(&fork_thread_arg->parent_env_store, &ctx->env_store,
+               sizeof(fork_thread_arg->parent_env_store));
+        fork_thread_arg->parent_umask = ctx->umask;
 
         /* Spawn child thread */
         child_proc->state = YOS_PROC_RUNNING;

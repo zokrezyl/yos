@@ -61,6 +61,11 @@ struct yos_proc {
     uint32_t tid_address;
     yos_proc_state_t state;
     int32_t exit_code;
+    /* If non-zero, this proc was terminated by signal `term_sig`
+     * (FreeBSD signum). yos_waitpid packs term_sig into the low
+     * 7 bits of the POSIX status word so guest code using
+     * WIFSIGNALED / WTERMSIG observes the right semantics. */
+    int32_t term_sig;
 
     pthread_mutex_t lock;
     pthread_cond_t wait_cond;
@@ -93,6 +98,15 @@ struct yos_proc {
 };
 
 struct yos_runtime;  /* forward decl */
+
+/* Per-ctx environment store entry. Cap defined here too so impl/env.c
+ * doesn't carry its own private constant. */
+#define YOS_ENV_MAX 512
+struct yos_env_entry {
+    uint32_t name_off;   /* wasm-memory offset of the name copy */
+    uint32_t value_off;  /* wasm-memory offset of the value copy */
+    uint32_t name_len;
+};
 
 struct yos_exec_ctx {
     /* Links */
@@ -188,6 +202,114 @@ struct yos_exec_ctx {
         long  timezone;         /* seconds west of UTC             */
         int   daylight;         /* 1 if DST observed in this zone  */
     } tz_state;
+
+    /* Environment store. Backing table for getenv/setenv/unsetenv/
+     * putenv/clearenv (impl/libc/env.c). Entries hold WASM-MEMORY
+     * offsets (name_off / value_off) into strings yos_malloc'd in
+     * the guest's mimalloc arena. Lives per-ctx so two guests' (or
+     * a parent + forked-child's) setenv calls don't trample each
+     * other. fork copies the parent's env_store into the child's
+     * fresh ctx; the underlying string bytes ride along with the
+     * wasm linear-memory snapshot, so the offsets stay valid.
+     *
+     * YOS_ENV_MAX caps the entry count. e[i].name_off==0 means a
+     * deleted slot (unsetenv compacts so the live entries are
+     * contiguous from 0..count-1). */
+    struct {
+        struct yos_env_entry e[YOS_ENV_MAX];
+        int    count;
+        int    initialised;
+    } env_store;
+
+    /* Per-ctx umask (file-creation mode mask). FreeBSD/POSIX umask
+     * applies to open/creat/mkdir/mkfifo/mknod — the host kernel
+     * does this at syscall time using the HOST PROCESS umask, which
+     * is shared across all yos guests (they're host pthreads of one
+     * process). Without per-ctx storage, child's umask(077) leaks
+     * into parent. yos sets the host umask to 0 once at startup and
+     * applies ctx->umask in software when calling host open/mkdir/
+     * etc. (see impl/io/io.c).
+     *
+     * 022 is the POSIX-shell default and what bash/zsh inherit on
+     * Linux; pick the same so guests started with no explicit umask
+     * still see normal "rw-r--r--" file modes. */
+    unsigned short umask;
+
+    /* Per-ctx FILE* table (impl/io/file.c). Indices 1..YOS_FILE_MAX-1
+     * are wasm-handle slots; indices 1/2/3 are reserved for
+     * stdin/stdout/stderr and resolved separately. Per-ctx storage
+     * prevents child fclose(handle) from invalidating parent's
+     * still-live handle, and fork dups the underlying host FILE*
+     * via fdopen(dup(fileno)) so each side has independent close
+     * semantics. file_modes[i] holds the fopen mode string so fork
+     * can reconstruct the FILE* with the right access flags. */
+    void   *file_slots[256];    /* host FILE *; NULL when slot is free.
+                                 * Must match YOS_FILE_MAX in file.c. */
+    int32_t file_wfds [256];    /* wasm fd that wraps each FILE*'s
+                                 * fileno (-1 if not allocated). */
+    char    file_modes[256][8]; /* fopen mode strings — needed by fork
+                                 * to call fdopen on the dup'd fd. */
+
+    /* Per-ctx anchors for the static-buffer libc returns (strerror,
+     * localtime, gmtime, ctime, getpwuid, getgrgid, ttyname, setlocale,
+     * inet_ntoa-style, etc). impl/libc/pwd.c historically held these
+     * as FILE-SCOPE statics — shared across every guest in the same
+     * yos host process. Two concurrent guests calling, e.g., strerror
+     * would race on the same anchor: first guest allocates a wasm
+     * buffer at offset X in its own memory and caches X here, second
+     * guest sees the cached X and tries to write into ITS memory at
+     * offset X — which may or may not be a valid yos_malloc'd buffer.
+     * Manifestations include strerror returning empty strings, ls
+     * printing the same user/group repeatedly, and intermittent
+     * SIGSEGV when a guest's mimalloc bookkeeping never claimed the
+     * cached offset. Moving them on-ctx is the same fix shape as the
+     * env_store and FILE* table fixes earlier. */
+    struct {
+        uint32_t pwd, grp, login, ufu, gfg;
+        uint32_t tm, timestr;
+        uint32_t errstr, gaistr, hstr, signam;
+        uint32_t ttyname, ctermid, dirname, l64a, nl_langinfo;
+        uint32_t setlocale, getwd, tempnam, getusershell, tmpnam, proto;
+    } pwd_anchors;
+
+    /* Lazy-allocated per-ctx tables. Each was a process-wide static
+     * before. Pointer + capacity instead of inline array so ctxs that
+     * never use the corresponding feature don't pay the memory cost. */
+    void   *dir_slots;          /* yos_dir_slot[YOS_DIR_MAX] — opendir */
+    void   *pty_head;           /* head of pty_entry linked list */
+    int32_t pty_next_id;        /* next-assigned PTY id; start at 1 */
+    void   *fifo_head;          /* head of fifo_entry linked list */
+    void   *kq_proc_watches;    /* kqueue proc_watch[MAX_PROC_WATCH] */
+    uintptr_t kq_proc_watch_counter; /* darwin kqueue ident sequence */
+    void   *kq_tty_watchers;    /* darwin TTY watchers pointer array */
+
+    /* ydev device handle tables (audio/camera/sensor/location).
+     * Each is an array of pointers indexed by a guest-side handle
+     * id. Were process-wide; concurrent guests would alias each
+     * other's handles. */
+    void   *ydev_cam;           /* ydev_camera_t   *[YDEV_BR_HMAX] */
+    void   *ydev_ain;           /* ydev_audio_in_t *[YDEV_BR_HMAX] */
+    void   *ydev_aout;          /* ydev_audio_out_t*[YDEV_BR_HMAX] */
+    void   *ydev_sens;          /* ydev_sensor_t   *[YDEV_BR_HMAX] */
+    void   *ydev_loc;           /* ydev_loc_t      *[YDEV_BR_HMAX] */
+
+    /* FreeBSD userland helpers (impl/libc/freebsd_userland.c). */
+    uint32_t progname_off;      /* getprogname()'s cached wasm offset */
+    struct {                    /* fgetln stash — was "single ctx" static */
+        uint32_t buf_off;       /* wasm offset of last-line buffer */
+        uint32_t buf_cap;       /* capacity */
+        uint32_t buf_len;       /* current line length */
+        void    *host_fp;       /* FILE* this stash belongs to */
+    } fgetln_stash;
+
+    /* Fake-PTY termios (impl/libc/posix.c). Real PTYs aren't available
+     * on sandboxed iOS/tvOS so yos synthesises termios state per-ctx.
+     * Was a process-wide singleton — two guests' tcsetattr clobbered
+     * each other. termios is ~44 bytes on FreeBSD wasm32; we store
+     * it as opaque bytes to avoid needing the host's struct termios
+     * definition here. */
+    int      fake_pty_termios_init;
+    uint8_t  fake_pty_termios[256];
 
     /* Resolver state — deferred. Adding requires bridging
      * gethostbyname/getaddrinfo via res_n* reentrant variants.
@@ -319,6 +441,14 @@ struct yos_exec_ctx {
      * use wfd ≥ YOS_VFS_FD_BASE and skip this table. */
 #define YOS_FD_MAX 256
     int fd_map[YOS_FD_MAX];
+    /* Per-fd absolute path. Populated by path-taking opens (open/openat/
+     * creat/opendir). NULL means "we don't know the path" (sockets,
+     * pipes, fcntl-dup, accept, etc.). Used by yos_fchdir to update
+     * ctx->cwd without asking the host kernel — yos deliberately does
+     * not consult /proc or any kernel-specific fd→path facility. The
+     * string is yos_malloc'd from the host heap; freed on close /
+     * release; strdup'd on fork. */
+    char *fd_paths[YOS_FD_MAX];
     /* yos_fd_table_init runs at every load_wasm_module call (initial
      * load + every execve). After the first run, parent's dup2/redirect
      * setup must NOT be wiped by a second init. fd_table_inited stays
@@ -369,8 +499,19 @@ struct yos_exec_ctx {
      *
      *   sig_handlers[signum]  — wasm-side function-table index of the
      *                           registered handler (FreeBSD signums 1..31;
-     *                           [0] unused). Values 0/1/0xffffffff carry
-     *                           the SIG_DFL/SIG_IGN/SIG_ERR semantics.
+     *                           [0] unused). 0 means SIG_DFL (no handler).
+     *                           Real handler indices are 1..table_size-1
+     *                           in the wasm function table.
+     *   sig_ignore_mask       — separate from sig_handlers[]: bit
+     *                           (signo-1) set ⇔ signal is SIG_IGN.
+     *                           Without this, the FreeBSD ABI's
+     *                           `sa_handler = SIG_IGN = (void*)1` would
+     *                           collide with wasm function-table index
+     *                           1 (where clang's linker often places the
+     *                           first user-defined function). Splitting
+     *                           the SIG_IGN sentinel into its own bit
+     *                           lets ordinary handler indices live at
+     *                           any table position.
      *   sig_mask              — bitmask of blocked FreeBSD signals
      *                           (bit (signo-1)). Read/written by
      *                           sigprocmask, consulted by signal_pump
@@ -380,10 +521,11 @@ struct yos_exec_ctx {
      *                           targets this process. Cleared by
      *                           signal_pump as each is delivered.
      *
-     * Inheritance: fork copies all three from parent. Execve preserves
-     * sig_mask, resets handlers (custom → SIG_DFL; SIG_IGN preserved),
-     * and clears sig_pending. */
+     * Inheritance: fork copies all four from parent. Execve preserves
+     * sig_mask + sig_ignore_mask, resets handlers (custom → SIG_DFL;
+     * SIG_IGN preserved), and clears sig_pending. */
     uint32_t sig_handlers[32];
+    uint32_t sig_ignore_mask;
     uint32_t sig_mask;
     uint32_t sig_pending;
 };

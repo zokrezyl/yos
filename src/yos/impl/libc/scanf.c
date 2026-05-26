@@ -314,12 +314,12 @@ int32_t yos_sscanf(struct yos_exec_ctx *ctx, uint32_t src_off,
 
 /* fscanf — read full line from FILE handle into a scratch, scan that.
  * Same handle table as printf.c uses. */
-extern FILE *yos_handle_to_file(uint32_t h);
+extern FILE *yos_handle_to_file(struct yos_exec_ctx *ctx, uint32_t h);
 int32_t yos_fscanf(struct yos_exec_ctx *ctx, uint32_t fp,
                    uint32_t fmt_off, uint32_t va_off)
 {
     if (fmt_off >= ctx->memory_size) return -1;
-    FILE *f = yos_handle_to_file(fp);
+    FILE *f = yos_handle_to_file(ctx, fp);
     if (!f) return -1;
     char buf[4096];
     if (!fgets(buf, sizeof(buf), f)) return -1;

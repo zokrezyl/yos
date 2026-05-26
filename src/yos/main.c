@@ -2069,6 +2069,17 @@ int main(int argc, char **argv)
     ctx.envp = g_runtime.envp;
     pthread_mutex_init(&ctx.mem_lock, NULL);
     strcpy(ctx.cwd, proc->cwd);
+    /* POSIX default umask. yos drives umask in software (host umask
+     * forced to 0 at startup; impl/io/io.c applies ctx->umask to
+     * mode args of open/creat/mkdir/openat/mkdirat/mkfifo). Forked
+     * children inherit this via fork_thread_func; execve preserves
+     * it across the new module load. */
+    ctx.umask = 022;
+    /* Zero the host umask once so every host open/mkdir/creat uses
+     * the literal mode we hand it — masking happens in software so
+     * each ctx can have its own umask without colliding on the
+     * shared host process umask. */
+    umask(0);
 
     /* Load initial module */
     size_t wasm_size = 0;

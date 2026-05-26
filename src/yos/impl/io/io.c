@@ -157,11 +157,97 @@ int32_t yos_fd_alloc(struct yos_exec_ctx *ctx, int host_fd)
     for (int i = 0; i < YOS_FD_MAX; i++) {
         if (ctx->fd_map[i] < 0) {
             ctx->fd_map[i] = host_fd;
+            free(ctx->fd_paths[i]);
+            ctx->fd_paths[i] = NULL;
             return i;
         }
     }
     close(host_fd);
     return -EMFILE;
+}
+
+/* Lexically canonicalize an absolute path in place: collapse `//` →
+ * `/`, drop `./` segments, and resolve `../` against the preceding
+ * segment. Pure string transformation — does NOT touch the filesystem,
+ * does NOT resolve symlinks. We need this because fts(3) walks via
+ * fchdir(open("..")) and similar dance: openat with ".." records as
+ * "<base>/.." which, if appended literally, balloons the cwd into a
+ * megabyte of "../foo/../bar/../baz" stew and quickly overflows
+ * PATH_MAX, corrupting the stored path so later lookups against it
+ * fail with ENOENT. Canonicalizing on each store keeps fd_paths
+ * sized to the real depth of the tree, not to fts's traversal log.
+ *
+ * NOT a substitute for realpath(3): preserves symlinks (a/symlink/..
+ * canonicalizes to "a", not to wherever symlink pointed). For yos's
+ * use (tracking the path the guest believes it opened) lexical is
+ * correct — the guest opened "a/symlink/.." and that's what it
+ * thinks its cwd is. */
+static void canon_abs_path(char *p)
+{
+    if (!p || p[0] != '/') return;
+    /* Write to a separate buffer to keep the read pointer (in) strictly
+     * ahead of the write pointer. An in-place version trampled the
+     * input's '\0' on the first segment-with-trailing-'/' emission,
+     * so the outer `while (*in)` then walked into uninitialised stack,
+     * which appended random byte sequences (debug-output residue) to
+     * the canonicalised path — exactly the "/path/A/anager_Mac.app/..."
+     * doubling we observed under fts(3). */
+    char tmp[PATH_MAX];
+    char *out = tmp;
+    *out++ = '/';
+    const char *in = p + 1;
+    while (*in) {
+        while (*in == '/') in++;
+        if (!*in) break;
+        const char *seg_end = in;
+        while (*seg_end && *seg_end != '/') seg_end++;
+        size_t seg_len = seg_end - in;
+
+        if (seg_len == 1 && in[0] == '.') {
+            /* "." — drop. */
+        } else if (seg_len == 2 && in[0] == '.' && in[1] == '.') {
+            if (out > tmp + 1) {
+                out--;
+                while (out > tmp + 1 && out[-1] != '/') out--;
+            }
+        } else {
+            if (out + seg_len + 1 >= tmp + sizeof tmp) break;
+            memcpy(out, in, seg_len);
+            out += seg_len;
+            *out++ = '/';
+        }
+        in = seg_end;
+    }
+    if (out > tmp + 1 && out[-1] == '/') out--;
+    *out = '\0';
+    size_t n = out - tmp;
+    memcpy(p, tmp, n + 1);
+}
+
+/* Same as yos_fd_alloc but also records the absolute path of the file
+ * the fd was opened on. Called by path-taking opens so yos_fchdir can
+ * read the path back without consulting the host kernel. `path` may
+ * be NULL or relative — we resolve relative→absolute via the current
+ * ctx->cwd, then lexically canonicalize. */
+int32_t yos_fd_alloc_with_path(struct yos_exec_ctx *ctx, int host_fd,
+                               const char *path)
+{
+    int32_t wfd = yos_fd_alloc(ctx, host_fd);
+    if (wfd < 0 || !path) return wfd;
+    char abs[PATH_MAX];
+    if (path[0] == '/') {
+        snprintf(abs, sizeof abs, "%s", path);
+    } else if (ctx->cwd[0]) {
+        size_t cwd_n = strlen(ctx->cwd);
+        int need_slash = (cwd_n > 0 && ctx->cwd[cwd_n - 1] != '/');
+        snprintf(abs, sizeof abs, "%s%s%s", ctx->cwd,
+                 need_slash ? "/" : "", path);
+    } else {
+        snprintf(abs, sizeof abs, "%s", path);
+    }
+    canon_abs_path(abs);
+    ctx->fd_paths[wfd] = strdup(abs);
+    return wfd;
 }
 
 int32_t yos_fd_assign(struct yos_exec_ctx *ctx, int32_t newfd, int host_fd)
@@ -178,6 +264,8 @@ int32_t yos_fd_assign(struct yos_exec_ctx *ctx, int32_t newfd, int host_fd)
         close(old);
     }
     ctx->fd_map[newfd] = host_fd;
+    free(ctx->fd_paths[newfd]);
+    ctx->fd_paths[newfd] = NULL;
     return newfd;
 }
 
@@ -188,6 +276,8 @@ int32_t yos_fd_close(struct yos_exec_ctx *ctx, int32_t wfd)
     if (hfd < 0) return yos_errno_neg(ctx, EBADF);
     int r = close(hfd);
     ctx->fd_map[wfd] = -1;
+    free(ctx->fd_paths[wfd]);
+    ctx->fd_paths[wfd] = NULL;
     return yos_errno_check(ctx, (int32_t)r);
 }
 
@@ -200,6 +290,8 @@ void yos_fd_release_slot(struct yos_exec_ctx *ctx, int32_t wfd)
 {
     if (!ctx || wfd < 0 || wfd >= YOS_FD_MAX) return;
     ctx->fd_map[wfd] = -1;
+    free(ctx->fd_paths[wfd]);
+    ctx->fd_paths[wfd] = NULL;
 }
 
 void yos_fd_fork_dup(struct yos_exec_ctx *child, struct yos_exec_ctx *parent)
@@ -208,6 +300,7 @@ void yos_fd_fork_dup(struct yos_exec_ctx *child, struct yos_exec_ctx *parent)
         int phfd = parent->fd_map[i];
         if (phfd < 0) {
             child->fd_map[i] = -1;
+            child->fd_paths[i] = NULL;
             continue;
         }
         /* POSIX fork preserves FD_CLOEXEC; F_DUPFD strips it. Use
@@ -221,6 +314,8 @@ void yos_fd_fork_dup(struct yos_exec_ctx *child, struct yos_exec_ctx *parent)
                                                           : F_DUPFD;
         int chfd = fcntl(phfd, dupcmd, 0);
         child->fd_map[i] = (chfd >= 0) ? chfd : -1;
+        child->fd_paths[i] = parent->fd_paths[i]
+                             ? strdup(parent->fd_paths[i]) : NULL;
     }
 }
 
@@ -401,7 +496,13 @@ int32_t yos_write(struct yos_exec_ctx *ctx, int32_t fd, uint32_t buf, uint32_t c
                r > 0 ? " hex=" : "",
                r > 0 ? hex : "");
     }
-    return r < 0 ? -saved_errno : (int32_t)r;
+    /* POSIX contract: write returns -1 + errno on failure, NOT -errno.
+     * The wasm guest checks `if (write(...) == -1)` and reads errno
+     * via __error(); pre-fix, the bridge returned the raw -errno
+     * value (e.g. -32 for EPIPE), so the guest's compare-with-(-1)
+     * never matched and error handling silently fell through. */
+    if (r < 0) return yos_errno_neg(ctx, saved_errno);
+    return (int32_t)r;
 }
 
 /* Forward decls — definitions are further down with the fcntl
@@ -431,8 +532,8 @@ int32_t yos_open(struct yos_exec_ctx *ctx, uint32_t path, int32_t flags, int32_t
      * sets errno=0 + returns -1 on "not a FIFO" so we fall through
      * to the regular path. */
     {
-        extern int yos_fifo_try_open(const char *path, int flags);
-        int hfifo = yos_fifo_try_open(s, flags);
+        extern int yos_fifo_try_open(struct yos_exec_ctx *ctx, const char *path, int flags);
+        int hfifo = yos_fifo_try_open(ctx, s, flags);
         if (hfifo >= 0) return yos_fd_alloc(ctx, hfifo);
         if (errno != 0) return yos_errno_neg(ctx, errno);
     }
@@ -462,6 +563,10 @@ int32_t yos_open(struct yos_exec_ctx *ctx, uint32_t path, int32_t flags, int32_t
     if (hflags & O_CREAT) {
         if (mode && (uint32_t)mode + 4 <= ctx->memory_size)
             real_mode = *(int32_t *)(ctx->memory + (uint32_t)mode);
+        /* Apply per-ctx umask in software. Host umask is forced to 0
+         * at startup (main.c) so each ctx's umask doesn't fight over
+         * the shared host-process value. */
+        real_mode &= ~ctx->umask;
     } else {
         /* Without O_CREAT mode is ignored; don't deref a stack address
          * that may be 0 / past memory. */
@@ -473,7 +578,7 @@ int32_t yos_open(struct yos_exec_ctx *ctx, uint32_t path, int32_t flags, int32_t
                s, flags, hflags, mode, real_mode, r,
                r < 0 ? strerror(errno) : "");
     if (r < 0) return yos_errno_neg(ctx, errno);
-    return yos_fd_alloc(ctx, r);
+    return yos_fd_alloc_with_path(ctx, r, s);
 }
 
 int32_t yos_close(struct yos_exec_ctx *ctx, int32_t fd)
@@ -502,6 +607,8 @@ void yos_closefrom(struct yos_exec_ctx *ctx, int32_t lowfd)
         if (hfd < 0) continue;
         close(hfd);
         ctx->fd_map[i] = -1;
+        free(ctx->fd_paths[i]);
+        ctx->fd_paths[i] = NULL;
     }
 }
 
@@ -516,6 +623,8 @@ int32_t yos_close_range(struct yos_exec_ctx *ctx, uint32_t lowfd,
         if (hfd < 0) continue;
         close(hfd);
         ctx->fd_map[i] = -1;
+        free(ctx->fd_paths[i]);
+        ctx->fd_paths[i] = NULL;
     }
     return 0;
 }
@@ -524,9 +633,10 @@ int32_t yos_creat(struct yos_exec_ctx *ctx, uint32_t pathname, int32_t mode)
 {
     const char *s = wstr(ctx, pathname);
     if (!s) return yos_errno_neg(ctx, EFAULT);
-    int r = creat(s, mode);
+    const char *resolved = yos_path_resolve(ctx, s);
+    int r = creat(resolved, mode & ~ctx->umask);
     if (r < 0) return yos_errno_neg(ctx, errno);
-    return yos_fd_alloc(ctx, r);
+    return yos_fd_alloc_with_path(ctx, r, resolved);
 }
 
 int32_t yos_link(struct yos_exec_ctx *ctx, uint32_t oldname, uint32_t newname)
@@ -545,8 +655,8 @@ int32_t yos_unlink(struct yos_exec_ctx *ctx, uint32_t pathname)
     /* If this was a fake FIFO, drop the registry entry first so the
      * held pipe fds get freed; then unlink the placeholder file. */
     {
-        extern int yos_fifo_drop(const char *path);
-        (void)yos_fifo_drop(s);
+        extern int yos_fifo_drop(struct yos_exec_ctx *ctx, const char *path);
+        (void)yos_fifo_drop(ctx, s);
     }
     return yos_errno_check(ctx, unlink(s));
 }
@@ -654,7 +764,7 @@ int32_t yos_mkdir(struct yos_exec_ctx *ctx, uint32_t pathname, int32_t mode)
     const char *raw = wstr(ctx, pathname);
     if (!raw) return yos_errno_neg(ctx, EFAULT);
     const char *s = yos_path_resolve(ctx, raw);
-    return yos_errno_check(ctx, mkdir(s, mode));
+    return yos_errno_check(ctx, mkdir(s, mode & ~ctx->umask));
 }
 
 int32_t yos_rmdir(struct yos_exec_ctx *ctx, uint32_t pathname)
@@ -1252,6 +1362,7 @@ int32_t yos_openat(struct yos_exec_ctx *ctx, int32_t dfd, uint32_t filename, int
     if (hflags & O_CREAT) {
         if (mode && (uint32_t)mode + 4 <= ctx->memory_size)
             real_mode = *(int32_t *)(ctx->memory + (uint32_t)mode);
+        real_mode &= ~ctx->umask;
     } else {
         real_mode = 0;
     }
@@ -1261,13 +1372,29 @@ int32_t yos_openat(struct yos_exec_ctx *ctx, int32_t dfd, uint32_t filename, int
                host_dfd, path, flags, hflags, mode, real_mode, r,
                r < 0 ? strerror(errno) : "");
     if (r < 0) return yos_errno_neg(ctx, errno);
-    /* Allocate a wasm-side fd that maps to the host fd. The previous
-     * version returned the raw host fd, which broke the per-runtime fd
-     * table — child runtimes that did read(wasm_fd) would translate
-     * the same integer to a different host fd via fd_map and hit
-     * EBADF. On wasm-fd-table overflow, close the host fd to avoid
-     * leaking it. */
-    int wfd = yos_fd_alloc(ctx, r);
+    /* Resolve the path the openat actually targeted so we can record
+     * it in the fd table. Three cases:
+     *   1. `path` absolute → store as-is.
+     *   2. dfd == AT_FDCWD → resolve against ctx->cwd.
+     *   3. real dfd → resolve against the dfd's stored path. */
+    char openat_abs[PATH_MAX];
+    const char *record = NULL;
+    if (path[0] == '/') {
+        record = path;
+    } else if (dfd == YOS_FBSD_AT_FDCWD || dfd == AT_FDCWD) {
+        record = NULL;   /* let yos_fd_alloc_with_path do cwd-relative join */
+    } else {
+        const char *base = (dfd >= 0 && dfd < YOS_FD_MAX)
+                           ? ctx->fd_paths[dfd] : NULL;
+        if (base) {
+            size_t bn = strlen(base);
+            int need_slash = (bn > 0 && base[bn - 1] != '/');
+            snprintf(openat_abs, sizeof openat_abs, "%s%s%s", base,
+                     need_slash ? "/" : "", path);
+            record = openat_abs;
+        }
+    }
+    int wfd = yos_fd_alloc_with_path(ctx, r, record ? record : path);
     if (wfd < 0) close(r);
     return wfd;
 }
@@ -1276,7 +1403,7 @@ int32_t yos_mkdirat(struct yos_exec_ctx *ctx, int32_t dfd, uint32_t pathname, in
 {
     const char *s = wstr(ctx, pathname);
     if (!s) return yos_errno_neg(ctx, EFAULT);
-    return yos_errno_check(ctx, mkdirat(dfd, s, mode));
+    return yos_errno_check(ctx, mkdirat(dfd, s, mode & ~ctx->umask));
 }
 
 int32_t yos_vfs_mknodat(struct yos_exec_ctx *ctx, int32_t dfd, uint32_t filename, int32_t mode, uint32_t dev)
@@ -1421,9 +1548,14 @@ int32_t yos_dup2(struct yos_exec_ctx *ctx, int32_t oldfd, int32_t newfd)
     if (oldfd == newfd) return newfd;  /* POSIX: no-op */
     int host_new = fcntl(host_old, F_DUPFD, 0);
     if (host_new < 0) return yos_errno_neg(ctx, errno);
+    char *carry = (oldfd >= 0 && oldfd < YOS_FD_MAX && ctx->fd_paths[oldfd])
+                  ? strdup(ctx->fd_paths[oldfd]) : NULL;
     ydebug("dup2(oldwfd=%d hfd=%d, newwfd=%d) -> new_hfd=%d\n",
            oldfd, host_old, newfd, host_new);
-    return yos_fd_assign(ctx, newfd, host_new);
+    int32_t r = yos_fd_assign(ctx, newfd, host_new);
+    if (r >= 0 && carry) ctx->fd_paths[r] = carry;
+    else free(carry);
+    return r;
 }
 
 int32_t yos_dup3(struct yos_exec_ctx *ctx, int32_t oldfd, int32_t newfd, int32_t flags)
@@ -1434,7 +1566,12 @@ int32_t yos_dup3(struct yos_exec_ctx *ctx, int32_t oldfd, int32_t newfd, int32_t
     int host_new = fcntl(host_old,
                          (flags & O_CLOEXEC) ? F_DUPFD_CLOEXEC : F_DUPFD, 0);
     if (host_new < 0) return yos_errno_neg(ctx, errno);
-    return yos_fd_assign(ctx, newfd, host_new);
+    char *carry = (oldfd >= 0 && oldfd < YOS_FD_MAX && ctx->fd_paths[oldfd])
+                  ? strdup(ctx->fd_paths[oldfd]) : NULL;
+    int32_t r = yos_fd_assign(ctx, newfd, host_new);
+    if (r >= 0 && carry) ctx->fd_paths[r] = carry;
+    else free(carry);
+    return r;
 }
 
 
