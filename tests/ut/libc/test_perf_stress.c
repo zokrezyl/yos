@@ -912,7 +912,36 @@ int main(int argc, char **argv)
         long long ta = now_us();
         int spawned = 0;
         for (int i = 0; i < N; i++) {
-            if (pipe(pipes[i]) < 0) { emit_err("pipe failed\n"); fail++; break; }
+            if (pipe(pipes[i]) < 0) {
+                int e = errno;
+                char dump[1024];
+                int n = snprintf(dump, sizeof dump,
+                    "pipe failed at i=%d errno=%d (%s); open fds: ",
+                    i, e, strerror(e));
+                /* Dump every open fd 0..255 so we can see what was
+                 * inherited and what perf-stress accumulated. fstat
+                 * is the cheapest way to ask "is this fd open?".
+                 * The telnet→runsv→telnetd→shell chain inherits many
+                 * fds; print them so the report makes the cause
+                 * obvious instead of just "pipe failed". */
+                for (int fd = 0; fd < 256 && n < (int)sizeof dump - 16; fd++) {
+                    struct stat st;
+                    if (fstat(fd, &st) == 0) {
+                        const char *kind = "?";
+                        mode_t m = st.st_mode & S_IFMT;
+                        if (m == S_IFREG)  kind = "reg";
+                        else if (m == S_IFDIR)  kind = "dir";
+                        else if (m == S_IFCHR)  kind = "chr";
+                        else if (m == S_IFIFO)  kind = "fifo";
+                        else if (m == S_IFSOCK) kind = "sock";
+                        n += snprintf(dump + n, sizeof dump - n,
+                                      "%d:%s ", fd, kind);
+                    }
+                }
+                n += snprintf(dump + n, sizeof dump - n, "\n");
+                emit_err(dump);
+                fail++; break;
+            }
             pid_t pid = fork();
             if (pid < 0) { emit_err("proc-list fork failed\n"); fail++; break; }
             if (pid == 0) {

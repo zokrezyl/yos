@@ -24,6 +24,7 @@
 
 #include "wasm3.h"
 #include "m3_env.h"
+#include "impl/proc/pthread.h"   /* yos_pthread_host typedef + destroy */
 
 /* ============================================================================
  * Asyncify Helpers
@@ -226,6 +227,21 @@ int32_t yos_exit(struct yos_exec_ctx *ctx, int32_t code)
                 close(hfd);
                 ctx->fd_map[i] = -1;
             }
+        }
+        /* Tear down the per-ctx FILE* table. yos_fork_pump pre-dup'd
+         * every live parent FILE* via fdopen(dup(fileno(...))) so each
+         * inherited slot is an independent host FILE* — its underlying
+         * host fd is NOT the same kernel object as fd_map[file_wfds[i]]
+         * (that's a separate F_DUPFD dup). Without an explicit fclose
+         * here, the host fd inside the FILE* (and the FILE* itself)
+         * leaks on every fork that inherited a live stdio handle. */
+        for (int i = 0; i < 256; i++) {
+            FILE *fp = (FILE *)ctx->file_slots[i];
+            if (!fp) continue;
+            ctx->file_slots[i] = NULL;
+            ctx->file_wfds[i]  = -1;
+            ctx->file_modes[i][0] = '\0';
+            fclose(fp);
         }
 
         /* Notify any libuv-style EVFILT_PROC|NOTE_EXIT watcher in the
@@ -443,6 +459,30 @@ typedef struct {
     unsigned short parent_umask;
 } fork_thread_arg_t;
 
+/* Release every dup the parent thread stashed in fork_thread_arg.
+ * Used on any failure path where the child can't take ownership of
+ * the dups — left unreleased, they'd burn one host fd per failed
+ * fork until yos --server hits RLIMIT_NOFILE. parent_fd_map entries
+ * are raw host fds (close them); parent_file_dup_fps are fdopen'd
+ * FILE* handles around their own host fd (fclose closes both). */
+static void release_parent_dups(fork_thread_arg_t *a)
+{
+    for (int i = 0; i < YOS_FD_MAX; i++) {
+        if (a->parent_fd_map[i] >= 0) {
+            close(a->parent_fd_map[i]);
+            a->parent_fd_map[i] = -1;
+        }
+    }
+    for (int i = 0; i < 256; i++) {
+        FILE *fp = (FILE *)a->parent_file_dup_fps[i];
+        if (!fp) continue;
+        a->parent_file_dup_fps[i] = NULL;
+        a->parent_file_dup_wfds[i] = -1;
+        a->parent_file_modes[i][0] = '\0';
+        fclose(fp);
+    }
+}
+
 static void *fork_thread_func(void *arg)
 {
     ydebug("fork_thread_func: child thread tid=%d\n", (int)(uintptr_t)pthread_self());
@@ -477,6 +517,7 @@ static void *fork_thread_func(void *arg)
     IM3Runtime rt = m3_NewRuntime(env, 64 * 1024, NULL);
     if (!rt) {
         pthread_mutex_unlock(&fork_setup_lock);
+        release_parent_dups(fork_thread_arg);
         munmap(fork_thread_arg->memory_snapshot, fork_thread_arg->memory_size);
         free(fork_thread_arg->wasm_globals);
         free(fork_thread_arg);
@@ -487,6 +528,7 @@ static void *fork_thread_func(void *arg)
     struct yos_exec_ctx *child_ctx = calloc(1, sizeof(struct yos_exec_ctx));
     if (!child_ctx) {
         pthread_mutex_unlock(&fork_setup_lock);
+        release_parent_dups(fork_thread_arg);
         m3_FreeRuntime(rt);
         m3_FreeEnvironment(env);
         munmap(fork_thread_arg->memory_snapshot, fork_thread_arg->memory_size);
@@ -593,6 +635,16 @@ static void *fork_thread_func(void *arg)
     M3Result res = m3_ParseModule(env, &mod, fork_thread_arg->wasm_bytes, fork_thread_arg->wasm_bytes_size);
     if (res) {
         pthread_mutex_unlock(&fork_setup_lock);
+        /* child_ctx already adopted parent_fd_map / file_slots above;
+         * close THOSE (not the parent_* copies) so we don't
+         * double-close the same kernel objects. */
+        for (int i = 0; i < YOS_FD_MAX; i++) {
+            if (child_ctx->fd_map[i] >= 0) close(child_ctx->fd_map[i]);
+        }
+        for (int i = 0; i < 256; i++) {
+            FILE *fp = (FILE *)child_ctx->file_slots[i];
+            if (fp) fclose(fp);
+        }
         free(child_ctx);
         m3_FreeRuntime(rt);
         m3_FreeEnvironment(env);
@@ -605,6 +657,13 @@ static void *fork_thread_func(void *arg)
     res = m3_LoadModule(rt, mod);
     if (res) {
         pthread_mutex_unlock(&fork_setup_lock);
+        for (int i = 0; i < YOS_FD_MAX; i++) {
+            if (child_ctx->fd_map[i] >= 0) close(child_ctx->fd_map[i]);
+        }
+        for (int i = 0; i < 256; i++) {
+            FILE *fp = (FILE *)child_ctx->file_slots[i];
+            if (fp) fclose(fp);
+        }
         free(child_ctx);
         m3_FreeRuntime(rt);
         m3_FreeEnvironment(env);
@@ -751,9 +810,8 @@ static void *fork_thread_func(void *arg)
          * dereference them. Lazy-create happens further down when
          * yos_link_imports runs against the new module. */
         if (child_ctx->pthread_host) {
-            extern void yos_pthread_host_destroy(struct yos_pthread_host *);
             yos_pthread_host_destroy(
-                (struct yos_pthread_host *)child_ctx->pthread_host);
+                (yos_pthread_host *)child_ctx->pthread_host);
             child_ctx->pthread_host = NULL;
         }
 
@@ -1352,7 +1410,12 @@ void yos_fork_pump(struct yos_exec_ctx *ctx)
         pthread_t t;
         int r = pthread_create(&t, NULL, fork_thread_func, fork_thread_arg);
         if (r != 0) {
-            free(mem_copy);
+            /* Child thread never started — close every dup we just
+             * stashed in fork_thread_arg before discarding it. Without
+             * this, pthread_create EAGAIN (or any other transient
+             * failure) burns ~stdio_dup_count host fds. */
+            release_parent_dups(fork_thread_arg);
+            munmap(mem_copy, fork_thread_arg->memory_size);
             free(wasm_globals_copy);
             free(fork_thread_arg);
             child_proc->state = YOS_PROC_FREE;
@@ -2198,12 +2261,11 @@ int32_t yos_proc_clone(struct yos_exec_ctx *ctx,
     child->sid  = ctx->proc->sid;
     if (flags & CLONE_CHILD_CLEARTID) child->tid_address = ctid_addr;
 
-    /* Spawn through the same internal substrate the L1 import uses. */
-    extern int yos_clone_thread(void *h, uint32_t fn_idx, uint32_t arg,
-                                uint32_t ctid_addr, uint32_t tls,
-                                uint8_t *memory_base, uint32_t *out_tid);
+    /* Spawn through the same internal substrate the L1 import uses.
+     * yos_clone_thread comes from impl/proc/pthread.h (included at
+     * the top); no local extern decl needed. */
     uint32_t spawned_tid = 0;
-    int rc = yos_clone_thread((struct yos_pthread_host *)ctx->pthread_host,
+    int rc = yos_clone_thread((yos_pthread_host *)ctx->pthread_host,
                               fn, arg,
                               (flags & CLONE_CHILD_CLEARTID) ? ctid_addr : 0,
                               (flags & CLONE_SETTLS) ? tls : 0,
@@ -2483,7 +2545,10 @@ void yos_vfork_pump(struct yos_exec_ctx *ctx)
         pthread_t t;
         int r = pthread_create(&t, NULL, fork_thread_func, fork_thread_arg);
         if (r != 0) {
-            free(mem_copy);
+            /* Same fd-leak fix as the fork path above — release the
+             * dups stashed for a child thread that never ran. */
+            release_parent_dups(fork_thread_arg);
+            munmap(mem_copy, fork_thread_arg->memory_size);
             free(wasm_globals_copy);
             free(fork_thread_arg);
             child_proc->state = YOS_PROC_FREE;

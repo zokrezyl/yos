@@ -6,6 +6,11 @@
 #include <stdatomic.h>
 #include <sys/syscall.h>
 #include <sys/mman.h>
+#include <sys/resource.h>      /* RLIMIT_NOFILE — the host process needs
+                                  every wasm guest's host-fd dups to live
+                                  in one shared kernel fd table; macOS
+                                  defaults the soft limit to 256, which
+                                  one perf-stress run easily exhausts. */
 #include <sys/stat.h>          /* mkdir — explicit because Apple SDK
                                   doesn't pull it via the other sys
                                   headers above (Linux glibc happens to,
@@ -1726,6 +1731,23 @@ int main(int argc, char **argv)
         const char *forced_path = getenv("YOS_PATH");
         if (forced_path && *forced_path) {
             setenv("PATH", forced_path, 1);
+        }
+    }
+
+    /* Raise RLIMIT_NOFILE to the hard limit. Every wasm guest's host fd
+     * table lives in one shared kernel fd table (we are one host
+     * process running many guests as pthreads), and fork's F_DUPFD
+     * loop multiplies the dup count by the live-guest count. macOS's
+     * default soft limit is 256 — perf-stress alone bursts past that
+     * via 160+ child forks dupping a pty fd each. iOS/tvOS app
+     * bundles already pre-set the hard limit lower; we never lower
+     * it, only raise it to whatever the system permits. */
+    {
+        struct rlimit rl;
+        if (getrlimit(RLIMIT_NOFILE, &rl) == 0 &&
+            rl.rlim_cur < rl.rlim_max) {
+            rl.rlim_cur = rl.rlim_max;
+            (void)setrlimit(RLIMIT_NOFILE, &rl);
         }
     }
 
