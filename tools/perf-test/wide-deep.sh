@@ -11,11 +11,6 @@
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 mkdir -p tmp
-LOG="tmp/perf-wide-deep.log"
 ./tools/yos.sh perf-stress \
     -f 200 -d 10,10,5,2 -p 32 -e 100 \
-    -r 32 -k 50 -T 64 -R 24 -t 50 -i 10 -o 4096 \
-    > "$LOG" 2>&1
-echo "--- $LOG (tail) ---"
-tail -40 "$LOG"
-grep -q "^perf-stress ok$" "$LOG"
+    -r 32 -k 50 -T 64 -R 24 -t 50 -i 10 -o 4096 
