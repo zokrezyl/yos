@@ -92,19 +92,25 @@ int32_t yos_mmap(struct yos_exec_ctx *ctx, uint32_t addr, uint32_t length,
 
 int32_t yos_munmap(struct yos_exec_ctx *ctx, uint32_t addr, uint32_t len)
 {
-    /* Align to page */
-    len = (len + 4095) & ~4095;
-
-    ydebug("munmap(0x%x, 0x%x) -> 0\n", addr, len);
-
-    /* Zero out the memory region */
-    if (addr + len <= ctx->memory_size) {
-        memset(ctx->memory + addr, 0, len);
+    /* Page-align using uint64_t so a len near UINT32_MAX doesn't wrap
+     * silently to 0 (or some small page) and let the addr+len check
+     * pass on a bogus range. */
+    uint64_t aligned = ((uint64_t)len + 4095u) & ~(uint64_t)4095u;
+    if (aligned == 0 || aligned > ctx->memory_size ||
+        (uint64_t)addr + aligned > ctx->memory_size) {
+        ydebug("munmap(0x%x, 0x%x) -> -EINVAL (out of wasm memory 0x%x)\n",
+               addr, len, (uint32_t)ctx->memory_size);
+        return -EINVAL;
     }
+
+    ydebug("munmap(0x%x, 0x%x) -> 0\n", addr, (uint32_t)aligned);
+
+    /* Zero out the memory region. */
+    memset(ctx->memory + addr, 0, (size_t)aligned);
 
     /* Add to free list for reuse */
     pthread_mutex_lock(&ctx->mem_lock);
-    add_free_region(ctx, addr, len);
+    add_free_region(ctx, addr, (uint32_t)aligned);
     pthread_mutex_unlock(&ctx->mem_lock);
 
     return 0;
@@ -120,8 +126,11 @@ int32_t yos_munmap(struct yos_exec_ctx *ctx, uint32_t addr, uint32_t len)
 static int32_t check_range(struct yos_exec_ctx *ctx, uint32_t start, uint32_t len, const char *who)
 {
     if (len == 0) return 0;
+    /* 64-bit end calc — `start + len` in uint32 wraps for large inputs
+     * (e.g. start=0x80000000, len=0x80000001 wraps to 1 and silently
+     * "passes"). */
     if (start >= ctx->memory_size || len > ctx->memory_size ||
-        start + len > ctx->memory_size) {
+        (uint64_t)start + (uint64_t)len > ctx->memory_size) {
         ydebug("%s(0x%x, 0x%x) -> -ENOMEM (out of wasm memory 0x%x)\n",
                who, start, len, (uint32_t)ctx->memory_size);
         return -ENOMEM;
@@ -198,12 +207,19 @@ int32_t yos_mmap2(struct yos_exec_ctx *ctx, uint32_t addr, uint32_t length,
         return -ENOSYS;
     }
 
-    /* align length to page */
-    length = (length + 4095) & ~4095;
+    /* Page-align length via uint64_t so a value near UINT32_MAX doesn't
+     * wrap to 0 (or a small page) and slip past the bound checks. */
+    uint64_t aligned = ((uint64_t)length + 4095u) & ~(uint64_t)4095u;
+    if (aligned == 0 || aligned > ctx->memory_size) {
+        ydebug("mmap2: length=0x%x -> ENOMEM (aligned 0x%lx out of range)\n",
+               length, (unsigned long)aligned);
+        return -ENOMEM;
+    }
+    length = (uint32_t)aligned;
 
     /* MAP_FIXED: use the requested address if it fits in memory */
     if ((flags & MAP_FIXED) && addr != 0) {
-        if (addr + length > ctx->memory_size) {
+        if ((uint64_t)addr + (uint64_t)length > ctx->memory_size) {
             ydebug("mmap2: MAP_FIXED addr=0x%x len=0x%x -> ENOMEM\n", addr, length);
             return -ENOMEM;
         }
@@ -237,7 +253,7 @@ int32_t yos_mmap2(struct yos_exec_ctx *ctx, uint32_t addr, uint32_t length,
         return -ENOMEM;
     }
     result = ctx->mmap_top;
-    uint32_t new_end = result + length;
+    uint64_t new_end = (uint64_t)result + (uint64_t)length;
 
     if (new_end > ctx->memory_size) {
         pthread_mutex_unlock(&ctx->mem_lock);
@@ -245,7 +261,7 @@ int32_t yos_mmap2(struct yos_exec_ctx *ctx, uint32_t addr, uint32_t length,
         return -ENOMEM;
     }
 
-    ctx->mmap_top = new_end;
+    ctx->mmap_top = (uint32_t)new_end;
     pthread_mutex_unlock(&ctx->mem_lock);
 
     /* anonymous mmap must return zeroed memory */

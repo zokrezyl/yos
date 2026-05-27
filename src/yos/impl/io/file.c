@@ -52,6 +52,7 @@
 extern int yos_fd_get(struct yos_exec_ctx *ctx, int wasm_fd);
 extern int32_t yos_fd_alloc(struct yos_exec_ctx *ctx, int host_fd);
 extern int32_t yos_fd_close(struct yos_exec_ctx *ctx, int32_t wfd);
+extern const char *yos_path_resolve(struct yos_exec_ctx *ctx, const char *p);
 
 FILE *yos_handle_to_file(struct yos_exec_ctx *ctx, uint32_t h)
 {
@@ -159,8 +160,12 @@ uint32_t yos_fopen(struct yos_exec_ctx *ctx, uint32_t path_off, uint32_t mode_of
 {
     if (!path_off || !mode_off) return 0;
     if (path_off >= ctx->memory_size || mode_off >= ctx->memory_size) return 0;
-    const char *path = (const char *)(ctx->memory + path_off);
+    const char *path_in = (const char *)(ctx->memory + path_off);
     const char *mode = (const char *)(ctx->memory + mode_off);
+    /* Route through the per-ctx cwd resolver — yos never calls host
+     * chdir(), so a raw fopen() on a relative path resolves against
+     * the host process cwd, not the guest's. */
+    const char *path = yos_path_resolve(ctx, path_in);
     FILE *f = fopen(path, mode);
     if (!f) return 0;
     uint32_t h = yos_alloc_file_handle_with_mode(ctx, f, mode);
@@ -173,8 +178,9 @@ uint32_t yos_freopen(struct yos_exec_ctx *ctx, uint32_t path_off,
 {
     if (!path_off || !mode_off) return 0;
     FILE *f_old = handle_to_file(fp);
-    const char *path = (const char *)(ctx->memory + path_off);
+    const char *path_in = (const char *)(ctx->memory + path_off);
     const char *mode = (const char *)(ctx->memory + mode_off);
+    const char *path = yos_path_resolve(ctx, path_in);
     FILE *f_new = freopen(path, mode, f_old ? f_old : NULL);
     if (!f_new) return 0;
     /* If reopened in-place, return the same handle. */
@@ -185,13 +191,35 @@ uint32_t yos_freopen(struct yos_exec_ctx *ctx, uint32_t path_off,
 
 uint32_t yos_fdopen(struct yos_exec_ctx *ctx, int32_t wfd, uint32_t mode_off)
 {
+    if (!ctx) return 0;
     int hfd = yos_fd_get(ctx, wfd);
     if (hfd < 0) return 0;
     if (!mode_off || mode_off >= ctx->memory_size) return 0;
     const char *mode = (const char *)(ctx->memory + mode_off);
     FILE *f = fdopen(hfd, mode);
     if (!f) return 0;
-    return yos_alloc_file_handle_with_mode(ctx, f, mode);
+    /* fdopen transfers ownership of `hfd` to the FILE*: per POSIX, fclose
+     * closes the underlying fd. Adopt the EXISTING wfd into the FILE
+     * handle table — do NOT call yos_fd_alloc, which would point a
+     * second wfd at the same hfd and leave the original wfd dangling at
+     * a closed-then-recycled host fd after fclose. */
+    extern void yos_fd_release_slot(struct yos_exec_ctx *ctx, int32_t wfd);
+    for (uint32_t i = 4; i < YOS_FILE_MAX; i++) {
+        if (ctx->file_slots[i] == NULL) {
+            ctx->file_slots[i] = f;
+            ctx->file_wfds[i]  = wfd;
+            size_t n = strlen(mode);
+            if (n >= sizeof(ctx->file_modes[i])) n = sizeof(ctx->file_modes[i]) - 1;
+            memcpy(ctx->file_modes[i], mode, n);
+            ctx->file_modes[i][n] = '\0';
+            return i;
+        }
+    }
+    /* Out of slots: fclose() will close hfd; release the wfd slot too
+     * so the now-stale wfd reads EBADF instead of a recycled host fd. */
+    fclose(f);
+    yos_fd_release_slot(ctx, wfd);
+    return 0;
 }
 
 int32_t yos_fclose(struct yos_exec_ctx *ctx, uint32_t fp)
