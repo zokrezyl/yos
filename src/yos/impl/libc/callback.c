@@ -21,6 +21,7 @@
 #include <stddef.h>
 #include <string.h>
 #include <stdlib.h>
+#include <dirent.h>
 
 #include "wasm3.h"
 #include "m3_env.h"
@@ -142,23 +143,39 @@ static m3ApiRawFunction(m3_yos_bsearch)
  *
  * The bridge can't pass `compar` and `filter` directly because they
  * are wasm function-table indices, not host function pointers. We
- * implement scandir using opendir+readdir+sort, calling back into
- * the wasm filter via m3_Call when appropriate.
+ * use the same lookup_fn/call_cmp machinery as qsort to dispatch.
  *
- * The result must be stored as an array of `struct dirent *` in the
- * GUEST's wasm memory. Since we don't have a guest-side allocator
- * we can directly call from here, and dirent layout differs between
- * glibc and FreeBSD anyway, the simplest correct path is:
+ * Result layout in wasm memory (POSIX scandir contract):
  *
- *   - allocate one big block via the guest allocator (yos_malloc)
- *   - lay out FreeBSD-shape dirents back-to-back
- *   - write a per-entry pointer array immediately after
- *   - store the array's wasm offset into *namelist_off
+ *   namelist[0] → wasm_offset → FreeBSD struct dirent { d_fileno (8),
+ *                                                       d_off (8),
+ *                                                       d_reclen (2),
+ *                                                       d_type (1),
+ *                                                       d_pad0 (1),
+ *                                                       d_namlen (2),
+ *                                                       d_pad1 (2),
+ *                                                       d_name[N] }
+ *   namelist[1] → wasm_offset → ...
+ *   ...
  *
- * For now we return 0 (empty result, no allocation needed) — nvim
- * uses scandir for plugin/runtime discovery and tolerates an empty
- * directory. Full impl is follow-up work. */
+ * Each dirent is allocated via yos_malloc rounded to 8-byte alignment
+ * to keep the d_fileno 64-bit-aligned. The namelist array itself is
+ * also yos_malloc'd. */
 extern uint32_t yos_malloc(struct yos_exec_ctx *ctx, uint32_t size);
+extern void     yos_free  (struct yos_exec_ctx *ctx, uint32_t off);
+
+/* Invoke a wasm filter(const struct dirent *) → int. On m3 failure,
+ * keep the entry (return 1) — being permissive matches "we couldn't
+ * call the filter; assume keep" semantics that the guest can recover
+ * from, vs. silently dropping every entry. */
+static int call_filter(IM3Runtime rt, IM3Function fn, uint32_t e_off)
+{
+    M3Result r = m3_CallV(fn, e_off);
+    if (r) return 1;
+    int32_t out = 0;
+    m3_GetResultsV(fn, &out);
+    return (int)out;
+}
 
 static m3ApiRawFunction(m3_yos_scandir)
 {
@@ -167,19 +184,131 @@ static m3ApiRawFunction(m3_yos_scandir)
     m3ApiGetArg(uint32_t, namelist_off);
     m3ApiGetArg(uint32_t, filter_idx);
     m3ApiGetArg(uint32_t, compar_idx);
-    (void)path_off; (void)filter_idx; (void)compar_idx;
 
     struct yos_exec_ctx *ctx = (struct yos_exec_ctx *)m3_GetUserData(runtime);
     uint32_t mem_size = 0;
     ctx->memory = m3_GetMemory(runtime, &mem_size, 0);
     ctx->memory_size = mem_size;
 
-    /* Set *namelist = NULL so the caller treats the result as empty. */
-    if (namelist_off && namelist_off + 4 <= mem_size) {
-        *(uint32_t *)(ctx->memory + namelist_off) = 0;
+    if (!path_off || path_off >= mem_size) m3ApiReturn(-1);
+    const char *path = (const char *)(ctx->memory + path_off);
+
+    /* The host's opendir/readdir gives us the directory contents in
+     * host-libc dirent shape; we convert each to FreeBSD shape on
+     * the wasm side. */
+    extern const char *yos_path_resolve(struct yos_exec_ctx *ctx, const char *p);
+    const char *resolved = yos_path_resolve(ctx, path);
+    DIR *d = opendir(resolved);
+    if (!d) m3ApiReturn(-1);
+
+    IM3Function filter = filter_idx ? lookup_fn(runtime, filter_idx) : NULL;
+    IM3Function compar = compar_idx ? lookup_fn(runtime, compar_idx) : NULL;
+
+    /* Collect wasm offsets of accepted dirents. host-side dyn array. */
+    uint32_t *offsets = NULL;
+    size_t cap = 0, n = 0;
+
+    struct dirent *de;
+    while ((de = readdir(d)) != NULL) {
+        size_t namlen = strlen(de->d_name);
+        if (namlen > 255) namlen = 255;
+
+        /* FreeBSD struct dirent: 24-byte header (d_fileno 8, d_off 8,
+         * d_reclen 2, d_type 1, d_pad0 1, d_namlen 2, d_pad1 2) +
+         * d_name[N+1] (NUL-terminated), rounded to 8-byte alignment
+         * so d_fileno of the NEXT entry would stay aligned. */
+        const uint32_t hdr_sz = 24;
+        uint32_t need        = hdr_sz + (uint32_t)namlen + 1;
+        uint32_t alloc_sz    = (need + 7u) & ~7u;
+        uint32_t e_off = yos_malloc(ctx, alloc_sz);
+        if (!e_off) {
+            closedir(d);
+            for (size_t i = 0; i < n; i++) yos_free(ctx, offsets[i]);
+            free(offsets);
+            m3ApiReturn(-1);
+        }
+        uint8_t *p = ctx->memory + e_off;
+        memset(p, 0, alloc_sz);
+        /* d_fileno (uint64 on FreeBSD wasm32) — host ino_t may be 64-
+         * or 32-bit depending on platform; widen to 64-bit safely. */
+        *(uint64_t *)(p + 0)  = (uint64_t)de->d_ino;
+        /* d_off (uint64) — we don't get a portable telldir-equivalent
+         * here, leave zero. The guest's only POSIX-valid use is to
+         * seekdir(d, dent->d_off) which yos doesn't support anyway. */
+        *(uint64_t *)(p + 8)  = 0;
+        *(uint16_t *)(p + 16) = (uint16_t)alloc_sz;       /* d_reclen */
+        p[18]                 = de->d_type;               /* d_type   */
+        p[19]                 = 0;                        /* d_pad0   */
+        *(uint16_t *)(p + 20) = (uint16_t)namlen;         /* d_namlen */
+        *(uint16_t *)(p + 22) = 0;                        /* d_pad1   */
+        memcpy(p + 24, de->d_name, namlen);
+        p[24 + namlen] = '\0';
+
+        /* filter(const struct dirent *) returns nonzero to keep. */
+        if (filter) {
+            if (!call_filter(runtime, filter, e_off)) {
+                yos_free(ctx, e_off);
+                continue;
+            }
+        }
+
+        if (n == cap) {
+            size_t newcap = cap ? cap * 2 : 16;
+            uint32_t *nv = (uint32_t *)realloc(offsets, newcap * sizeof(uint32_t));
+            if (!nv) {
+                closedir(d);
+                yos_free(ctx, e_off);
+                for (size_t i = 0; i < n; i++) yos_free(ctx, offsets[i]);
+                free(offsets);
+                m3ApiReturn(-1);
+            }
+            offsets = nv;
+            cap = newcap;
+        }
+        offsets[n++] = e_off;
     }
-    /* 0 entries — caller skips iteration cleanly. */
-    m3ApiReturn(0);
+    closedir(d);
+
+    /* Allocate the wasm-side namelist (array of n wasm pointers). */
+    uint32_t list_off = 0;
+    if (n) {
+        uint32_t list_sz = (uint32_t)(n * 4);  /* wasm32 pointer = 4 B */
+        list_off = yos_malloc(ctx, list_sz);
+        if (!list_off) {
+            for (size_t i = 0; i < n; i++) yos_free(ctx, offsets[i]);
+            free(offsets);
+            m3ApiReturn(-1);
+        }
+        for (size_t i = 0; i < n; i++) {
+            *(uint32_t *)(ctx->memory + list_off + (uint32_t)i * 4u) = offsets[i];
+        }
+    }
+    free(offsets);
+
+    /* Sort the namelist via compar. POSIX scandir's compar takes
+     * (const struct dirent **, const struct dirent **) — i.e. pointers
+     * INTO the namelist array. We pass the wasm offsets of consecutive
+     * slots. O(n²) insertion sort; sufficient for typical directories. */
+    if (compar && n > 1) {
+        for (size_t i = 1; i < n; i++) {
+            for (size_t j = i; j > 0; j--) {
+                uint32_t a_off = list_off + (uint32_t)(j - 1) * 4u;
+                uint32_t b_off = list_off + (uint32_t)j * 4u;
+                int c = call_cmp(runtime, compar, a_off, b_off);
+                if (c <= 0) break;
+                uint32_t av = *(uint32_t *)(ctx->memory + a_off);
+                uint32_t bv = *(uint32_t *)(ctx->memory + b_off);
+                *(uint32_t *)(ctx->memory + a_off) = bv;
+                *(uint32_t *)(ctx->memory + b_off) = av;
+            }
+        }
+    }
+
+    /* Write *namelist = list_off (NULL when n == 0). */
+    if (namelist_off && namelist_off + 4 <= mem_size) {
+        *(uint32_t *)(ctx->memory + namelist_off) = list_off;
+    }
+    m3ApiReturn((int32_t)n);
 }
 
 /* atexit / __cxa_atexit / at_quick_exit — register a wasm callback

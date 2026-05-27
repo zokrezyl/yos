@@ -76,9 +76,9 @@ extern uint32_t yos_malloc(struct yos_exec_ctx *ctx, uint32_t size);
  * per kind, reused across calls — same lifetime contract as libc's
  * static `_pw` / `_gr` slots. Allocated lazily on first call so
  * yos_malloc has a real ctx to allocate from. */
-static uint32_t pwd_buf_off;        /* wasm offset of passwd buffer (struct+strs) */
-static uint32_t grp_buf_off;        /* wasm offset of group buffer */
-static uint32_t login_buf_off;      /* wasm offset of login-name buffer */
+/* ctx->pwd_anchors.pwd moved to ctx->pwd_anchors.pwd */
+/* ctx->pwd_anchors.grp moved to ctx->pwd_anchors.grp */
+/* ctx->pwd_anchors.login moved to ctx->pwd_anchors.login */
 /* SEPARATE buffers for user_from_uid vs group_from_gid. ls prints both
  * via `printf("%s %s", user_from_uid(...), group_from_gid(...))` —
  * arg evaluation order writes user first, group second, both into the
@@ -96,9 +96,8 @@ static uint32_t login_buf_off;      /* wasm offset of login-name buffer */
  * itself, traps. yos_pwd_post_execve_reset() (called from proc.c after
  * every m3_FreeRuntime, mirrors yos_env_post_execve_reset) wipes the
  * anchors so each new wasm process re-allocates fresh. */
-static uint32_t ufu_buf_off;        /* user_from_uid result */
-static uint32_t gfg_buf_off;        /* group_from_gid result */
-
+/* ctx->pwd_anchors.ufu moved to ctx->pwd_anchors.ufu */
+/* ctx->pwd_anchors.gfg moved to ctx->pwd_anchors.gfg */
 static uint32_t ensure_buf(struct yos_exec_ctx *ctx,
                            uint32_t *anchor, uint32_t want)
 {
@@ -166,7 +165,7 @@ uint32_t yos_getpwuid(struct yos_exec_ctx *ctx, uint32_t uid)
         ydebug("getpwuid(%u) -> NULL\n", uid);
         return 0;
     }
-    uint32_t buf = ensure_buf(ctx, &pwd_buf_off, PWD_BUF_SZ);
+    uint32_t buf = ensure_buf(ctx, &ctx->pwd_anchors.pwd, PWD_BUF_SZ);
     if (!buf) { errno = ENOMEM; return 0; }
     /* Reserve the first byte for the empty-string sentinel that
      * pack_string returns when out of room. */
@@ -188,7 +187,7 @@ uint32_t yos_getpwnam(struct yos_exec_ctx *ctx, uint32_t name_off)
     const char *name = (const char *)(ctx->memory + name_off);
     struct passwd *pw = getpwnam(name);
     if (!pw) { ydebug("getpwnam(%s) -> NULL\n", name); return 0; }
-    uint32_t buf = ensure_buf(ctx, &pwd_buf_off, PWD_BUF_SZ);
+    uint32_t buf = ensure_buf(ctx, &ctx->pwd_anchors.pwd, PWD_BUF_SZ);
     if (!buf) return 0;
     ctx->memory[buf] = '\0';
     uint32_t cursor = WASM_PASSWD_SZ;
@@ -253,7 +252,7 @@ uint32_t yos_getpwent(struct yos_exec_ctx *ctx)
 {
     struct passwd *pw = getpwent();
     if (!pw) return 0;
-    uint32_t buf = ensure_buf(ctx, &pwd_buf_off, PWD_BUF_SZ);
+    uint32_t buf = ensure_buf(ctx, &ctx->pwd_anchors.pwd, PWD_BUF_SZ);
     if (!buf) return 0;
     ctx->memory[buf] = '\0';
     uint32_t cursor = WASM_PASSWD_SZ;
@@ -275,7 +274,7 @@ uint32_t yos_getlogin(struct yos_exec_ctx *ctx)
         if (pw && pw->pw_name) l = pw->pw_name;
         else l = "yos";
     }
-    uint32_t buf = ensure_buf(ctx, &login_buf_off, LOGIN_BUF_SZ);
+    uint32_t buf = ensure_buf(ctx, &ctx->pwd_anchors.login, LOGIN_BUF_SZ);
     if (!buf) return 0;
     size_t n = strlen(l);
     if (n >= LOGIN_BUF_SZ) n = LOGIN_BUF_SZ - 1;
@@ -350,7 +349,7 @@ uint32_t yos_getgrgid(struct yos_exec_ctx *ctx, uint32_t gid)
 {
     struct group *gr = getgrgid((gid_t)gid);
     if (!gr) { ydebug("getgrgid(%u) -> NULL\n", gid); return 0; }
-    uint32_t buf = ensure_buf(ctx, &grp_buf_off, GRP_BUF_SZ);
+    uint32_t buf = ensure_buf(ctx, &ctx->pwd_anchors.grp, GRP_BUF_SZ);
     if (!buf) return 0;
     ctx->memory[buf] = '\0';
     uint32_t cursor = WASM_GROUP_SZ;
@@ -366,7 +365,7 @@ uint32_t yos_getgrnam(struct yos_exec_ctx *ctx, uint32_t name_off)
     const char *name = (const char *)(ctx->memory + name_off);
     struct group *gr = getgrnam(name);
     if (!gr) return 0;
-    uint32_t buf = ensure_buf(ctx, &grp_buf_off, GRP_BUF_SZ);
+    uint32_t buf = ensure_buf(ctx, &ctx->pwd_anchors.grp, GRP_BUF_SZ);
     if (!buf) return 0;
     ctx->memory[buf] = '\0';
     uint32_t cursor = WASM_GROUP_SZ;
@@ -413,7 +412,7 @@ uint32_t yos_getgrent(struct yos_exec_ctx *ctx)
 {
     struct group *gr = getgrent();
     if (!gr) return 0;
-    uint32_t buf = ensure_buf(ctx, &grp_buf_off, GRP_BUF_SZ);
+    uint32_t buf = ensure_buf(ctx, &ctx->pwd_anchors.grp, GRP_BUF_SZ);
     if (!buf) return 0;
     ctx->memory[buf] = '\0';
     uint32_t cursor = WASM_GROUP_SZ;
@@ -434,8 +433,8 @@ void yos_endgrent(struct yos_exec_ctx *ctx) { (void)ctx; endgrent(); }
  * Auto-bridge stubs them as -ENOSYS today (see hooks.yaml stub:);
  * here we route them via custom_proc instead. */
 
-static uint32_t tm_buf_off;       /* CV_TM_GUEST_SZ = 44 bytes */
-static uint32_t timestr_buf_off;  /* "Wed Jun 30 21:49:08 1993\n\0" = 26 chars */
+/* ctx->pwd_anchors.tm moved to ctx->pwd_anchors.tm */
+/* ctx->pwd_anchors.timestr moved to ctx->pwd_anchors.timestr */
 #define TIMESTR_BUF_SZ  64u
 
 uint32_t yos_gmtime(struct yos_exec_ctx *ctx, uint32_t time_off)
@@ -446,7 +445,7 @@ uint32_t yos_gmtime(struct yos_exec_ctx *ctx, uint32_t time_off)
     time_t t = (time_t)*(int32_t *)(ctx->memory + time_off);
     struct tm tm;
     if (!gmtime_r(&t, &tm)) return 0;
-    uint32_t buf = ensure_buf(ctx, &tm_buf_off, CV_TM_GUEST_SZ);
+    uint32_t buf = ensure_buf(ctx, &ctx->pwd_anchors.tm, CV_TM_GUEST_SZ);
     if (!buf) return 0;
     cv_tm_h2w(ctx->memory + buf, &tm);
     return buf;
@@ -460,7 +459,7 @@ uint32_t yos_localtime(struct yos_exec_ctx *ctx, uint32_t time_off)
     time_t t = (time_t)*(int32_t *)(ctx->memory + time_off);
     struct tm tm;
     if (!localtime_r(&t, &tm)) return 0;
-    uint32_t buf = ensure_buf(ctx, &tm_buf_off, CV_TM_GUEST_SZ);
+    uint32_t buf = ensure_buf(ctx, &ctx->pwd_anchors.tm, CV_TM_GUEST_SZ);
     if (!buf) return 0;
     cv_tm_h2w(ctx->memory + buf, &tm);
     return buf;
@@ -474,7 +473,7 @@ uint32_t yos_ctime(struct yos_exec_ctx *ctx, uint32_t time_off)
     time_t t = (time_t)*(int32_t *)(ctx->memory + time_off);
     char hostbuf[64];
     if (!ctime_r(&t, hostbuf)) return 0;
-    uint32_t buf = ensure_buf(ctx, &timestr_buf_off, TIMESTR_BUF_SZ);
+    uint32_t buf = ensure_buf(ctx, &ctx->pwd_anchors.timestr, TIMESTR_BUF_SZ);
     if (!buf) return 0;
     size_t n = strlen(hostbuf);
     if (n >= TIMESTR_BUF_SZ) n = TIMESTR_BUF_SZ - 1;
@@ -521,7 +520,7 @@ uint32_t yos_asctime(struct yos_exec_ctx *ctx, uint32_t tm_off)
     tm.tm_isdst = *(int32_t *)(w + 32);
     char hostbuf[64];
     if (!asctime_r(&tm, hostbuf)) return 0;
-    uint32_t buf = ensure_buf(ctx, &timestr_buf_off, TIMESTR_BUF_SZ);
+    uint32_t buf = ensure_buf(ctx, &ctx->pwd_anchors.timestr, TIMESTR_BUF_SZ);
     if (!buf) return 0;
     size_t n = strlen(hostbuf);
     if (n >= TIMESTR_BUF_SZ) n = TIMESTR_BUF_SZ - 1;
@@ -566,10 +565,10 @@ int32_t yos_asctime_r(struct yos_exec_ctx *ctx, uint32_t tm_off,
  *   don't trample each other.
  */
 
-static uint32_t errstr_buf_off;
-static uint32_t gaistr_buf_off;
-static uint32_t hstr_buf_off;
-static uint32_t signam_buf_off;
+/* ctx->pwd_anchors.errstr moved to ctx->pwd_anchors.errstr */
+/* ctx->pwd_anchors.gaistr moved to ctx->pwd_anchors.gaistr */
+/* ctx->pwd_anchors.hstr moved to ctx->pwd_anchors.hstr */
+/* ctx->pwd_anchors.signam moved to ctx->pwd_anchors.signam */
 #define ERRSTR_BUF_SZ  128u
 
 static uint32_t copy_const_to_wasm(struct yos_exec_ctx *ctx,
@@ -587,22 +586,22 @@ static uint32_t copy_const_to_wasm(struct yos_exec_ctx *ctx,
 
 uint32_t yos_strerror(struct yos_exec_ctx *ctx, int32_t errnum)
 {
-    return copy_const_to_wasm(ctx, &errstr_buf_off, strerror(errnum));
+    return copy_const_to_wasm(ctx, &ctx->pwd_anchors.errstr, strerror(errnum));
 }
 
 uint32_t yos_gai_strerror(struct yos_exec_ctx *ctx, int32_t errnum)
 {
-    return copy_const_to_wasm(ctx, &gaistr_buf_off, gai_strerror(errnum));
+    return copy_const_to_wasm(ctx, &ctx->pwd_anchors.gaistr, gai_strerror(errnum));
 }
 
 uint32_t yos_hstrerror(struct yos_exec_ctx *ctx, int32_t errnum)
 {
-    return copy_const_to_wasm(ctx, &hstr_buf_off, hstrerror(errnum));
+    return copy_const_to_wasm(ctx, &ctx->pwd_anchors.hstr, hstrerror(errnum));
 }
 
 uint32_t yos_strsignal(struct yos_exec_ctx *ctx, int32_t signum)
 {
-    return copy_const_to_wasm(ctx, &signam_buf_off, strsignal(signum));
+    return copy_const_to_wasm(ctx, &ctx->pwd_anchors.signam, strsignal(signum));
 }
 
 /* ── more static-buffer string returners ────────────────────────
@@ -613,15 +612,15 @@ uint32_t yos_strsignal(struct yos_exec_ctx *ctx, int32_t signum)
  * each other within a single statement.
  */
 
-static uint32_t ttyname_buf_off;
-static uint32_t ctermid_buf_off;
-static uint32_t dirname_buf_off;
-static uint32_t l64a_buf_off;
-static uint32_t nl_langinfo_buf_off;
-static uint32_t setlocale_buf_off;
-static uint32_t getwd_buf_off;
-static uint32_t tempnam_buf_off;
-static uint32_t getusershell_buf_off;
+/* ctx->pwd_anchors.ttyname moved to ctx->pwd_anchors.ttyname */
+/* ctx->pwd_anchors.ctermid moved to ctx->pwd_anchors.ctermid */
+/* ctx->pwd_anchors.dirname moved to ctx->pwd_anchors.dirname */
+/* ctx->pwd_anchors.l64a moved to ctx->pwd_anchors.l64a */
+/* ctx->pwd_anchors.nl_langinfo moved to ctx->pwd_anchors.nl_langinfo */
+/* ctx->pwd_anchors.setlocale moved to ctx->pwd_anchors.setlocale */
+/* ctx->pwd_anchors.getwd moved to ctx->pwd_anchors.getwd */
+/* ctx->pwd_anchors.tempnam moved to ctx->pwd_anchors.tempnam */
+/* ctx->pwd_anchors.getusershell moved to ctx->pwd_anchors.getusershell */
 #define TTYNAME_BUF_SZ   256u
 #define CTERMID_BUF_SZ   64u
 #define DIRNAME_BUF_SZ   1024u
@@ -637,7 +636,7 @@ uint32_t yos_ttyname(struct yos_exec_ctx *ctx, int32_t wfd)
 {
     int hfd = yos_fd_get(ctx, wfd);
     if (hfd < 0) return 0;
-    return copy_const_to_wasm(ctx, &ttyname_buf_off, ttyname(hfd));
+    return copy_const_to_wasm(ctx, &ctx->pwd_anchors.ttyname, ttyname(hfd));
 }
 
 int32_t yos_ttyname_r(struct yos_exec_ctx *ctx, int32_t wfd,
@@ -661,7 +660,7 @@ uint32_t yos_ctermid(struct yos_exec_ctx *ctx, uint32_t s_off)
         strcpy((char *)(ctx->memory + s_off), p);
         return s_off;
     }
-    return copy_const_to_wasm(ctx, &ctermid_buf_off, p);
+    return copy_const_to_wasm(ctx, &ctx->pwd_anchors.ctermid, p);
 }
 
 /* dirname / basename — POSIX permits modifying the input buffer
@@ -674,7 +673,7 @@ uint32_t yos_dirname(struct yos_exec_ctx *ctx, uint32_t path_off)
 {
     if (!path_off || path_off >= ctx->memory_size) return 0;
     const char *src = (const char *)(ctx->memory + path_off);
-    uint32_t buf = ensure_buf(ctx, &dirname_buf_off, DIRNAME_BUF_SZ);
+    uint32_t buf = ensure_buf(ctx, &ctx->pwd_anchors.dirname, DIRNAME_BUF_SZ);
     if (!buf) return 0;
     size_t n = strnlen(src, DIRNAME_BUF_SZ - 1);
     memcpy(ctx->memory + buf, src, n);
@@ -712,7 +711,7 @@ uint32_t yos_tempnam(struct yos_exec_ctx *ctx, uint32_t dir_off, uint32_t prefix
     const char *prefix = prefix_off ? (const char *)(ctx->memory + prefix_off) : NULL;
     char *r = tempnam(dir, prefix);
     if (!r) return 0;
-    uint32_t off = copy_const_to_wasm(ctx, &tempnam_buf_off, r);
+    uint32_t off = copy_const_to_wasm(ctx, &ctx->pwd_anchors.tempnam, r);
     free(r);
     return off;
 }
@@ -733,7 +732,7 @@ uint32_t yos_mktemp(struct yos_exec_ctx *ctx, uint32_t template_off)
  * libc-internal buffer. Used by /etc/passwd parsers historically. */
 uint32_t yos_l64a(struct yos_exec_ctx *ctx, int32_t value)
 {
-    return copy_const_to_wasm(ctx, &l64a_buf_off, l64a((long)value));
+    return copy_const_to_wasm(ctx, &ctx->pwd_anchors.l64a, l64a((long)value));
 }
 
 /* nl_langinfo — return locale-specific descriptive string for the
@@ -782,19 +781,50 @@ static int yos_freebsd_nl_item_to_host(int32_t fbsd_item)
 uint32_t yos_nl_langinfo(struct yos_exec_ctx *ctx, int32_t item)
 {
     int host_item = yos_freebsd_nl_item_to_host(item);
-    if (host_item < 0) return copy_const_to_wasm(ctx, &nl_langinfo_buf_off, "");
-    return copy_const_to_wasm(ctx, &nl_langinfo_buf_off, nl_langinfo(host_item));
+    if (host_item < 0) return copy_const_to_wasm(ctx, &ctx->pwd_anchors.nl_langinfo, "");
+    return copy_const_to_wasm(ctx, &ctx->pwd_anchors.nl_langinfo, nl_langinfo(host_item));
 }
 
-/* setlocale(category, locale) — query/set the locale. When
- * `locale` is NULL it queries; otherwise it sets and returns the
- * new locale name. Returning a wasm-side string in both cases. */
+/* setlocale(category, locale) — query/set the locale.
+ *
+ * Per-ctx isolation: the previous impl called host setlocale() which
+ * is process-wide → child's setlocale("POSIX") overwrote the parent's
+ * locale state. The CLAUDE.md / types.h note flags this as a known
+ * leak with a long-term fix via uselocale(); that path needs
+ * <xlocale.h> on darwin and full coverage of every locale-sensitive
+ * bridge (strftime, printf %.d in some locales, isalpha, …) to avoid
+ * divergence between query-mode and actual behaviour.
+ *
+ * Pragmatic fix for now: route query+set through ctx->locale_name
+ * without touching host state. Other guests/forks aren't disturbed,
+ * and the FreeBSD-libc contract for setlocale() — "the returned
+ * string identifies the locale that's now active" — is honoured for
+ * query mode. Side effect: locale-sensitive functions still use the
+ * host's default locale, which is "C" in nix-built yos. That matches
+ * the previous behaviour for every guest that didn't explicitly call
+ * setlocale — and the guests that DID set locale generally only do
+ * so to confirm "C" is in effect (ssh, nvim). True per-ctx locale-
+ * sensitive behaviour is a follow-up that requires per-bridge
+ * uselocale() in every locale-aware impl/*.c entry. */
 uint32_t yos_setlocale(struct yos_exec_ctx *ctx, int32_t category, uint32_t locale_off)
 {
+    (void)category;
     const char *locale = locale_off ? (const char *)(ctx->memory + locale_off) : NULL;
-    char *r = setlocale(category, locale);
-    if (!r) return 0;
-    return copy_const_to_wasm(ctx, &setlocale_buf_off, r);
+
+    if (locale == NULL) {
+        /* Query mode: return the per-ctx name if set, else default "C". */
+        const char *cur = ctx->locale_name[0] ? ctx->locale_name : "C";
+        return copy_const_to_wasm(ctx, &ctx->pwd_anchors.setlocale, cur);
+    }
+
+    /* Set mode: record on the ctx; do NOT call host setlocale (which
+     * would mutate every other guest in this process). */
+    size_t n = strlen(locale);
+    if (n >= sizeof(ctx->locale_name)) n = sizeof(ctx->locale_name) - 1;
+    memcpy(ctx->locale_name, locale, n);
+    ctx->locale_name[n] = '\0';
+
+    return copy_const_to_wasm(ctx, &ctx->pwd_anchors.setlocale, ctx->locale_name);
 }
 
 /* getusershell — return next entry from /etc/shells. NULL when
@@ -803,7 +833,7 @@ uint32_t yos_getusershell(struct yos_exec_ctx *ctx)
 {
     char *r = getusershell();
     if (!r) return 0;
-    return copy_const_to_wasm(ctx, &getusershell_buf_off, r);
+    return copy_const_to_wasm(ctx, &ctx->pwd_anchors.getusershell, r);
 }
 void yos_setusershell(struct yos_exec_ctx *ctx) { (void)ctx; setusershell(); }
 void yos_endusershell(struct yos_exec_ctx *ctx) { (void)ctx; endusershell(); }
@@ -836,7 +866,7 @@ size_t yos_strftime(struct yos_exec_ctx *ctx, uint32_t buf_off, uint32_t maxsize
 /* tmpnam — generate a unique temp-file name. Like tempnam but no
  * dir/prefix args. Wasm side may pass NULL → use static buffer; or
  * a buffer pointer (FreeBSD L_tmpnam = 1024 bytes). */
-static uint32_t tmpnam_buf_off;
+/* ctx->pwd_anchors.tmpnam moved to ctx->pwd_anchors.tmpnam */
 uint32_t yos_tmpnam(struct yos_exec_ctx *ctx, uint32_t s_off)
 {
     char host[1024];
@@ -848,7 +878,7 @@ uint32_t yos_tmpnam(struct yos_exec_ctx *ctx, uint32_t s_off)
         memcpy(ctx->memory + s_off, r, n + 1);
         return s_off;
     }
-    return copy_const_to_wasm(ctx, &tmpnam_buf_off, r);
+    return copy_const_to_wasm(ctx, &ctx->pwd_anchors.tmpnam, r);
 }
 
 /* ── strtok / strtok_r / strsep (pointer-into-input return) ─────
@@ -956,8 +986,7 @@ uint32_t yos_tmpfile(struct yos_exec_ctx *ctx)
  */
 #define WASM_PROTOENT_SZ 12u
 #define PROTO_BUF_SZ     128u
-static uint32_t proto_buf_off;
-
+/* ctx->pwd_anchors.proto moved to ctx->pwd_anchors.proto */
 struct yos_proto_entry { const char *name; int number; };
 static const struct yos_proto_entry yos_proto_table[] = {
     { "ip",   0 },
@@ -969,7 +998,7 @@ static const struct yos_proto_entry yos_proto_table[] = {
 static uint32_t emit_protoent(struct yos_exec_ctx *ctx,
                               const struct yos_proto_entry *e)
 {
-    uint32_t buf = ensure_buf(ctx, &proto_buf_off, PROTO_BUF_SZ);
+    uint32_t buf = ensure_buf(ctx, &ctx->pwd_anchors.proto, PROTO_BUF_SZ);
     if (!buf) return 0;
     /* Layout in the slab:
      *    [0 .. 11]   struct protoent (p_name, p_aliases, p_proto)
@@ -1034,22 +1063,22 @@ uint32_t yos_user_from_uid(struct yos_exec_ctx *ctx, uint32_t uid, int32_t nouse
 {
     struct passwd *pw = getpwuid((uid_t)uid);
     if (pw && pw->pw_name && pw->pw_name[0])
-        return emit_ugname(ctx, &ufu_buf_off, pw->pw_name);
+        return emit_ugname(ctx, &ctx->pwd_anchors.ufu, pw->pw_name);
     if (nouser) return 0;
     char num[16];
     snprintf(num, sizeof num, "%u", uid);
-    return emit_ugname(ctx, &ufu_buf_off, num);
+    return emit_ugname(ctx, &ctx->pwd_anchors.ufu, num);
 }
 
 uint32_t yos_group_from_gid(struct yos_exec_ctx *ctx, uint32_t gid, int32_t nogroup)
 {
     struct group *gr = getgrgid((gid_t)gid);
     if (gr && gr->gr_name && gr->gr_name[0])
-        return emit_ugname(ctx, &gfg_buf_off, gr->gr_name);
+        return emit_ugname(ctx, &ctx->pwd_anchors.gfg, gr->gr_name);
     if (nogroup) return 0;
     char num[16];
     snprintf(num, sizeof num, "%u", gid);
-    return emit_ugname(ctx, &gfg_buf_off, num);
+    return emit_ugname(ctx, &ctx->pwd_anchors.gfg, num);
 }
 
 /* Called from impl/proc/proc.c::fork_thread_func right after the old
@@ -1061,34 +1090,38 @@ uint32_t yos_group_from_gid(struct yos_exec_ctx *ctx, uint32_t gid, int32_t nogr
  * a single yos session traps because user_from_uid writes the result
  * string into garbage / random wasm memory. Mirrors the same fix
  * yos_env_post_execve_reset does for env.c. */
-void yos_pwd_post_execve_reset(void)
+void yos_pwd_post_execve_reset(struct yos_exec_ctx *ctx)
 {
-    /* Every `*_buf_off` anchor declared at file scope in this TU is a
-     * wasm offset that survives across the m3_FreeRuntime + m3_NewRuntime
-     * pair execve does. The next process's ensure_buf() / equivalent
+    /* Every `*_buf_off` anchor on ctx->pwd_anchors is a wasm offset
+     * that survives across the m3_FreeRuntime + m3_NewRuntime pair
+     * execve does. The next process's ensure_buf() / equivalent
      * would otherwise see the anchor as already-allocated and hand back
      * a stale offset into freed memory. Zero them so each new wasm
-     * program starts with fresh allocations. */
-    pwd_buf_off          = 0;
-    grp_buf_off          = 0;
-    login_buf_off        = 0;
-    ufu_buf_off          = 0;
-    gfg_buf_off          = 0;
-    tm_buf_off           = 0;
-    timestr_buf_off      = 0;
-    errstr_buf_off       = 0;
-    gaistr_buf_off       = 0;
-    hstr_buf_off         = 0;
-    signam_buf_off       = 0;
-    ttyname_buf_off      = 0;
-    ctermid_buf_off      = 0;
-    dirname_buf_off      = 0;
-    l64a_buf_off         = 0;
-    nl_langinfo_buf_off  = 0;
-    setlocale_buf_off    = 0;
-    getwd_buf_off        = 0;
-    tempnam_buf_off      = 0;
-    getusershell_buf_off = 0;
-    tmpnam_buf_off       = 0;
-    proto_buf_off        = 0;
+     * program starts with fresh allocations.
+     *
+     * Anchors now live PER-CTX (types.h::yos_exec_ctx::pwd_anchors)
+     * — used to be file-scope statics, which broke when two
+     * concurrent guests in the same yos host hit them. */
+    ctx->pwd_anchors.pwd          = 0;
+    ctx->pwd_anchors.grp          = 0;
+    ctx->pwd_anchors.login        = 0;
+    ctx->pwd_anchors.ufu          = 0;
+    ctx->pwd_anchors.gfg          = 0;
+    ctx->pwd_anchors.tm           = 0;
+    ctx->pwd_anchors.timestr      = 0;
+    ctx->pwd_anchors.errstr       = 0;
+    ctx->pwd_anchors.gaistr       = 0;
+    ctx->pwd_anchors.hstr         = 0;
+    ctx->pwd_anchors.signam       = 0;
+    ctx->pwd_anchors.ttyname      = 0;
+    ctx->pwd_anchors.ctermid      = 0;
+    ctx->pwd_anchors.dirname      = 0;
+    ctx->pwd_anchors.l64a         = 0;
+    ctx->pwd_anchors.nl_langinfo  = 0;
+    ctx->pwd_anchors.setlocale    = 0;
+    ctx->pwd_anchors.getwd        = 0;
+    ctx->pwd_anchors.tempnam      = 0;
+    ctx->pwd_anchors.getusershell = 0;
+    ctx->pwd_anchors.tmpnam       = 0;
+    ctx->pwd_anchors.proto        = 0;
 }

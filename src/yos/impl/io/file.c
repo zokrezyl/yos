@@ -34,17 +34,13 @@
 
 #define YOS_FILE_MAX 256
 
-/* Per-slot state: the host FILE* AND the wasm fd that wraps the
- * file's underlying host fd. Two pieces are needed because the wasm
- * guest sees them as DIFFERENT NAMESPACES:
- *
- *   - FILE-handle index (the value returned by fopen / passed to
- *     fread / fwrite / etc.). 1..3 are stdin/stdout/stderr, 4..MAX
- *     are dynamically allocated.
- *
- *   - wasm fd (the value returned by fileno() / dirfd() / passed to
- *     read / write / fstat / fcntl / close). Indexes into ctx->fd_map
- *     which holds host fds.
+/* Per-slot state lives ON ctx->file_slots[] / ctx->file_wfds[] /
+ * ctx->file_modes[] (types.h). Per-ctx storage is what lets a forked
+ * child fclose its inherited handle without invalidating the parent's
+ * still-live handle. fork additionally fdopen(dup(fileno(parent_fp)))
+ * each live slot into the child's table so the underlying host FILE*
+ * is independent in each side — that's what makes fclose on one side
+ * leave the other side's host FILE* alive.
  *
  * Pre-fix: yos_fileno returned `fileno(host_FILE)` directly — the
  * raw host fd. The wasm guest passed that to env.fstat, which
@@ -52,27 +48,23 @@
  * host fd as a wasm fd. fd_map[host_fd] was unset → EBADF →
  * "ssh nixem" failed with `fstat /Users/.../.ssh/config: Bad file
  * descriptor` after the underlying fopen had succeeded. */
-struct yos_file_slot {
-    FILE   *fp;
-    int32_t wfd;   /* -1 if not allocated */
-};
-static struct yos_file_slot yos_files[YOS_FILE_MAX];
-static pthread_mutex_t yos_file_lock = PTHREAD_MUTEX_INITIALIZER;
 
 extern int yos_fd_get(struct yos_exec_ctx *ctx, int wasm_fd);
 extern int32_t yos_fd_alloc(struct yos_exec_ctx *ctx, int host_fd);
 extern int32_t yos_fd_close(struct yos_exec_ctx *ctx, int32_t wfd);
+extern const char *yos_path_resolve(struct yos_exec_ctx *ctx, const char *p);
 
-FILE *yos_handle_to_file(uint32_t h)
+FILE *yos_handle_to_file(struct yos_exec_ctx *ctx, uint32_t h)
 {
     /* Pre-bound stream handles: 1 = stdin, 2 = stdout, 3 = stderr. */
     if (h == 1) return stdin;
     if (h == 2) return stdout;
     if (h == 3) return stderr;
     if (h < 4 || h >= YOS_FILE_MAX) return NULL;
-    return yos_files[h].fp;
+    if (!ctx) return NULL;
+    return (FILE *)ctx->file_slots[h];
 }
-#define handle_to_file yos_handle_to_file
+#define handle_to_file(h) yos_handle_to_file(ctx, (h))
 
 /* For the pre-bound stream handles (1/2/3), look up the host fd the
  * wasm guest's per-ctx fd_map currently maps to wasm fd 0/1/2.
@@ -105,23 +97,38 @@ static int std_handle_hfd(struct yos_exec_ctx *ctx, uint32_t h)
  *
  * Caller passes ctx so we can reach ctx->fd_map. wfd_out is the
  * allocated wasm fd (or -1 on alloc failure). */
+uint32_t yos_alloc_file_handle_with_mode(struct yos_exec_ctx *ctx,
+                                         FILE *f, const char *mode);
+
 static uint32_t alloc_handle(struct yos_exec_ctx *ctx, FILE *f)
 {
-    if (!f) return 0;
+    return yos_alloc_file_handle_with_mode(ctx, f, NULL);
+}
+
+uint32_t yos_alloc_file_handle_with_mode(struct yos_exec_ctx *ctx,
+                                         FILE *f, const char *mode)
+{
+    if (!f || !ctx) return 0;
     int hfd = fileno(f);
-    int32_t wfd = (hfd >= 0 && ctx) ? yos_fd_alloc(ctx, hfd) : -1;
-    pthread_mutex_lock(&yos_file_lock);
+    int32_t wfd = (hfd >= 0) ? yos_fd_alloc(ctx, hfd) : -1;
     for (uint32_t i = 4; i < YOS_FILE_MAX; i++) {
-        if (yos_files[i].fp == NULL) {
-            yos_files[i].fp  = f;
-            yos_files[i].wfd = wfd;
-            pthread_mutex_unlock(&yos_file_lock);
+        if (ctx->file_slots[i] == NULL) {
+            ctx->file_slots[i] = f;
+            ctx->file_wfds[i]  = wfd;
+            /* Record mode so fork can fdopen on the dup'd fd with
+             * the right access mode. mode==NULL means "we don't
+             * know" (e.g. tmpfile()) — fall back to "r+" which
+             * works for most callers post-fork. */
+            const char *m = mode ? mode : "r+";
+            size_t n = strlen(m);
+            if (n >= sizeof(ctx->file_modes[i])) n = sizeof(ctx->file_modes[i]) - 1;
+            memcpy(ctx->file_modes[i], m, n);
+            ctx->file_modes[i][n] = '\0';
             return i;
         }
     }
-    pthread_mutex_unlock(&yos_file_lock);
     /* Out of slots — undo the wasm-fd alloc so we don't leak it. */
-    if (wfd >= 0 && ctx) yos_fd_close(ctx, wfd);
+    if (wfd >= 0) yos_fd_close(ctx, wfd);
     return 0;
 }
 
@@ -132,17 +139,16 @@ uint32_t yos_alloc_file_handle(struct yos_exec_ctx *ctx, FILE *f)
 
 static void free_handle(struct yos_exec_ctx *ctx, uint32_t h)
 {
-    if (h < 4 || h >= YOS_FILE_MAX) return;
-    pthread_mutex_lock(&yos_file_lock);
-    int32_t wfd = yos_files[h].wfd;
-    yos_files[h].fp  = NULL;
-    yos_files[h].wfd = -1;
-    pthread_mutex_unlock(&yos_file_lock);
+    if (h < 4 || h >= YOS_FILE_MAX || !ctx) return;
+    int32_t wfd = ctx->file_wfds[h];
+    ctx->file_slots[h] = NULL;
+    ctx->file_wfds[h]  = -1;
+    ctx->file_modes[h][0] = '\0';
     /* The host fd is closed by fclose() before we reach this point —
      * the wasm-fd slot just needs to be released (NOT close again,
      * which would EBADF). yos_fd_close hits close(hfd) again, so
      * we release the slot manually. */
-    if (wfd >= 0 && ctx) {
+    if (wfd >= 0) {
         extern void yos_fd_release_slot(struct yos_exec_ctx *ctx, int32_t wfd);
         yos_fd_release_slot(ctx, wfd);
     }
@@ -154,11 +160,15 @@ uint32_t yos_fopen(struct yos_exec_ctx *ctx, uint32_t path_off, uint32_t mode_of
 {
     if (!path_off || !mode_off) return 0;
     if (path_off >= ctx->memory_size || mode_off >= ctx->memory_size) return 0;
-    const char *path = (const char *)(ctx->memory + path_off);
+    const char *path_in = (const char *)(ctx->memory + path_off);
     const char *mode = (const char *)(ctx->memory + mode_off);
+    /* Route through the per-ctx cwd resolver — yos never calls host
+     * chdir(), so a raw fopen() on a relative path resolves against
+     * the host process cwd, not the guest's. */
+    const char *path = yos_path_resolve(ctx, path_in);
     FILE *f = fopen(path, mode);
     if (!f) return 0;
-    uint32_t h = alloc_handle(ctx, f);
+    uint32_t h = yos_alloc_file_handle_with_mode(ctx, f, mode);
     if (!h) fclose(f);
     return h;
 }
@@ -168,8 +178,9 @@ uint32_t yos_freopen(struct yos_exec_ctx *ctx, uint32_t path_off,
 {
     if (!path_off || !mode_off) return 0;
     FILE *f_old = handle_to_file(fp);
-    const char *path = (const char *)(ctx->memory + path_off);
+    const char *path_in = (const char *)(ctx->memory + path_off);
     const char *mode = (const char *)(ctx->memory + mode_off);
+    const char *path = yos_path_resolve(ctx, path_in);
     FILE *f_new = freopen(path, mode, f_old ? f_old : NULL);
     if (!f_new) return 0;
     /* If reopened in-place, return the same handle. */
@@ -180,13 +191,35 @@ uint32_t yos_freopen(struct yos_exec_ctx *ctx, uint32_t path_off,
 
 uint32_t yos_fdopen(struct yos_exec_ctx *ctx, int32_t wfd, uint32_t mode_off)
 {
+    if (!ctx) return 0;
     int hfd = yos_fd_get(ctx, wfd);
     if (hfd < 0) return 0;
     if (!mode_off || mode_off >= ctx->memory_size) return 0;
     const char *mode = (const char *)(ctx->memory + mode_off);
     FILE *f = fdopen(hfd, mode);
     if (!f) return 0;
-    return alloc_handle(ctx, f);
+    /* fdopen transfers ownership of `hfd` to the FILE*: per POSIX, fclose
+     * closes the underlying fd. Adopt the EXISTING wfd into the FILE
+     * handle table — do NOT call yos_fd_alloc, which would point a
+     * second wfd at the same hfd and leave the original wfd dangling at
+     * a closed-then-recycled host fd after fclose. */
+    extern void yos_fd_release_slot(struct yos_exec_ctx *ctx, int32_t wfd);
+    for (uint32_t i = 4; i < YOS_FILE_MAX; i++) {
+        if (ctx->file_slots[i] == NULL) {
+            ctx->file_slots[i] = f;
+            ctx->file_wfds[i]  = wfd;
+            size_t n = strlen(mode);
+            if (n >= sizeof(ctx->file_modes[i])) n = sizeof(ctx->file_modes[i]) - 1;
+            memcpy(ctx->file_modes[i], mode, n);
+            ctx->file_modes[i][n] = '\0';
+            return i;
+        }
+    }
+    /* Out of slots: fclose() will close hfd; release the wfd slot too
+     * so the now-stale wfd reads EBADF instead of a recycled host fd. */
+    fclose(f);
+    yos_fd_release_slot(ctx, wfd);
+    return 0;
 }
 
 int32_t yos_fclose(struct yos_exec_ctx *ctx, uint32_t fp)
@@ -387,17 +420,13 @@ int32_t yos_clearerr(struct yos_exec_ctx *ctx, uint32_t fp){ (void)ctx; FILE *f=
  * introduced struct yos_file_slot.wfd for the ssh bug context. */
 int32_t yos_fileno(struct yos_exec_ctx *ctx, uint32_t fp)
 {
-    (void)ctx;
     /* Stream handles 1/2/3 map to the per-ctx wasm fds 0/1/2
      * (stdin/stdout/stderr). */
     if (fp == 1) return 0;
     if (fp == 2) return 1;
     if (fp == 3) return 2;
-    if (fp < 4 || fp >= YOS_FILE_MAX) return -1;
-    pthread_mutex_lock(&yos_file_lock);
-    int32_t wfd = yos_files[fp].wfd;
-    pthread_mutex_unlock(&yos_file_lock);
-    return wfd;
+    if (fp < 4 || fp >= YOS_FILE_MAX || !ctx) return -1;
+    return ctx->file_wfds[fp];
 }
 
 /* ── seek/tell ─────────────────────────────────────────────────── */

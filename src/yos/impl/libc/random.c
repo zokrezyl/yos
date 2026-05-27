@@ -23,16 +23,20 @@ extern int getentropy(void *, size_t);
 
 #include "yos/types.h"
 #include "impl/errno_helpers.h"
+#include "impl/io/io-internal.h"   /* wptr_range */
 
 int32_t yos_getentropy(struct yos_exec_ctx *ctx, uint32_t buf_off, uint32_t len)
 {
-    if (buf_off == 0)
-        return yos_errno_neg(ctx, EFAULT);
     if (len > 256)
         return yos_errno_neg(ctx, EINVAL);
-    if (buf_off + len > ctx->memory_size)
-        return yos_errno_neg(ctx, EFAULT);
-    return yos_errno_check(ctx, getentropy(ctx->memory + buf_off, (size_t)len));
+    /* wptr_range handles wrap-safe end calc AND the new zero-length
+     * semantics: getentropy(NULL, 0) succeeds (no-op), getentropy(NULL,
+     * len>0) returns EFAULT. Out-of-range / overflowing ranges all
+     * land in the NULL → EFAULT branch below. */
+    void *p = wptr_range(ctx, buf_off, len);
+    if (!p) return yos_errno_neg(ctx, EFAULT);
+    if (len == 0) return 0;
+    return yos_errno_check(ctx, getentropy(p, (size_t)len));
 }
 
 /* arc4random_buf — implemented directly via getentropy(2) instead of
@@ -48,9 +52,13 @@ int32_t yos_getentropy(struct yos_exec_ctx *ctx, uint32_t buf_off, uint32_t len)
 void yos_arc4random_buf(struct yos_exec_ctx *ctx, uint32_t buf_off,
                         uint32_t len)
 {
-    if (!buf_off || !len) return;
-    if (buf_off + len > ctx->memory_size) return;
-    uint8_t *p = ctx->memory + buf_off;
+    if (!len) return;
+    /* wptr_range does the wrap-safe 64-bit end calc. Pre-fix this used
+     * `buf_off + len` in uint32 arithmetic; large buf_off + len wrapped
+     * past memory_size and let getentropy scribble outside wasm
+     * memory. */
+    uint8_t *p = (uint8_t *)wptr_range(ctx, buf_off, len);
+    if (!p) return;
     while (len > 0) {
         size_t n = len > 256 ? 256 : len;
         /* getentropy can't fail here (host always has /dev/urandom);

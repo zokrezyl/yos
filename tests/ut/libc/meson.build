@@ -29,6 +29,14 @@ wasm_cflags = [
   '-Wl,--allow-undefined',    # unresolved fn refs become env.<name>
                               # imports automatically — that's exactly
                               # the yos contract.
+  # Skip wasm function-table indices 0 and 1 so user functions land at
+  # index ≥ 2. The FreeBSD ABI encodes SIG_DFL as 0 and SIG_IGN as 1;
+  # if a wasm guest's sigaction handler landed at table[1] (which
+  # clang's linker does for small modules with few address-taken
+  # functions), yos couldn't distinguish "function at table[1]" from
+  # "user passed SIG_IGN" at the bridge boundary. --table-base=2
+  # leaves indices 0 and 1 unused at link time.
+  '-Wl,--table-base=2',
   '-O2',
 ]
 
@@ -342,5 +350,109 @@ foreach t : libc_tests
     ],
     suite       : 'libc',
     should_fail : t in libc_tests_xfail,
+  )
+endforeach
+
+# ─── parametrised fork-child matrix ─────────────────────────────────
+#
+# gen_fork_matrix.py reads fork_matrix.yaml and emits one
+# test_fork_child_<name>.c per row into the build tree. Every row
+# forks, so every generated test goes through wasm-opt --asyncify.
+#
+# Reconfigure note: meson runs the --list-names step at CONFIGURE
+# time, so adding/renaming/removing rows in fork_matrix.yaml requires
+# `meson setup --reconfigure build-<host>` (or wiping the build dir).
+# Editing only the BODY of an existing row is fine — that's a
+# build-time recompile via the custom_target's input dependency.
+gen_fork_script = files('gen_fork_matrix.py')
+fork_matrix_yaml = files('fork_matrix.yaml')
+
+# Configure-time probe: ask the generator for the row name list so
+# the foreach loop below can declare one test() per row.
+fork_names_cmd = run_command(
+  py, gen_fork_script,
+  '--yaml',       fork_matrix_yaml[0],
+  '--list-names',
+  check : true,
+)
+fork_row_names = fork_names_cmd.stdout().strip().split('\n')
+
+# Same probe, but only rows tagged `xfail: true` — these are tests that
+# pin known yos bugs. They still run and still go through asyncify so a
+# fix elsewhere will flip them to UNEXPECTEDPASS and force a YAML edit.
+fork_xfail_cmd = run_command(
+  py, gen_fork_script,
+  '--yaml',       fork_matrix_yaml[0],
+  '--list-xfail',
+  check : true,
+)
+fork_xfail_stdout = fork_xfail_cmd.stdout().strip()
+if fork_xfail_stdout == ''
+  fork_xfail_names = []
+else
+  fork_xfail_names = fork_xfail_stdout.split('\n')
+endif
+
+# Pre-compute the output filename list so custom_target knows what
+# to expect. Order MUST match the order gen_fork_matrix.py emits
+# (which is the row order in the YAML — both sides walk the same
+# list in the same order, so indexing below is stable).
+fork_gen_outputs = []
+foreach n : fork_row_names
+  fork_gen_outputs += 'test_fork_child_' + n + '.c'
+endforeach
+
+fork_gen = custom_target(
+  'fork-matrix-gen',
+  input            : [fork_matrix_yaml, gen_fork_script],
+  output           : fork_gen_outputs,
+  command          : [py, gen_fork_script,
+                      '--yaml',    '@INPUT0@',
+                      '--out-dir', '@OUTDIR@'],
+  build_by_default : true,
+)
+
+# Per-row wasm build + meson test entry. Each row goes through the
+# same wasm-clang + wasm-opt --asyncify path the hand-written fork
+# tests use (test_fork_basic etc.), so a row that misbehaves trips
+# the same diagnostics path as the manual tests.
+fork_row_index = 0
+foreach n : fork_row_names
+  src = fork_gen[fork_row_index]
+  fork_row_index += 1
+
+  raw_wasm = custom_target(
+    'test_fork_child_' + n + '-raw.wasm',
+    input            : src,
+    output           : 'test_fork_child_' + n + '-raw.wasm',
+    depends          : sysroot_skel,
+    command          : [wasm_cc, wasm_cflags, '-o', '@OUTPUT@', '@INPUT0@'],
+    build_by_default : true,
+  )
+
+  wasm = custom_target(
+    'test_fork_child_' + n + '.wasm',
+    input            : raw_wasm,
+    output           : 'test_fork_child_' + n + '.wasm',
+    command          : [wasm_opt, '--asyncify', '-o', '@OUTPUT@', '@INPUT@'],
+    build_by_default : true,
+  )
+
+  test('test_fork_child_' + n,
+    py,
+    args : [
+      files('run_libc_test.py'),
+      '--yos',  yos_bin,
+      '--src',  src,
+      '--wasm', wasm,
+    ],
+    suite       : 'libc',
+    # Each row forks + waits; on a loaded CI box that can creep past
+    # the default per-test timeout. 45 s is comfortable headroom.
+    timeout     : 45,
+    # `xfail: true` in the YAML row pins a known yos bug — the test
+    # PASSES the suite by failing the assertion, and UNEXPECTEDPASSes
+    # (suite-failing) the day the underlying bridge is fixed.
+    should_fail : n in fork_xfail_names,
   )
 endforeach

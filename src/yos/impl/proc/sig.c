@@ -25,8 +25,26 @@
 static void record_handler(struct yos_exec_ctx *ctx, int signum,
                            uint32_t handler_idx)
 {
-    if (ctx && signum > 0 && signum < YOS_NSIG)
+    if (!ctx || signum <= 0 || signum >= YOS_NSIG) return;
+    /* Split the FreeBSD sentinel values out of the table-index slot so
+     * a real wasm function pointer at table index 1 can coexist with
+     * SIG_IGN (which is also encoded as 1 in the FreeBSD ABI). The
+     * caller writes:
+     *   0   → SIG_DFL  (clear ignore bit, set idx=0)
+     *   1   → SIG_IGN  (set ignore bit, idx unused but reset to 0)
+     *   ≥ 2 → real wasm function-table index
+     * invoke_signal_handler reads sig_ignore_mask FIRST, then dispatches
+     * via sig_handlers[]. */
+    if (handler_idx == 0u /* SIG_DFL */) {
+        ctx->sig_ignore_mask &= ~(1u << signum);
+        ctx->sig_handlers[signum] = 0;
+    } else if (handler_idx == 1u /* SIG_IGN */) {
+        ctx->sig_ignore_mask |= (1u << signum);
+        ctx->sig_handlers[signum] = 0;
+    } else {
+        ctx->sig_ignore_mask &= ~(1u << signum);
         ctx->sig_handlers[signum] = handler_idx;
+    }
 }
 
 static inline uint32_t signum_bit(int signum)
@@ -73,17 +91,83 @@ void yos_signal_set_pending(int fbsd_signum)
 #define YOS_SIG_IGN ((uint32_t)1)
 #define YOS_SIG_ERR ((uint32_t)0xffffffffu)
 
+/* FreeBSD default action for each signal. "T" = terminate the
+ * process; "I" = ignore; "S" = stop; "C" = continue. Indexed by
+ * FreeBSD signum (1..31). Only "T" matters for the SIG_DFL path —
+ * we already drop ignored and stop/continue signals. Source:
+ * sigaction(2) manual page on FreeBSD. */
+static int default_action_is_terminate(int signum)
+{
+    switch (signum) {
+        case  1: /* SIGHUP   */
+        case  2: /* SIGINT   */
+        case  3: /* SIGQUIT  */
+        case  4: /* SIGILL   */
+        case  5: /* SIGTRAP  */
+        case  6: /* SIGABRT  */
+        case  7: /* SIGEMT   */
+        case  8: /* SIGFPE   */
+        case  9: /* SIGKILL  */
+        case 10: /* SIGBUS   */
+        case 11: /* SIGSEGV  */
+        case 12: /* SIGSYS   */
+        case 13: /* SIGPIPE  */
+        case 14: /* SIGALRM  */
+        case 15: /* SIGTERM  */
+        case 24: /* SIGXCPU  */
+        case 25: /* SIGXFSZ  */
+        case 26: /* SIGVTALRM */
+        case 27: /* SIGPROF  */
+        case 30: /* SIGUSR1  */
+        case 31: /* SIGUSR2  */
+            return 1;
+        default:
+            return 0;
+    }
+}
+
 static void invoke_signal_handler(struct yos_exec_ctx *ctx, int signum)
 {
     if (!ctx || signum <= 0 || signum >= YOS_NSIG) return;
+    /* SIG_IGN is tracked in a separate bitmask so the FreeBSD ABI
+     * value (sa_handler == 1) doesn't collide with wasm function-
+     * table index 1 (where small wasm modules place their first
+     * indirectly-called function). See types.h::sig_ignore_mask. */
+    if (ctx->sig_ignore_mask & (1u << signum)) return;
     uint32_t idx = ctx->sig_handlers[signum];
     ydebug("invoke_signal_handler: sig=%d idx=%u\n", signum, idx);
-    /* SIG_DFL (0): no handler installed — default kernel disposition,
-     * which for SIGCHLD is "ignore" — we just return.
-     * SIG_IGN (1): caller explicitly asked us to drop the signal —
-     * also return. Without this check, idx=1 would dereference
-     * function-table slot 1, which is some unrelated wasm function. */
-    if (idx == YOS_SIG_DFL || idx == YOS_SIG_IGN) return;
+    /* idx == 0 means SIG_DFL (no handler registered). Wasm function
+     * table index 0 is reserved by the wasm ABI as the null sentinel
+     * (indirect-call through 0 traps), so this never aliases a real
+     * handler.
+     *
+     * For SIG_DFL on a "terminate" signal, POSIX says the process
+     * dies. yos's model: mark the proc as ZOMBIE, encode term_sig
+     * so waitpid sees WIFSIGNALED. For the ROOT proc (pid 1) we
+     * also _exit() the yos host — pthread_exit alone is not enough
+     * on darwin because main-macos.c spawns a daemon Mach exception
+     * thread (mach_exc_thread), so killing only the wasm thread
+     * leaves the host process alive with no progress, making the
+     * guest unkillable via Ctrl-C. For forked-child procs (pid > 1)
+     * we keep the pthread_exit-only path so the parent yos host
+     * stays up and reaps the child via waitpid. */
+    if (idx == YOS_SIG_DFL) {
+        if (default_action_is_terminate(signum) && ctx->proc) {
+            ctx->proc->state     = YOS_PROC_ZOMBIE;
+            ctx->proc->exit_code = 0;
+            ctx->proc->term_sig  = signum;
+            ctx->proc->exited    = 1;
+            pthread_cond_broadcast(&ctx->proc->wait_cond);
+            if (ctx->proc->pid <= 1) {
+                /* Root guest. Bring the whole host down with the
+                 * shell convention 128+signum so a parent shell
+                 * reports the signal correctly. */
+                _exit(128 + signum);
+            }
+            pthread_exit(NULL);
+        }
+        return;
+    }
     IM3Runtime rt = (IM3Runtime)ctx->runtime;
     if (!rt) return;
     IM3Module mod = rt->modules;
@@ -126,6 +210,26 @@ void yos_signal_pump(struct yos_exec_ctx *ctx)
                                           __ATOMIC_ACQ_REL);
     if (fresh) __atomic_or_fetch(&ctx->sig_pending, fresh, __ATOMIC_ACQ_REL);
 
+    /* SIGKILL is uncatchable AND unmaskable per POSIX. Handle it
+     * before the normal deliverable-bits loop so the guest can't
+     * accidentally (or maliciously) sigprocmask itself unkillable.
+     * Terminating here uses pthread_exit instead of pthread_cancel,
+     * which leaves wasm3's per-runtime state in a consistent
+     * shape and avoids the m3Error-crash-in-next-fork hazard that
+     * pthread_cancel caused. */
+    uint32_t pend = __atomic_load_n(&ctx->sig_pending, __ATOMIC_ACQUIRE);
+    if (pend & (1u << 9)) {
+        if (ctx->proc) {
+            ctx->proc->state     = YOS_PROC_ZOMBIE;
+            ctx->proc->exit_code = 0;
+            ctx->proc->term_sig  = 9;
+            ctx->proc->exited    = 1;
+            pthread_cond_broadcast(&ctx->proc->wait_cond);
+            if (ctx->proc->pid <= 1) _exit(128 + 9);
+        }
+        pthread_exit(NULL);
+    }
+
     /* Deliver every pending signal that isn't blocked. Each delivery
      * clears the pending bit atomically (kill() from another thread
      * may set bits concurrently); blocked bits stay set and get
@@ -148,7 +252,13 @@ int32_t yos_sig_rt_sigaction(struct yos_exec_ctx *ctx, int32_t signum,
     (void)sigsetsize;
     if (!ctx || signum <= 0 || signum >= YOS_NSIG)
         return yos_errno_neg(ctx, EINVAL);
-    uint32_t prev = ctx->sig_handlers[signum];
+    /* Materialise the FreeBSD-ABI value for the previous handler from
+     * yos's split representation. If the signal was SIG_IGN, the
+     * FreeBSD ABI expects sa_handler == 1; if it was a registered
+     * function, return the wasm-table index; otherwise SIG_DFL == 0. */
+    uint32_t prev_abi;
+    if (ctx->sig_ignore_mask & (1u << signum)) prev_abi = 1u;       /* SIG_IGN */
+    else                                       prev_abi = ctx->sig_handlers[signum];
     if (act && ctx->memory && act + 4 <= ctx->memory_size) {
         /* FreeBSD i386 struct sigaction: sa_handler/sa_sigaction is at
          * offset 0; the value is a wasm function-table index, NOT a
@@ -159,7 +269,7 @@ int32_t yos_sig_rt_sigaction(struct yos_exec_ctx *ctx, int32_t signum,
     if (oldact && ctx->memory && oldact + 32 <= ctx->memory_size) {
         uint8_t *p = ctx->memory + oldact;
         memset(p, 0, 32);
-        *(uint32_t *)p = prev;       /* sa_handler */
+        *(uint32_t *)p = prev_abi;   /* sa_handler in FreeBSD-ABI encoding */
     }
     return 0;
 }
@@ -255,7 +365,9 @@ int32_t yos_sigaction(struct yos_exec_ctx *ctx, int32_t signum,
 uint32_t yos_signal(struct yos_exec_ctx *ctx, int32_t signum, uint32_t handler)
 {
     if (!ctx || signum <= 0 || signum >= YOS_NSIG) return YOS_SIG_ERR;
-    uint32_t old = ctx->sig_handlers[signum];
+    uint32_t old;
+    if (ctx->sig_ignore_mask & (1u << signum)) old = YOS_SIG_IGN;
+    else                                       old = ctx->sig_handlers[signum];
     record_handler(ctx, signum, handler);
     return old;
 }

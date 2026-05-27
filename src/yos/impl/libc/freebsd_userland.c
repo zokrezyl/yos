@@ -283,13 +283,13 @@ static m3ApiRawFunction(m3_yos_strtonum) {
  * overwrite. We per-call allocate a fresh guest buf and free the
  * previous one to mimic that. Single-buffer-per-call is cheap and
  * correct enough for cut + grep's read paths. */
-extern FILE *yos_handle_to_file(uint32_t h);
+extern FILE *yos_handle_to_file(struct yos_exec_ctx *ctx, uint32_t h);
 extern int   yos_free(struct yos_exec_ctx *ctx, uint32_t off);
 
-/* Per-context stash of the last fgetln return; freed on next call.
- * Keying on ctx avoids cross-thread/cross-fork contamination. */
-struct fgetln_stash { uint32_t off; uint32_t cap; };
-static struct fgetln_stash g_fgetln_stash;   /* good enough — single ctx */
+/* Per-ctx fgetln stash. Was a process-wide static — concurrent
+ * guests would free each other's wasm-side line buffer mid-read.
+ * Lives on ctx->fgetln_stash; see types.h for the field layout
+ * (we reuse buf_off/buf_cap from the on-ctx struct). */
 
 static m3ApiRawFunction(m3_yos_fgetln) {
     m3ApiReturnType(uint32_t)
@@ -298,7 +298,7 @@ static m3ApiRawFunction(m3_yos_fgetln) {
     struct yos_exec_ctx *ctx =
         (struct yos_exec_ctx *)m3_GetUserData(runtime);
     refresh_mem(runtime, ctx);
-    FILE *f = yos_handle_to_file(fp_off);
+    FILE *f = yos_handle_to_file(ctx, fp_off);
     if (!f) {
         errno = EBADF; write_errno(ctx);
         if (lenp_off && lenp_off + 4 <= ctx->memory_size)
@@ -318,9 +318,9 @@ static m3ApiRawFunction(m3_yos_fgetln) {
     /* Free previous stash so the "buffer is private to the stream"
      * contract holds — guests that hold the old pointer past the
      * next fgetln call get use-after-free, same as on real BSD. */
-    if (g_fgetln_stash.off) {
-        yos_free(ctx, g_fgetln_stash.off);
-        g_fgetln_stash.off = 0;
+    if (ctx->fgetln_stash.buf_off) {
+        yos_free(ctx, ctx->fgetln_stash.buf_off);
+        ctx->fgetln_stash.buf_off = 0;
     }
     uint32_t off = yos_malloc(ctx, (uint32_t)n);
     if (!off) {
@@ -332,8 +332,8 @@ static m3ApiRawFunction(m3_yos_fgetln) {
     }
     memcpy(ctx->memory + off, line, (size_t)n);
     free(line);
-    g_fgetln_stash.off = off;
-    g_fgetln_stash.cap = (uint32_t)n;
+    ctx->fgetln_stash.buf_off = off;
+    ctx->fgetln_stash.buf_cap = (uint32_t)n;
     if (lenp_off && lenp_off + 4 <= ctx->memory_size)
         *(uint32_t *)(ctx->memory + lenp_off) = (uint32_t)n;
     m3ApiReturn(off);
@@ -341,19 +341,18 @@ static m3ApiRawFunction(m3_yos_fgetln) {
 
 /* getprogname / setprogname: per-process program name. We stash a
  * guest-side buffer once and return its offset on every call. */
-static uint32_t g_progname_off;
 
 static m3ApiRawFunction(m3_yos_getprogname) {
     m3ApiReturnType(uint32_t)
     struct yos_exec_ctx *ctx =
         (struct yos_exec_ctx *)m3_GetUserData(runtime);
     refresh_mem(runtime, ctx);
-    if (!g_progname_off) {
+    if (!ctx->progname_off) {
         /* Synthesise a default from argv[0] if the guest never
          * set one. */
-        g_progname_off = guest_dup_str(ctx, "yos-tool");
+        ctx->progname_off = guest_dup_str(ctx, "yos-tool");
     }
-    m3ApiReturn(g_progname_off);
+    m3ApiReturn(ctx->progname_off);
 }
 
 static m3ApiRawFunction(m3_yos_setprogname) {
@@ -366,8 +365,8 @@ static m3ApiRawFunction(m3_yos_setprogname) {
     /* Take just the basename — FreeBSD's setprogname does the same. */
     const char *base = strrchr(raw, '/');
     base = base ? base + 1 : raw;
-    if (g_progname_off) yos_free(ctx, g_progname_off);
-    g_progname_off = guest_dup_str(ctx, base);
+    if (ctx->progname_off) yos_free(ctx, ctx->progname_off);
+    ctx->progname_off = guest_dup_str(ctx, base);
     m3ApiSuccess();
 }
 
@@ -463,11 +462,13 @@ void yos_freebsd_userland_link(IM3Module mod)
 }
 
 /* Called from impl/proc/proc.c after m3_FreeRuntime during execve.
- * g_progname_off is a wasm offset into the now-freed memory; the next
+ * ctx->progname_off is a wasm offset into the now-freed memory; the next
  * process's getprogname() would otherwise hand back the stale offset
  * and the guest would dereference whatever happens to live there
  * in the fresh wasm linear memory. */
-void yos_freebsd_userland_post_execve_reset(void)
+void yos_freebsd_userland_post_execve_reset(struct yos_exec_ctx *ctx)
 {
-    g_progname_off = 0;
+    ctx->progname_off = 0;
+    ctx->fgetln_stash.buf_off = 0;
+    ctx->fgetln_stash.buf_cap = 0;
 }

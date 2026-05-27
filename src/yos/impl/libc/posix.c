@@ -47,6 +47,29 @@
 extern int  yos_fd_alloc(struct yos_exec_ctx *ctx, int host_fd);
 extern int  yos_fd_get  (struct yos_exec_ctx *ctx, int wasm_fd);
 extern void yos_fd_close(struct yos_exec_ctx *ctx, int wasm_fd);
+extern const char *yos_path_resolve(struct yos_exec_ctx *ctx, const char *p);
+
+/* Validated [offset, offset+len) range → host pointer. Mirrors the
+ * same-named helper in impl/io/io-internal.h. Returns NULL when the
+ * range falls outside wasm memory, when the 64-bit end overflows,
+ * OR when offset is 0 with len>0 (guest NULL pointer + intent to
+ * write — that's EFAULT).
+ *
+ * Zero-length calls (len==0) succeed regardless of offset value, so
+ * POSIX `send(fd, NULL, 0, ...)` / `recv(fd, NULL, 0, ...)` etc. do
+ * not EFAULT. Returns a non-NULL host pointer (validated against
+ * memory_size so we don't leak a wild pointer for an out-of-range
+ * offset). */
+static inline void *posix_wptr_range(struct yos_exec_ctx *ctx, uint32_t offset,
+                                     uint64_t len)
+{
+    if (len == 0)
+        return (offset <= ctx->memory_size) ? (ctx->memory + offset) : NULL;
+    if (offset == 0) return NULL;
+    if (offset >= ctx->memory_size) return NULL;
+    if ((uint64_t)offset + len > (uint64_t)ctx->memory_size) return NULL;
+    return ctx->memory + offset;
+}
 
 /* ── fd-remapping passthroughs ────────────────────────────────────── */
 
@@ -63,6 +86,12 @@ int32_t yos_dup(struct yos_exec_ctx *ctx, int32_t wfd)
     }
     int new_wfd = yos_fd_alloc(ctx, new_hfd);
     if (new_wfd < 0) { close(new_hfd); return yos_errno_neg(ctx, EMFILE); }
+    /* Propagate recorded path. fts(3) under find(1) opens "." into one
+     * fd then dups it into another for stash-and-restore; without this
+     * the dup'd fd has no path, so a later fchdir on it can't update
+     * ctx->cwd. */
+    if (ctx->fd_paths[wfd])
+        ctx->fd_paths[new_wfd] = strdup(ctx->fd_paths[wfd]);
     ydebug("dup(wfd=%d hfd=%d) -> new_wfd=%d new_hfd=%d\n",
            wfd, hfd, new_wfd, new_hfd);
     return new_wfd;
@@ -100,9 +129,13 @@ int32_t yos_getsockname(struct yos_exec_ctx *ctx, int32_t wfd,
     int hfd = yos_fd_get(ctx, wfd);
     ydebug("getsockname(wfd=%d hfd=%d)\n", wfd, hfd);
     if (hfd < 0) return yos_errno_neg(ctx, EBADF);
+    if (!posix_wptr_range(ctx, addrlen_off, 4))
+        return yos_errno_neg(ctx, EFAULT);
     uint32_t *addrlen_p = (uint32_t *)(ctx->memory + addrlen_off);
     socklen_t cap = (socklen_t)*addrlen_p;
     if (cap > 256) cap = 256;  /* cap; libuv only needs the family */
+    if (!posix_wptr_range(ctx, addr_off, cap))
+        return yos_errno_neg(ctx, EFAULT);
     uint8_t host_buf[256];
     socklen_t host_len = cap;
     if (getsockname(hfd, (struct sockaddr *)host_buf, &host_len) < 0) {
@@ -280,9 +313,10 @@ int32_t yos_connect(struct yos_exec_ctx *ctx, int32_t fd, uint32_t addr_off,
 {
     int hfd = yos_fd_get(ctx, fd);
     if (hfd < 0) return hfd;
-    if (addr_off >= ctx->memory_size) return yos_errno_neg(ctx, EFAULT);
     uint8_t hostbuf[256];
     if (addrlen > sizeof(hostbuf)) return yos_errno_neg(ctx, EINVAL);
+    if (!posix_wptr_range(ctx, addr_off, addrlen))
+        return yos_errno_neg(ctx, EFAULT);
     memcpy(hostbuf, ctx->memory + addr_off, addrlen);
     freebsd_sockaddr_to_host(hostbuf, (socklen_t)addrlen);
     return yos_errno_check(ctx,
@@ -297,9 +331,14 @@ int32_t yos_accept(struct yos_exec_ctx *ctx, int32_t fd, uint32_t addr_off,
     socklen_t hlen = 0;
     socklen_t *hlen_p = NULL;
     struct sockaddr *haddr = NULL;
-    if (addr_off && addrlen_off &&
-        addr_off < ctx->memory_size && addrlen_off + 4 <= ctx->memory_size) {
-        hlen   = (socklen_t)*(uint32_t *)(ctx->memory + addrlen_off);
+    if (addr_off && addrlen_off) {
+        /* Read *addrlen first so we can validate the addr buffer range
+         * before the host kernel writes into it. */
+        if (!posix_wptr_range(ctx, addrlen_off, 4))
+            return yos_errno_neg(ctx, EFAULT);
+        hlen = (socklen_t)*(uint32_t *)(ctx->memory + addrlen_off);
+        if (!posix_wptr_range(ctx, addr_off, hlen))
+            return yos_errno_neg(ctx, EFAULT);
         hlen_p = &hlen;
         haddr  = (struct sockaddr *)(ctx->memory + addr_off);
     }
@@ -316,8 +355,9 @@ ssize_t yos_send(struct yos_exec_ctx *ctx, int32_t fd, uint32_t buf_off,
 {
     int hfd = yos_fd_get(ctx, fd);
     if (hfd < 0) return hfd;
-    if (buf_off >= ctx->memory_size) return yos_errno_neg(ctx, EFAULT);
-    ssize_t n = send(hfd, ctx->memory + buf_off, len, flags);
+    void *p = posix_wptr_range(ctx, buf_off, len);
+    if (!p) return yos_errno_neg(ctx, EFAULT);
+    ssize_t n = send(hfd, p, len, flags);
     return yos_errno_check(ctx, (int32_t)n);
 }
 
@@ -326,8 +366,9 @@ ssize_t yos_recv(struct yos_exec_ctx *ctx, int32_t fd, uint32_t buf_off,
 {
     int hfd = yos_fd_get(ctx, fd);
     if (hfd < 0) return hfd;
-    if (buf_off >= ctx->memory_size) return yos_errno_neg(ctx, EFAULT);
-    ssize_t n = recv(hfd, ctx->memory + buf_off, len, flags);
+    void *p = posix_wptr_range(ctx, buf_off, len);
+    if (!p) return yos_errno_neg(ctx, EFAULT);
+    ssize_t n = recv(hfd, p, len, flags);
     return yos_errno_check(ctx, (int32_t)n);
 }
 
@@ -337,11 +378,15 @@ ssize_t yos_sendto(struct yos_exec_ctx *ctx, int32_t fd, uint32_t buf_off,
 {
     int hfd = yos_fd_get(ctx, fd);
     if (hfd < 0) return hfd;
+    void *p = posix_wptr_range(ctx, buf_off, len);
+    if (!p) return yos_errno_neg(ctx, EFAULT);
     const struct sockaddr *dst = NULL;
-    if (dst_off && dst_off < ctx->memory_size)
+    if (dst_off) {
+        if (!posix_wptr_range(ctx, dst_off, dst_len))
+            return yos_errno_neg(ctx, EFAULT);
         dst = (const struct sockaddr *)(ctx->memory + dst_off);
-    ssize_t n = sendto(hfd, ctx->memory + buf_off, len, flags, dst,
-                       (socklen_t)dst_len);
+    }
+    ssize_t n = sendto(hfd, p, len, flags, dst, (socklen_t)dst_len);
     return yos_errno_check(ctx, (int32_t)n);
 }
 
@@ -351,15 +396,21 @@ ssize_t yos_recvfrom(struct yos_exec_ctx *ctx, int32_t fd, uint32_t buf_off,
 {
     int hfd = yos_fd_get(ctx, fd);
     if (hfd < 0) return hfd;
+    void *p = posix_wptr_range(ctx, buf_off, len);
+    if (!p) return yos_errno_neg(ctx, EFAULT);
     socklen_t hlen = 0;
     socklen_t *hlen_p = NULL;
     struct sockaddr *src = NULL;
-    if (src_off && srclen_off && srclen_off + 4 <= ctx->memory_size) {
-        hlen   = (socklen_t)*(uint32_t *)(ctx->memory + srclen_off);
+    if (src_off && srclen_off) {
+        if (!posix_wptr_range(ctx, srclen_off, 4))
+            return yos_errno_neg(ctx, EFAULT);
+        hlen = (socklen_t)*(uint32_t *)(ctx->memory + srclen_off);
+        if (!posix_wptr_range(ctx, src_off, hlen))
+            return yos_errno_neg(ctx, EFAULT);
         hlen_p = &hlen;
         src    = (struct sockaddr *)(ctx->memory + src_off);
     }
-    ssize_t n = recvfrom(hfd, ctx->memory + buf_off, len, flags, src, hlen_p);
+    ssize_t n = recvfrom(hfd, p, len, flags, src, hlen_p);
     if (n < 0) return yos_errno_neg(ctx, errno);
     if (srclen_off) *(uint32_t *)(ctx->memory + srclen_off) = (uint32_t)hlen;
     return n;
@@ -422,7 +473,20 @@ int32_t yos_select(struct yos_exec_ctx *ctx, int32_t nfds,
         if (hfd > max_hfd) max_hfd = hfd;
     }
 
-    struct timeval *tv = to_off ? (struct timeval *)(ctx->memory + to_off) : NULL;
+    /* struct timeval on FreeBSD wasm32 is 8 bytes (32-bit time_t +
+     * 32-bit suseconds_t). On macOS/Linux x86_64 host it's 16 bytes
+     * (64-bit time_t + 32-bit suseconds_t + 4 bytes padding).
+     * Treating the wasm-memory bytes directly as `struct timeval *`
+     * makes the host read 8 bytes of garbage as the high 32 bits of
+     * tv_sec, often producing tv_sec = -1 → EINVAL from select.
+     * Convert via the codegen-emitted cv_timeval_w2h. */
+    extern void cv_timeval_w2h(struct timeval *h, const uint8_t *w);
+    struct timeval host_tv;
+    struct timeval *tv = NULL;
+    if (to_off) {
+        cv_timeval_w2h(&host_tv, ctx->memory + to_off);
+        tv = &host_tv;
+    }
     int rc = select(max_hfd + 1, &hr, &hw, &he, tv);
     if (rc < 0) return yos_errno_neg(ctx, errno);
 
@@ -446,7 +510,10 @@ int32_t yos_getpeername(struct yos_exec_ctx *ctx, int32_t fd,
     int hfd = yos_fd_get(ctx, fd);
     if (hfd < 0) return hfd;
     if (!addr_off || !addrlen_off) return yos_errno_neg(ctx, EFAULT);
+    if (!posix_wptr_range(ctx, addrlen_off, 4)) return yos_errno_neg(ctx, EFAULT);
     socklen_t hlen = (socklen_t)*(uint32_t *)(ctx->memory + addrlen_off);
+    if (!posix_wptr_range(ctx, addr_off, hlen))
+        return yos_errno_neg(ctx, EFAULT);
     if (getpeername(hfd, (struct sockaddr *)(ctx->memory + addr_off), &hlen) < 0)
         return yos_errno_neg(ctx, errno);
     *(uint32_t *)(ctx->memory + addrlen_off) = (uint32_t)hlen;
@@ -727,13 +794,24 @@ int32_t yos_getnameinfo(struct yos_exec_ctx *ctx, uint32_t sa_off,
                         uint32_t salen, uint32_t host_off, uint32_t hostlen,
                         uint32_t serv_off, uint32_t servlen, int32_t flags)
 {
-    if (!sa_off || sa_off + salen > ctx->memory_size) return EAI_SYSTEM;
+    if (!posix_wptr_range(ctx, sa_off, salen)) return EAI_SYSTEM;
     uint8_t hostbuf_sa[256];
     if (salen > sizeof(hostbuf_sa)) return EAI_SYSTEM;
     memcpy(hostbuf_sa, ctx->memory + sa_off, salen);
     freebsd_sockaddr_to_host(hostbuf_sa, (socklen_t)salen);
-    char *hbuf = host_off ? (char *)(ctx->memory + host_off) : NULL;
-    char *sbuf = serv_off ? (char *)(ctx->memory + serv_off) : NULL;
+    /* host_off / serv_off are optional output buffers. Validate the
+     * full range when given so the host doesn't write past the guest's
+     * buffer. */
+    char *hbuf = NULL;
+    if (host_off) {
+        if (!posix_wptr_range(ctx, host_off, hostlen)) return EAI_SYSTEM;
+        hbuf = (char *)(ctx->memory + host_off);
+    }
+    char *sbuf = NULL;
+    if (serv_off) {
+        if (!posix_wptr_range(ctx, serv_off, servlen)) return EAI_SYSTEM;
+        sbuf = (char *)(ctx->memory + serv_off);
+    }
     return getnameinfo((const struct sockaddr *)hostbuf_sa, (socklen_t)salen,
                        hbuf, (socklen_t)hostlen, sbuf, (socklen_t)servlen,
                        ni_flags_fb_to_lx(flags));
@@ -748,7 +826,7 @@ int32_t yos_getnameinfo(struct yos_exec_ctx *ctx, uint32_t sa_off,
 int32_t yos_posix_madvise(struct yos_exec_ctx *ctx, uint32_t addr_off,
                           uint32_t len, int32_t advice)
 {
-    if (!addr_off || addr_off + len > ctx->memory_size) return EINVAL;
+    if (!posix_wptr_range(ctx, addr_off, len)) return EINVAL;
     long ps = sysconf(_SC_PAGESIZE);
     uintptr_t host_addr = (uintptr_t)(ctx->memory + addr_off);
     uintptr_t aligned = host_addr & ~((uintptr_t)ps - 1);
@@ -811,7 +889,10 @@ uint32_t yos_realpath(struct yos_exec_ctx *ctx, uint32_t path_off,
         return 0;
     }
     char *buf = (char *)(ctx->memory + resolved_off);
-    char *r = realpath(p, buf);
+    /* Resolve against ctx->cwd so a relative input to realpath() is
+     * canonicalized from the guest's cwd, not the host process cwd. */
+    const char *resolved = yos_path_resolve(ctx, p);
+    char *r = realpath(resolved, buf);
     if (!r) {
         extern int yos_remap_errno_h2g(int);
         if (ctx && ctx->memory && ctx->errno_off)
@@ -946,7 +1027,33 @@ int32_t yos_fchdir(struct yos_exec_ctx *ctx, int32_t wfd)
 {
     int hfd = yos_fd_get(ctx, wfd);
     if (hfd < 0) return yos_errno_neg(ctx, EBADF);
-    return yos_errno_check(ctx, fchdir(hfd));
+
+    /* Verify it's actually a directory before committing — fchdir on
+     * a non-dir fd must return ENOTDIR. */
+    struct stat st;
+    if (fstat(hfd, &st) < 0) return yos_errno_neg(ctx, errno);
+    if (!S_ISDIR(st.st_mode)) return yos_errno_neg(ctx, ENOTDIR);
+
+    /* Update ctx->cwd from the path recorded at open-time. yos's
+     * fd table tracks (wfd → host_fd, absolute_path); every open /
+     * openat / opendir populates it. We DELIBERATELY skip host
+     * fchdir() — yos's pthread-per-ctx model shares host cwd across
+     * guests, and a real fchdir would silently move every other
+     * guest's relative paths. Same compromise yos_chdir made.
+     *
+     * If no path was recorded (e.g. fd came from socket, pipe,
+     * fcntl-dup, accept) we have nothing to set cwd to — fchdir on
+     * a non-recorded fd returns 0 but leaves ctx->cwd unchanged. */
+    if (wfd >= 0 && wfd < YOS_FD_MAX && ctx->fd_paths[wfd]) {
+        strncpy(ctx->cwd, ctx->fd_paths[wfd], PATH_MAX - 1);
+        ctx->cwd[PATH_MAX - 1] = '\0';
+        ydebug("fchdir(wfd=%d hfd=%d) → ctx->cwd=\"%s\"\n",
+               wfd, hfd, ctx->cwd);
+    } else {
+        ydebug("fchdir(wfd=%d hfd=%d) — no recorded path; cwd unchanged\n",
+               wfd, hfd);
+    }
+    return 0;
 }
 
 /* ── pread / pwrite (host has same signature, just need fd remap) ── */
@@ -989,8 +1096,14 @@ int32_t yos_issetugid(struct yos_exec_ctx *ctx) { (void)ctx; return 0; }
 
 uint32_t yos_umask(struct yos_exec_ctx *ctx, uint32_t mask)
 {
-    (void)ctx;
-    return (uint32_t)umask((mode_t)mask);
+    /* Per-ctx umask: store in ctx, return previous. The host process
+     * umask is forced to 0 at startup (main.c) so file-creating
+     * bridges apply masking in software via ctx->umask — that lets
+     * concurrent yos guests each have their own umask without
+     * stomping the shared host-process value. */
+    uint32_t prev = (uint32_t)ctx->umask;
+    ctx->umask = (unsigned short)(mask & 0777);
+    return prev;
 }
 
 int32_t yos_sync(struct yos_exec_ctx *ctx)
@@ -1000,12 +1113,47 @@ int32_t yos_sync(struct yos_exec_ctx *ctx)
     return 0;
 }
 
+/* sysconf returns `long` on the host (64-bit on macOS/Linux x86_64).
+ * wasm32 long is 32-bit; the auto-passthrough bridge truncates the
+ * top 32 bits and turns LONG_MAX (which darwin returns for unbounded
+ * limits like _SC_OPEN_MAX) into -1, breaking shells and runtimes
+ * that probe sysconf at startup.
+ *
+ * Two-step fix here: clamp the host result into int32 range, and
+ * map -1+errno through the standard errno helper so the guest sees
+ * a real ENOSYS for unsupported names. The FreeBSD _SC_* constants
+ * mostly match darwin's (both are BSD-derived) so we forward the
+ * name as-is; if Linux glibc renumbering shows up, add a remap
+ * table here. */
+int32_t yos_sysconf(struct yos_exec_ctx *ctx, int32_t name)
+{
+    errno = 0;
+    long r = sysconf((int)name);
+    if (r < 0) {
+        /* sysconf returns -1 with errno=0 to mean "unlimited / not
+         * specifically configured", and -1 with errno != 0 for a
+         * real error. POSIX says callers must check errno to
+         * distinguish; wasm guests do the same, so propagate. */
+        if (errno != 0) return yos_errno_neg(ctx, errno);
+        return -1;
+    }
+    if (r > 0x7fffffffL) return 0x7fffffff;
+    return (int32_t)r;
+}
+
 /* ── signals ──────────────────────────────────────────────────────── */
 
 int32_t yos_raise(struct yos_exec_ctx *ctx, int32_t sig)
 {
-    (void)ctx;
-    return yos_errno_check(ctx, raise(sig));
+    /* raise() == kill(getpid(), sig). Going through host raise()
+     * delivers a real host SIGUSR1/etc. which yos doesn't route to
+     * the wasm-side handler (only the few signals installed by
+     * yos_install_host_signal_handlers get forwarded). Route through
+     * yos_kill instead so the per-ctx sig_handlers[] table is
+     * consulted and yos_signal_pump fires the registered handler. */
+    if (!ctx || !ctx->proc) return yos_errno_neg(ctx, EINVAL);
+    extern int32_t yos_kill(struct yos_exec_ctx *, int32_t, int32_t);
+    return yos_kill(ctx, ctx->proc->pid, sig);
 }
 
 int32_t yos_killpg(struct yos_exec_ctx *ctx, int32_t pgrp, int32_t sig)
@@ -1151,8 +1299,10 @@ int cc_fb_to_lx(int fb_idx)
  * line editing). The wasm guest may then tcsetattr to switch the
  * line discipline; we silently accept those and remember the last
  * struct so subsequent tcgetattr round-trips are stable. */
-static struct termios g_fake_pty_termios;
-static int            g_fake_pty_termios_init;
+/* Per-ctx (ctx->fake_pty_termios is opaque bytes wide enough for
+ * struct termios — see types.h). Used to be a process-wide pair of
+ * statics; two telnet sessions both calling tcsetattr would clobber
+ * each other's PTY line-discipline state. */
 
 static void fake_pty_termios_defaults(struct termios *t)
 {
@@ -1196,11 +1346,11 @@ int32_t yos_tcgetattr(struct yos_exec_ctx *ctx, int32_t wfd, uint32_t t_off)
      * picks the no-tty code path and runs without a prompt. */
     extern int yos_pty_is_pty_fd(int hfd);
     if (yos_pty_is_pty_fd(hfd)) {
-        if (!g_fake_pty_termios_init) {
-            fake_pty_termios_defaults(&g_fake_pty_termios);
-            g_fake_pty_termios_init = 1;
+        if (!ctx->fake_pty_termios_init) {
+            fake_pty_termios_defaults((struct termios *)ctx->fake_pty_termios);
+            ctx->fake_pty_termios_init = 1;
         }
-        termios_lx_to_fb(ctx->memory + t_off, &g_fake_pty_termios);
+        termios_lx_to_fb(ctx->memory + t_off, (struct termios *)ctx->fake_pty_termios);
         return 0;
     }
 
@@ -1225,15 +1375,15 @@ int32_t yos_tcsetattr(struct yos_exec_ctx *ctx, int32_t wfd,
     extern int yos_pty_is_pty_fd(int hfd);
     extern int yos_pty_set_onlcr(int hfd, int on);
     if (yos_pty_is_pty_fd(hfd)) {
-        if (!g_fake_pty_termios_init) {
-            fake_pty_termios_defaults(&g_fake_pty_termios);
-            g_fake_pty_termios_init = 1;
+        if (!ctx->fake_pty_termios_init) {
+            fake_pty_termios_defaults((struct termios *)ctx->fake_pty_termios);
+            ctx->fake_pty_termios_init = 1;
         }
-        termios_fb_to_lx(&g_fake_pty_termios, ctx->memory + t_off);
+        termios_fb_to_lx((struct termios *)ctx->fake_pty_termios, ctx->memory + t_off);
         /* Sync ONLCR to the pty-entry so master reads emit CRLF when
          * the guest leaves the slave in cooked mode (default) and
          * raw LF when the guest cleared the bit (cfmakeraw etc.). */
-        yos_pty_set_onlcr(hfd, !!(g_fake_pty_termios.c_oflag & ONLCR));
+        yos_pty_set_onlcr(hfd, !!(((struct termios *)ctx->fake_pty_termios)->c_oflag & ONLCR));
         (void)actions;
         return 0;
     }
@@ -1338,10 +1488,12 @@ static void wasm_timeval2_to_host(const uint8_t *w, struct timeval h[2])
 int32_t yos_utimes(struct yos_exec_ctx *ctx, uint32_t path_off, uint32_t times_off)
 {
     if (!path_off || path_off >= ctx->memory_size) return yos_errno_neg(ctx, EFAULT);
-    const char *path = (const char *)(ctx->memory + path_off);
+    const char *path_in = (const char *)(ctx->memory + path_off);
+    const char *path = yos_path_resolve(ctx, path_in);
     struct timeval *p = NULL, h[2];
     if (times_off) {
-        if (times_off + 16 > ctx->memory_size) return yos_errno_neg(ctx, EFAULT);
+        /* sizeof(wasm timeval[2]) = 16; overflow-safe via posix_wptr_range. */
+        if (!posix_wptr_range(ctx, times_off, 16)) return yos_errno_neg(ctx, EFAULT);
         wasm_timeval2_to_host(ctx->memory + times_off, h);
         p = h;
     }
@@ -1355,7 +1507,7 @@ int32_t yos_futimes(struct yos_exec_ctx *ctx, int32_t wfd, uint32_t times_off)
     if (hfd < 0) return yos_errno_neg(ctx, EBADF);
     struct timeval *p = NULL, h[2];
     if (times_off) {
-        if (times_off + 16 > ctx->memory_size) return yos_errno_neg(ctx, EFAULT);
+        if (!posix_wptr_range(ctx, times_off, 16)) return yos_errno_neg(ctx, EFAULT);
         wasm_timeval2_to_host(ctx->memory + times_off, h);
         p = h;
     }
@@ -1366,10 +1518,11 @@ int32_t yos_futimes(struct yos_exec_ctx *ctx, int32_t wfd, uint32_t times_off)
 int32_t yos_lutimes(struct yos_exec_ctx *ctx, uint32_t path_off, uint32_t times_off)
 {
     if (!path_off || path_off >= ctx->memory_size) return yos_errno_neg(ctx, EFAULT);
-    const char *path = (const char *)(ctx->memory + path_off);
+    const char *path_in = (const char *)(ctx->memory + path_off);
+    const char *path = yos_path_resolve(ctx, path_in);
     struct timeval *p = NULL, h[2];
     if (times_off) {
-        if (times_off + 16 > ctx->memory_size) return yos_errno_neg(ctx, EFAULT);
+        if (!posix_wptr_range(ctx, times_off, 16)) return yos_errno_neg(ctx, EFAULT);
         wasm_timeval2_to_host(ctx->memory + times_off, h);
         p = h;
     }
@@ -1388,18 +1541,23 @@ int32_t yos_lutimes(struct yos_exec_ctx *ctx, uint32_t path_off, uint32_t times_
 #include <sys/utsname.h>
 int32_t yos___xuname(struct yos_exec_ctx *ctx, int32_t namesz, uint32_t buf_off)
 {
-    if (namesz <= 0 || !buf_off) return yos_errno_neg(ctx, EFAULT);
-    uint32_t total = (uint32_t)namesz * 5;
-    if (buf_off + total > ctx->memory_size) return yos_errno_neg(ctx, EFAULT);
+    /* Reject zero / non-positive AND clamp namesz against an obviously-
+     * absurd ceiling so namesz*5 can't wrap uint32_t. Real FreeBSD
+     * passes SYS_NMLN=256; anything above 64 KiB per field is junk. */
+    if (namesz <= 0 || namesz > 65536) return yos_errno_neg(ctx, EFAULT);
+    /* 64-bit total — wrap-safe range check via posix_wptr_range. */
+    uint64_t total = (uint64_t)namesz * 5;
+    char *base = (char *)posix_wptr_range(ctx, buf_off, total);
+    if (!base) return yos_errno_neg(ctx, EFAULT);
     char *fields[5] = {
-        (char *)(ctx->memory + buf_off + 0u * (uint32_t)namesz),  /* sysname */
-        (char *)(ctx->memory + buf_off + 1u * (uint32_t)namesz),  /* nodename */
-        (char *)(ctx->memory + buf_off + 2u * (uint32_t)namesz),  /* release */
-        (char *)(ctx->memory + buf_off + 3u * (uint32_t)namesz),  /* version */
-        (char *)(ctx->memory + buf_off + 4u * (uint32_t)namesz),  /* machine */
+        base + 0u * (uint32_t)namesz,  /* sysname */
+        base + 1u * (uint32_t)namesz,  /* nodename */
+        base + 2u * (uint32_t)namesz,  /* release */
+        base + 3u * (uint32_t)namesz,  /* version */
+        base + 4u * (uint32_t)namesz,  /* machine */
     };
     /* Zero everything first so any short string is NUL-terminated. */
-    memset(ctx->memory + buf_off, 0, total);
+    memset(base, 0, (size_t)total);
 
     struct utsname host;
     if (uname(&host) < 0) return yos_errno_neg(ctx, errno);
@@ -1758,9 +1916,12 @@ void yos_strmode(struct yos_exec_ctx *ctx, uint32_t mode_in, uint32_t p_off)
 void yos_explicit_bzero(struct yos_exec_ctx *ctx, uint32_t buf_off,
                         uint32_t n)
 {
-    if (!buf_off || !n) return;
-    if (buf_off + n > ctx->memory_size) return;
-    volatile uint8_t *p = (volatile uint8_t *)(ctx->memory + buf_off);
+    if (!n) return;
+    /* Wrap-safe range validation — pre-fix used uint32 buf_off+n which
+     * wrapped to a small value for large inputs and let the zero loop
+     * stomp outside wasm memory. */
+    volatile uint8_t *p = (volatile uint8_t *)posix_wptr_range(ctx, buf_off, n);
+    if (!p) return;
     while (n--) *p++ = 0;
 }
 
@@ -1943,11 +2104,9 @@ uint32_t yos_readpassphrase(struct yos_exec_ctx *ctx,
                             uint32_t prompt_off, uint32_t buf_off,
                             uint32_t bufsize, int32_t flags)
 {
-    if (!buf_off || bufsize == 0 ||
-        buf_off + bufsize > ctx->memory_size)
-        return 0;
-
-    char *buf = (char *)(ctx->memory + buf_off);
+    if (bufsize == 0) return 0;
+    char *buf = (char *)posix_wptr_range(ctx, buf_off, bufsize);
+    if (!buf) return 0;
     const char *prompt =
         (prompt_off && prompt_off < ctx->memory_size)
         ? (const char *)(ctx->memory + prompt_off) : "";

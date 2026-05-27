@@ -301,12 +301,12 @@ int yos_vsnprintf_core(struct yos_exec_ctx *ctx,
  * writes to a real fopen()'d file (handle ≥ 4), and a previous shim
  * here was hard-coding 1→stdout / 2→stderr / else→stdout, sending
  * every log line to stdout instead. */
-extern FILE *yos_handle_to_file(uint32_t h);
+extern FILE *yos_handle_to_file(struct yos_exec_ctx *ctx, uint32_t h);
 static FILE *guest_fp_to_host(struct yos_exec_ctx *ctx, uint32_t fp_off)
 {
     (void)ctx;
     if (fp_off == 0) return stdout;
-    FILE *f = yos_handle_to_file(fp_off);
+    FILE *f = yos_handle_to_file(ctx, fp_off);
     return f ? f : stdout;
 }
 

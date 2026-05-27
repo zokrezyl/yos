@@ -128,7 +128,8 @@ int32_t yos_vfs_preadv2(struct yos_exec_ctx *ctx, int32_t fd, uint32_t vec,
 {
     int32_t hfd = yos_fd_get(ctx, fd);
     if (hfd < 0) return hfd;
-    struct iovec iov[vlen];
+    if (vlen < 0 || vlen > YOS_IOV_MAX) return yos_errno_neg(ctx, EINVAL);
+    struct iovec iov[YOS_IOV_MAX];
     int r = yos_iovec_w32_to_host(ctx, vec, vlen, iov);
     if (r) return r;
     off_t offset = ((off_t)pos_h << 32) | pos_l;
@@ -142,7 +143,8 @@ int32_t yos_vfs_pwritev2(struct yos_exec_ctx *ctx, int32_t fd, uint32_t vec,
 {
     int32_t hfd = yos_fd_get(ctx, fd);
     if (hfd < 0) return hfd;
-    struct iovec iov[vlen];
+    if (vlen < 0 || vlen > YOS_IOV_MAX) return yos_errno_neg(ctx, EINVAL);
+    struct iovec iov[YOS_IOV_MAX];
     int r = yos_iovec_w32_to_host(ctx, vec, vlen, iov);
     if (r) return r;
     off_t offset = ((off_t)pos_h << 32) | pos_l;
@@ -157,7 +159,8 @@ int32_t yos_vfs_vmsplice(struct yos_exec_ctx *ctx, int32_t fd, uint32_t vec,
 {
     int32_t hfd = yos_fd_get(ctx, fd);
     if (hfd < 0) return hfd;
-    struct iovec iov[vlen];
+    if (vlen > YOS_IOV_MAX) return yos_errno_neg(ctx, EINVAL);
+    struct iovec iov[YOS_IOV_MAX];
     int r = yos_iovec_w32_to_host(ctx, vec, (int)vlen, iov);
     if (r) return r;
     ssize_t n = vmsplice(hfd, iov, vlen, flags);
@@ -172,7 +175,8 @@ int32_t yos_vfs_process_madvise(struct yos_exec_ctx *ctx, int32_t pidfd,
 {
     int32_t hfd = yos_fd_get(ctx, pidfd);
     if (hfd < 0) return hfd;
-    struct iovec iov[vlen];
+    if (vlen > YOS_IOV_MAX) return yos_errno_neg(ctx, EINVAL);
+    struct iovec iov[YOS_IOV_MAX];
     int r = yos_iovec_w32_to_host(ctx, vec, (int)vlen, iov);
     if (r) return r;
     /* Use raw syscall — process_madvise has no glibc wrapper everywhere. */
@@ -191,15 +195,17 @@ int32_t yos_vfs_process_vm_readv(struct yos_exec_ctx *ctx, int32_t pid,
                                  uint32_t rvec, uint32_t riovcnt,
                                  uint32_t flags)
 {
-    struct iovec liov[liovcnt];
+    if (liovcnt > YOS_IOV_MAX || riovcnt > YOS_IOV_MAX)
+        return yos_errno_neg(ctx, EINVAL);
+    struct iovec liov[YOS_IOV_MAX];
     int r = yos_iovec_w32_to_host(ctx, lvec, (int)liovcnt, liov);
     if (r) return r;
     /* Remote iovec: addresses are in the OTHER process — we still have to
      * convert the wasm32 layout to host layout, but the bases stay raw
      * because they're not pointers into our memory. */
-    struct iovec riov[riovcnt];
+    struct iovec riov[YOS_IOV_MAX];
     if (riovcnt) {
-        uint8_t *p = wptr(ctx, rvec);
+        uint8_t *p = wptr_range(ctx, rvec, (uint64_t)riovcnt * 8u);
         if (!p) return yos_errno_neg(ctx, EFAULT);
         for (uint32_t i = 0; i < riovcnt; i++) {
             uint32_t base = *(uint32_t *)(p + i * 8);
@@ -218,12 +224,14 @@ int32_t yos_vfs_process_vm_writev(struct yos_exec_ctx *ctx, int32_t pid,
                                   uint32_t rvec, uint32_t riovcnt,
                                   uint32_t flags)
 {
-    struct iovec liov[liovcnt];
+    if (liovcnt > YOS_IOV_MAX || riovcnt > YOS_IOV_MAX)
+        return yos_errno_neg(ctx, EINVAL);
+    struct iovec liov[YOS_IOV_MAX];
     int r = yos_iovec_w32_to_host(ctx, lvec, (int)liovcnt, liov);
     if (r) return r;
-    struct iovec riov[riovcnt];
+    struct iovec riov[YOS_IOV_MAX];
     if (riovcnt) {
-        uint8_t *p = wptr(ctx, rvec);
+        uint8_t *p = wptr_range(ctx, rvec, (uint64_t)riovcnt * 8u);
         if (!p) return yos_errno_neg(ctx, EFAULT);
         for (uint32_t i = 0; i < riovcnt; i++) {
             uint32_t base = *(uint32_t *)(p + i * 8);
@@ -239,7 +247,9 @@ int32_t yos_vfs_process_vm_writev(struct yos_exec_ctx *ctx, int32_t pid,
 
 int32_t yos_vfs_getdents(struct yos_exec_ctx *ctx, int32_t fd, uint32_t dirent, uint32_t count)
 {
-    void *p = wptr(ctx, dirent);
+    /* Validate the FULL [dirent, dirent+count) range — the kernel
+     * writes up to `count` bytes of dirent records into the buffer. */
+    void *p = wptr_range(ctx, dirent, count);
     if (!p) return yos_errno_neg(ctx, EFAULT);
     int32_t hfd = yos_fd_get(ctx, fd);
     if (hfd < 0) return hfd;
@@ -249,7 +259,7 @@ int32_t yos_vfs_getdents(struct yos_exec_ctx *ctx, int32_t fd, uint32_t dirent, 
 
 int32_t yos_vfs_getdents64(struct yos_exec_ctx *ctx, int32_t fd, uint32_t dirent, uint32_t count)
 {
-    void *p = wptr(ctx, dirent);
+    void *p = wptr_range(ctx, dirent, count);
     if (!p) return yos_errno_neg(ctx, EFAULT);
 
     /* Check if virtual fd */
@@ -370,7 +380,7 @@ int32_t yos_vfs_sendfile(struct yos_exec_ctx *ctx, int32_t out_fd, int32_t in_fd
     ssize_t r = sendfile(hout, hin, off_arg, count);
     if (r < 0) return yos_errno_neg(ctx, errno);
     if (wasm_off) {
-        if (off_val > 0x7fffffffLL || off_val < -0x80000000LL) return -EOVERFLOW;
+        if (off_val > 0x7fffffffLL || off_val < -0x80000000LL) return yos_errno_neg(ctx, EOVERFLOW);
         *wasm_off = (int32_t)off_val;
     }
     return (int32_t)r;
@@ -468,7 +478,7 @@ int32_t yos_vfs_timer_create(struct yos_exec_ctx *ctx, int32_t clockid, uint32_t
     }
     if (rc < 0) return yos_errno_neg(ctx, errno);
     int wid = timer_table_alloc(ctx, host_id);
-    if (wid < 0) { timer_delete(host_id); return -EAGAIN; }
+    if (wid < 0) { timer_delete(host_id); return yos_errno_neg(ctx, EAGAIN); }
     int32_t *out = wptr(ctx, timerid_out);
     if (!out) { timer_delete(host_id); timer_table_free(ctx, wid); return yos_errno_neg(ctx, EFAULT); }
     *out = wid;
@@ -478,7 +488,7 @@ int32_t yos_vfs_timer_create(struct yos_exec_ctx *ctx, int32_t clockid, uint32_t
 int32_t yos_vfs_timer_settime(struct yos_exec_ctx *ctx, int32_t timerid, int32_t flags, uint32_t new_value, uint32_t old_value)
 {
     timer_t hid = timer_table_get(ctx, timerid);
-    if (!hid) return -EINVAL;
+    if (!hid) return yos_errno_neg(ctx, EINVAL);
     struct host64___kernel_itimerspec host_new, host_old;
     if (!new_value) return yos_errno_neg(ctx, EFAULT);
     void *wp = wptr(ctx, new_value);
@@ -501,7 +511,7 @@ int32_t yos_vfs_timer_settime64(struct yos_exec_ctx *ctx, int32_t timerid, int32
     /* _time64 variant: wasm passes the modern 16-byte timespec; layouts
      * match host's __kernel_itimerspec. Plain memcpy + passthrough. */
     timer_t hid = timer_table_get(ctx, timerid);
-    if (!hid) return -EINVAL;
+    if (!hid) return yos_errno_neg(ctx, EINVAL);
     if (!new_value) return yos_errno_neg(ctx, EFAULT);
     struct itimerspec *host_new = wptr(ctx, new_value);
     struct itimerspec *host_old = old_value ? wptr(ctx, old_value) : NULL;
@@ -513,7 +523,7 @@ int32_t yos_vfs_timer_settime64(struct yos_exec_ctx *ctx, int32_t timerid, int32
 int32_t yos_vfs_timer_gettime(struct yos_exec_ctx *ctx, int32_t timerid, uint32_t cur_value)
 {
     timer_t hid = timer_table_get(ctx, timerid);
-    if (!hid) return -EINVAL;
+    if (!hid) return yos_errno_neg(ctx, EINVAL);
     struct host64___kernel_itimerspec host_val;
     int rc = timer_gettime(hid, (struct itimerspec *)&host_val);
     if (rc < 0) return yos_errno_neg(ctx, errno);
@@ -527,7 +537,7 @@ int32_t yos_vfs_timer_gettime(struct yos_exec_ctx *ctx, int32_t timerid, uint32_
 int32_t yos_vfs_timer_gettime64(struct yos_exec_ctx *ctx, int32_t timerid, uint32_t cur_value)
 {
     timer_t hid = timer_table_get(ctx, timerid);
-    if (!hid) return -EINVAL;
+    if (!hid) return yos_errno_neg(ctx, EINVAL);
     struct itimerspec *host_val = wptr(ctx, cur_value);
     if (!host_val) return yos_errno_neg(ctx, EFAULT);
     int rc = timer_gettime(hid, host_val);
@@ -536,9 +546,8 @@ int32_t yos_vfs_timer_gettime64(struct yos_exec_ctx *ctx, int32_t timerid, uint3
 
 int32_t yos_vfs_timer_delete(struct yos_exec_ctx *ctx, int32_t timerid)
 {
-    (void)ctx;
     timer_t hid = timer_table_get(ctx, timerid);
-    if (!hid) return -EINVAL;
+    if (!hid) return yos_errno_neg(ctx, EINVAL);
     int rc = timer_delete(hid);
     timer_table_free(ctx, timerid);
     return yos_errno_check(ctx, rc);
@@ -546,9 +555,8 @@ int32_t yos_vfs_timer_delete(struct yos_exec_ctx *ctx, int32_t timerid)
 
 int32_t yos_vfs_timer_getoverrun(struct yos_exec_ctx *ctx, int32_t timerid)
 {
-    (void)ctx;
     timer_t hid = timer_table_get(ctx, timerid);
-    if (!hid) return -EINVAL;
+    if (!hid) return yos_errno_neg(ctx, EINVAL);
     int rc = timer_getoverrun(hid);
     return yos_errno_check(ctx, (int32_t)rc);
 }
@@ -576,7 +584,7 @@ static int nmask_w32_to_host(struct yos_exec_ctx *ctx, uint32_t wasm_addr,
     if (!wasm_addr) return 0;
     size_t bits  = maxnode;
     size_t words = (bits + 63) / 64;  /* host 64-bit words */
-    if (words > host_cap) return -EINVAL;
+    if (words > host_cap) return yos_errno_neg(ctx, EINVAL);
     /* wasm side: ceil(bits/32) 32-bit words. */
     size_t w32_words = (bits + 31) / 32;
     const uint32_t *wp = wptr(ctx, wasm_addr);
@@ -689,7 +697,8 @@ int32_t yos_vfs_execveat(struct yos_exec_ctx *ctx, int32_t dirfd, uint32_t pathn
      * Easier: just copy into a temp wasm buffer at heap_end and call
      * yos_execve with that wasm address. */
     size_t need = strlen(resolved) + 1;
-    if (ctx->heap_end + need > ctx->memory_size) return -ENOMEM;
+    if ((uint64_t)ctx->heap_end + need > (uint64_t)ctx->memory_size)
+        return yos_errno_neg(ctx, ENOMEM);
     uint32_t scratch = ctx->heap_end;
     memcpy(ctx->memory + scratch, resolved, need);
     return yos_execve(ctx, scratch, argv, envp);
@@ -727,7 +736,7 @@ int32_t yos_vfs_io_setup(struct yos_exec_ctx *ctx, uint32_t nr_events, uint32_t 
     if (r < 0) return yos_errno_neg(ctx, errno);
     if (host_id > 0xffffffffUL) {
         long _ignore = syscall(SYS_io_destroy, host_id); (void)_ignore;
-        return -EOVERFLOW;
+        return yos_errno_neg(ctx, EOVERFLOW);
     }
     uint32_t *out = wptr(ctx, ctx_idp);
     if (!out) { long _i = syscall(SYS_io_destroy, host_id); (void)_i; return yos_errno_neg(ctx, EFAULT); }
@@ -753,7 +762,7 @@ int32_t yos_vfs_io_submit(struct yos_exec_ctx *ctx, uint32_t ctx_id, int32_t nr,
      * convert each iocb in place into a per-call scratch buffer and
      * pass scratch addresses. Cap at 64 IOCBs per submit; bigger
      * batches are rare and can be split by the caller. */
-    if (nr > 64) return -E2BIG;
+    if (nr > 64) return yos_errno_neg(ctx, E2BIG);
     struct host64_iocb scratch[64];
     struct iocb *hpp[64];
     for (int i = 0; i < nr; i++) {

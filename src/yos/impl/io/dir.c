@@ -22,7 +22,7 @@
  *                               `((dirp)->dd_fd)` — i.e. a load of the
  *                               first int. fts/find/ls all rely on
  *                               that path returning a usable fd.
- *     +4 : uint32_t slot_idx  — index back into g_dirs[]. Bridges
+ *     +4 : uint32_t slot_idx  — index back into ctx_dirs(ctx)[]. Bridges
  *                               look the slot up here so we can keep
  *                               the per-stream state host-side without
  *                               teaching the guest about it.
@@ -116,16 +116,29 @@ struct yos_dir_slot {
 #define YOS_DD_FD_OFF       0
 #define YOS_DD_SLOTIDX_OFF  4
 
-static struct yos_dir_slot g_dirs[YOS_DIR_MAX];
-static pthread_mutex_t     g_dirs_lock = PTHREAD_MUTEX_INITIALIZER;
+/* DIR slot array is per-ctx — stored as a heap allocation hung off
+ * ctx->dir_slots so guests that never opendir don't pay the ~270 KB
+ * inline cost. Was process-wide static `g_dirs`; two concurrent
+ * guests both opendir-ing /tmp would race the same slot indices
+ * and each guest's dd_off (a wasm offset INTO THAT GUEST'S MEMORY)
+ * would be interpreted in the other guest's memory by the next
+ * readdir call → garbage entry returns / SIGSEGV in slot_from_dd. */
+static struct yos_dir_slot *ctx_dirs(struct yos_exec_ctx *ctx)
+{
+    if (!ctx->dir_slots) {
+        ctx->dir_slots = calloc(YOS_DIR_MAX, sizeof(struct yos_dir_slot));
+    }
+    return (struct yos_dir_slot *)ctx->dir_slots;
+}
 
 /* Look up a slot by its yos-internal index (used only when we already
  * know the slot — see slot_from_dd for the guest-pointer path). */
-static struct yos_dir_slot *slot_get(uint32_t handle)
+static struct yos_dir_slot *slot_get(struct yos_exec_ctx *ctx, uint32_t handle)
 {
     if (handle == 0 || handle >= YOS_DIR_MAX) return NULL;
-    if (!g_dirs[handle].in_use) return NULL;
-    return &g_dirs[handle];
+    struct yos_dir_slot *dirs = ctx_dirs(ctx);
+    if (!dirs || !dirs[handle].in_use) return NULL;
+    return &dirs[handle];
 }
 
 /* Translate a guest DIR* (wasm offset of the header struct) to its
@@ -137,26 +150,25 @@ static struct yos_dir_slot *slot_from_dd(struct yos_exec_ctx *ctx,
     if (dd_off == 0) return NULL;
     if ((uint64_t)dd_off + YOS_DD_SIZE > ctx->memory_size) return NULL;
     uint32_t idx = *(uint32_t *)(ctx->memory + dd_off + YOS_DD_SLOTIDX_OFF);
-    struct yos_dir_slot *slot = slot_get(idx);
+    struct yos_dir_slot *slot = slot_get(ctx, idx);
     if (!slot || slot->dd_off != dd_off) return NULL;
     return slot;
 }
 
 /* Reserve a slot; caller fills host_dir / vfs_file then commits with
  * slot_finalise(). Returns 0 on failure. */
-static uint32_t slot_reserve(void)
+static uint32_t slot_reserve(struct yos_exec_ctx *ctx)
 {
-    pthread_mutex_lock(&g_dirs_lock);
+    struct yos_dir_slot *dirs = ctx_dirs(ctx);
+    if (!dirs) return 0;
     for (uint32_t i = 1; i < YOS_DIR_MAX; i++) {
-        if (!g_dirs[i].in_use) {
-            memset(&g_dirs[i], 0, sizeof(g_dirs[i]));
-            g_dirs[i].in_use = 1;
-            g_dirs[i].wasm_fd = -1;
-            pthread_mutex_unlock(&g_dirs_lock);
+        if (!dirs[i].in_use) {
+            memset(&dirs[i], 0, sizeof(dirs[i]));
+            dirs[i].in_use = 1;
+            dirs[i].wasm_fd = -1;
             return i;
         }
     }
-    pthread_mutex_unlock(&g_dirs_lock);
     return 0;
 }
 
@@ -167,7 +179,9 @@ static uint32_t slot_reserve(void)
  * again from just the guest pointer). */
 static int slot_finalise(struct yos_exec_ctx *ctx, uint32_t handle)
 {
-    struct yos_dir_slot *slot = &g_dirs[handle];
+    struct yos_dir_slot *dirs = ctx_dirs(ctx);
+    if (!dirs) return -1;
+    struct yos_dir_slot *slot = &dirs[handle];
     slot->scratch_off = yos_malloc(ctx, YOS_FBSD_DIRENT_SIZE);
     if (slot->scratch_off == 0) goto fail;
     slot->dd_off = yos_malloc(ctx, YOS_DD_SIZE);
@@ -180,9 +194,7 @@ static int slot_finalise(struct yos_exec_ctx *ctx, uint32_t handle)
     *(uint32_t *)(ctx->memory + slot->dd_off + YOS_DD_SLOTIDX_OFF) = handle;
     return 0;
 fail:
-    pthread_mutex_lock(&g_dirs_lock);
     slot->in_use = 0;
-    pthread_mutex_unlock(&g_dirs_lock);
     return -1;
 }
 
@@ -200,14 +212,15 @@ static struct yos_file *vfs_file_from_fd(struct yos_exec_ctx *ctx, int32_t fd)
  * release their half independently (closedir owns the original, the
  * wasm fd owns the dup). Returns -1 on failure (caller must close the
  * DIR* itself in that case). */
-static int alloc_wasm_fd_for_host_dir(struct yos_exec_ctx *ctx, DIR *d)
+static int alloc_wasm_fd_for_host_dir(struct yos_exec_ctx *ctx, DIR *d,
+                                      const char *opened_path)
 {
-    extern int yos_fd_alloc(struct yos_exec_ctx *, int);
+    extern int yos_fd_alloc_with_path(struct yos_exec_ctx *, int, const char *);
     int orig = dirfd(d);
     if (orig < 0) return -1;
     int duped = dup(orig);
     if (duped < 0) return -1;
-    int wfd = yos_fd_alloc(ctx, duped);
+    int wfd = yos_fd_alloc_with_path(ctx, duped, opened_path);
     if (wfd < 0) { close(duped); return -1; }
     return wfd;
 }
@@ -242,22 +255,22 @@ uint32_t yos_opendir(struct yos_exec_ctx *ctx, uint32_t path_off)
         struct yos_file *vfile = vfs_file_from_fd(ctx, vfd);
         if (!vfile) return yos_errno_null(ctx, ENOENT);
 
-        uint32_t h = slot_reserve();
+        uint32_t h = slot_reserve(ctx);
         if (h == 0) {
             if (ops->close) ops->close(ctx, vfile);
             return yos_errno_null(ctx, EMFILE);
         }
-        g_dirs[h].vfs_file = vfile;
-        g_dirs[h].vfs_ops  = ops;
-        g_dirs[h].wasm_fd  = vfd; /* virtual fd; usable for fstat etc. */
+        ctx_dirs(ctx)[h].vfs_file = vfile;
+        ctx_dirs(ctx)[h].vfs_ops  = ops;
+        ctx_dirs(ctx)[h].wasm_fd  = vfd; /* virtual fd; usable for fstat etc. */
         if (slot_finalise(ctx, h) < 0) {
             if (ops->close) ops->close(ctx, vfile);
             return yos_errno_null(ctx, ENOMEM);
         }
         if (ytrace_default_enabled())
             ydebug("opendir(\"%s\") = dd_off 0x%x slot %u wasm_fd %d (vfs)\n",
-                   path, g_dirs[h].dd_off, h, g_dirs[h].wasm_fd);
-        return g_dirs[h].dd_off;
+                   path, ctx_dirs(ctx)[h].dd_off, h, ctx_dirs(ctx)[h].wasm_fd);
+        return ctx_dirs(ctx)[h].dd_off;
     }
 
     /* Host-backed path. */
@@ -267,15 +280,15 @@ uint32_t yos_opendir(struct yos_exec_ctx *ctx, uint32_t path_off)
         ydebug("opendir(\"%s\") = %p%s\n", path, (void *)d,
                d ? "" : strerror(errno));
     if (!d) return yos_errno_null(ctx, errno);
-    uint32_t h = slot_reserve();
+    uint32_t h = slot_reserve(ctx);
     if (h == 0) { closedir(d); return yos_errno_null(ctx, EMFILE); }
-    g_dirs[h].host_dir = d;
-    g_dirs[h].wasm_fd  = alloc_wasm_fd_for_host_dir(ctx, d);
+    ctx_dirs(ctx)[h].host_dir = d;
+    ctx_dirs(ctx)[h].wasm_fd  = alloc_wasm_fd_for_host_dir(ctx, d, path);
     if (slot_finalise(ctx, h) < 0) {
         closedir(d);
         return yos_errno_null(ctx, ENOMEM);
     }
-    return g_dirs[h].dd_off;
+    return ctx_dirs(ctx)[h].dd_off;
 }
 
 uint32_t yos_fdopendir(struct yos_exec_ctx *ctx, int32_t wasm_fd)
@@ -286,19 +299,19 @@ uint32_t yos_fdopendir(struct yos_exec_ctx *ctx, int32_t wasm_fd)
     errno = 0;
     DIR *d = fdopendir(hfd);
     if (!d) return yos_errno_null(ctx, errno);
-    uint32_t h = slot_reserve();
+    uint32_t h = slot_reserve(ctx);
     if (h == 0) { closedir(d); return yos_errno_null(ctx, EMFILE); }
-    g_dirs[h].host_dir = d;
+    ctx_dirs(ctx)[h].host_dir = d;
     /* fdopendir transfers ownership of the host fd to the DIR — the
      * caller's wasm fd still refers to the same host fd, which is what
      * we want surfaced via _dirfd. No dup needed; the wasm fd already
      * points at it. */
-    g_dirs[h].wasm_fd = wasm_fd;
+    ctx_dirs(ctx)[h].wasm_fd = wasm_fd;
     if (slot_finalise(ctx, h) < 0) {
         closedir(d);
         return yos_errno_null(ctx, ENOMEM);
     }
-    return g_dirs[h].dd_off;
+    return ctx_dirs(ctx)[h].dd_off;
 }
 
 /* Lay one FreeBSD-i386 dirent into the slot's wasm scratch and return
@@ -326,6 +339,15 @@ static uint32_t emit_fbsd_dirent(struct yos_exec_ctx *ctx,
 
 uint32_t yos_readdir(struct yos_exec_ctx *ctx, uint32_t dd_off)
 {
+    /* Deliver any host-side pending signals before each readdir. Tools
+     * like find(1) loop through readdir+fstatat+fchdir without ever
+     * calling read(), so the existing pump in yos_read never fires —
+     * Ctrl-C would queue in g_host_pending_signals but never reach the
+     * wasm guest, making the program unkillable until completion. The
+     * pump is cheap when the bitmask is empty (single atomic load),
+     * so the overhead is acceptable on the hot readdir path. */
+    extern void yos_signal_pump(struct yos_exec_ctx *);
+    yos_signal_pump(ctx);
     struct yos_dir_slot *slot = slot_from_dd(ctx, dd_off);
     if (!slot) return yos_errno_null(ctx, EBADF);
 
@@ -388,18 +410,30 @@ int32_t yos_closedir(struct yos_exec_ctx *ctx, uint32_t dd_off)
     if (!slot) return yos_errno_neg(ctx, EBADF);
 
     int rc = 0;
+    int32_t wfd = slot->wasm_fd;
     if (slot->host_dir) {
         if (closedir(slot->host_dir) < 0) rc = -errno;
     } else if (slot->vfs_file && slot->vfs_ops && slot->vfs_ops->close) {
         int32_t r = slot->vfs_ops->close(ctx, slot->vfs_file);
         if (r < 0) rc = r;
     }
+    /* Release the dup'd host fd that alloc_wasm_fd_for_host_dir
+     * allocated alongside this DIR*. closedir() above closed only
+     * the directory stream's OWN host fd — the duped fd recorded
+     * at slot->wasm_fd lives on in ctx->fd_map until we drop it.
+     * Without this, every opendir/closedir pair leaks one wfd slot;
+     * fts(3) under find(1) burns through YOS_FD_MAX (256) in a few
+     * thousand directories and the next opendir fails with EMFILE,
+     * which propagates as _dirfd()=-EMFILE and trips fts's
+     * fts_safe_changedir fallback to _open(NULL, ...), surfacing as
+     * "Bad address" errors and a truncated tree walk. */
+    extern int32_t yos_fd_close(struct yos_exec_ctx *, int32_t);
+    if (wfd >= 0 && wfd < YOS_FD_MAX && !yos_is_virtual_fd(wfd))
+        yos_fd_close(ctx, wfd);
     uint32_t scratch  = slot->scratch_off;
     uint32_t hdr_off  = slot->dd_off;
-    pthread_mutex_lock(&g_dirs_lock);
     memset(slot, 0, sizeof(*slot));
     slot->wasm_fd = -1;
-    pthread_mutex_unlock(&g_dirs_lock);
     if (scratch) yos_free(ctx, scratch);
     if (hdr_off) yos_free(ctx, hdr_off);
     if (rc < 0) return yos_errno_neg(ctx, -rc);

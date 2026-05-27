@@ -73,8 +73,19 @@
 #include <dirent.h>
 #include <sys/sysctl.h>
 #include <sys/wait.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <sys/resource.h>
+#include <errno.h>
 
 extern char **environ;
+
+/* Per-instance tmp-file prefix. Set once in main() from the outer
+ * perf-stress process's getpid(). Concurrent perf-stress instances
+ * (one per telnet session under `yos --server`) MUST have disjoint
+ * file paths in /tmp so they don't clobber each other's payloads.
+ * File-scope because thread_worker reads it from a worker pthread. */
+static char yos_perf_tprefix[64];
 
 static long long now_us(void)
 {
@@ -106,8 +117,8 @@ static void emit_err(const char *s)
 static void *thread_worker(void *arg)
 {
     int id = (int)(long)arg;
-    char path[64];
-    snprintf(path, sizeof path, "/tmp/yos-perf-t%d.dat", id);
+    char path[96];
+    snprintf(path, sizeof path, "%s-t%d.dat", yos_perf_tprefix, id);
     int fd = open(path, O_CREAT | O_WRONLY | O_TRUNC, 0600);
     if (fd < 0) return (void *)(long)1;
     char buf[1024];
@@ -700,6 +711,38 @@ int main(int argc, char **argv)
     int fail = 0;
     char line[256];
 
+    /* Per-instance tmpfile prefix. Two concurrent perf-stress runs
+     * (e.g. one per telnet session under `yos --server`) would
+     * otherwise clobber each other's /tmp files — same paths, same
+     * O_CREAT|O_TRUNC, same unlink at the end — and report flaky
+     * failures that look like fd or proc-table races but are
+     * actually just test cross-contamination. Suffix every test
+     * filename with this guest's outer pid so concurrent runs use
+     * disjoint paths. yos_perf_tprefix is file-scope so
+     * thread_worker (in a pthread) can read it without the
+     * pthread-create arg gymnastics. */
+    /* Use BOTH the outer pid AND the monotonic nanosecond timestamp
+     * so:
+     *   - concurrent guests in ONE yos host process get distinct pids
+     *     → distinct prefixes;
+     *   - concurrent INVOCATIONS of yos.sh (separate host processes,
+     *     each starting at pid=1) get distinct nanosec stamps →
+     *     still distinct.
+     * Without the timestamp, the second case would clobber and
+     * surface as the "fd issues / flaky" perf-stress failures the
+     * user kept hitting when running two telnet sessions or two
+     * direct invocations side-by-side. */
+    {
+        struct timespec ns;
+        clock_gettime(CLOCK_MONOTONIC, &ns);
+        snprintf(yos_perf_tprefix, sizeof yos_perf_tprefix,
+                 "/tmp/yos-perf-p%d-n%ld%ld",
+                 (int)getpid(), (long)ns.tv_sec, (long)ns.tv_nsec);
+    }
+    /* Local alias keeps the existing tprefix-using code below
+     * unchanged. */
+    const char *tprefix = yos_perf_tprefix;
+
     snprintf(line, sizeof line, "== yos perf-stress (argv[0]=%s) ==\n",
              argv[0] ? argv[0] : "(null)");
     emit(line);
@@ -724,9 +767,13 @@ int main(int argc, char **argv)
         pid_t pid = fork();
         if (pid < 0) { emit_err("fork failed\n"); fail++; break; }
         if (pid == 0) {
-            int fd = open("/tmp/yos-perf-fchild.dat",
+            char fchild_path[96];
+            snprintf(fchild_path, sizeof fchild_path,
+                     "%s-fchild.dat", tprefix);
+            int fd = open(fchild_path,
                           O_CREAT | O_WRONLY | O_TRUNC, 0600);
             if (fd >= 0) { write(fd, "ok", 2); close(fd); }
+            unlink(fchild_path);
             _exit(0);
         }
         int st = 0;
@@ -764,7 +811,9 @@ int main(int argc, char **argv)
             int prod = 1;
             for (int i = 0; i < depth; i++) { prod *= branches[i]; expect_lines += prod; }
         }
-        const char *logp = "/tmp/yos-perf-tree.log";
+        char tree_log[96];
+        snprintf(tree_log, sizeof tree_log, "%s-tree.log", tprefix);
+        const char *logp = tree_log;
         unlink(logp);
         int log_fd = open(logp, O_CREAT | O_WRONLY | O_TRUNC | O_APPEND, 0600);
         if (log_fd < 0) {
@@ -863,7 +912,36 @@ int main(int argc, char **argv)
         long long ta = now_us();
         int spawned = 0;
         for (int i = 0; i < N; i++) {
-            if (pipe(pipes[i]) < 0) { emit_err("pipe failed\n"); fail++; break; }
+            if (pipe(pipes[i]) < 0) {
+                int e = errno;
+                char dump[1024];
+                int n = snprintf(dump, sizeof dump,
+                    "pipe failed at i=%d errno=%d (%s); open fds: ",
+                    i, e, strerror(e));
+                /* Dump every open fd 0..255 so we can see what was
+                 * inherited and what perf-stress accumulated. fstat
+                 * is the cheapest way to ask "is this fd open?".
+                 * The telnet→runsv→telnetd→shell chain inherits many
+                 * fds; print them so the report makes the cause
+                 * obvious instead of just "pipe failed". */
+                for (int fd = 0; fd < 256 && n < (int)sizeof dump - 16; fd++) {
+                    struct stat st;
+                    if (fstat(fd, &st) == 0) {
+                        const char *kind = "?";
+                        mode_t m = st.st_mode & S_IFMT;
+                        if (m == S_IFREG)  kind = "reg";
+                        else if (m == S_IFDIR)  kind = "dir";
+                        else if (m == S_IFCHR)  kind = "chr";
+                        else if (m == S_IFIFO)  kind = "fifo";
+                        else if (m == S_IFSOCK) kind = "sock";
+                        n += snprintf(dump + n, sizeof dump - n,
+                                      "%d:%s ", fd, kind);
+                    }
+                }
+                n += snprintf(dump + n, sizeof dump - n, "\n");
+                emit_err(dump);
+                fail++; break;
+            }
             pid_t pid = fork();
             if (pid < 0) { emit_err("proc-list fork failed\n"); fail++; break; }
             if (pid == 0) {
@@ -1341,18 +1419,41 @@ int main(int argc, char **argv)
                 }
                 started++;
             }
-            /* Let them run for a varied bit before asking to stop.
-             * No usleep — yos's sleep round-trip is uneven in this
-             * stress path. Burn CPU on main for a randomized count.
-             * Has to be LARGE so the worker threads actually rack up
-             * a meaningful bump count before the stop flag flips —
-             * previous 200K..1M burn finished in well under a ms on
-             * release-build wasm3, threads got ~5 iters each, the
-             * "lots of contended mutex acquires" property never
-             * exercised. */
-            long burn = 1000000L + (long)chaos_rand_mod(3000000L);
-            volatile long s = 0;
-            for (long b = 0; b < burn; b++) s += b;
+            /* Wait until the workers have actually contended on the
+             * mutex before flipping stop. A blind burn-CPU loop here
+             * silently scales wrong: at high thread counts (~50+
+             * per round under -t 50), pthread_create itself takes
+             * long enough that main's burn completes before the
+             * last-created workers have even cleared their startup
+             * critical section — they observe stop==1 on entry to
+             * the loop and never bump. Result was "0 bumps, 0
+             * mismatches" — vacuously passing because round_sum and
+             * total_bumps are both 0.
+             *
+             * Poll the bump counter instead. We require at least
+             * MIN_BUMPS_PER_THREAD per started thread (so 50 threads
+             * → 250 bumps minimum before we let stop fire). Capped
+             * by a wall-clock timeout so a genuine pthread regression
+             * still fails the round instead of hanging the test. */
+            /* Target ~50 bumps/thread — matches the average implied
+             * by the old fixed-burn loop's behaviour at the `-l`
+             * preset (148 threads, 12091 bumps ≈ 81/thread) without
+             * blowing up wall time at higher scales. Floor not just
+             * "any non-zero" so the contention scenario actually
+             * plays out long enough to surface lost-update races. */
+            const long MIN_BUMPS_PER_THREAD = 50;
+            const long min_total_bumps = (long)started * MIN_BUMPS_PER_THREAD;
+            const long long poll_t0 = now_us();
+            const long long POLL_TIMEOUT_US = 5LL * 1000LL * 1000LL;
+            for (;;) {
+                pthread_mutex_lock(&cctx.lock);
+                long b = cctx.total_bumps;
+                pthread_mutex_unlock(&cctx.lock);
+                if (b >= min_total_bumps) break;
+                if (now_us() - poll_t0 >= POLL_TIMEOUT_US) break;
+                volatile long s = 0;
+                for (long i = 0; i < 50000L; i++) s += i;
+            }
             cctx.stop = 1;
             long round_sum = 0;
             for (int i = 0; i < started; i++) {
@@ -1382,11 +1483,23 @@ int main(int argc, char **argv)
           total_threads, tb - ta, total_bumps_sum, mismatches);
         emit(line);
         if (mismatches) fail++;
+        /* Liveness assertion: with N threads contending on a mutex
+         * for at least the poll timeout, we expect non-trivial bump
+         * counts. A zero-bump aggregate means workers never actually
+         * ran — a vacuous mismatches==0 result that hides a real
+         * pthread bridge regression. See yos issue #17. */
+        if (total_threads > 0 && total_bumps_sum == 0) {
+            emit_err("chaos thread: 0 bumps across all rounds — "
+                     "workers never executed (issue #17)\n");
+            fail++;
+        }
     }
 
     /* ---- 6. file I/O throughput -------------------------------- */
     long long t6 = now_us();
-    int fd = open("/tmp/yos-perf-io.dat",
+    char io_path[96];
+    snprintf(io_path, sizeof io_path, "%s-io.dat", tprefix);
+    int fd = open(io_path,
                   O_CREAT | O_WRONLY | O_TRUNC, 0600);
     if (fd < 0) {
         emit_err("io open failed\n");
@@ -1413,7 +1526,375 @@ int main(int argc, char **argv)
                  "write %ld B       : %8lld us total, %6lld KB/s\n",
                  bytes, dt, (long long)bytes * 1000 / dt);
         emit(line);
-        unlink("/tmp/yos-perf-io.dat");
+        unlink(io_path);
+    }
+
+    /* ---- 7. stdio FILE* round-trip ----------------------------
+     * Exercises the per-ctx FILE* table (ctx->file_slots) end-to-end:
+     * fopen for write, fwrite/fputs a known payload, fflush, fclose,
+     * fopen for read, fread back, fclose. The buffered I/O path is
+     * separate from the raw fd path above. */
+    {
+        long long ta = now_us();
+        char stdio_path[96];
+        snprintf(stdio_path, sizeof stdio_path, "%s-stdio.dat", tprefix);
+        const char *p = stdio_path;
+        unlink(p);
+        FILE *fp = fopen(p, "w");
+        if (!fp) {
+            emit_err("stdio: fopen w failed\n");
+            fail++;
+        } else {
+            const char *payload = "perf-stdio-payload\n";
+            const int n_lines = 100;
+            int wrote_ok = 1;
+            for (int i = 0; i < n_lines; i++) {
+                if (fputs(payload, fp) < 0) { wrote_ok = 0; break; }
+            }
+            fflush(fp);
+            fclose(fp);
+            if (!wrote_ok) {
+                emit_err("stdio: fputs short\n");
+                fail++;
+            } else {
+                FILE *rp = fopen(p, "r");
+                if (!rp) { emit_err("stdio: fopen r failed\n"); fail++; }
+                else {
+                    char buf[4096];
+                    size_t got = fread(buf, 1, sizeof buf, rp);
+                    fclose(rp);
+                    size_t expected = strlen(payload) * (size_t)n_lines;
+                    if (got != expected) {
+                        snprintf(line, sizeof line,
+                                 "stdio: fread short (got %zu, want %zu)\n",
+                                 got, expected);
+                        emit_err(line);
+                        fail++;
+                    }
+                }
+            }
+            unlink(p);
+        }
+        long long tb = now_us();
+        snprintf(line, sizeof line,
+                 "stdio FILE* x100 : %8lld us total\n", tb - ta);
+        emit(line);
+    }
+
+    /* ---- 8. stat / fstat / lstat on a fresh file -------------- */
+    {
+        long long ta = now_us();
+        char stat_path[96];
+        snprintf(stat_path, sizeof stat_path, "%s-stat.dat", tprefix);
+        const char *p = stat_path;
+        unlink(p);
+        int sfd = open(p, O_CREAT | O_WRONLY | O_TRUNC, 0644);
+        if (sfd < 0) { emit_err("stat: open failed\n"); fail++; }
+        else {
+            const char payload[] = "STAT_PAYLOAD";
+            write(sfd, payload, sizeof payload - 1);
+            struct stat fst;
+            if (fstat(sfd, &fst) != 0) { emit_err("stat: fstat failed\n"); fail++; }
+            else if (fst.st_size != (off_t)(sizeof payload - 1)) {
+                emit_err("stat: fst.st_size wrong\n"); fail++;
+            }
+            close(sfd);
+            struct stat st;
+            if (stat(p, &st) != 0) { emit_err("stat: stat failed\n"); fail++; }
+            else if (st.st_size != (off_t)(sizeof payload - 1)) {
+                emit_err("stat: st.st_size wrong\n"); fail++;
+            }
+            if (lstat(p, &st) != 0) { emit_err("stat: lstat failed\n"); fail++; }
+            unlink(p);
+        }
+        long long tb = now_us();
+        snprintf(line, sizeof line,
+                 "stat/fstat   x3   : %8lld us total\n", tb - ta);
+        emit(line);
+    }
+
+    /* ---- 9. dup / dup2 redirect round-trip ------------------- */
+    {
+        long long ta = now_us();
+        char dup_path[96];
+        snprintf(dup_path, sizeof dup_path, "%s-dup.dat", tprefix);
+        const char *p = dup_path;
+        unlink(p);
+        int orig = open(p, O_CREAT | O_RDWR | O_TRUNC, 0600);
+        if (orig < 0) { emit_err("dup: open failed\n"); fail++; }
+        else {
+            int d1 = dup(orig);
+            int d2 = dup(orig);
+            int d3 = -1;
+            if (d1 < 0 || d2 < 0) { emit_err("dup: dup failed\n"); fail++; }
+            else {
+                /* Write to each fd, expect all to share the file. */
+                write(d1, "A", 1);
+                write(d2, "B", 1);
+                /* dup2: target=orig+10 (pick something unused). */
+                d3 = orig + 10;
+                if (dup2(d2, d3) != d3) {
+                    emit_err("dup: dup2 failed\n"); fail++;
+                } else {
+                    write(d3, "C", 1);
+                }
+            }
+            close(d1); close(d2);
+            if (d3 >= 0) close(d3);
+            close(orig);
+            /* Now read back the contents — should be "ABC". */
+            int rfd = open(p, O_RDONLY);
+            char rb[16] = {0};
+            if (rfd >= 0) {
+                read(rfd, rb, sizeof rb - 1);
+                close(rfd);
+                if (rb[0] != 'A' || rb[1] != 'B' || rb[2] != 'C') {
+                    emit_err("dup: contents mismatch\n"); fail++;
+                }
+            } else { emit_err("dup: reopen failed\n"); fail++; }
+            unlink(p);
+        }
+        long long tb = now_us();
+        snprintf(line, sizeof line,
+                 "dup/dup2     x3   : %8lld us total\n", tb - ta);
+        emit(line);
+    }
+
+    /* ---- 10. mkdir / chdir / getcwd / rmdir round-trip ------- */
+    {
+        long long ta = now_us();
+        char dir_path[96];
+        snprintf(dir_path, sizeof dir_path, "%s-dir", tprefix);
+        const char *d = dir_path;
+        rmdir(d);
+        if (mkdir(d, 0755) != 0) { emit_err("dir: mkdir failed\n"); fail++; }
+        else {
+            char saved_cwd[1024];
+            if (!getcwd(saved_cwd, sizeof saved_cwd)) {
+                emit_err("dir: getcwd before chdir failed\n"); fail++;
+            }
+            if (chdir(d) != 0) { emit_err("dir: chdir failed\n"); fail++; }
+            else {
+                char now_cwd[1024];
+                if (!getcwd(now_cwd, sizeof now_cwd)) {
+                    emit_err("dir: getcwd after chdir failed\n"); fail++;
+                } else {
+                    /* Last 4 chars should be "-dir" — exact path may
+                     * canonicalise (/private/tmp vs /tmp on darwin). */
+                    size_t nl = strlen(now_cwd);
+                    if (nl < 4 || memcmp(now_cwd + nl - 4, "-dir", 4) != 0) {
+                        emit_err("dir: getcwd post-chdir didn't end in -dir\n");
+                        fail++;
+                    }
+                }
+                /* Restore. */
+                chdir(saved_cwd);
+            }
+            if (rmdir(d) != 0) { emit_err("dir: rmdir failed\n"); fail++; }
+        }
+        long long tb = now_us();
+        snprintf(line, sizeof line,
+                 "dir ops      x4   : %8lld us total\n", tb - ta);
+        emit(line);
+    }
+
+    /* ---- 11. opendir / readdir / closedir on /tmp ------------ */
+    {
+        long long ta = now_us();
+        DIR *dp = opendir("/tmp");
+        if (!dp) { emit_err("readdir: opendir /tmp failed\n"); fail++; }
+        else {
+            int n = 0;
+            struct dirent *de;
+            while ((de = readdir(dp)) != NULL && n < 10000) n++;
+            closedir(dp);
+            if (n < 2) {  /* must at least see . and .. */
+                emit_err("readdir: too few entries\n"); fail++;
+            }
+            long long tb = now_us();
+            snprintf(line, sizeof line,
+                     "opendir/readdir   : %8lld us total (%d entries)\n",
+                     tb - ta, n);
+            emit(line);
+        }
+    }
+
+    /* ---- 12. scandir with filter + alphasort-like compar ----- */
+    {
+        long long ta = now_us();
+        struct dirent **list = NULL;
+        /* No filter (NULL means keep all). No compar (NULL means
+         * unordered). Tests the bare-minimum scandir path. */
+        int n = scandir("/tmp", &list, NULL, NULL);
+        if (n < 0) { emit_err("scandir: failed\n"); fail++; }
+        else {
+            /* Free the namelist + each entry (POSIX scandir owns
+             * the allocation). yos's wasm-side free is via free(). */
+            for (int i = 0; i < n; i++) free(list[i]);
+            if (list) free(list);
+        }
+        long long tb = now_us();
+        snprintf(line, sizeof line,
+                 "scandir           : %8lld us total (%d entries)\n",
+                 tb - ta, n);
+        emit(line);
+    }
+
+    /* ---- 13. mmap / munmap anonymous regions ----------------- */
+    {
+        long long ta = now_us();
+        const int reps = 50;
+        int mm_ok = 1;
+        for (int i = 0; i < reps; i++) {
+            void *p = mmap(NULL, 64 * 1024, PROT_READ | PROT_WRITE,
+                           MAP_ANON | MAP_PRIVATE, -1, 0);
+            if (p == MAP_FAILED) { mm_ok = 0; break; }
+            ((volatile char *)p)[0] = 'm';
+            ((volatile char *)p)[64 * 1024 - 1] = 'm';
+            munmap(p, 64 * 1024);
+        }
+        if (!mm_ok) { emit_err("mmap: alloc-or-map failed\n"); fail++; }
+        long long tb = now_us();
+        snprintf(line, sizeof line,
+                 "mmap/munmap  x%-3d : %8lld us total\n", reps, tb - ta);
+        emit(line);
+    }
+
+    /* ---- 14. sigaction install / restore / self-kill --------- */
+    if (getenv("YOS_SKIP_SIGACTION") == NULL) {
+        long long ta = now_us();
+        struct sigaction sa, oldsa;
+        memset(&sa, 0, sizeof sa);
+        sa.sa_handler = SIG_IGN;
+        sigemptyset(&sa.sa_mask);
+        sa.sa_flags = 0;
+        if (sigaction(SIGUSR2, &sa, &oldsa) != 0) {
+            emit_err("sigaction: install failed\n"); fail++;
+        } else {
+            /* Restore — must not corrupt state. */
+            if (sigaction(SIGUSR2, &oldsa, NULL) != 0) {
+                emit_err("sigaction: restore failed\n"); fail++;
+            }
+            /* sigprocmask round-trip. */
+            sigset_t block, prev;
+            sigemptyset(&block);
+            sigaddset(&block, SIGUSR1);
+            if (sigprocmask(SIG_BLOCK, &block, &prev) != 0) {
+                emit_err("sigprocmask: block failed\n"); fail++;
+            } else {
+                if (sigprocmask(SIG_SETMASK, &prev, NULL) != 0) {
+                    emit_err("sigprocmask: restore failed\n"); fail++;
+                }
+            }
+        }
+        long long tb = now_us();
+        snprintf(line, sizeof line,
+                 "sigaction    x4   : %8lld us total\n", tb - ta);
+        emit(line);
+    }
+
+    /* ---- 15. wait3 / wait4 — spawn one child each, reap ------
+     *
+     * NOTE: this phase exposes a host yos race when TWO perf-stress
+     * instances run concurrently in two separate yos host processes
+     * (e.g. two telnet sessions under `yos --server`, or two
+     * background invocations from a shell): SIGSEGV at the fork()
+     * below. Single-process runs always pass. Setting
+     * `YOS_SKIP_WAIT34=1` disables this phase as a workaround.
+     *
+     * Bisect summary:
+     *   - With `-r 0 -R 0` (chaos disabled), concurrent runs pass.
+     *   - With chaos enabled, concurrent runs crash here every time.
+     *   - The crash is at fork(), NOT inside wait3/wait4 themselves.
+     * Hypothesis: chaos's pthread_cancel cascade leaves host-side
+     * detached threads in a teardown window that the next fork's
+     * snapshot allocator races against. Two concurrent yos hosts
+     * tighten the window enough to expose it consistently. Real
+     * fix likely lives in src/yos/impl/proc/proc.c's pthread-
+     * cancel / fork-snapshot interaction. Pinned as a follow-up.
+     */
+    if (getenv("YOS_SKIP_WAIT34") == NULL) {
+        long long ta = now_us();
+        pid_t c3 = fork();
+        if (c3 < 0) { emit_err("wait3: fork failed\n"); fail++; }
+        else if (c3 == 0) _exit(33);
+        else {
+            int st = 0;
+            struct rusage ru;
+            memset(&ru, 0, sizeof ru);
+            pid_t r = wait3(&st, 0, &ru);
+            if (r != c3) { emit_err("wait3: wrong pid\n"); fail++; }
+            else if (!WIFEXITED(st) || WEXITSTATUS(st) != 33) {
+                emit_err("wait3: status wrong\n"); fail++;
+            }
+        }
+
+        pid_t c4 = fork();
+        if (c4 < 0) { emit_err("wait4: fork failed\n"); fail++; }
+        else if (c4 == 0) _exit(44);
+        else {
+            int st = 0;
+            struct rusage ru;
+            memset(&ru, 0, sizeof ru);
+            pid_t r = wait4(c4, &st, 0, &ru);
+            if (r != c4) { emit_err("wait4: wrong pid\n"); fail++; }
+            else if (!WIFEXITED(st) || WEXITSTATUS(st) != 44) {
+                emit_err("wait4: status wrong\n"); fail++;
+            }
+        }
+        long long tb = now_us();
+        snprintf(line, sizeof line,
+                 "wait3/wait4  x2   : %8lld us total\n", tb - ta);
+        emit(line);
+    }
+
+    /* ---- 16. rand / srand — PRNG sanity ---------------------- */
+    {
+        long long ta = now_us();
+        srand(42);
+        int r1 = rand();
+        srand(42);
+        int r2 = rand();
+        if (r1 != r2) {
+            emit_err("rand: srand(42) reseed gave different first rand()\n");
+            fail++;
+        }
+        /* Draw 1000 values; verify they're not all the same (PRNG
+         * isn't stuck). */
+        srand(123);
+        int prev = rand();
+        int variation = 0;
+        for (int i = 0; i < 1000; i++) {
+            int v = rand();
+            if (v != prev) { variation++; prev = v; }
+        }
+        if (variation < 100) {
+            emit_err("rand: PRNG appears stuck\n"); fail++;
+        }
+        long long tb = now_us();
+        snprintf(line, sizeof line,
+                 "rand/srand   x1k  : %8lld us total\n", tb - ta);
+        emit(line);
+    }
+
+    /* ---- 17. static-buffer fns: localtime/gmtime/strerror/ctime
+     * Quick smoke test: each should return a non-NULL pointer with
+     * non-empty content. */
+    {
+        long long ta = now_us();
+        time_t t = 1768521600;  /* 2026-01-15 12:00 UTC */
+        struct tm *lt = localtime(&t);
+        if (!lt || lt->tm_year < 100) { emit_err("localtime: bad\n"); fail++; }
+        struct tm *gt = gmtime(&t);
+        if (!gt || gt->tm_year < 100) { emit_err("gmtime: bad\n"); fail++; }
+        const char *cs = ctime(&t);
+        if (!cs || cs[0] == 0) { emit_err("ctime: bad\n"); fail++; }
+        const char *es = strerror(EACCES);
+        if (!es || es[0] == 0) { emit_err("strerror: bad\n"); fail++; }
+        long long tb = now_us();
+        snprintf(line, sizeof line,
+                 "static-bufs  x4   : %8lld us total\n", tb - ta);
+        emit(line);
     }
 
     if (fail) {

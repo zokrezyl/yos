@@ -6,6 +6,11 @@
 #include <stdatomic.h>
 #include <sys/syscall.h>
 #include <sys/mman.h>
+#include <sys/resource.h>      /* RLIMIT_NOFILE — the host process needs
+                                  every wasm guest's host-fd dups to live
+                                  in one shared kernel fd table; macOS
+                                  defaults the soft limit to 256, which
+                                  one perf-stress run easily exhausts. */
 #include <sys/stat.h>          /* mkdir — explicit because Apple SDK
                                   doesn't pull it via the other sys
                                   headers above (Linux glibc happens to,
@@ -1257,6 +1262,9 @@ void yos_link_imports(IM3Module module, struct yos_exec_ctx *ctx)
     yos_strto_link(module);
     extern void yos_kqueue_link(IM3Module mod);
     yos_kqueue_link(module);
+    /* ydev — env.ydev_* bridges for camera/audio/sensors/location. */
+    extern void yos_ydev_link(IM3Module mod, struct yos_exec_ctx *c);
+    yos_ydev_link(module, ctx);
     m3_LinkRawFunction(module, "env", "setjmp", "i(i)", m3_setjmp);
     m3_LinkRawFunction(module, "env", "longjmp", "v(ii)", m3_longjmp);
     m3_LinkRawFunction(module, "env", "_setjmp", "i(i)", m3_setjmp);
@@ -1524,6 +1532,15 @@ static void host_signal_dispatcher(int host_sig)
     if (fbsd > 0) yos_signal_set_pending(fbsd);
 }
 
+/* No-op handler for the SIGUSR2 side-channel. deliver_to_proc uses
+ * pthread_kill(target, SIGUSR2) to wake a host thread that's blocked
+ * in read/usleep/etc., so the target's next bridge call enters
+ * yos_signal_pump and notices a SIGKILL bit in ctx->sig_pending. The
+ * actual signal carries no info — its sole job is to cause EINTR.
+ * Without an installed handler, default disposition is TERMINATE,
+ * and a single chaos-test SIGKILL takes down the whole yos --server. */
+static void host_sigusr2_wake(int sig) { (void)sig; }
+
 static void yos_install_host_signal_handlers(void)
 {
     /* No SA_RESTART. We DO want blocking reads/writes to return
@@ -1540,6 +1557,13 @@ static void yos_install_host_signal_handlers(void)
     for (size_t i = 0; i < sizeof sigs / sizeof sigs[0]; i++) {
         sigaction(sigs[i], &sa, NULL);
     }
+    /* SIGUSR2 is the inter-thread wake used by deliver_to_proc.
+     * Install a no-op handler so it just interrupts blocking
+     * syscalls instead of terminating the process. */
+    struct sigaction sa_usr2 = { .sa_handler = host_sigusr2_wake,
+                                 .sa_flags   = 0 };
+    sigemptyset(&sa_usr2.sa_mask);
+    sigaction(SIGUSR2, &sa_usr2, NULL);
 }
 
 /* Load and prepare a wasm module. Returns 0 on success. */
@@ -1733,6 +1757,23 @@ int main(int argc, char **argv)
         const char *forced_path = getenv("YOS_PATH");
         if (forced_path && *forced_path) {
             setenv("PATH", forced_path, 1);
+        }
+    }
+
+    /* Raise RLIMIT_NOFILE to the hard limit. Every wasm guest's host fd
+     * table lives in one shared kernel fd table (we are one host
+     * process running many guests as pthreads), and fork's F_DUPFD
+     * loop multiplies the dup count by the live-guest count. macOS's
+     * default soft limit is 256 — perf-stress alone bursts past that
+     * via 160+ child forks dupping a pty fd each. iOS/tvOS app
+     * bundles already pre-set the hard limit lower; we never lower
+     * it, only raise it to whatever the system permits. */
+    {
+        struct rlimit rl;
+        if (getrlimit(RLIMIT_NOFILE, &rl) == 0 &&
+            rl.rlim_cur < rl.rlim_max) {
+            rl.rlim_cur = rl.rlim_max;
+            (void)setrlimit(RLIMIT_NOFILE, &rl);
         }
     }
 
@@ -1995,17 +2036,21 @@ int main(int argc, char **argv)
         g_runtime.envp = environ;
     }
 
-    /* Initialize VFS mount table. The mount infrastructure stays —
-     * we keep it for future devfs/ramfs/etc. — but the /proc mount
-     * is GONE by default. FreeBSD doesn't ship /proc; procfs(5) is
-     * a disabled-by-default Linux-compat shim. yos's process-list
-     * surface is sysctl(KERN_PROC_*) in impl/libc/sysctl.c, which is
-     * what the FreeBSD-shaped libc actually calls. The procfs synth
-     * backend in src/yos/vfs/procfs.c stays available; a guest that
-     * really wants Linux semantics can register it via an explicit
-     * mount once we expose mount(2). */
+    /* Initialize VFS mount table. /proc stays mounted by default
+     * because guest libraries (and tests) routinely ask for
+     * `/proc/self/exe` to discover their own image path. Without
+     * the mount, yos_readlink falls through to the HOST's
+     * readlink("/proc/self/exe") and returns the path to the yos
+     * NATIVE binary — perf-stress's fork+execve test then tries to
+     * re-exec that binary and ENOEXECs, because yos isn't a wasm
+     * file. FreeBSD doesn't ship /proc by default but its
+     * procfs(5) is well known and many ports rely on it; the
+     * mount is cheap (one entry) and the synth backend is
+     * already linked. */
     static struct yos_mount_table mount_table;
     yos_mount_table_init(&mount_table);
+    extern const struct yos_file_operations yos_procfs_ops;
+    yos_mount_add(&mount_table, "/proc", &yos_procfs_ops);
     g_runtime.mount_table = &mount_table;
 
     /* yctl: spin up the introspection/control daemon if --yctl-socket
@@ -2076,6 +2121,17 @@ int main(int argc, char **argv)
     ctx.envp = g_runtime.envp;
     pthread_mutex_init(&ctx.mem_lock, NULL);
     strcpy(ctx.cwd, proc->cwd);
+    /* POSIX default umask. yos drives umask in software (host umask
+     * forced to 0 at startup; impl/io/io.c applies ctx->umask to
+     * mode args of open/creat/mkdir/openat/mkdirat/mkfifo). Forked
+     * children inherit this via fork_thread_func; execve preserves
+     * it across the new module load. */
+    ctx.umask = 022;
+    /* Zero the host umask once so every host open/mkdir/creat uses
+     * the literal mode we hand it — masking happens in software so
+     * each ctx can have its own umask without colliding on the
+     * shared host process umask. */
+    umask(0);
 
     /* Load initial module */
     size_t wasm_size = 0;

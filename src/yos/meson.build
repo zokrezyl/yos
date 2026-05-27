@@ -163,6 +163,10 @@ is_tvos_app = get_option('tvos_unblock')
 is_darwin_app = is_ios_app or is_tvos_app
 is_macos      = (host_os == 'darwin') and (not is_darwin_app)
 
+# ydev — cross-platform camera/audio/sensor/location abstraction.
+# Defines ydev_dep (link_with libydev.a + framework link_args on darwin).
+subdir('impl/ydev')
+
 impl_platform_sources = []
 if host_os == 'linux'
   impl_platform_sources += files(
@@ -235,6 +239,7 @@ yos_runtime_sources = files(
   'impl/libc/strto.c',
   'impl/libc/sysctl.c',
   'impl/libc/syslog_extras.c',
+  'impl/libc/ydev_bridge.c',     # env.ydev_* wasm bridges
   # ytrace + yplatform — switchable trace-point machinery imported
   # verbatim from yetty (with yetty_yplatform → yos_yplatform).
   # ytrace.h defines ydebug/yinfo/ywarn/yerror/ytrace and the
@@ -298,6 +303,7 @@ yos_common_c_args = [
 yos_common_deps = [
   wasm3_dep,
   api_bridge_dep,      # m3w_<fn> wrappers + yos_brg_link_imports()
+  ydev_dep,            # ydev — camera/audio/sensors/location surface
   threads_dep,
   m_dep,
   iconv_dep,           # darwin/BSD: separate libiconv

@@ -21,9 +21,16 @@ extern int32_t yos_fd_alloc    (struct yos_exec_ctx *ctx, int host_fd);
 extern int32_t yos_fd_close    (struct yos_exec_ctx *ctx, int32_t wfd);
 extern int     yos_xlate_dfd   (struct yos_exec_ctx *ctx, int32_t wfd);
 extern const char *yos_path_resolve(struct yos_exec_ctx *ctx, const char *p);
+extern const char *yos_path_resolve_at(struct yos_exec_ctx *ctx, int host_dfd, const char *p);
 extern void    yos_signal_pump (struct yos_exec_ctx *ctx);
 
 struct iovec;
+/* Bound on iovec entry count — matches Linux IOV_MAX. Anything beyond
+ * this is treated as EINVAL. Sized so the YOS_IOV_MAX-element struct
+ * iovec stack array in each readv/writev/preadv/pwritev/preadv2/
+ * pwritev2/vmsplice/process_madvise/process_vm_*v caller stays at a
+ * sane ~16 KiB on the host stack. */
+#define YOS_IOV_MAX 1024
 extern int yos_iovec_w32_to_host(struct yos_exec_ctx *ctx,
                                  uint32_t wasm_iov, int32_t iovcnt,
                                  struct iovec *host_iov);
@@ -39,6 +46,35 @@ static inline void *wptr(struct yos_exec_ctx *ctx, uint32_t offset)
 static inline const char *wstr(struct yos_exec_ctx *ctx, uint32_t offset)
 {
     return (const char *)wptr(ctx, offset);
+}
+
+/* Validated [offset, offset+len) range → host pointer. Use this for any
+ * buffer the host kernel/libc will read or write whose length is
+ * guest-controlled — `wptr` alone validates only the first byte and
+ * lets a `read(fd, p, count)` where p sits near memory_size and count
+ * is huge stomp past wasm memory. End calc is 64-bit so wraparound
+ * can't make the bound check pass.
+ *
+ * Zero-length calls (len==0) succeed even when offset==0 — POSIX
+ * `read(fd, NULL, 0)` / `write(fd, NULL, 0)` etc. are defined as
+ * no-ops and must not EFAULT. We return a non-NULL host pointer in
+ * that case (so callers' `if (!p) return EFAULT` does not trip),
+ * still validated against memory_size so an offset past the end
+ * doesn't leak a wild pointer.
+ *
+ * For len>0, offset==0 returns NULL — that's a guest NULL pointer
+ * with intent to write, which is EFAULT. */
+static inline void *wptr_range(struct yos_exec_ctx *ctx, uint32_t offset, uint64_t len)
+{
+    if (len == 0) {
+        /* `offset == memory_size` is a one-past-end pointer; legal
+         * for zero-length per ISO C, and the kernel won't touch it. */
+        return (offset <= ctx->memory_size) ? (ctx->memory + offset) : 0;
+    }
+    if (offset == 0) return 0;
+    if (offset >= ctx->memory_size) return 0;
+    if ((uint64_t)offset + len > (uint64_t)ctx->memory_size) return 0;
+    return ctx->memory + offset;
 }
 
 static inline int32_t host_fd(struct yos_exec_ctx *ctx, int32_t fd)
