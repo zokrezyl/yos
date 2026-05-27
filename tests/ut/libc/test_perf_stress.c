@@ -1435,7 +1435,13 @@ int main(int argc, char **argv)
              * → 250 bumps minimum before we let stop fire). Capped
              * by a wall-clock timeout so a genuine pthread regression
              * still fails the round instead of hanging the test. */
-            const long MIN_BUMPS_PER_THREAD = 5;
+            /* Target ~50 bumps/thread — matches the average implied
+             * by the old fixed-burn loop's behaviour at the `-l`
+             * preset (148 threads, 12091 bumps ≈ 81/thread) without
+             * blowing up wall time at higher scales. Floor not just
+             * "any non-zero" so the contention scenario actually
+             * plays out long enough to surface lost-update races. */
+            const long MIN_BUMPS_PER_THREAD = 50;
             const long min_total_bumps = (long)started * MIN_BUMPS_PER_THREAD;
             const long long poll_t0 = now_us();
             const long long POLL_TIMEOUT_US = 5LL * 1000LL * 1000LL;

@@ -53,10 +53,16 @@ static inline const char *wstr(struct yos_exec_ctx *ctx, uint32_t offset)
  * guest-controlled — `wptr` alone validates only the first byte and
  * lets a `read(fd, p, count)` where p sits near memory_size and count
  * is huge stomp past wasm memory. End calc is 64-bit so wraparound
- * can't make the bound check pass. len==0 returns the base pointer
- * (or NULL on bad offset) without reading any bytes. */
+ * can't make the bound check pass.
+ *
+ * offset==0 returns NULL even for len==0, matching `wptr`'s
+ * "guest NULL pointer" convention. Otherwise a guest passing buf=0
+ * with count>0 would be silently treated as a valid buffer at wasm
+ * offset 0 — letting the kernel scribble over wasm-side data the
+ * guest didn't intend to expose. Callers EFAULT on NULL. */
 static inline void *wptr_range(struct yos_exec_ctx *ctx, uint32_t offset, uint64_t len)
 {
+    if (offset == 0) return 0;
     if (offset >= ctx->memory_size) return 0;
     if ((uint64_t)offset + len > (uint64_t)ctx->memory_size) return 0;
     return ctx->memory + offset;

@@ -51,11 +51,15 @@ extern const char *yos_path_resolve(struct yos_exec_ctx *ctx, const char *p);
 
 /* Validated [offset, offset+len) range → host pointer. Mirrors the
  * same-named helper in impl/io/io-internal.h. Returns NULL when the
- * range falls outside wasm memory OR when the 64-bit end overflows.
- * len==0 still requires a valid offset (caller can check). */
+ * range falls outside wasm memory, when the 64-bit end overflows, OR
+ * when offset is 0 (guest NULL pointer convention, matching wptr's
+ * shape — without this, recv/recvfrom/send/etc. passed buf=0 with
+ * count>0 would be silently treated as a valid buffer at wasm offset
+ * 0 and let the kernel scribble there). */
 static inline void *posix_wptr_range(struct yos_exec_ctx *ctx, uint32_t offset,
                                      uint64_t len)
 {
+    if (offset == 0) return NULL;
     if (offset >= ctx->memory_size) return NULL;
     if ((uint64_t)offset + len > (uint64_t)ctx->memory_size) return NULL;
     return ctx->memory + offset;
@@ -784,13 +788,24 @@ int32_t yos_getnameinfo(struct yos_exec_ctx *ctx, uint32_t sa_off,
                         uint32_t salen, uint32_t host_off, uint32_t hostlen,
                         uint32_t serv_off, uint32_t servlen, int32_t flags)
 {
-    if (!sa_off || sa_off + salen > ctx->memory_size) return EAI_SYSTEM;
+    if (!posix_wptr_range(ctx, sa_off, salen)) return EAI_SYSTEM;
     uint8_t hostbuf_sa[256];
     if (salen > sizeof(hostbuf_sa)) return EAI_SYSTEM;
     memcpy(hostbuf_sa, ctx->memory + sa_off, salen);
     freebsd_sockaddr_to_host(hostbuf_sa, (socklen_t)salen);
-    char *hbuf = host_off ? (char *)(ctx->memory + host_off) : NULL;
-    char *sbuf = serv_off ? (char *)(ctx->memory + serv_off) : NULL;
+    /* host_off / serv_off are optional output buffers. Validate the
+     * full range when given so the host doesn't write past the guest's
+     * buffer. */
+    char *hbuf = NULL;
+    if (host_off) {
+        if (!posix_wptr_range(ctx, host_off, hostlen)) return EAI_SYSTEM;
+        hbuf = (char *)(ctx->memory + host_off);
+    }
+    char *sbuf = NULL;
+    if (serv_off) {
+        if (!posix_wptr_range(ctx, serv_off, servlen)) return EAI_SYSTEM;
+        sbuf = (char *)(ctx->memory + serv_off);
+    }
     return getnameinfo((const struct sockaddr *)hostbuf_sa, (socklen_t)salen,
                        hbuf, (socklen_t)hostlen, sbuf, (socklen_t)servlen,
                        ni_flags_fb_to_lx(flags));
@@ -805,7 +820,7 @@ int32_t yos_getnameinfo(struct yos_exec_ctx *ctx, uint32_t sa_off,
 int32_t yos_posix_madvise(struct yos_exec_ctx *ctx, uint32_t addr_off,
                           uint32_t len, int32_t advice)
 {
-    if (!addr_off || addr_off + len > ctx->memory_size) return EINVAL;
+    if (!posix_wptr_range(ctx, addr_off, len)) return EINVAL;
     long ps = sysconf(_SC_PAGESIZE);
     uintptr_t host_addr = (uintptr_t)(ctx->memory + addr_off);
     uintptr_t aligned = host_addr & ~((uintptr_t)ps - 1);
@@ -1471,7 +1486,8 @@ int32_t yos_utimes(struct yos_exec_ctx *ctx, uint32_t path_off, uint32_t times_o
     const char *path = yos_path_resolve(ctx, path_in);
     struct timeval *p = NULL, h[2];
     if (times_off) {
-        if (times_off + 16 > ctx->memory_size) return yos_errno_neg(ctx, EFAULT);
+        /* sizeof(wasm timeval[2]) = 16; overflow-safe via posix_wptr_range. */
+        if (!posix_wptr_range(ctx, times_off, 16)) return yos_errno_neg(ctx, EFAULT);
         wasm_timeval2_to_host(ctx->memory + times_off, h);
         p = h;
     }
@@ -1485,7 +1501,7 @@ int32_t yos_futimes(struct yos_exec_ctx *ctx, int32_t wfd, uint32_t times_off)
     if (hfd < 0) return yos_errno_neg(ctx, EBADF);
     struct timeval *p = NULL, h[2];
     if (times_off) {
-        if (times_off + 16 > ctx->memory_size) return yos_errno_neg(ctx, EFAULT);
+        if (!posix_wptr_range(ctx, times_off, 16)) return yos_errno_neg(ctx, EFAULT);
         wasm_timeval2_to_host(ctx->memory + times_off, h);
         p = h;
     }
@@ -1500,7 +1516,7 @@ int32_t yos_lutimes(struct yos_exec_ctx *ctx, uint32_t path_off, uint32_t times_
     const char *path = yos_path_resolve(ctx, path_in);
     struct timeval *p = NULL, h[2];
     if (times_off) {
-        if (times_off + 16 > ctx->memory_size) return yos_errno_neg(ctx, EFAULT);
+        if (!posix_wptr_range(ctx, times_off, 16)) return yos_errno_neg(ctx, EFAULT);
         wasm_timeval2_to_host(ctx->memory + times_off, h);
         p = h;
     }
@@ -2074,11 +2090,9 @@ uint32_t yos_readpassphrase(struct yos_exec_ctx *ctx,
                             uint32_t prompt_off, uint32_t buf_off,
                             uint32_t bufsize, int32_t flags)
 {
-    if (!buf_off || bufsize == 0 ||
-        buf_off + bufsize > ctx->memory_size)
-        return 0;
-
-    char *buf = (char *)(ctx->memory + buf_off);
+    if (bufsize == 0) return 0;
+    char *buf = (char *)posix_wptr_range(ctx, buf_off, bufsize);
+    if (!buf) return 0;
     const char *prompt =
         (prompt_off && prompt_off < ctx->memory_size)
         ? (const char *)(ctx->memory + prompt_off) : "";
