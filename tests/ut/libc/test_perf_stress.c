@@ -1419,18 +1419,35 @@ int main(int argc, char **argv)
                 }
                 started++;
             }
-            /* Let them run for a varied bit before asking to stop.
-             * No usleep — yos's sleep round-trip is uneven in this
-             * stress path. Burn CPU on main for a randomized count.
-             * Has to be LARGE so the worker threads actually rack up
-             * a meaningful bump count before the stop flag flips —
-             * previous 200K..1M burn finished in well under a ms on
-             * release-build wasm3, threads got ~5 iters each, the
-             * "lots of contended mutex acquires" property never
-             * exercised. */
-            long burn = 1000000L + (long)chaos_rand_mod(3000000L);
-            volatile long s = 0;
-            for (long b = 0; b < burn; b++) s += b;
+            /* Wait until the workers have actually contended on the
+             * mutex before flipping stop. A blind burn-CPU loop here
+             * silently scales wrong: at high thread counts (~50+
+             * per round under -t 50), pthread_create itself takes
+             * long enough that main's burn completes before the
+             * last-created workers have even cleared their startup
+             * critical section — they observe stop==1 on entry to
+             * the loop and never bump. Result was "0 bumps, 0
+             * mismatches" — vacuously passing because round_sum and
+             * total_bumps are both 0.
+             *
+             * Poll the bump counter instead. We require at least
+             * MIN_BUMPS_PER_THREAD per started thread (so 50 threads
+             * → 250 bumps minimum before we let stop fire). Capped
+             * by a wall-clock timeout so a genuine pthread regression
+             * still fails the round instead of hanging the test. */
+            const long MIN_BUMPS_PER_THREAD = 5;
+            const long min_total_bumps = (long)started * MIN_BUMPS_PER_THREAD;
+            const long long poll_t0 = now_us();
+            const long long POLL_TIMEOUT_US = 5LL * 1000LL * 1000LL;
+            for (;;) {
+                pthread_mutex_lock(&cctx.lock);
+                long b = cctx.total_bumps;
+                pthread_mutex_unlock(&cctx.lock);
+                if (b >= min_total_bumps) break;
+                if (now_us() - poll_t0 >= POLL_TIMEOUT_US) break;
+                volatile long s = 0;
+                for (long i = 0; i < 50000L; i++) s += i;
+            }
             cctx.stop = 1;
             long round_sum = 0;
             for (int i = 0; i < started; i++) {
@@ -1460,6 +1477,16 @@ int main(int argc, char **argv)
           total_threads, tb - ta, total_bumps_sum, mismatches);
         emit(line);
         if (mismatches) fail++;
+        /* Liveness assertion: with N threads contending on a mutex
+         * for at least the poll timeout, we expect non-trivial bump
+         * counts. A zero-bump aggregate means workers never actually
+         * ran — a vacuous mismatches==0 result that hides a real
+         * pthread bridge regression. See yos issue #17. */
+        if (total_threads > 0 && total_bumps_sum == 0) {
+            emit_err("chaos thread: 0 bumps across all rounds — "
+                     "workers never executed (issue #17)\n");
+            fail++;
+        }
     }
 
     /* ---- 6. file I/O throughput -------------------------------- */
