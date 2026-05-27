@@ -71,6 +71,27 @@ const char *yos_path_resolve(struct yos_exec_ctx *ctx, const char *p)
     return buf;
 }
 
+/* For *at()-family bridges: choose the right path-resolution policy
+ * for a given (host_dfd, path) pair.
+ *
+ *   absolute path    → passthrough (kernel won't consult any dirfd)
+ *   host_dfd == AT_FDCWD → resolve against ctx->cwd (the kernel's
+ *                      AT_FDCWD is the *host process* cwd, not ours)
+ *   real translated dfd  → leave the path alone; host_dfd points at
+ *                      the same directory the guest's wfd does, so
+ *                      the host kernel resolves the relative path
+ *                      against that directory correctly.
+ *
+ * Like yos_path_resolve, the cwd-relative branch returns a TLS buffer
+ * — callers that pair two resolve calls (renameat, linkat) must
+ * snapshot the first result to the stack before the second call. */
+const char *yos_path_resolve_at(struct yos_exec_ctx *ctx, int host_dfd, const char *p)
+{
+    if (!p) return NULL;
+    if (host_dfd == AT_FDCWD) return yos_path_resolve(ctx, p);
+    return p;
+}
+
 /* ============================================================================
  * Per-runtime fd table.
  * ============================================================================ */
@@ -329,7 +350,11 @@ int32_t yos_fd_translate(struct yos_exec_ctx *ctx, int32_t fd)
 
 int32_t yos_read(struct yos_exec_ctx *ctx, int32_t fd, uint32_t buf, uint32_t count)
 {
-    void *p = wptr(ctx, buf);
+    /* Validate the FULL [buf, buf+count) range — the host kernel writes
+     * up to `count` bytes into the buffer, and `wptr` alone only checks
+     * the first byte. A buffer near memory_size with a huge count would
+     * otherwise let read() stomp past wasm memory. */
+    void *p = wptr_range(ctx, buf, count);
     if (!p) return yos_errno_neg(ctx, EFAULT);
 
     /* Check if virtual fd */
@@ -403,7 +428,9 @@ read_done:;
 
 int32_t yos_write(struct yos_exec_ctx *ctx, int32_t fd, uint32_t buf, uint32_t count)
 {
-    void *p = wptr(ctx, buf);
+    /* Validate the FULL [buf, buf+count) range so the host kernel can't
+     * read past wasm memory when count is guest-controlled. */
+    void *p = wptr_range(ctx, buf, count);
     if (!p) return yos_errno_neg(ctx, EFAULT);
     int32_t hfd = yos_fd_get(ctx, fd);
     if (hfd < 0) return hfd;
@@ -641,10 +668,17 @@ int32_t yos_creat(struct yos_exec_ctx *ctx, uint32_t pathname, int32_t mode)
 
 int32_t yos_link(struct yos_exec_ctx *ctx, uint32_t oldname, uint32_t newname)
 {
-    const char *o = wstr(ctx, oldname);
-    const char *n = wstr(ctx, newname);
-    if (!o || !n) return yos_errno_neg(ctx, EFAULT);
-    return yos_errno_check(ctx, link(o, n));
+    const char *o_in = wstr(ctx, oldname);
+    const char *n_in = wstr(ctx, newname);
+    if (!o_in || !n_in) return yos_errno_neg(ctx, EFAULT);
+    /* yos_path_resolve returns a TLS buffer; the second call would
+     * clobber the first when both args are relative. Snapshot to the
+     * stack between calls. */
+    char o_buf[PATH_MAX];
+    const char *o = yos_path_resolve(ctx, o_in);
+    snprintf(o_buf, sizeof o_buf, "%s", o);
+    const char *n = yos_path_resolve(ctx, n_in);
+    return yos_errno_check(ctx, link(o_buf, n));
 }
 
 int32_t yos_unlink(struct yos_exec_ctx *ctx, uint32_t pathname)
@@ -894,7 +928,7 @@ int32_t yos_ioctl(struct yos_exec_ctx *ctx, int32_t fd, uint32_t cmd, uint32_t a
             return 0;
         } else {
             int32_t pgid = *(int32_t *)argp;
-            if (pgid <= 0) return -EINVAL;
+            if (pgid <= 0) return yos_errno_neg(ctx, EINVAL);
             ctx->rt->fg_pgid = pgid;
             ydebug("ioctl TIOCSPGRP(virt) <- %d\n", pgid);
             return 0;
@@ -1164,23 +1198,29 @@ int32_t yos_vfs_fcntl64(struct yos_exec_ctx *ctx, int32_t fd, int32_t cmd, int32
 
 int32_t yos_vfs_chroot(struct yos_exec_ctx *ctx, uint32_t filename)
 {
-    (void)ctx; (void)filename;
-    return -EPERM;
+    (void)filename;
+    return yos_errno_neg(ctx, EPERM);
 }
 
 int32_t yos_symlink(struct yos_exec_ctx *ctx, uint32_t oldpath, uint32_t newpath)
 {
+    /* `oldpath` is the symlink target — STORED as text in the new
+     * symlink, never dereferenced here — so do NOT resolve it against
+     * ctx->cwd. Only `newpath` (where the symlink is created) needs
+     * cwd resolution. */
     const char *o = wstr(ctx, oldpath);
-    const char *n = wstr(ctx, newpath);
-    if (!o || !n) return yos_errno_neg(ctx, EFAULT);
+    const char *n_in = wstr(ctx, newpath);
+    if (!o || !n_in) return yos_errno_neg(ctx, EFAULT);
+    const char *n = yos_path_resolve(ctx, n_in);
     return yos_errno_check(ctx, symlink(o, n));
 }
 
 int32_t yos_readlink(struct yos_exec_ctx *ctx, uint32_t path, uint32_t buf, uint32_t bufsiz)
 {
-    const char *s = wstr(ctx, path);
-    char *b = (char *)wptr(ctx, buf);
-    if (!s || !b) return yos_errno_neg(ctx, EFAULT);
+    const char *s_in = wstr(ctx, path);
+    char *b = (char *)wptr_range(ctx, buf, bufsiz);
+    if (!s_in || !b) return yos_errno_neg(ctx, EFAULT);
+    const char *s = yos_path_resolve(ctx, s_in);
 
     /* Check if path is in a virtual filesystem */
     struct yos_mount_table *mt = (struct yos_mount_table *)ctx->rt->mount_table;
@@ -1198,8 +1238,9 @@ int32_t yos_readlink(struct yos_exec_ctx *ctx, uint32_t path, uint32_t buf, uint
 
 int32_t yos_truncate(struct yos_exec_ctx *ctx, uint32_t path, int32_t length)
 {
-    const char *s = wstr(ctx, path);
-    if (!s) return yos_errno_neg(ctx, EFAULT);
+    const char *s_in = wstr(ctx, path);
+    if (!s_in) return yos_errno_neg(ctx, EFAULT);
+    const char *s = yos_path_resolve(ctx, s_in);
     return yos_errno_check(ctx, truncate(s, length));
 }
 
@@ -1221,22 +1262,31 @@ int32_t yos_fchown(struct yos_exec_ctx *ctx, int32_t fd, int32_t user, int32_t g
     return yos_errno_check(ctx, fchown(host_fd(ctx, fd), user, group));
 }
 
-/* TODO: replace with per-process fd table / custom VFS */
 /* Convert a wasm32 iovec[] (8 bytes/entry: u32 base, u32 len) into a host
  * iovec[] (16 bytes/entry: u64 base, u64 len) by translating each base
  * pointer through the wasm linear memory. The host array must already
- * be sized for `vlen` entries. Returns 0 on success, -errno on bad ptr. */
+ * be sized for `vlen` entries. Returns 0 on success, -errno on bad input
+ * (including unbounded vlen, vector table out of memory, or any iovec
+ * base+len pair out of wasm memory). YOS_IOV_MAX is in io-internal.h
+ * so the linux-slice iovec callers see the same cap. */
 int yos_iovec_w32_to_host(struct yos_exec_ctx *ctx,
                                   uint32_t wasm_vec, int vlen,
                                   struct iovec *host_iov)
 {
-    if (vlen <= 0) return 0;
-    uint8_t *iov_ptr = wptr(ctx, wasm_vec);
+    if (vlen == 0) return 0;
+    if (vlen < 0 || vlen > YOS_IOV_MAX) return yos_errno_neg(ctx, EINVAL);
+    /* Validate the FULL wasm-iovec table range — wptr(wasm_vec) alone
+     * doesn't catch wasm_vec + vlen*8 spilling past memory_size. */
+    uint8_t *iov_ptr = wptr_range(ctx, wasm_vec, (uint64_t)vlen * 8u);
     if (!iov_ptr) return yos_errno_neg(ctx, EFAULT);
     for (int i = 0; i < vlen; i++) {
         uint32_t base = *(uint32_t *)(iov_ptr + i * 8);
         uint32_t len  = *(uint32_t *)(iov_ptr + i * 8 + 4);
-        host_iov[i].iov_base = wptr(ctx, base);
+        /* Validate each base+len pair; a single bad iovec must fail
+         * the whole call before any kernel I/O touches wasm memory. */
+        void *p = wptr_range(ctx, base, len);
+        if (!p && len > 0) return yos_errno_neg(ctx, EFAULT);
+        host_iov[i].iov_base = p;
         host_iov[i].iov_len = len;
     }
     return 0;
@@ -1244,7 +1294,8 @@ int yos_iovec_w32_to_host(struct yos_exec_ctx *ctx,
 
 int32_t yos_readv(struct yos_exec_ctx *ctx, int32_t fd, uint32_t vec, int32_t vlen)
 {
-    struct iovec host_iov[vlen];
+    if (vlen < 0 || vlen > YOS_IOV_MAX) return yos_errno_neg(ctx, EINVAL);
+    struct iovec host_iov[YOS_IOV_MAX];
     int r = yos_iovec_w32_to_host(ctx, vec, vlen, host_iov);
     if (r) return r;
     ssize_t n = readv(host_fd(ctx, fd), host_iov, vlen);
@@ -1253,7 +1304,8 @@ int32_t yos_readv(struct yos_exec_ctx *ctx, int32_t fd, uint32_t vec, int32_t vl
 
 int32_t yos_writev(struct yos_exec_ctx *ctx, int32_t fd, uint32_t vec, int32_t vlen)
 {
-    struct iovec host_iov[vlen];
+    if (vlen < 0 || vlen > YOS_IOV_MAX) return yos_errno_neg(ctx, EINVAL);
+    struct iovec host_iov[YOS_IOV_MAX];
     int r = yos_iovec_w32_to_host(ctx, vec, vlen, host_iov);
     if (r) return r;
     int hfd = host_fd(ctx, fd);
@@ -1271,7 +1323,7 @@ int32_t yos_writev(struct yos_exec_ctx *ctx, int32_t fd, uint32_t vec, int32_t v
 
 int32_t yos_vfs_pread64(struct yos_exec_ctx *ctx, int32_t fd, uint32_t buf, uint32_t count, uint32_t pos)
 {
-    void *p = wptr(ctx, buf);
+    void *p = wptr_range(ctx, buf, count);
     if (!p) return yos_errno_neg(ctx, EFAULT);
     ssize_t r = pread(host_fd(ctx, fd), p, count, pos);
     return yos_errno_check(ctx, (int32_t)r);
@@ -1279,7 +1331,7 @@ int32_t yos_vfs_pread64(struct yos_exec_ctx *ctx, int32_t fd, uint32_t buf, uint
 
 int32_t yos_vfs_pwrite64(struct yos_exec_ctx *ctx, int32_t fd, uint32_t buf, uint32_t count, uint32_t pos)
 {
-    void *p = wptr(ctx, buf);
+    void *p = wptr_range(ctx, buf, count);
     if (!p) return yos_errno_neg(ctx, EFAULT);
     ssize_t r = pwrite(host_fd(ctx, fd), p, count, pos);
     return yos_errno_check(ctx, (int32_t)r);
@@ -1331,14 +1383,14 @@ int32_t yos_getcwd(struct yos_exec_ctx *ctx, uint32_t buf, uint32_t size)
 
 int32_t yos_openat(struct yos_exec_ctx *ctx, int32_t dfd, uint32_t filename, int32_t flags, int32_t mode)
 {
-    const char *path = wstr(ctx, filename);
-    if (!path) return yos_errno_neg(ctx, EFAULT);
+    const char *path_in = wstr(ctx, filename);
+    if (!path_in) return yos_errno_neg(ctx, EFAULT);
 
     /* Check if path is in a virtual filesystem */
     struct yos_mount_table *mt = (struct yos_mount_table *)ctx->rt->mount_table;
     if (mt) {
         const char *remaining;
-        const struct yos_file_operations *ops = yos_mount_resolve(mt, path, &remaining);
+        const struct yos_file_operations *ops = yos_mount_resolve(mt, path_in, &remaining);
         if (ops && ops->open) {
             return ops->open(ctx, remaining, flags, mode);
         }
@@ -1354,6 +1406,10 @@ int32_t yos_openat(struct yos_exec_ctx *ctx, int32_t dfd, uint32_t filename, int
     int host_dfd = (dfd == AT_FDCWD) ? AT_FDCWD : yos_fd_get(ctx, dfd);
     if (host_dfd < 0 && host_dfd != AT_FDCWD)
         return host_dfd;
+    /* For AT_FDCWD, resolve the relative path against ctx->cwd so the
+     * guest's chdir is honored — the host's AT_FDCWD points at the
+     * host process cwd, which is shared across all guests. */
+    const char *path = yos_path_resolve_at(ctx, host_dfd, path_in);
 
     int hflags = oflags_fb_to_lx(flags);
     /* See yos_open: openat is also variadic; mode comes via a wasm
@@ -1401,35 +1457,44 @@ int32_t yos_openat(struct yos_exec_ctx *ctx, int32_t dfd, uint32_t filename, int
 
 int32_t yos_mkdirat(struct yos_exec_ctx *ctx, int32_t dfd, uint32_t pathname, int32_t mode)
 {
-    const char *s = wstr(ctx, pathname);
-    if (!s) return yos_errno_neg(ctx, EFAULT);
-    return yos_errno_check(ctx, mkdirat(dfd, s, mode & ~ctx->umask));
+    const char *s_in = wstr(ctx, pathname);
+    if (!s_in) return yos_errno_neg(ctx, EFAULT);
+    /* dfd was previously passed straight to host mkdirat — interpreting
+     * the guest's wasm fd as a host fd number; any real dfd hit the
+     * wrong directory or EBADF. */
+    int host_dfd = yos_xlate_dfd(ctx, dfd);
+    const char *s = yos_path_resolve_at(ctx, host_dfd, s_in);
+    return yos_errno_check(ctx, mkdirat(host_dfd, s, mode & ~ctx->umask));
 }
 
 int32_t yos_vfs_mknodat(struct yos_exec_ctx *ctx, int32_t dfd, uint32_t filename, int32_t mode, uint32_t dev)
 {
-    const char *s = wstr(ctx, filename);
-    if (!s) return yos_errno_neg(ctx, EFAULT);
-    return yos_errno_check(ctx, mknodat(yos_xlate_dfd(ctx, dfd), s, mode, dev));
+    const char *s_in = wstr(ctx, filename);
+    if (!s_in) return yos_errno_neg(ctx, EFAULT);
+    int host_dfd = yos_xlate_dfd(ctx, dfd);
+    const char *s = yos_path_resolve_at(ctx, host_dfd, s_in);
+    return yos_errno_check(ctx, mknodat(host_dfd, s, mode, dev));
 }
 
 int32_t yos_fchownat(struct yos_exec_ctx *ctx, int32_t dfd, uint32_t filename, int32_t user, int32_t group, int32_t flag)
 {
-    const char *s = wstr(ctx, filename);
-    if (!s) return yos_errno_neg(ctx, EFAULT);
-    return yos_errno_check(ctx, fchownat(yos_xlate_dfd(ctx, dfd), s, user, group, yos_at_flags_fb_to_lx(flag)));
+    const char *s_in = wstr(ctx, filename);
+    if (!s_in) return yos_errno_neg(ctx, EFAULT);
+    int host_dfd = yos_xlate_dfd(ctx, dfd);
+    const char *s = yos_path_resolve_at(ctx, host_dfd, s_in);
+    return yos_errno_check(ctx, fchownat(host_dfd, s, user, group, yos_at_flags_fb_to_lx(flag)));
 }
 
 int32_t yos_vfs_fstatat64(struct yos_exec_ctx *ctx, int32_t dfd, uint32_t filename, uint32_t statbuf, int32_t flag)
 {
-    const char *path = wstr(ctx, filename);
-    if (!path) return yos_errno_neg(ctx, EFAULT);
+    const char *path_in = wstr(ctx, filename);
+    if (!path_in) return yos_errno_neg(ctx, EFAULT);
 
     /* Check if path is in a virtual filesystem */
     struct yos_mount_table *mt = (struct yos_mount_table *)ctx->rt->mount_table;
     if (mt) {
         const char *remaining;
-        const struct yos_file_operations *ops = yos_mount_resolve(mt, path, &remaining);
+        const struct yos_file_operations *ops = yos_mount_resolve(mt, path_in, &remaining);
         if (ops && ops->stat) {
             void *buf = wptr(ctx, statbuf);
             if (!buf) return yos_errno_neg(ctx, EFAULT);
@@ -1438,6 +1503,7 @@ int32_t yos_vfs_fstatat64(struct yos_exec_ctx *ctx, int32_t dfd, uint32_t filena
     }
 
     int host_dfd = yos_xlate_dfd(ctx, dfd);
+    const char *path = yos_path_resolve_at(ctx, host_dfd, path_in);
     int host_flag = yos_at_flags_fb_to_lx(flag);
     ydebug("fstatat(dfd=%d->%d path=\"%s\" flag=0x%x->0x%x)\n",
            dfd, host_dfd, path, flag, host_flag);
@@ -1469,67 +1535,92 @@ int32_t yos_vfs_fstatat64(struct yos_exec_ctx *ctx, int32_t dfd, uint32_t filena
 
 int32_t yos_unlinkat(struct yos_exec_ctx *ctx, int32_t dfd, uint32_t pathname, int32_t flag)
 {
-    const char *s = wstr(ctx, pathname);
-    if (!s) return yos_errno_neg(ctx, EFAULT);
-    return yos_errno_check(ctx, unlinkat(yos_xlate_dfd(ctx, dfd), s, yos_at_flags_fb_to_lx(flag)));
+    const char *s_in = wstr(ctx, pathname);
+    if (!s_in) return yos_errno_neg(ctx, EFAULT);
+    int host_dfd = yos_xlate_dfd(ctx, dfd);
+    const char *s = yos_path_resolve_at(ctx, host_dfd, s_in);
+    return yos_errno_check(ctx, unlinkat(host_dfd, s, yos_at_flags_fb_to_lx(flag)));
 }
 
 int32_t yos_renameat(struct yos_exec_ctx *ctx, int32_t olddfd, uint32_t oldname, int32_t newdfd, uint32_t newname)
 {
-    const char *o = wstr(ctx, oldname);
-    const char *n = wstr(ctx, newname);
-    if (!o || !n) return yos_errno_neg(ctx, EFAULT);
-    return yos_errno_check(ctx, renameat(yos_xlate_dfd(ctx, olddfd), o, yos_xlate_dfd(ctx, newdfd), n));
+    const char *o_in = wstr(ctx, oldname);
+    const char *n_in = wstr(ctx, newname);
+    if (!o_in || !n_in) return yos_errno_neg(ctx, EFAULT);
+    int host_olddfd = yos_xlate_dfd(ctx, olddfd);
+    int host_newdfd = yos_xlate_dfd(ctx, newdfd);
+    /* Both resolves may use yos_path_resolve's TLS buffer — snapshot
+     * the first result before kicking off the second. */
+    char o_buf[PATH_MAX];
+    const char *o = yos_path_resolve_at(ctx, host_olddfd, o_in);
+    snprintf(o_buf, sizeof o_buf, "%s", o);
+    const char *n = yos_path_resolve_at(ctx, host_newdfd, n_in);
+    return yos_errno_check(ctx, renameat(host_olddfd, o_buf, host_newdfd, n));
 }
 
 int32_t yos_linkat(struct yos_exec_ctx *ctx, int32_t olddfd, uint32_t oldname, int32_t newdfd, uint32_t newname, int32_t flags)
 {
-    const char *o = wstr(ctx, oldname);
-    const char *n = wstr(ctx, newname);
-    if (!o || !n) return yos_errno_neg(ctx, EFAULT);
-    return yos_errno_check(ctx, linkat(yos_xlate_dfd(ctx, olddfd), o, yos_xlate_dfd(ctx, newdfd), n, yos_at_flags_fb_to_lx(flags)));
+    const char *o_in = wstr(ctx, oldname);
+    const char *n_in = wstr(ctx, newname);
+    if (!o_in || !n_in) return yos_errno_neg(ctx, EFAULT);
+    int host_olddfd = yos_xlate_dfd(ctx, olddfd);
+    int host_newdfd = yos_xlate_dfd(ctx, newdfd);
+    char o_buf[PATH_MAX];
+    const char *o = yos_path_resolve_at(ctx, host_olddfd, o_in);
+    snprintf(o_buf, sizeof o_buf, "%s", o);
+    const char *n = yos_path_resolve_at(ctx, host_newdfd, n_in);
+    return yos_errno_check(ctx, linkat(host_olddfd, o_buf, host_newdfd, n, yos_at_flags_fb_to_lx(flags)));
 }
 
 int32_t yos_symlinkat(struct yos_exec_ctx *ctx, uint32_t oldname, int32_t newdfd, uint32_t newname)
 {
+    /* `oldname` is the link's TEXT CONTENT, never dereferenced here. */
     const char *o = wstr(ctx, oldname);
-    const char *n = wstr(ctx, newname);
-    if (!o || !n) return yos_errno_neg(ctx, EFAULT);
-    return yos_errno_check(ctx, symlinkat(o, yos_xlate_dfd(ctx, newdfd), n));
+    const char *n_in = wstr(ctx, newname);
+    if (!o || !n_in) return yos_errno_neg(ctx, EFAULT);
+    int host_newdfd = yos_xlate_dfd(ctx, newdfd);
+    const char *n = yos_path_resolve_at(ctx, host_newdfd, n_in);
+    return yos_errno_check(ctx, symlinkat(o, host_newdfd, n));
 }
 
 int32_t yos_readlinkat(struct yos_exec_ctx *ctx, int32_t dfd, uint32_t path, uint32_t buf, uint32_t bufsiz)
 {
-    const char *s = wstr(ctx, path);
-    char *b = (char *)wptr(ctx, buf);
-    if (!s || !b) return yos_errno_neg(ctx, EFAULT);
+    const char *s_in = wstr(ctx, path);
+    char *b = (char *)wptr_range(ctx, buf, bufsiz);
+    if (!s_in || !b) return yos_errno_neg(ctx, EFAULT);
 
     /* Check if path is in a virtual filesystem */
     struct yos_mount_table *mt = (struct yos_mount_table *)ctx->rt->mount_table;
     if (mt) {
         const char *remaining;
-        const struct yos_file_operations *ops = yos_mount_resolve(mt, s, &remaining);
+        const struct yos_file_operations *ops = yos_mount_resolve(mt, s_in, &remaining);
         if (ops && ops->readlink) {
             return ops->readlink(ctx, remaining, b, bufsiz);
         }
     }
 
-    ssize_t r = readlinkat(yos_xlate_dfd(ctx, dfd), s, b, bufsiz);
+    int host_dfd = yos_xlate_dfd(ctx, dfd);
+    const char *s = yos_path_resolve_at(ctx, host_dfd, s_in);
+    ssize_t r = readlinkat(host_dfd, s, b, bufsiz);
     return yos_errno_check(ctx, (int32_t)r);
 }
 
 int32_t yos_fchmodat(struct yos_exec_ctx *ctx, int32_t dfd, uint32_t filename, int32_t mode)
 {
-    const char *s = wstr(ctx, filename);
-    if (!s) return yos_errno_neg(ctx, EFAULT);
-    return yos_errno_check(ctx, fchmodat(yos_xlate_dfd(ctx, dfd), s, mode, 0));
+    const char *s_in = wstr(ctx, filename);
+    if (!s_in) return yos_errno_neg(ctx, EFAULT);
+    int host_dfd = yos_xlate_dfd(ctx, dfd);
+    const char *s = yos_path_resolve_at(ctx, host_dfd, s_in);
+    return yos_errno_check(ctx, fchmodat(host_dfd, s, mode, 0));
 }
 
 int32_t yos_faccessat(struct yos_exec_ctx *ctx, int32_t dfd, uint32_t filename, int32_t mode)
 {
-    const char *s = wstr(ctx, filename);
-    if (!s) return yos_errno_neg(ctx, EFAULT);
-    return yos_errno_check(ctx, faccessat(yos_xlate_dfd(ctx, dfd), s, mode, 0));
+    const char *s_in = wstr(ctx, filename);
+    if (!s_in) return yos_errno_neg(ctx, EFAULT);
+    int host_dfd = yos_xlate_dfd(ctx, dfd);
+    const char *s = yos_path_resolve_at(ctx, host_dfd, s_in);
+    return yos_errno_check(ctx, faccessat(host_dfd, s, mode, 0));
 }
 
 /* dup2/dup3: assign a fresh host-fd dup of oldfd into wasm-slot newfd.
@@ -1562,7 +1653,7 @@ int32_t yos_dup3(struct yos_exec_ctx *ctx, int32_t oldfd, int32_t newfd, int32_t
 {
     int32_t host_old = yos_fd_get(ctx, oldfd);
     if (host_old < 0) return host_old;
-    if (oldfd == newfd) return -EINVAL;  /* dup3 forbids equal fds */
+    if (oldfd == newfd) return yos_errno_neg(ctx, EINVAL);  /* dup3 forbids equal fds */
     int host_new = fcntl(host_old,
                          (flags & O_CLOEXEC) ? F_DUPFD_CLOEXEC : F_DUPFD, 0);
     if (host_new < 0) return yos_errno_neg(ctx, errno);
@@ -1617,7 +1708,8 @@ int32_t yos_preadv(struct yos_exec_ctx *ctx, int32_t fd, uint32_t vec, int32_t v
 {
     int32_t hfd = yos_fd_get(ctx, fd);
     if (hfd < 0) return hfd;
-    struct iovec iov[vlen];
+    if (vlen < 0 || vlen > YOS_IOV_MAX) return yos_errno_neg(ctx, EINVAL);
+    struct iovec iov[YOS_IOV_MAX];
     int r = yos_iovec_w32_to_host(ctx, vec, vlen, iov);
     if (r) return r;
     off_t offset = ((off_t)pos_h << 32) | pos_l;
@@ -1629,7 +1721,8 @@ int32_t yos_pwritev(struct yos_exec_ctx *ctx, int32_t fd, uint32_t vec, int32_t 
 {
     int32_t hfd = yos_fd_get(ctx, fd);
     if (hfd < 0) return hfd;
-    struct iovec iov[vlen];
+    if (vlen < 0 || vlen > YOS_IOV_MAX) return yos_errno_neg(ctx, EINVAL);
+    struct iovec iov[YOS_IOV_MAX];
     int r = yos_iovec_w32_to_host(ctx, vec, vlen, iov);
     if (r) return r;
     off_t offset = ((off_t)pos_h << 32) | pos_l;

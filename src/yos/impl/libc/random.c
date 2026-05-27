@@ -30,7 +30,9 @@ int32_t yos_getentropy(struct yos_exec_ctx *ctx, uint32_t buf_off, uint32_t len)
         return yos_errno_neg(ctx, EFAULT);
     if (len > 256)
         return yos_errno_neg(ctx, EINVAL);
-    if (buf_off + len > ctx->memory_size)
+    /* 64-bit end check so a guest-controlled len near UINT32_MAX cannot
+     * wrap past the bound and let getentropy write outside wasm memory. */
+    if ((uint64_t)buf_off + (uint64_t)len > (uint64_t)ctx->memory_size)
         return yos_errno_neg(ctx, EFAULT);
     return yos_errno_check(ctx, getentropy(ctx->memory + buf_off, (size_t)len));
 }

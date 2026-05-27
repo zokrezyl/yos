@@ -47,6 +47,19 @@
 extern int  yos_fd_alloc(struct yos_exec_ctx *ctx, int host_fd);
 extern int  yos_fd_get  (struct yos_exec_ctx *ctx, int wasm_fd);
 extern void yos_fd_close(struct yos_exec_ctx *ctx, int wasm_fd);
+extern const char *yos_path_resolve(struct yos_exec_ctx *ctx, const char *p);
+
+/* Validated [offset, offset+len) range → host pointer. Mirrors the
+ * same-named helper in impl/io/io-internal.h. Returns NULL when the
+ * range falls outside wasm memory OR when the 64-bit end overflows.
+ * len==0 still requires a valid offset (caller can check). */
+static inline void *posix_wptr_range(struct yos_exec_ctx *ctx, uint32_t offset,
+                                     uint64_t len)
+{
+    if (offset >= ctx->memory_size) return NULL;
+    if ((uint64_t)offset + len > (uint64_t)ctx->memory_size) return NULL;
+    return ctx->memory + offset;
+}
 
 /* ── fd-remapping passthroughs ────────────────────────────────────── */
 
@@ -106,9 +119,13 @@ int32_t yos_getsockname(struct yos_exec_ctx *ctx, int32_t wfd,
     int hfd = yos_fd_get(ctx, wfd);
     ydebug("getsockname(wfd=%d hfd=%d)\n", wfd, hfd);
     if (hfd < 0) return yos_errno_neg(ctx, EBADF);
+    if (!posix_wptr_range(ctx, addrlen_off, 4))
+        return yos_errno_neg(ctx, EFAULT);
     uint32_t *addrlen_p = (uint32_t *)(ctx->memory + addrlen_off);
     socklen_t cap = (socklen_t)*addrlen_p;
     if (cap > 256) cap = 256;  /* cap; libuv only needs the family */
+    if (!posix_wptr_range(ctx, addr_off, cap))
+        return yos_errno_neg(ctx, EFAULT);
     uint8_t host_buf[256];
     socklen_t host_len = cap;
     if (getsockname(hfd, (struct sockaddr *)host_buf, &host_len) < 0) {
@@ -286,9 +303,10 @@ int32_t yos_connect(struct yos_exec_ctx *ctx, int32_t fd, uint32_t addr_off,
 {
     int hfd = yos_fd_get(ctx, fd);
     if (hfd < 0) return hfd;
-    if (addr_off >= ctx->memory_size) return yos_errno_neg(ctx, EFAULT);
     uint8_t hostbuf[256];
     if (addrlen > sizeof(hostbuf)) return yos_errno_neg(ctx, EINVAL);
+    if (!posix_wptr_range(ctx, addr_off, addrlen))
+        return yos_errno_neg(ctx, EFAULT);
     memcpy(hostbuf, ctx->memory + addr_off, addrlen);
     freebsd_sockaddr_to_host(hostbuf, (socklen_t)addrlen);
     return yos_errno_check(ctx,
@@ -303,9 +321,14 @@ int32_t yos_accept(struct yos_exec_ctx *ctx, int32_t fd, uint32_t addr_off,
     socklen_t hlen = 0;
     socklen_t *hlen_p = NULL;
     struct sockaddr *haddr = NULL;
-    if (addr_off && addrlen_off &&
-        addr_off < ctx->memory_size && addrlen_off + 4 <= ctx->memory_size) {
-        hlen   = (socklen_t)*(uint32_t *)(ctx->memory + addrlen_off);
+    if (addr_off && addrlen_off) {
+        /* Read *addrlen first so we can validate the addr buffer range
+         * before the host kernel writes into it. */
+        if (!posix_wptr_range(ctx, addrlen_off, 4))
+            return yos_errno_neg(ctx, EFAULT);
+        hlen = (socklen_t)*(uint32_t *)(ctx->memory + addrlen_off);
+        if (!posix_wptr_range(ctx, addr_off, hlen))
+            return yos_errno_neg(ctx, EFAULT);
         hlen_p = &hlen;
         haddr  = (struct sockaddr *)(ctx->memory + addr_off);
     }
@@ -322,8 +345,9 @@ ssize_t yos_send(struct yos_exec_ctx *ctx, int32_t fd, uint32_t buf_off,
 {
     int hfd = yos_fd_get(ctx, fd);
     if (hfd < 0) return hfd;
-    if (buf_off >= ctx->memory_size) return yos_errno_neg(ctx, EFAULT);
-    ssize_t n = send(hfd, ctx->memory + buf_off, len, flags);
+    void *p = posix_wptr_range(ctx, buf_off, len);
+    if (!p) return yos_errno_neg(ctx, EFAULT);
+    ssize_t n = send(hfd, p, len, flags);
     return yos_errno_check(ctx, (int32_t)n);
 }
 
@@ -332,8 +356,9 @@ ssize_t yos_recv(struct yos_exec_ctx *ctx, int32_t fd, uint32_t buf_off,
 {
     int hfd = yos_fd_get(ctx, fd);
     if (hfd < 0) return hfd;
-    if (buf_off >= ctx->memory_size) return yos_errno_neg(ctx, EFAULT);
-    ssize_t n = recv(hfd, ctx->memory + buf_off, len, flags);
+    void *p = posix_wptr_range(ctx, buf_off, len);
+    if (!p) return yos_errno_neg(ctx, EFAULT);
+    ssize_t n = recv(hfd, p, len, flags);
     return yos_errno_check(ctx, (int32_t)n);
 }
 
@@ -343,11 +368,15 @@ ssize_t yos_sendto(struct yos_exec_ctx *ctx, int32_t fd, uint32_t buf_off,
 {
     int hfd = yos_fd_get(ctx, fd);
     if (hfd < 0) return hfd;
+    void *p = posix_wptr_range(ctx, buf_off, len);
+    if (!p) return yos_errno_neg(ctx, EFAULT);
     const struct sockaddr *dst = NULL;
-    if (dst_off && dst_off < ctx->memory_size)
+    if (dst_off) {
+        if (!posix_wptr_range(ctx, dst_off, dst_len))
+            return yos_errno_neg(ctx, EFAULT);
         dst = (const struct sockaddr *)(ctx->memory + dst_off);
-    ssize_t n = sendto(hfd, ctx->memory + buf_off, len, flags, dst,
-                       (socklen_t)dst_len);
+    }
+    ssize_t n = sendto(hfd, p, len, flags, dst, (socklen_t)dst_len);
     return yos_errno_check(ctx, (int32_t)n);
 }
 
@@ -357,15 +386,21 @@ ssize_t yos_recvfrom(struct yos_exec_ctx *ctx, int32_t fd, uint32_t buf_off,
 {
     int hfd = yos_fd_get(ctx, fd);
     if (hfd < 0) return hfd;
+    void *p = posix_wptr_range(ctx, buf_off, len);
+    if (!p) return yos_errno_neg(ctx, EFAULT);
     socklen_t hlen = 0;
     socklen_t *hlen_p = NULL;
     struct sockaddr *src = NULL;
-    if (src_off && srclen_off && srclen_off + 4 <= ctx->memory_size) {
-        hlen   = (socklen_t)*(uint32_t *)(ctx->memory + srclen_off);
+    if (src_off && srclen_off) {
+        if (!posix_wptr_range(ctx, srclen_off, 4))
+            return yos_errno_neg(ctx, EFAULT);
+        hlen = (socklen_t)*(uint32_t *)(ctx->memory + srclen_off);
+        if (!posix_wptr_range(ctx, src_off, hlen))
+            return yos_errno_neg(ctx, EFAULT);
         hlen_p = &hlen;
         src    = (struct sockaddr *)(ctx->memory + src_off);
     }
-    ssize_t n = recvfrom(hfd, ctx->memory + buf_off, len, flags, src, hlen_p);
+    ssize_t n = recvfrom(hfd, p, len, flags, src, hlen_p);
     if (n < 0) return yos_errno_neg(ctx, errno);
     if (srclen_off) *(uint32_t *)(ctx->memory + srclen_off) = (uint32_t)hlen;
     return n;
@@ -465,7 +500,10 @@ int32_t yos_getpeername(struct yos_exec_ctx *ctx, int32_t fd,
     int hfd = yos_fd_get(ctx, fd);
     if (hfd < 0) return hfd;
     if (!addr_off || !addrlen_off) return yos_errno_neg(ctx, EFAULT);
+    if (!posix_wptr_range(ctx, addrlen_off, 4)) return yos_errno_neg(ctx, EFAULT);
     socklen_t hlen = (socklen_t)*(uint32_t *)(ctx->memory + addrlen_off);
+    if (!posix_wptr_range(ctx, addr_off, hlen))
+        return yos_errno_neg(ctx, EFAULT);
     if (getpeername(hfd, (struct sockaddr *)(ctx->memory + addr_off), &hlen) < 0)
         return yos_errno_neg(ctx, errno);
     *(uint32_t *)(ctx->memory + addrlen_off) = (uint32_t)hlen;
@@ -830,7 +868,10 @@ uint32_t yos_realpath(struct yos_exec_ctx *ctx, uint32_t path_off,
         return 0;
     }
     char *buf = (char *)(ctx->memory + resolved_off);
-    char *r = realpath(p, buf);
+    /* Resolve against ctx->cwd so a relative input to realpath() is
+     * canonicalized from the guest's cwd, not the host process cwd. */
+    const char *resolved = yos_path_resolve(ctx, p);
+    char *r = realpath(resolved, buf);
     if (!r) {
         extern int yos_remap_errno_h2g(int);
         if (ctx && ctx->memory && ctx->errno_off)
@@ -1426,7 +1467,8 @@ static void wasm_timeval2_to_host(const uint8_t *w, struct timeval h[2])
 int32_t yos_utimes(struct yos_exec_ctx *ctx, uint32_t path_off, uint32_t times_off)
 {
     if (!path_off || path_off >= ctx->memory_size) return yos_errno_neg(ctx, EFAULT);
-    const char *path = (const char *)(ctx->memory + path_off);
+    const char *path_in = (const char *)(ctx->memory + path_off);
+    const char *path = yos_path_resolve(ctx, path_in);
     struct timeval *p = NULL, h[2];
     if (times_off) {
         if (times_off + 16 > ctx->memory_size) return yos_errno_neg(ctx, EFAULT);
@@ -1454,7 +1496,8 @@ int32_t yos_futimes(struct yos_exec_ctx *ctx, int32_t wfd, uint32_t times_off)
 int32_t yos_lutimes(struct yos_exec_ctx *ctx, uint32_t path_off, uint32_t times_off)
 {
     if (!path_off || path_off >= ctx->memory_size) return yos_errno_neg(ctx, EFAULT);
-    const char *path = (const char *)(ctx->memory + path_off);
+    const char *path_in = (const char *)(ctx->memory + path_off);
+    const char *path = yos_path_resolve(ctx, path_in);
     struct timeval *p = NULL, h[2];
     if (times_off) {
         if (times_off + 16 > ctx->memory_size) return yos_errno_neg(ctx, EFAULT);

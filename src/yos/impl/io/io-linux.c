@@ -128,7 +128,8 @@ int32_t yos_vfs_preadv2(struct yos_exec_ctx *ctx, int32_t fd, uint32_t vec,
 {
     int32_t hfd = yos_fd_get(ctx, fd);
     if (hfd < 0) return hfd;
-    struct iovec iov[vlen];
+    if (vlen < 0 || vlen > YOS_IOV_MAX) return yos_errno_neg(ctx, EINVAL);
+    struct iovec iov[YOS_IOV_MAX];
     int r = yos_iovec_w32_to_host(ctx, vec, vlen, iov);
     if (r) return r;
     off_t offset = ((off_t)pos_h << 32) | pos_l;
@@ -142,7 +143,8 @@ int32_t yos_vfs_pwritev2(struct yos_exec_ctx *ctx, int32_t fd, uint32_t vec,
 {
     int32_t hfd = yos_fd_get(ctx, fd);
     if (hfd < 0) return hfd;
-    struct iovec iov[vlen];
+    if (vlen < 0 || vlen > YOS_IOV_MAX) return yos_errno_neg(ctx, EINVAL);
+    struct iovec iov[YOS_IOV_MAX];
     int r = yos_iovec_w32_to_host(ctx, vec, vlen, iov);
     if (r) return r;
     off_t offset = ((off_t)pos_h << 32) | pos_l;
@@ -157,7 +159,8 @@ int32_t yos_vfs_vmsplice(struct yos_exec_ctx *ctx, int32_t fd, uint32_t vec,
 {
     int32_t hfd = yos_fd_get(ctx, fd);
     if (hfd < 0) return hfd;
-    struct iovec iov[vlen];
+    if (vlen > YOS_IOV_MAX) return yos_errno_neg(ctx, EINVAL);
+    struct iovec iov[YOS_IOV_MAX];
     int r = yos_iovec_w32_to_host(ctx, vec, (int)vlen, iov);
     if (r) return r;
     ssize_t n = vmsplice(hfd, iov, vlen, flags);
@@ -172,7 +175,8 @@ int32_t yos_vfs_process_madvise(struct yos_exec_ctx *ctx, int32_t pidfd,
 {
     int32_t hfd = yos_fd_get(ctx, pidfd);
     if (hfd < 0) return hfd;
-    struct iovec iov[vlen];
+    if (vlen > YOS_IOV_MAX) return yos_errno_neg(ctx, EINVAL);
+    struct iovec iov[YOS_IOV_MAX];
     int r = yos_iovec_w32_to_host(ctx, vec, (int)vlen, iov);
     if (r) return r;
     /* Use raw syscall — process_madvise has no glibc wrapper everywhere. */
@@ -191,15 +195,17 @@ int32_t yos_vfs_process_vm_readv(struct yos_exec_ctx *ctx, int32_t pid,
                                  uint32_t rvec, uint32_t riovcnt,
                                  uint32_t flags)
 {
-    struct iovec liov[liovcnt];
+    if (liovcnt > YOS_IOV_MAX || riovcnt > YOS_IOV_MAX)
+        return yos_errno_neg(ctx, EINVAL);
+    struct iovec liov[YOS_IOV_MAX];
     int r = yos_iovec_w32_to_host(ctx, lvec, (int)liovcnt, liov);
     if (r) return r;
     /* Remote iovec: addresses are in the OTHER process — we still have to
      * convert the wasm32 layout to host layout, but the bases stay raw
      * because they're not pointers into our memory. */
-    struct iovec riov[riovcnt];
+    struct iovec riov[YOS_IOV_MAX];
     if (riovcnt) {
-        uint8_t *p = wptr(ctx, rvec);
+        uint8_t *p = wptr_range(ctx, rvec, (uint64_t)riovcnt * 8u);
         if (!p) return yos_errno_neg(ctx, EFAULT);
         for (uint32_t i = 0; i < riovcnt; i++) {
             uint32_t base = *(uint32_t *)(p + i * 8);
@@ -218,12 +224,14 @@ int32_t yos_vfs_process_vm_writev(struct yos_exec_ctx *ctx, int32_t pid,
                                   uint32_t rvec, uint32_t riovcnt,
                                   uint32_t flags)
 {
-    struct iovec liov[liovcnt];
+    if (liovcnt > YOS_IOV_MAX || riovcnt > YOS_IOV_MAX)
+        return yos_errno_neg(ctx, EINVAL);
+    struct iovec liov[YOS_IOV_MAX];
     int r = yos_iovec_w32_to_host(ctx, lvec, (int)liovcnt, liov);
     if (r) return r;
-    struct iovec riov[riovcnt];
+    struct iovec riov[YOS_IOV_MAX];
     if (riovcnt) {
-        uint8_t *p = wptr(ctx, rvec);
+        uint8_t *p = wptr_range(ctx, rvec, (uint64_t)riovcnt * 8u);
         if (!p) return yos_errno_neg(ctx, EFAULT);
         for (uint32_t i = 0; i < riovcnt; i++) {
             uint32_t base = *(uint32_t *)(p + i * 8);
