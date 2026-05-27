@@ -51,14 +51,20 @@ extern const char *yos_path_resolve(struct yos_exec_ctx *ctx, const char *p);
 
 /* Validated [offset, offset+len) range → host pointer. Mirrors the
  * same-named helper in impl/io/io-internal.h. Returns NULL when the
- * range falls outside wasm memory, when the 64-bit end overflows, OR
- * when offset is 0 (guest NULL pointer convention, matching wptr's
- * shape — without this, recv/recvfrom/send/etc. passed buf=0 with
- * count>0 would be silently treated as a valid buffer at wasm offset
- * 0 and let the kernel scribble there). */
+ * range falls outside wasm memory, when the 64-bit end overflows,
+ * OR when offset is 0 with len>0 (guest NULL pointer + intent to
+ * write — that's EFAULT).
+ *
+ * Zero-length calls (len==0) succeed regardless of offset value, so
+ * POSIX `send(fd, NULL, 0, ...)` / `recv(fd, NULL, 0, ...)` etc. do
+ * not EFAULT. Returns a non-NULL host pointer (validated against
+ * memory_size so we don't leak a wild pointer for an out-of-range
+ * offset). */
 static inline void *posix_wptr_range(struct yos_exec_ctx *ctx, uint32_t offset,
                                      uint64_t len)
 {
+    if (len == 0)
+        return (offset <= ctx->memory_size) ? (ctx->memory + offset) : NULL;
     if (offset == 0) return NULL;
     if (offset >= ctx->memory_size) return NULL;
     if ((uint64_t)offset + len > (uint64_t)ctx->memory_size) return NULL;
@@ -1535,18 +1541,23 @@ int32_t yos_lutimes(struct yos_exec_ctx *ctx, uint32_t path_off, uint32_t times_
 #include <sys/utsname.h>
 int32_t yos___xuname(struct yos_exec_ctx *ctx, int32_t namesz, uint32_t buf_off)
 {
-    if (namesz <= 0 || !buf_off) return yos_errno_neg(ctx, EFAULT);
-    uint32_t total = (uint32_t)namesz * 5;
-    if (buf_off + total > ctx->memory_size) return yos_errno_neg(ctx, EFAULT);
+    /* Reject zero / non-positive AND clamp namesz against an obviously-
+     * absurd ceiling so namesz*5 can't wrap uint32_t. Real FreeBSD
+     * passes SYS_NMLN=256; anything above 64 KiB per field is junk. */
+    if (namesz <= 0 || namesz > 65536) return yos_errno_neg(ctx, EFAULT);
+    /* 64-bit total — wrap-safe range check via posix_wptr_range. */
+    uint64_t total = (uint64_t)namesz * 5;
+    char *base = (char *)posix_wptr_range(ctx, buf_off, total);
+    if (!base) return yos_errno_neg(ctx, EFAULT);
     char *fields[5] = {
-        (char *)(ctx->memory + buf_off + 0u * (uint32_t)namesz),  /* sysname */
-        (char *)(ctx->memory + buf_off + 1u * (uint32_t)namesz),  /* nodename */
-        (char *)(ctx->memory + buf_off + 2u * (uint32_t)namesz),  /* release */
-        (char *)(ctx->memory + buf_off + 3u * (uint32_t)namesz),  /* version */
-        (char *)(ctx->memory + buf_off + 4u * (uint32_t)namesz),  /* machine */
+        base + 0u * (uint32_t)namesz,  /* sysname */
+        base + 1u * (uint32_t)namesz,  /* nodename */
+        base + 2u * (uint32_t)namesz,  /* release */
+        base + 3u * (uint32_t)namesz,  /* version */
+        base + 4u * (uint32_t)namesz,  /* machine */
     };
     /* Zero everything first so any short string is NUL-terminated. */
-    memset(ctx->memory + buf_off, 0, total);
+    memset(base, 0, (size_t)total);
 
     struct utsname host;
     if (uname(&host) < 0) return yos_errno_neg(ctx, errno);
@@ -1905,9 +1916,12 @@ void yos_strmode(struct yos_exec_ctx *ctx, uint32_t mode_in, uint32_t p_off)
 void yos_explicit_bzero(struct yos_exec_ctx *ctx, uint32_t buf_off,
                         uint32_t n)
 {
-    if (!buf_off || !n) return;
-    if (buf_off + n > ctx->memory_size) return;
-    volatile uint8_t *p = (volatile uint8_t *)(ctx->memory + buf_off);
+    if (!n) return;
+    /* Wrap-safe range validation — pre-fix used uint32 buf_off+n which
+     * wrapped to a small value for large inputs and let the zero loop
+     * stomp outside wasm memory. */
+    volatile uint8_t *p = (volatile uint8_t *)posix_wptr_range(ctx, buf_off, n);
+    if (!p) return;
     while (n--) *p++ = 0;
 }
 

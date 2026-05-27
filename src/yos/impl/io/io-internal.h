@@ -55,13 +55,22 @@ static inline const char *wstr(struct yos_exec_ctx *ctx, uint32_t offset)
  * is huge stomp past wasm memory. End calc is 64-bit so wraparound
  * can't make the bound check pass.
  *
- * offset==0 returns NULL even for len==0, matching `wptr`'s
- * "guest NULL pointer" convention. Otherwise a guest passing buf=0
- * with count>0 would be silently treated as a valid buffer at wasm
- * offset 0 — letting the kernel scribble over wasm-side data the
- * guest didn't intend to expose. Callers EFAULT on NULL. */
+ * Zero-length calls (len==0) succeed even when offset==0 — POSIX
+ * `read(fd, NULL, 0)` / `write(fd, NULL, 0)` etc. are defined as
+ * no-ops and must not EFAULT. We return a non-NULL host pointer in
+ * that case (so callers' `if (!p) return EFAULT` does not trip),
+ * still validated against memory_size so an offset past the end
+ * doesn't leak a wild pointer.
+ *
+ * For len>0, offset==0 returns NULL — that's a guest NULL pointer
+ * with intent to write, which is EFAULT. */
 static inline void *wptr_range(struct yos_exec_ctx *ctx, uint32_t offset, uint64_t len)
 {
+    if (len == 0) {
+        /* `offset == memory_size` is a one-past-end pointer; legal
+         * for zero-length per ISO C, and the kernel won't touch it. */
+        return (offset <= ctx->memory_size) ? (ctx->memory + offset) : 0;
+    }
     if (offset == 0) return 0;
     if (offset >= ctx->memory_size) return 0;
     if ((uint64_t)offset + len > (uint64_t)ctx->memory_size) return 0;
