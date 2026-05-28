@@ -487,8 +487,35 @@ int32_t yos_select(struct yos_exec_ctx *ctx, int32_t nfds,
         cv_timeval_w2h(&host_tv, ctx->memory + to_off);
         tv = &host_tv;
     }
+    /* Pump pending signals BEFORE blocking. Without this, a signal
+     * that arrived between the previous bridge exit and this select
+     * entry stays unprocessed — the guest blocks in select() without
+     * the wasm-side handler ever firing. tcpserver/telnetd are
+     * select-loop daemons: kill <pid> sets target's sig_pending,
+     * pthread_kill wakes the host thread with SIGUSR2 (EINTR returns
+     * from host select), but the wasm handler is only invoked from
+     * inside a yos_signal_pump call.
+     *
+     * Two pump call sites: (1) here before host select to catch
+     * already-pending signals; (2) immediately after host select if
+     * it returned -1+EINTR, so the next bridge call doesn't have to
+     * wait for some other yield point to process the signal that
+     * just woke us up. */
+    extern void yos_signal_pump(struct yos_exec_ctx *);
+    yos_signal_pump(ctx);
     int rc = select(max_hfd + 1, &hr, &hw, &he, tv);
-    if (rc < 0) return yos_errno_neg(ctx, errno);
+    int saved_errno = (rc < 0) ? errno : 0;
+    if (rc < 0 && saved_errno == EINTR) {
+        /* Drain the pending bitmask — the signal that interrupted us
+         * needs to reach its wasm handler before the guest's libc
+         * loops back into another select. SIGTERM with SIG_DFL will
+         * pthread_exit() inside the pump and never return here. */
+        yos_signal_pump(ctx);
+    }
+    if (rc < 0) {
+        errno = saved_errno;
+        return yos_errno_neg(ctx, errno);
+    }
 
     /* Rebuild the guest fd_sets with only the wasm-fd bits set. */
     if (guest_r) FD_ZERO(guest_r);

@@ -95,6 +95,14 @@ struct yos_proc {
     char cwd[PATH_MAX];      /* current working directory */
     char **cmdline;          /* command line args (NULL-terminated) */
     int cmdline_argc;
+    /* Set to 1 by yos_proc_post_exit_cleanup when this proc's original
+     * parent died and we forcibly set ppid=1. POSIX init auto-reaps
+     * orphans; yos's init (runsvdir, or whatever pid 1 happens to be)
+     * does not. We auto-reap at the orphan's exit time to keep the
+     * proc table clean — but ONLY when this flag is set, NOT just
+     * because ppid==1 (a legitimate child of the root guest pid 1
+     * still needs waitpid by its parent). */
+    int was_orphaned;
 };
 
 struct yos_runtime;  /* forward decl */

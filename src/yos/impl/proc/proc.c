@@ -101,6 +101,131 @@ struct yos_proc *yos_proc_find(struct yos_runtime *rt, int32_t pid)
     return NULL;
 }
 
+/* Post-exit proc-table maintenance. Called from yos_exit AND from
+ * signal_pump's SIG_DFL terminate path (which bypasses yos_exit by
+ * calling pthread_exit directly). Two responsibilities:
+ *
+ *   1. Reparent any children of the just-exiting proc to init (pid 1).
+ *      POSIX semantics: orphans get inherited by init, not left
+ *      pointing at a dead parent.
+ *   2. Auto-reap THIS proc when the parent ignores SIGCHLD or when
+ *      the parent IS init — POSIX kernels discard the zombie in
+ *      either case (the latter because init is the universal reaper).
+ *      Without this, every closed telnet session leaves an
+ *      un-reapable zombie + an orphan zsh that nothing ever cleans.
+ *
+ * Safe to call after the proc has been marked ZOMBIE. Caller holds
+ * no locks. Returns 1 if the proc was auto-reaped (state set to
+ * FREE), 0 if it remains ZOMBIE awaiting an explicit waitpid. */
+void yos_proc_post_exit_cleanup(struct yos_exec_ctx *ctx)
+{
+    if (!ctx || !ctx->proc || !ctx->rt) return;
+    int32_t exiting_pid = ctx->proc->pid;
+    int32_t parent_pid  = ctx->proc->ppid;
+
+    /* Close all host fds the proc holds. Critical because signal_pump
+     * may reach here via SIG_DFL terminate WITHOUT going through
+     * yos_exit, which is the other place that closes fds. Without
+     * this, an orphan shell still holds its PTY slave fd, telnetd
+     * never sees master EOF, and the session lingers.
+     *
+     * Walk wasm fds 0..MAX. The `hfd >= 3` filter keeps yos's own
+     * host stdin/stdout/stderr (host fds 0/1/2) intact while still
+     * closing the guest's dup'd copies — yos_fd_table_init F_DUPFD's
+     * fd_map[0,1,2] to host fds >= 3 at startup, and tcpserver-forked
+     * children dup2 the socket over wasm fd 0/1/2 (the host fd is
+     * a fresh dup, also >= 3). Both shapes get closed. */
+    for (int i = 0; i < YOS_FD_MAX; i++) {
+        int hfd = ctx->fd_map[i];
+        if (hfd >= 3) {
+            close(hfd);
+            ctx->fd_map[i] = -1;
+        }
+    }
+    for (int i = 0; i < 256; i++) {
+        FILE *fp = (FILE *)ctx->file_slots[i];
+        if (!fp) continue;
+        ctx->file_slots[i] = NULL;
+        ctx->file_wfds[i]  = -1;
+        ctx->file_modes[i][0] = '\0';
+        fclose(fp);
+    }
+
+    /* FreeBSD SIGCHLD = 20 (matches default_action_is_terminate table
+     * in sig.c). Auto-reap on either:
+     *   - parent has SIGCHLD=SIG_IGN (POSIX SA_NOCLDWAIT semantics)
+     *   - this proc was orphaned (its real parent already died and we
+     *     forcibly set ppid=1). Init normally reaps orphans; yos's
+     *     init doesn't, so we do it here.
+     * Do NOT auto-reap just because ppid==1 — a legitimate child of
+     * the root guest (pid 1) still needs waitpid by its parent. */
+    const int FBSD_SIGCHLD = 20;
+    int parent_ignores_chld = (ctx->proc->was_orphaned != 0);
+    /* Collect any children of the exiting proc; we'll SIGHUP them
+     * after dropping the lock. POSIX: when a session leader (which
+     * here is roughly "the proc that opened the controlling tty's
+     * master fd") terminates, children get SIGHUP so an orphaned
+     * shell exits naturally instead of camping on a dead PTY.
+     * yos doesn't track session leadership explicitly, so we apply
+     * the SIGHUP-orphans rule whenever a proc dies — practical
+     * enough for telnetd→zsh and matches what users expect when
+     * their controlling tty hangs up. */
+    int32_t hup_pids[YOS_MAX_PROCS];
+    int hup_count = 0;
+    pthread_mutex_lock(&ctx->rt->proc_lock);
+    for (int i = 0; i < YOS_MAX_PROCS; i++) {
+        struct yos_proc *p = &ctx->rt->procs[i];
+        if (p->state == YOS_PROC_FREE) continue;
+        if (p->ppid == exiting_pid && p->pid != exiting_pid) {
+            p->ppid = 1;
+            p->was_orphaned = 1;
+            if (hup_count < YOS_MAX_PROCS)
+                hup_pids[hup_count++] = p->pid;
+        }
+        if (p->pid == parent_pid && p->ctx_handle) {
+            struct yos_exec_ctx *pctx =
+                (struct yos_exec_ctx *)p->ctx_handle;
+            if (pctx->sig_ignore_mask & (1u << FBSD_SIGCHLD))
+                parent_ignores_chld = 1;
+        }
+    }
+    if (parent_ignores_chld && ctx->proc->state == YOS_PROC_ZOMBIE) {
+        pthread_mutex_lock(&ctx->proc->lock);
+        ctx->proc->state      = YOS_PROC_FREE;
+        ctx->proc->ctx_handle = NULL;
+        if (ctx->proc->cmdline) {
+            for (int j = 0; j < ctx->proc->cmdline_argc; j++)
+                free(ctx->proc->cmdline[j]);
+            free(ctx->proc->cmdline);
+            ctx->proc->cmdline = NULL;
+            ctx->proc->cmdline_argc = 0;
+        }
+        pthread_mutex_unlock(&ctx->proc->lock);
+        ydebug("post_exit_cleanup: auto-reap pid=%d ppid=%d "
+               "(ignores=%d init=%d)\n",
+               exiting_pid, parent_pid, parent_ignores_chld,
+               parent_pid == 1);
+    }
+    pthread_mutex_unlock(&ctx->rt->proc_lock);
+
+    ydebug("post_exit_cleanup: pid=%d hup_count=%d\n",
+           exiting_pid, hup_count);
+
+    /* Deliver SIGHUP to orphaned children outside the rt lock — the
+     * deliver path takes its own per-proc lock and we don't want to
+     * nest. Same wake-channel as kill: per-ctx sig_pending + SIGUSR2
+     * wake. Most shells (zsh, bash) exit on SIGHUP with default
+     * disposition, so orphaned interactive shells release their PTY
+     * slave fds promptly when their controlling-tty owner dies. */
+    extern int yos_proc_kill_by_pid(struct yos_runtime *, int32_t, int32_t);
+    for (int i = 0; i < hup_count; i++) {
+        const int FBSD_SIGHUP = 1;
+        int rc = yos_proc_kill_by_pid(ctx->rt, hup_pids[i], FBSD_SIGHUP);
+        ydebug("post_exit_cleanup: SIGHUP -> orphan pid=%d (rc=%d)\n",
+               hup_pids[i], rc);
+    }
+}
+
 int32_t yos_exit(struct yos_exec_ctx *ctx, int32_t code)
 {
     ydebug("exit(%d) is_child=%d\n", code, ctx->is_child);
@@ -188,6 +313,11 @@ int32_t yos_exit(struct yos_exec_ctx *ctx, int32_t code)
         pthread_cond_broadcast(&ctx->proc->wait_cond);
         pthread_mutex_unlock(&ctx->proc->lock);
 
+        /* Reparent orphans + auto-reap if parent ignores SIGCHLD or
+         * is init. Helper is shared with signal_pump's SIG_DFL
+         * terminate path so kill-via-signal cleans up the same way. */
+        yos_proc_post_exit_cleanup(ctx);
+
         /* Runtime-wide "something exited" event. main.c's shutdown
          * wait blocks on this so yos doesn't tear down while a
          * forked child is still alive. Per-proc wait_cond above
@@ -213,36 +343,10 @@ int32_t yos_exit(struct yos_exec_ctx *ctx, int32_t code)
          * output glued onto the next command's. fflush(NULL) flushes
          * every open output stream including stdout / stderr. */
         fflush(NULL);
-        /* Close all host fds the child holds. yos's fork F_DUPFD's the
-         * parent's fd_map into the child so each side has independent
-         * host fds (so close/dup2 in one runtime doesn't trample the
-         * other). On a real OS, process exit closes every fd
-         * implicitly; pthread_exit does NOT. Without this loop the
-         * child's dup'd pipe write-end leaks, the pipe never reaches
-         * EOF, and the parent's read (e.g. `echo a | read v`) hangs
-         * forever waiting for data. */
-        for (int i = 0; i < YOS_FD_MAX; i++) {
-            int hfd = ctx->fd_map[i];
-            if (hfd >= 3) {  /* don't close 0/1/2 — those are shared host stdio */
-                close(hfd);
-                ctx->fd_map[i] = -1;
-            }
-        }
-        /* Tear down the per-ctx FILE* table. yos_fork_pump pre-dup'd
-         * every live parent FILE* via fdopen(dup(fileno(...))) so each
-         * inherited slot is an independent host FILE* — its underlying
-         * host fd is NOT the same kernel object as fd_map[file_wfds[i]]
-         * (that's a separate F_DUPFD dup). Without an explicit fclose
-         * here, the host fd inside the FILE* (and the FILE* itself)
-         * leaks on every fork that inherited a live stdio handle. */
-        for (int i = 0; i < 256; i++) {
-            FILE *fp = (FILE *)ctx->file_slots[i];
-            if (!fp) continue;
-            ctx->file_slots[i] = NULL;
-            ctx->file_wfds[i]  = -1;
-            ctx->file_modes[i][0] = '\0';
-            fclose(fp);
-        }
+        /* Fd + FILE* close + reparent + auto-reap all live in
+         * yos_proc_post_exit_cleanup(). yos_exit is one of two
+         * places that calls it; the other is signal_pump's SIG_DFL
+         * terminate path. Both flows now produce identical cleanup. */
 
         /* Notify any libuv-style EVFILT_PROC|NOTE_EXIT watcher in the
          * parent runtime. libuv on __FreeBSD__ uses kqueue PROC events
@@ -2037,13 +2141,29 @@ static int deliver_to_proc(struct yos_proc *p, int sig)
      * authoritative yos-side signal delivery: the target's
      * yos_signal_pump will fire the registered handler at the next
      * yield point (provided the signal isn't blocked in sig_mask).
-     * The pthread_kill below is a side-channel wake-up so a target
-     * blocked in read()/usleep() returns EINTR and runs its pump. */
+     *
+     * The pthread_kill below is ONLY a side-channel wake-up so a
+     * target blocked in read()/usleep()/nanosleep() returns EINTR and
+     * runs its pump. We use SIGUSR2 (not the original sig number) for
+     * the wake-up because:
+     *   1. If we sent the actual signum, host_signal_dispatcher would
+     *      run in the target's thread and set the GLOBAL
+     *      g_host_pending_signals bit. The first guest to call
+     *      signal_pump after that (often the kill CALLER, since it
+     *      writes prompt output right after kill returns) would steal
+     *      that global bit and process the signal AS IF IT WERE FOR
+     *      ITSELF — `kill <bg_job>` terminated the shell instead of
+     *      the job. Issue: telnet-mode kill %1 hung the session.
+     *   2. SIGUSR2 has a registered no-op handler (host_sigusr2_wake
+     *      in main.c) whose entire purpose is to interrupt the
+     *      target's blocking syscall without contaminating the
+     *      global pending bitmask.
+     * Sig 0 (existence probe) was handled above; we don't reach here. */
     if (p->ctx_handle && sig > 0 && sig < 32) {
         struct yos_exec_ctx *target = (struct yos_exec_ctx *)p->ctx_handle;
         __atomic_or_fetch(&target->sig_pending, 1u << sig, __ATOMIC_RELEASE);
     }
-    int rc = pthread_kill(p->thread, sig);
+    int rc = pthread_kill(p->thread, SIGUSR2);
     return rc == 0 ? 0 : -rc;
 }
 

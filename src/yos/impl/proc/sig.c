@@ -164,6 +164,12 @@ static void invoke_signal_handler(struct yos_exec_ctx *ctx, int signum)
                  * reports the signal correctly. */
                 _exit(128 + signum);
             }
+            /* Same post-exit cleanup as yos_exit: reparent orphans
+             * and auto-reap if parent ignores SIGCHLD or is init.
+             * Without calling this, kill-by-signal leaves zombies
+             * the user's `ps` will keep seeing across sessions. */
+            extern void yos_proc_post_exit_cleanup(struct yos_exec_ctx *);
+            yos_proc_post_exit_cleanup(ctx);
             pthread_exit(NULL);
         }
         return;

@@ -587,7 +587,18 @@ int32_t yos_poll(struct yos_exec_ctx *ctx,
         for (uint32_t i = 0; i < nfds; i++)
             if (synth_revents[i]) { has_synth = 1; break; }
         int eff_timeout = has_synth ? 0 : timeout;
+        /* Pump pending signals before blocking. Same reason as in
+         * yos_select / yos_read — a kill that wakes this guest via
+         * SIGUSR2 needs the wasm handler to fire on the EINTR return,
+         * not at some later yield point. */
+        extern void yos_signal_pump(struct yos_exec_ctx *);
+        yos_signal_pump(ctx);
         r = poll(host_pfds, (nfds_t)nfds, eff_timeout);
+        if (r < 0 && errno == EINTR) {
+            int saved_errno = errno;
+            yos_signal_pump(ctx);
+            errno = saved_errno;
+        }
     } else {
         r = 0;
     }
