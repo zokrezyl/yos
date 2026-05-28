@@ -4,6 +4,7 @@
 #include <yos/ytrace/ytrace.h>
 #include "impl/proc/clone-abi.h"
 #include "impl/errno_helpers.h"   /* yos_errno_neg — exec failure POSIX errno */
+#include "impl/io/io-internal.h"  /* wstr_check */
 #include <stdint.h>
 #include <time.h>
 #include <unistd.h>
@@ -1738,11 +1739,26 @@ static int32_t host_execve_fallback(const char *fn, struct yos_exec_ctx *ctx,
                                     uint32_t argv_ptr)
 {
 #ifdef YOS_ALLOW_HOST_EXEC
-    /* Marshal wasm argv into host argv (strdup so the originals can be
-     * freed when the wasm runtime tears down). */
-    uint32_t *wasm_argv = (uint32_t *)(ctx->memory + argv_ptr);
+    /* Validate the argv pointer-array and every guest string it points
+     * to before strdup'ing into host argv. argv_ptr==0 is legal (zero-
+     * arg exec); empty terminator at offset 0 still needs in-range
+     * check on the first slot. Without this a hostile guest can hand
+     * us an OOB argv or an unterminated string and we walk past wasm
+     * memory before execv. */
+    if (argv_ptr != 0 &&
+        (uint64_t)argv_ptr + 4ULL > (uint64_t)ctx->memory_size)
+        return -EFAULT;
+    uint32_t *wasm_argv = argv_ptr ? (uint32_t *)(ctx->memory + argv_ptr) : NULL;
     int argc = 0;
-    while (wasm_argv[argc] != 0 && argc < 1024) argc++;
+    if (wasm_argv) {
+        while (argc < 1024) {
+            uint64_t slot_end = (uint64_t)argv_ptr + (uint64_t)(argc + 1) * 4ULL;
+            if (slot_end > (uint64_t)ctx->memory_size) return -EFAULT;
+            if (wasm_argv[argc] == 0) break;
+            if (!wstr_check(ctx, wasm_argv[argc])) return -EFAULT;
+            argc++;
+        }
+    }
     char **host_argv = malloc((argc + 1) * sizeof(char *));
     if (!host_argv) return -ENOMEM;
     for (int i = 0; i < argc; ++i)
@@ -2106,7 +2122,11 @@ static int execvp_path_search(struct yos_exec_ctx *ctx,
 
 int32_t yos_execvp(struct yos_exec_ctx *ctx, uint32_t file, uint32_t argv_ptr)
 {
-    const char *fn = (const char *)(ctx->memory + file);
+    /* Validate file is an in-range, NUL-terminated guest string before
+     * strchr/execvp_path_search walk it. argv pointer-array + each
+     * string it points to are validated downstream by yos_execve. */
+    const char *fn = wstr_check(ctx, file);
+    if (!fn) return -EFAULT;
     if (strchr(fn, '/')) {
         return yos_execve(ctx, file, argv_ptr, 0);
     }
@@ -2122,7 +2142,7 @@ int32_t yos_execvp(struct yos_exec_ctx *ctx, uint32_t file, uint32_t argv_ptr)
      * memory state is leaving. ctx->heap_end is a stable cursor; the
      * 4 KiB headroom is plenty for a PATH-resolved entry. */
     uint32_t off = ctx->heap_end + 1024;
-    if (off + 4096 > ctx->memory_size) return -ENOMEM;
+    if ((uint64_t)off + 4096ULL > (uint64_t)ctx->memory_size) return -ENOMEM;
     size_t n = strlen(resolved);
     memcpy(ctx->memory + off, resolved, n + 1);
     return yos_execve(ctx, off, argv_ptr, 0);
@@ -2132,7 +2152,8 @@ int32_t yos_execvp(struct yos_exec_ctx *ctx, uint32_t file, uint32_t argv_ptr)
 int32_t yos_execvpe(struct yos_exec_ctx *ctx, uint32_t file,
                     uint32_t argv_ptr, uint32_t envp)
 {
-    const char *fn = (const char *)(ctx->memory + file);
+    const char *fn = wstr_check(ctx, file);
+    if (!fn) return -EFAULT;
     if (strchr(fn, '/')) {
         return yos_execve(ctx, file, argv_ptr, envp);
     }
@@ -2142,7 +2163,7 @@ int32_t yos_execvpe(struct yos_exec_ctx *ctx, uint32_t file,
         return -ENOENT;
     }
     uint32_t off = ctx->heap_end + 1024;
-    if (off + 4096 > ctx->memory_size) return -ENOMEM;
+    if ((uint64_t)off + 4096ULL > (uint64_t)ctx->memory_size) return -ENOMEM;
     size_t n = strlen(resolved);
     memcpy(ctx->memory + off, resolved, n + 1);
     return yos_execve(ctx, off, argv_ptr, envp);

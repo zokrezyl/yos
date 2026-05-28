@@ -478,10 +478,14 @@ int32_t yos_sigsuspend(struct yos_exec_ctx *ctx, uint32_t mask_off)
  * intended manipulation is purely on the FreeBSD layout.
  */
 
-/* sig-linux.c / sig-darwin.c use this; declared in sig-internal.h. */
+/* sig-linux.c / sig-darwin.c use this; declared in sig-internal.h.
+ * 64-bit math so a near-end offset + sigset size can't wrap into a
+ * pass on 32-bit guests where uint32_t addition silently overflows. */
 int yos_sigset_bound(struct yos_exec_ctx *ctx, uint32_t off)
 {
-    return off && off + YOS_FBSD_SIGSET_BYTES <= ctx->memory_size;
+    if (off == 0) return 0;
+    return (uint64_t)off + (uint64_t)YOS_FBSD_SIGSET_BYTES
+           <= (uint64_t)ctx->memory_size;
 }
 
 /* POSIX sig{empty,fill,add,del,ismember}set: return 0 / -1 with
@@ -683,7 +687,8 @@ int32_t yos_sigaltstack(struct yos_exec_ctx *ctx,
                          uint32_t ss_off, uint32_t oss_off)
 {
     if (ss_off) {
-        if (ss_off + YOS_FBSD_STACK_T_BYTES > ctx->memory_size)
+        if ((uint64_t)ss_off + (uint64_t)YOS_FBSD_STACK_T_BYTES
+            > (uint64_t)ctx->memory_size)
             return yos_errno_neg(ctx, EFAULT);
         /* Honestly we'd want to remember these for the oss query on a
          * later call; nothing in tree consumes that yet. Drop the
@@ -691,7 +696,8 @@ int32_t yos_sigaltstack(struct yos_exec_ctx *ctx,
          * oss only care whether the kernel accepted the call. */
     }
     if (oss_off) {
-        if (oss_off + YOS_FBSD_STACK_T_BYTES > ctx->memory_size)
+        if ((uint64_t)oss_off + (uint64_t)YOS_FBSD_STACK_T_BYTES
+            > (uint64_t)ctx->memory_size)
             return yos_errno_neg(ctx, EFAULT);
         uint8_t *p = ctx->memory + oss_off;
         memset(p, 0, YOS_FBSD_STACK_T_BYTES);
@@ -714,7 +720,8 @@ int32_t yos_sigwait(struct yos_exec_ctx *ctx,
                     uint32_t set_off, uint32_t sig_out_off)
 {
     if (!yos_sigset_bound(ctx, set_off))             return EFAULT;
-    if (!sig_out_off || sig_out_off + 4 > ctx->memory_size)
+    if (!sig_out_off ||
+        (uint64_t)sig_out_off + 4ULL > (uint64_t)ctx->memory_size)
         return EFAULT;
 
     sigset_t host;

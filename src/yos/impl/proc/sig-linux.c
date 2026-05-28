@@ -18,10 +18,19 @@
 #include <string.h>
 #include <time.h>
 
+/* FreeBSD-i386 siginfo_t is 64 bytes; timespec is 8. 64-bit math so a
+ * near-end info_off / timeout_off can't wrap into a false pass. */
+#define YOS_FBSD_SIGINFO_BYTES 64
+#define YOS_FBSD_TIMESPEC_BYTES 8
+
 int32_t yos_sigwaitinfo(struct yos_exec_ctx *ctx,
                         uint32_t set_off, uint32_t info_off)
 {
     if (!yos_sigset_bound(ctx, set_off)) return yos_errno_neg(ctx, EFAULT);
+    if (info_off &&
+        (uint64_t)info_off + (uint64_t)YOS_FBSD_SIGINFO_BYTES
+        > (uint64_t)ctx->memory_size)
+        return yos_errno_neg(ctx, EFAULT);
 
     sigset_t host;
     fbsd_sigset_to_host(ctx->memory + set_off, &host);
@@ -30,9 +39,9 @@ int32_t yos_sigwaitinfo(struct yos_exec_ctx *ctx,
     if (rc < 0) return yos_errno_neg(ctx, errno);
 
     /* Zero the wasm siginfo_t if provided so callers don't read stale
-     * memory. FreeBSD-i386 siginfo_t is 64 bytes. */
-    if (info_off && info_off + 64 <= ctx->memory_size)
-        memset(ctx->memory + info_off, 0, 64);
+     * memory. */
+    if (info_off)
+        memset(ctx->memory + info_off, 0, YOS_FBSD_SIGINFO_BYTES);
 
     int fbsig = host_to_fbsd_signo(rc);
     return (fbsig > 0) ? fbsig : rc;
@@ -43,13 +52,18 @@ int32_t yos_sigtimedwait(struct yos_exec_ctx *ctx,
                          uint32_t timeout_off)
 {
     if (!yos_sigset_bound(ctx, set_off)) return yos_errno_neg(ctx, EFAULT);
+    if (info_off &&
+        (uint64_t)info_off + (uint64_t)YOS_FBSD_SIGINFO_BYTES
+        > (uint64_t)ctx->memory_size)
+        return yos_errno_neg(ctx, EFAULT);
 
     sigset_t host;
     fbsd_sigset_to_host(ctx->memory + set_off, &host);
 
     struct timespec ts, *tsp = NULL;
     if (timeout_off) {
-        if (timeout_off + 8 > ctx->memory_size)
+        if ((uint64_t)timeout_off + (uint64_t)YOS_FBSD_TIMESPEC_BYTES
+            > (uint64_t)ctx->memory_size)
             return yos_errno_neg(ctx, EFAULT);
         uint32_t s, n;
         memcpy(&s, ctx->memory + timeout_off,     4);
@@ -62,8 +76,8 @@ int32_t yos_sigtimedwait(struct yos_exec_ctx *ctx,
     int rc = sigtimedwait(&host, NULL, tsp);
     if (rc < 0) return yos_errno_neg(ctx, errno);
 
-    if (info_off && info_off + 64 <= ctx->memory_size)
-        memset(ctx->memory + info_off, 0, 64);
+    if (info_off)
+        memset(ctx->memory + info_off, 0, YOS_FBSD_SIGINFO_BYTES);
 
     int fbsig = host_to_fbsd_signo(rc);
     return (fbsig > 0) ? fbsig : rc;

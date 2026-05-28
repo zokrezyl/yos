@@ -159,10 +159,40 @@ uint32_t yos_calloc(struct yos_exec_ctx *ctx, uint32_t nmemb, uint32_t size)
     return off;
 }
 
+/* posix_memalign returns a pointer shifted past block_off + HDR_SIZE so
+ * the byte at `off` satisfies the caller's (>HDR_SIZE) alignment. The
+ * raw block start is stashed at off-4 so we can recover it on free /
+ * realloc. Normal yos_malloc pointers have (off & 15) == 8 because
+ * block_off is 16-aligned and HDR_SIZE = 8; a shifted pointer is at
+ * least 16-aligned, giving (off & 15) == 0. We use that as a fast
+ * discriminator, then validate the back-pointer to avoid mis-treating
+ * a normal block whose stored `next` field happens to look heap-shaped.
+ *
+ * Returns the raw block user-pointer (suitable for yos_free's block-
+ * header math) if `off` is a shifted posix_memalign pointer, else
+ * returns `off` unchanged. */
+static uint32_t unshift_user_off(struct yos_exec_ctx *ctx, uint32_t off)
+{
+    if ((off & 15u) != 0) return off;
+    /* Need at least 4 bytes of back-pointer slot before off, and the
+     * back-pointer itself sits inside the heap. */
+    if (off < ctx->alloc_lo + 2u * HDR_SIZE) return off;
+    uint32_t raw = *(uint32_t *)(ctx->memory + off - 4u);
+    if (raw < ctx->alloc_lo + HDR_SIZE || raw >= off) return off;
+    if (raw + HDR_SIZE > ctx->alloc_hi) return off;
+    uint32_t bo = raw - HDR_SIZE;
+    uint32_t bs = blk_size(ctx, bo);
+    if (bs < MIN_BLOCK || bo + bs > ctx->alloc_hi) return off;
+    /* `off` must lie strictly inside the block's payload range. */
+    if (off >= bo + bs) return off;
+    return raw;
+}
+
 void yos_free(struct yos_exec_ctx *ctx, uint32_t off)
 {
     if (off == 0) return;
     if (off < ctx->alloc_lo + HDR_SIZE || off >= ctx->alloc_hi) return;
+    off = unshift_user_off(ctx, off);
     uint32_t blk_off = off - HDR_SIZE;
     pthread_mutex_lock(&g_alloc_lock);
     /* Sanity-check the size field — block must fit in the heap. */
@@ -226,6 +256,11 @@ uint32_t yos_realloc(struct yos_exec_ctx *ctx, uint32_t off, uint32_t newsize)
     if (newsize == 0) { yos_free(ctx, off); return 0; }
     if (off < ctx->alloc_lo + HDR_SIZE || off >= ctx->alloc_hi)
         return 0;  /* Foreign pointer — refuse, same as free's bound check. */
+    /* If `off` came from posix_memalign, unshift to the raw block start
+     * so the size math below reads the right header. The realloc result
+     * is no longer guaranteed to keep the original alignment — that's
+     * C99/POSIX-conformant. */
+    off = unshift_user_off(ctx, off);
     uint32_t blk_off = off - HDR_SIZE;
     uint32_t oldsz   = blk_size(ctx, blk_off);
     if (oldsz < HDR_SIZE || blk_off + oldsz > ctx->alloc_hi) return 0;
@@ -255,33 +290,33 @@ int32_t yos_posix_memalign(struct yos_exec_ctx *ctx, uint32_t memptr_off,
      * sizeof(void *). On wasm32 sizeof(void *) = 4. */
     if (alignment < sizeof(uint32_t) ||
         (alignment & (alignment - 1)) != 0) return EINVAL;
-    /* yos_malloc lays out blocks at ALIGN (=16) boundaries but
-     * returns the user-visible pointer at +HDR_SIZE (8) into the
-     * block, so the actual user pointer alignment is 8. Anything ≤8
-     * is satisfied directly; for stricter alignment we over-allocate
-     * by `alignment - 8` and round the user pointer up. We don't
-     * adjust the block header in that case so yos_free will free
-     * the SAME block — the user just sees an offset at +N inside
-     * the block, but the block-header bookkeeping is unchanged.
-     *
-     * Trade-off: free() expects the original raw pointer. If the
-     * user passes the aligned offset back to free(), the bookkeeping
-     * fails (header off-8 contains padding bytes, not a valid size).
-     * For the common posix_memalign-then-free pattern this means a
-     * leak, not a crash. Acceptable for the libc surface today; a
-     * proper fix means widening the block header to encode the user
-     * offset. The user-visible win: posix_memalign(out, 16, …) now
-     * returns a valid aligned pointer instead of EINVAL. */
-    uint32_t base_align = HDR_SIZE;  /* what yos_malloc actually delivers */
-    uint32_t need;
-    if (alignment <= base_align) {
-        need = size;
-    } else {
-        need = size + (alignment - base_align);
+    /* yos_malloc returns a pointer at (block_off + HDR_SIZE), 8-aligned.
+     * If the caller asks for ≤ 8 we return it directly — no shift, free
+     * works trivially. */
+    if (alignment <= HDR_SIZE) {
+        uint32_t off = yos_malloc(ctx, size ? size : 1);
+        if (!off) return ENOMEM;
+        *(uint32_t *)(ctx->memory + memptr_off) = off;
+        return 0;
     }
-    uint32_t raw = yos_malloc(ctx, need);
+    /* alignment > 8 → over-allocate by `alignment` bytes so we can shift
+     * forward and still fit `size` payload. Write the raw user-pointer
+     * at (aligned - 4) so yos_free / yos_realloc can recover it via
+     * unshift_user_off(). Shift-detection in free() keys on
+     * (off & 15) == 0; alignment > 8 + power-of-two-and-multiple-of-4
+     * → alignment ≥ 16, so aligned is always 16-aligned. */
+    uint64_t need = (uint64_t)size + (uint64_t)alignment;
+    if (need == 0) need = 1;
+    if (need > (uint64_t)UINT32_MAX) return ENOMEM;
+    uint32_t raw = yos_malloc(ctx, (uint32_t)need);
     if (!raw) return ENOMEM;
     uint32_t aligned = (raw + alignment - 1u) & ~(alignment - 1u);
+    /* Ensure we have at least 4 bytes of back-pointer slot between raw
+     * and aligned. If raw is already alignment-aligned (so aligned ==
+     * raw), bump forward by `alignment` bytes — we over-allocated for
+     * exactly this case. */
+    if (aligned == raw) aligned = raw + alignment;
+    *(uint32_t *)(ctx->memory + aligned - 4u) = raw;
     *(uint32_t *)(ctx->memory + memptr_off) = aligned;
     return 0;
 }

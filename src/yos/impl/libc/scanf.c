@@ -34,6 +34,7 @@
 
 #include "yos/types.h"
 #include <yos/ytrace/ytrace.h>
+#include "impl/io/io-internal.h"   /* wstr_check */
 
 static inline void va_align(uint32_t *off, uint32_t a) {
     *off = (*off + a - 1) & ~(a - 1);
@@ -311,10 +312,12 @@ static int do_scan(struct yos_exec_ctx *ctx, const char *src,
 int32_t yos_sscanf(struct yos_exec_ctx *ctx, uint32_t src_off,
                    uint32_t fmt_off, uint32_t va_off)
 {
-    if (src_off >= ctx->memory_size || fmt_off >= ctx->memory_size)
-        return -1;
-    const char *src = (const char *)(ctx->memory + src_off);
-    const char *fmt = (const char *)(ctx->memory + fmt_off);
+    /* wstr_check ensures the strings are in-range AND NUL-terminated
+     * inside wasm memory. do_scan walks both with no upper bound; an
+     * unterminated guest string would let it read past memory_size. */
+    const char *src = wstr_check(ctx, src_off);
+    const char *fmt = wstr_check(ctx, fmt_off);
+    if (!src || !fmt) return -1;
     int r = do_scan(ctx, src, fmt, va_off);
     ydebug("sscanf(\"%s\", \"%s\") = %d\n", src, fmt, r);
     return r;
@@ -326,20 +329,20 @@ extern FILE *yos_handle_to_file(struct yos_exec_ctx *ctx, uint32_t h);
 int32_t yos_fscanf(struct yos_exec_ctx *ctx, uint32_t fp,
                    uint32_t fmt_off, uint32_t va_off)
 {
-    if (fmt_off >= ctx->memory_size) return -1;
+    const char *fmt = wstr_check(ctx, fmt_off);
+    if (!fmt) return -1;
     FILE *f = yos_handle_to_file(ctx, fp);
     if (!f) return -1;
     char buf[4096];
     if (!fgets(buf, sizeof(buf), f)) return -1;
-    const char *fmt = (const char *)(ctx->memory + fmt_off);
     return do_scan(ctx, buf, fmt, va_off);
 }
 
 int32_t yos_scanf(struct yos_exec_ctx *ctx, uint32_t fmt_off, uint32_t va_off)
 {
-    if (fmt_off >= ctx->memory_size) return -1;
+    const char *fmt = wstr_check(ctx, fmt_off);
+    if (!fmt) return -1;
     char buf[4096];
     if (!fgets(buf, sizeof(buf), stdin)) return -1;
-    const char *fmt = (const char *)(ctx->memory + fmt_off);
     return do_scan(ctx, buf, fmt, va_off);
 }

@@ -36,6 +36,7 @@
 
 #include "yos/types.h"
 #include <yos/ytrace/ytrace.h>
+#include "impl/io/io-internal.h"   /* wstr_check */
 #include <unistd.h>     /* write() for stream-handle fd_map routing */
 
 /* Read one slot from the guest's va_list region.
@@ -232,18 +233,12 @@ static void format_one(struct yos_exec_ctx *ctx,
     }
     case 's': {
         uint32_t s_off = va_i32(ctx, vap);
-        const char *s = "(null)";
-        /* Validate the guest string is in-range AND has a NUL byte
-         * before memory_size. Host snprintf walks the string with
-         * strlen — without bounds, a non-terminated guest string lets
-         * it read past wasm memory. Fall back to "(null)" on bad
-         * pointer so the format output stays well-shaped. */
-        if (s_off && s_off < ctx->memory_size) {
-            const char *p = (const char *)(ctx->memory + s_off);
-            const char *end = (const char *)(ctx->memory + ctx->memory_size);
-            const char *q;
-            for (q = p; q < end; ++q) if (*q == 0) { s = p; break; }
-        }
+        const char *s = wstr_check(ctx, s_off);
+        /* wstr_check returns NULL if s_off is 0, OOB, or not NUL-
+         * terminated within memory_size. Host snprintf would otherwise
+         * walk past wasm memory. Render "(null)" so the format output
+         * stays well-shaped. */
+        if (!s) s = "(null)";
         n = width_star && prec_star ? snprintf(buf, sizeof(buf), spec, star_w, star_p, s)
           : width_star              ? snprintf(buf, sizeof(buf), spec, star_w, s)
           : prec_star               ? snprintf(buf, sizeof(buf), spec, star_p, s)
@@ -298,7 +293,16 @@ int yos_vsnprintf_core(struct yos_exec_ctx *ctx,
                        char *out, size_t out_cap,
                        uint32_t fmt_off, uint32_t va_off)
 {
-    const char *fmt = (const char *)(ctx->memory + fmt_off);
+    /* Validate the guest format string is in-range AND NUL-terminated
+     * before memory_size. Without this, a guest fmt_off near
+     * memory_size with no NUL lets the `while (*fmt)` loop walk past
+     * wasm memory and dereference whatever sits next in the host
+     * address space. Bad fmt -> empty result, terminator written. */
+    const char *fmt = wstr_check(ctx, fmt_off);
+    if (!fmt) {
+        if (out_cap > 0) out[0] = '\0';
+        return 0;
+    }
     size_t pos = 0;
     while (*fmt) {
         if (*fmt != '%') {

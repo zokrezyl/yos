@@ -24,6 +24,11 @@ int32_t yos_sigwaitinfo(struct yos_exec_ctx *ctx,
                         uint32_t set_off, uint32_t info_off)
 {
     if (!yos_sigset_bound(ctx, set_off)) return yos_errno_neg(ctx, EFAULT);
+    /* FreeBSD-i386 siginfo_t is 64 bytes. 64-bit math so a near-end
+     * info_off can't wrap into a false pass. */
+    if (info_off &&
+        (uint64_t)info_off + 64ULL > (uint64_t)ctx->memory_size)
+        return yos_errno_neg(ctx, EFAULT);
 
     sigset_t host;
     fbsd_sigset_to_host(ctx->memory + set_off, &host);
@@ -33,8 +38,8 @@ int32_t yos_sigwaitinfo(struct yos_exec_ctx *ctx,
     if (e != 0) return yos_errno_neg(ctx, e);
 
     /* Zero the wasm siginfo_t if provided so callers don't read stale
-     * memory. FreeBSD-i386 siginfo_t is 64 bytes. */
-    if (info_off && info_off + 64 <= ctx->memory_size)
+     * memory. */
+    if (info_off)
         memset(ctx->memory + info_off, 0, 64);
 
     int fbsig = host_to_fbsd_signo(sig);
