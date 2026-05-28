@@ -72,7 +72,13 @@ static m3ApiRawFunction(m3_yos_qsort)
     ctx->memory = m3_GetMemory(runtime, &mem_size, 0);
     ctx->memory_size = mem_size;
 
-    if (!size || n < 2 || (uint64_t)n * size > mem_size - base) m3ApiSuccess();
+    /* Wrap-safe range check. The old form `(uint64_t)n*size > mem_size - base`
+     * underflows the subtraction in unsigned 32-bit when base > mem_size,
+     * yielding a huge value that passes the comparison; then `ctx->memory +
+     * base` is out of bounds. Use additive form, all promoted to uint64. */
+    if (!size || n < 2 || base >= mem_size ||
+        (uint64_t)base + (uint64_t)n * (uint64_t)size > (uint64_t)mem_size)
+        m3ApiSuccess();
 
     IM3Function cmp = lookup_fn(runtime, cmp_idx);
     if (!cmp) m3ApiSuccess();
@@ -122,7 +128,15 @@ static m3ApiRawFunction(m3_yos_bsearch)
     ctx->memory = m3_GetMemory(runtime, &mem_size, 0);
     ctx->memory_size = mem_size;
 
-    if (!size || !n || (uint64_t)n * size > mem_size - base) m3ApiReturn(0);
+    /* Same wrap-safe additive form as qsort above. Also validate the
+     * `key` offset: the comparator dereferences it as a guest pointer
+     * via `call_cmp`, and if key sits past mem_size we'd otherwise
+     * spend the whole search comparing against wasm memory we don't
+     * own. */
+    if (!size || !n || base >= mem_size || key >= mem_size ||
+        (uint64_t)base + (uint64_t)n * (uint64_t)size > (uint64_t)mem_size ||
+        (uint64_t)key + (uint64_t)size > (uint64_t)mem_size)
+        m3ApiReturn(0);
 
     IM3Function cmp = lookup_fn(runtime, cmp_idx);
     if (!cmp) m3ApiReturn(0);

@@ -269,12 +269,33 @@ static m3ApiRawFunction(m3_yos_kevent)
     int kq = yos_fd_get(ctx, kq_wfd);
     if (kq < 0) { write_errno(ctx, EBADF); m3ApiReturn(-1); }
 
+    /* Reject negative counts. Without this, `nchanges < 0` skipped
+     * the apply-loop silently but `nevents < 0` reached epoll_wait
+     * which interprets it as "block forever for any non-positive"
+     * — masking real bugs. */
+    if (nchanges < 0 || nevents < 0) {
+        write_errno(ctx, EINVAL); m3ApiReturn(-1);
+    }
+    /* Pre-validate the FULL changelist + eventlist ranges in 64-bit
+     * up front. Wrap-prone `off + i*KE_SZ` checks inside the loop
+     * could pass on bogus inputs where the addition overflowed back
+     * into the valid range. */
+    if (nchanges > 0) {
+        if (changelist == 0 ||
+            (uint64_t)changelist + (uint64_t)nchanges * KE_SZ > (uint64_t)mem_size) {
+            write_errno(ctx, EFAULT); m3ApiReturn(-1);
+        }
+    }
+    if (nevents > 0) {
+        if (eventlist == 0 ||
+            (uint64_t)eventlist + (uint64_t)nevents * KE_SZ > (uint64_t)mem_size) {
+            write_errno(ctx, EFAULT); m3ApiReturn(-1);
+        }
+    }
+
     /* Apply changelist. Each kevent describes a registration change. */
     for (int i = 0; i < nchanges; i++) {
         uint8_t *ke = ctx->memory + changelist + (uint32_t)i * KE_SZ;
-        if (changelist + (uint32_t)(i+1) * KE_SZ > mem_size) {
-            write_errno(ctx, EFAULT); m3ApiReturn(-1);
-        }
         uint32_t ident   = ke_ident(ke);
         int16_t  filter  = ke_filter(ke);
         uint16_t flags   = ke_flags(ke);
@@ -355,7 +376,10 @@ static m3ApiRawFunction(m3_yos_kevent)
     /* Compute timeout in ms. NULL pointer → block forever. */
     int timeout_ms = -1;
     if (timeout_off) {
-        if (timeout_off + 12 > mem_size) { write_errno(ctx, EFAULT); m3ApiReturn(-1); }
+        /* timespec on FreeBSD wasm32 is 12 bytes (int64 sec + int32 nsec). */
+        if ((uint64_t)timeout_off + 12ULL > (uint64_t)mem_size) {
+            write_errno(ctx, EFAULT); m3ApiReturn(-1);
+        }
         int64_t  tv_sec;
         int32_t  tv_nsec;
         memcpy(&tv_sec,  ctx->memory + timeout_off + 0, 8);
@@ -383,11 +407,11 @@ static m3ApiRawFunction(m3_yos_kevent)
         ydebug("kevent#%d returned %d events\n", my_call, n);
     }
 
-    /* Marshal back into FreeBSD kevent structs in eventlist. */
+    /* Marshal back into FreeBSD kevent structs in eventlist. The
+     * eventlist range was pre-validated in 64-bit at function entry
+     * for the user-supplied `nevents`; epoll_wait clamps `n` to that,
+     * so the per-entry indexing is safe without a re-check here. */
     for (int i = 0; i < n; i++) {
-        if (eventlist + (uint32_t)(i+1) * KE_SZ > mem_size) {
-            write_errno(ctx, EFAULT); m3ApiReturn(-1);
-        }
         uint8_t *ke = ctx->memory + eventlist + (uint32_t)i * KE_SZ;
         memset(ke, 0, KE_SZ);
         uint64_t tag = eevs[i].data.u64;
