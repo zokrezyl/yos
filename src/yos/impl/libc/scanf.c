@@ -40,6 +40,14 @@ static inline void va_align(uint32_t *off, uint32_t a) {
 }
 static inline uint32_t va_p(struct yos_exec_ctx *ctx, uint32_t *off) {
     va_align(off, 4);
+    /* Range-check the va-pack slot — the va-list lives in wasm memory
+     * and a bogus va_off / format-arg-count mismatch can otherwise
+     * walk us past memory_size. Return 0 on overflow so per-conv
+     * handlers below take their "bad pointer → skip" branches. */
+    if ((uint64_t)*off + 4ULL > (uint64_t)ctx->memory_size) {
+        *off += 4;
+        return 0;
+    }
     uint32_t v = *(uint32_t *)(ctx->memory + *off);
     *off += 4;
     return v;
@@ -108,7 +116,7 @@ static int do_scan(struct yos_exec_ctx *ctx, const char *src,
         if (conv == 'n') {
             if (!suppress) {
                 uint32_t p = va_p(ctx, &va_off);
-                if (p && p + 4 <= ctx->memory_size)
+                if (p && (uint64_t)p + 4ULL <= (uint64_t)ctx->memory_size)
                     *(int32_t *)(ctx->memory + p) = (int32_t)(in - src);
             }
             continue;
@@ -165,23 +173,23 @@ static int do_scan(struct yos_exec_ctx *ctx, const char *src,
                 if (p && p < ctx->memory_size) {
                     switch (length) {
                     case 2:  /* hh */
-                        if (p + 1 <= ctx->memory_size)
+                        if ((uint64_t)p + 1ULL <= (uint64_t)ctx->memory_size)
                             *(int8_t *)(ctx->memory + p) =
                                 is_signed ? (int8_t)sv : (int8_t)uv;
                         break;
                     case 1:  /* h */
-                        if (p + 2 <= ctx->memory_size)
+                        if ((uint64_t)p + 2ULL <= (uint64_t)ctx->memory_size)
                             *(int16_t *)(ctx->memory + p) =
                                 is_signed ? (int16_t)sv : (int16_t)uv;
                         break;
                     case 4:  /* ll */
                     case 5:  /* j/z/t/L — guest is wasm32, 64-bit */
-                        if (p + 8 <= ctx->memory_size)
+                        if ((uint64_t)p + 8ULL <= (uint64_t)ctx->memory_size)
                             *(int64_t *)(ctx->memory + p) =
                                 is_signed ? sv : (int64_t)uv;
                         break;
                     default:
-                        if (p + 4 <= ctx->memory_size)
+                        if ((uint64_t)p + 4ULL <= (uint64_t)ctx->memory_size)
                             *(int32_t *)(ctx->memory + p) =
                                 is_signed ? (int32_t)sv : (int32_t)uv;
                         break;
@@ -201,7 +209,7 @@ static int do_scan(struct yos_exec_ctx *ctx, const char *src,
             size_t cap = (width > 0) ? (size_t)width : SIZE_MAX;
             size_t i = 0;
             while (*in && !isspace((unsigned char)*in) && i < cap) {
-                if (!suppress && p && p + i + 1 <= ctx->memory_size)
+                if (!suppress && p && (uint64_t)p + (uint64_t)i + 1ULL <= (uint64_t)ctx->memory_size)
                     ctx->memory[p + i] = (uint8_t)*in;
                 in++; i++;
             }
@@ -219,7 +227,7 @@ static int do_scan(struct yos_exec_ctx *ctx, const char *src,
             if (!suppress) p = va_p(ctx, &va_off);
             for (size_t i = 0; i < n; i++) {
                 if (*in == 0) { n = i; break; }
-                if (!suppress && p && p + i + 1 <= ctx->memory_size)
+                if (!suppress && p && (uint64_t)p + (uint64_t)i + 1ULL <= (uint64_t)ctx->memory_size)
                     ctx->memory[p + i] = (uint8_t)*in;
                 in++;
             }
@@ -256,7 +264,7 @@ static int do_scan(struct yos_exec_ctx *ctx, const char *src,
                 int in_set = accept[(unsigned char)*in] != 0;
                 if (negate) in_set = !in_set;
                 if (!in_set) break;
-                if (!suppress && p && p + i + 1 <= ctx->memory_size)
+                if (!suppress && p && (uint64_t)p + (uint64_t)i + 1ULL <= (uint64_t)ctx->memory_size)
                     ctx->memory[p + i] = (uint8_t)*in;
                 in++; i++;
             }
@@ -279,10 +287,10 @@ static int do_scan(struct yos_exec_ctx *ctx, const char *src,
                 uint32_t p = va_p(ctx, &va_off);
                 if (p && p < ctx->memory_size) {
                     if (length >= 3) {  /* l/L — double */
-                        if (p + 8 <= ctx->memory_size)
+                        if ((uint64_t)p + 8ULL <= (uint64_t)ctx->memory_size)
                             *(double *)(ctx->memory + p) = d;
                     } else {
-                        if (p + 4 <= ctx->memory_size)
+                        if ((uint64_t)p + 4ULL <= (uint64_t)ctx->memory_size)
                             *(float *)(ctx->memory + p) = (float)d;
                     }
                 }

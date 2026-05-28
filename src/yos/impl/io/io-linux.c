@@ -470,16 +470,18 @@ int32_t yos_vfs_timer_create(struct yos_exec_ctx *ctx, int32_t clockid, uint32_t
     if (sevp == 0) {
         rc = timer_create(clockid, NULL, &host_id);
     } else {
+        const void *sevp_p = wptr_range(ctx, sevp, sizeof(struct wasm32_sigevent));
+        if (!sevp_p) return yos_errno_neg(ctx, EFAULT);
         struct host64_sigevent host_sev;
         sigevent_wasm32_to_host(
-            (const struct wasm32_sigevent *)wptr(ctx, sevp),
+            (const struct wasm32_sigevent *)sevp_p,
             &host_sev);
         rc = timer_create(clockid, (struct sigevent *)&host_sev, &host_id);
     }
     if (rc < 0) return yos_errno_neg(ctx, errno);
     int wid = timer_table_alloc(ctx, host_id);
     if (wid < 0) { timer_delete(host_id); return yos_errno_neg(ctx, EAGAIN); }
-    int32_t *out = wptr(ctx, timerid_out);
+    int32_t *out = wptr_range(ctx, timerid_out, sizeof(int32_t));
     if (!out) { timer_delete(host_id); timer_table_free(ctx, wid); return yos_errno_neg(ctx, EFAULT); }
     *out = wid;
     return 0;
@@ -491,18 +493,20 @@ int32_t yos_vfs_timer_settime(struct yos_exec_ctx *ctx, int32_t timerid, int32_t
     if (!hid) return yos_errno_neg(ctx, EINVAL);
     struct host64___kernel_itimerspec host_new, host_old;
     if (!new_value) return yos_errno_neg(ctx, EFAULT);
-    void *wp = wptr(ctx, new_value);
+    void *wp = wptr_range(ctx, new_value, sizeof(struct wasm32___kernel_itimerspec));
     if (!wp) return yos_errno_neg(ctx, EFAULT);
+    void *wo = NULL;
+    if (old_value) {
+        wo = wptr_range(ctx, old_value, sizeof(struct wasm32___kernel_itimerspec));
+        if (!wo) return yos_errno_neg(ctx, EFAULT);
+    }
     __kernel_itimerspec_wasm32_to_host(
         (const struct wasm32___kernel_itimerspec *)wp, &host_new);
     int rc = timer_settime(hid, flags, (struct itimerspec *)&host_new,
-                            old_value ? (struct itimerspec *)&host_old : NULL);
+                            wo ? (struct itimerspec *)&host_old : NULL);
     if (rc < 0) return yos_errno_neg(ctx, errno);
-    if (old_value) {
-        void *wo = wptr(ctx, old_value);
-        if (wo) __kernel_itimerspec_host_to_wasm32(
+    if (wo) __kernel_itimerspec_host_to_wasm32(
             &host_old, (struct wasm32___kernel_itimerspec *)wo);
-    }
     return 0;
 }
 
@@ -513,9 +517,13 @@ int32_t yos_vfs_timer_settime64(struct yos_exec_ctx *ctx, int32_t timerid, int32
     timer_t hid = timer_table_get(ctx, timerid);
     if (!hid) return yos_errno_neg(ctx, EINVAL);
     if (!new_value) return yos_errno_neg(ctx, EFAULT);
-    struct itimerspec *host_new = wptr(ctx, new_value);
-    struct itimerspec *host_old = old_value ? wptr(ctx, old_value) : NULL;
+    struct itimerspec *host_new = wptr_range(ctx, new_value, sizeof(struct itimerspec));
     if (!host_new) return yos_errno_neg(ctx, EFAULT);
+    struct itimerspec *host_old = NULL;
+    if (old_value) {
+        host_old = wptr_range(ctx, old_value, sizeof(struct itimerspec));
+        if (!host_old) return yos_errno_neg(ctx, EFAULT);
+    }
     int rc = timer_settime(hid, flags, host_new, host_old);
     return yos_errno_check(ctx, rc);
 }
@@ -524,11 +532,11 @@ int32_t yos_vfs_timer_gettime(struct yos_exec_ctx *ctx, int32_t timerid, uint32_
 {
     timer_t hid = timer_table_get(ctx, timerid);
     if (!hid) return yos_errno_neg(ctx, EINVAL);
+    void *wo = wptr_range(ctx, cur_value, sizeof(struct wasm32___kernel_itimerspec));
+    if (!wo) return yos_errno_neg(ctx, EFAULT);
     struct host64___kernel_itimerspec host_val;
     int rc = timer_gettime(hid, (struct itimerspec *)&host_val);
     if (rc < 0) return yos_errno_neg(ctx, errno);
-    void *wo = wptr(ctx, cur_value);
-    if (!wo) return yos_errno_neg(ctx, EFAULT);
     __kernel_itimerspec_host_to_wasm32(
         &host_val, (struct wasm32___kernel_itimerspec *)wo);
     return 0;
@@ -538,7 +546,7 @@ int32_t yos_vfs_timer_gettime64(struct yos_exec_ctx *ctx, int32_t timerid, uint3
 {
     timer_t hid = timer_table_get(ctx, timerid);
     if (!hid) return yos_errno_neg(ctx, EINVAL);
-    struct itimerspec *host_val = wptr(ctx, cur_value);
+    struct itimerspec *host_val = wptr_range(ctx, cur_value, sizeof(struct itimerspec));
     if (!host_val) return yos_errno_neg(ctx, EFAULT);
     int rc = timer_gettime(hid, host_val);
     return yos_errno_check(ctx, rc);
@@ -587,7 +595,7 @@ static int nmask_w32_to_host(struct yos_exec_ctx *ctx, uint32_t wasm_addr,
     if (words > host_cap) return yos_errno_neg(ctx, EINVAL);
     /* wasm side: ceil(bits/32) 32-bit words. */
     size_t w32_words = (bits + 31) / 32;
-    const uint32_t *wp = wptr(ctx, wasm_addr);
+    const uint32_t *wp = wptr_range(ctx, wasm_addr, (uint64_t)w32_words * 4ULL);
     if (!wp) return yos_errno_neg(ctx, EFAULT);
     for (size_t i = 0; i < words; i++) {
         uint32_t lo = (i*2     < w32_words) ? wp[i*2]     : 0;
@@ -604,7 +612,7 @@ static int nmask_host_to_w32(struct yos_exec_ctx *ctx, uint32_t wasm_addr,
     size_t bits  = maxnode;
     size_t words = (bits + 63) / 64;
     size_t w32_words = (bits + 31) / 32;
-    uint32_t *wp = wptr(ctx, wasm_addr);
+    uint32_t *wp = wptr_range(ctx, wasm_addr, (uint64_t)w32_words * 4ULL);
     if (!wp) return yos_errno_neg(ctx, EFAULT);
     for (size_t i = 0; i < words; i++) {
         uint64_t v = host_buf[i];
@@ -629,7 +637,11 @@ int32_t yos_vfs_set_mempolicy(struct yos_exec_ctx *ctx, int32_t mode, uint32_t n
 int32_t yos_vfs_get_mempolicy(struct yos_exec_ctx *ctx, uint32_t mode, uint32_t nmask, uint32_t maxnode, uint32_t addr, uint32_t flags)
 {
     uint64_t host[NMASK_HOST_MAX] = {0};
-    int *mode_p = mode ? wptr(ctx, mode) : NULL;
+    int *mode_p = NULL;
+    if (mode) {
+        mode_p = wptr_range(ctx, mode, sizeof(int));
+        if (!mode_p) return yos_errno_neg(ctx, EFAULT);
+    }
     long ret = syscall(SYS_get_mempolicy, (long)mode_p,
                         nmask ? (long)host : 0L,
                         (long)maxnode, (long)addr, (long)flags);
@@ -641,9 +653,11 @@ int32_t yos_vfs_get_mempolicy(struct yos_exec_ctx *ctx, uint32_t mode, uint32_t 
 int32_t yos_vfs_mbind(struct yos_exec_ctx *ctx, uint32_t start, uint32_t len, int32_t mode, uint32_t nmask, uint32_t maxnode, uint32_t flags)
 {
     uint64_t host[NMASK_HOST_MAX] = {0};
+    void *start_p = wptr_range(ctx, start, len);
+    if (!start_p && len) return yos_errno_neg(ctx, EFAULT);
     int r = nmask_w32_to_host(ctx, nmask, maxnode, host, NMASK_HOST_MAX);
     if (r < 0) return r;
-    long ret = syscall(SYS_mbind, (long)(uintptr_t)(ctx->memory + start),
+    long ret = syscall(SYS_mbind, (long)(uintptr_t)start_p,
                         (long)len, (long)mode,
                         nmask ? (long)host : 0L, (long)maxnode, (long)flags);
     return yos_errno_check(ctx, (int32_t)ret);

@@ -1090,8 +1090,9 @@ int32_t yos_pread(struct yos_exec_ctx *ctx, int32_t wfd, uint32_t buf,
 {
     int hfd = yos_fd_get(ctx, wfd);
     if (hfd < 0) return yos_errno_neg(ctx, EBADF);
-    if (buf + count > ctx->memory_size) return yos_errno_neg(ctx, EFAULT);
-    ssize_t r = pread(hfd, ctx->memory + buf, count, (off_t)off);
+    void *p = posix_wptr_range(ctx, buf, count);
+    if (!p) return yos_errno_neg(ctx, EFAULT);
+    ssize_t r = pread(hfd, p, count, (off_t)off);
     return yos_errno_check(ctx, (int32_t)r);
 }
 
@@ -1100,8 +1101,9 @@ int32_t yos_pwrite(struct yos_exec_ctx *ctx, int32_t wfd, uint32_t buf,
 {
     int hfd = yos_fd_get(ctx, wfd);
     if (hfd < 0) return yos_errno_neg(ctx, EBADF);
-    if (buf + count > ctx->memory_size) return yos_errno_neg(ctx, EFAULT);
-    ssize_t r = pwrite(hfd, ctx->memory + buf, count, (off_t)off);
+    void *p = posix_wptr_range(ctx, buf, count);
+    if (!p) return yos_errno_neg(ctx, EFAULT);
+    ssize_t r = pwrite(hfd, p, count, (off_t)off);
     return yos_errno_check(ctx, (int32_t)r);
 }
 
@@ -1234,7 +1236,8 @@ int sock_type_fb_to_lx_fwd(int t) { return sock_type_fb_to_lx(t); }
 int32_t yos_socketpair(struct yos_exec_ctx *ctx, int32_t domain,
                        int32_t type, int32_t protocol, uint32_t sv_off)
 {
-    if (sv_off + 8 > ctx->memory_size) return yos_errno_neg(ctx, EFAULT);
+    /* sv_off → int sv[2]; 8 bytes total. Wrap-safe range check. */
+    if (!posix_wptr_range(ctx, sv_off, 8)) return yos_errno_neg(ctx, EFAULT);
     int hfds[2];
     /* Detect the FreeBSD high-bit flags before they get masked away
      * by sock_type_fb_to_lx (which on darwin maps both to 0 because
@@ -1364,7 +1367,7 @@ static void fake_pty_termios_defaults(struct termios *t)
 
 int32_t yos_tcgetattr(struct yos_exec_ctx *ctx, int32_t wfd, uint32_t t_off)
 {
-    if (t_off + YOS_FBSD_TERMIOS_SIZE > ctx->memory_size) return yos_errno_neg(ctx, EFAULT);
+    if (!posix_wptr_range(ctx, t_off, YOS_FBSD_TERMIOS_SIZE)) return yos_errno_neg(ctx, EFAULT);
     int hfd = yos_fd_get(ctx, wfd);
     if (hfd < 0) return yos_errno_neg(ctx, EBADF);
 
@@ -1390,7 +1393,7 @@ int32_t yos_tcgetattr(struct yos_exec_ctx *ctx, int32_t wfd, uint32_t t_off)
 int32_t yos_tcsetattr(struct yos_exec_ctx *ctx, int32_t wfd,
                       int32_t actions, uint32_t t_off)
 {
-    if (t_off + YOS_FBSD_TERMIOS_SIZE > ctx->memory_size) return yos_errno_neg(ctx, EFAULT);
+    if (!posix_wptr_range(ctx, t_off, YOS_FBSD_TERMIOS_SIZE)) return yos_errno_neg(ctx, EFAULT);
     int hfd = yos_fd_get(ctx, wfd);
     if (hfd < 0) return yos_errno_neg(ctx, EBADF);
 
@@ -1434,7 +1437,7 @@ int32_t yos_tcsetattr(struct yos_exec_ctx *ctx, int32_t wfd,
  * struct because glibc writes Linux's 60-byte layout. */
 void yos_cfmakeraw(struct yos_exec_ctx *ctx, uint32_t t_off)
 {
-    if (t_off + YOS_FBSD_TERMIOS_SIZE > ctx->memory_size) return;
+    if (!posix_wptr_range(ctx, t_off, YOS_FBSD_TERMIOS_SIZE)) return;
     uint8_t *w = ctx->memory + t_off;
     uint32_t iflag = *(uint32_t *)(w +  0);
     uint32_t oflag = *(uint32_t *)(w +  4);
@@ -1462,27 +1465,27 @@ void yos_cfmakeraw(struct yos_exec_ctx *ctx, uint32_t t_off)
 
 int32_t yos_cfsetispeed(struct yos_exec_ctx *ctx, uint32_t t_off, uint32_t speed)
 {
-    if (t_off + YOS_FBSD_TERMIOS_SIZE > ctx->memory_size) return yos_errno_neg(ctx, EFAULT);
+    if (!posix_wptr_range(ctx, t_off, YOS_FBSD_TERMIOS_SIZE)) return yos_errno_neg(ctx, EFAULT);
     *(uint32_t *)(ctx->memory + t_off + 36) = speed;
     return 0;
 }
 
 int32_t yos_cfsetospeed(struct yos_exec_ctx *ctx, uint32_t t_off, uint32_t speed)
 {
-    if (t_off + YOS_FBSD_TERMIOS_SIZE > ctx->memory_size) return yos_errno_neg(ctx, EFAULT);
+    if (!posix_wptr_range(ctx, t_off, YOS_FBSD_TERMIOS_SIZE)) return yos_errno_neg(ctx, EFAULT);
     *(uint32_t *)(ctx->memory + t_off + 40) = speed;
     return 0;
 }
 
 uint32_t yos_cfgetispeed(struct yos_exec_ctx *ctx, uint32_t t_off)
 {
-    if (t_off + YOS_FBSD_TERMIOS_SIZE > ctx->memory_size) return 0;
+    if (!posix_wptr_range(ctx, t_off, YOS_FBSD_TERMIOS_SIZE)) return 0;
     return *(uint32_t *)(ctx->memory + t_off + 36);
 }
 
 uint32_t yos_cfgetospeed(struct yos_exec_ctx *ctx, uint32_t t_off)
 {
-    if (t_off + YOS_FBSD_TERMIOS_SIZE > ctx->memory_size) return 0;
+    if (!posix_wptr_range(ctx, t_off, YOS_FBSD_TERMIOS_SIZE)) return 0;
     return *(uint32_t *)(ctx->memory + t_off + 40);
 }
 
@@ -1611,8 +1614,8 @@ int32_t yos___xuname(struct yos_exec_ctx *ctx, int32_t namesz, uint32_t buf_off)
 uint32_t yos_if_indextoname(struct yos_exec_ctx *ctx,
                             uint32_t ifindex, uint32_t name_off)
 {
-    if (!name_off || name_off + IF_NAMESIZE > ctx->memory_size) return 0;
-    char *buf = (char *)(ctx->memory + name_off);
+    char *buf = (char *)posix_wptr_range(ctx, name_off, IF_NAMESIZE);
+    if (!buf) return 0;
     if (!if_indextoname(ifindex, buf)) return 0;
     return name_off;
 }
@@ -1884,8 +1887,9 @@ int32_t yos_fstatfs(struct yos_exec_ctx *ctx, int32_t wfd, uint32_t buf_off)
 
 void yos_strmode(struct yos_exec_ctx *ctx, uint32_t mode_in, uint32_t p_off)
 {
-    if (!p_off || p_off + 12 > ctx->memory_size) return;
-    char *p = (char *)(ctx->memory + p_off);
+    /* 12-byte output buffer: 10 mode chars + extended-attr char + NUL. */
+    char *p = (char *)posix_wptr_range(ctx, p_off, 12);
+    if (!p) return;
     unsigned mode = (unsigned)mode_in;
 
     switch (mode & FB_S_IFMT) {
@@ -2076,11 +2080,10 @@ uint32_t yos_getservbyport(struct yos_exec_ctx *ctx, int32_t port_net,
 int32_t yos_timingsafe_bcmp(struct yos_exec_ctx *ctx, uint32_t a_off,
                             uint32_t b_off, uint32_t n)
 {
-    if (!a_off || !b_off || n == 0) return 0;
-    if (a_off + n > ctx->memory_size || b_off + n > ctx->memory_size)
-        return 1;
-    const uint8_t *a = ctx->memory + a_off;
-    const uint8_t *b = ctx->memory + b_off;
+    if (n == 0) return 0;
+    const uint8_t *a = (const uint8_t *)posix_wptr_range(ctx, a_off, n);
+    const uint8_t *b = (const uint8_t *)posix_wptr_range(ctx, b_off, n);
+    if (!a || !b) return 1;
     uint8_t r = 0;
     for (uint32_t i = 0; i < n; i++) r |= (uint8_t)(a[i] ^ b[i]);
     /* Contract: 0 iff equal, non-zero iff different. Don't compress
@@ -2091,11 +2094,10 @@ int32_t yos_timingsafe_bcmp(struct yos_exec_ctx *ctx, uint32_t a_off,
 int32_t yos_timingsafe_memcmp(struct yos_exec_ctx *ctx, uint32_t a_off,
                               uint32_t b_off, uint32_t n)
 {
-    if (!a_off || !b_off || n == 0) return 0;
-    if (a_off + n > ctx->memory_size || b_off + n > ctx->memory_size)
-        return 0;
-    const uint8_t *a = ctx->memory + a_off;
-    const uint8_t *b = ctx->memory + b_off;
+    if (n == 0) return 0;
+    const uint8_t *a = (const uint8_t *)posix_wptr_range(ctx, a_off, n);
+    const uint8_t *b = (const uint8_t *)posix_wptr_range(ctx, b_off, n);
+    if (!a || !b) return 0;
     /* OpenBSD-style constant-time memcmp: accumulate the first-differing
      * byte's sign into `res`; mask off subsequent updates with `done`.
      * Loop runs the full length on every call — no early exit. */

@@ -484,33 +484,37 @@ int yos_sigset_bound(struct yos_exec_ctx *ctx, uint32_t off)
     return off && off + YOS_FBSD_SIGSET_BYTES <= ctx->memory_size;
 }
 
+/* POSIX sig{empty,fill,add,del,ismember}set: return 0 / -1 with
+ * errno set, NOT -errno. Use yos_errno_neg so the per-ctx errno slot
+ * gets the FreeBSD-shape value and any `if (sigfillset(&s) == -1)`
+ * in the guest catches the failure. (pthread_sigmask is the odd one
+ * out: it returns the errno as a positive value.) */
 int32_t yos_sigemptyset(struct yos_exec_ctx *ctx, uint32_t set_off)
 {
-    if (!yos_sigset_bound(ctx, set_off)) return -EFAULT;
+    if (!yos_sigset_bound(ctx, set_off)) return yos_errno_neg(ctx, EFAULT);
     memset(ctx->memory + set_off, 0, YOS_FBSD_SIGSET_BYTES);
     return 0;
 }
 
 int32_t yos_sigfillset(struct yos_exec_ctx *ctx, uint32_t set_off)
 {
-    if (!yos_sigset_bound(ctx, set_off)) return -EFAULT;
+    if (!yos_sigset_bound(ctx, set_off)) return yos_errno_neg(ctx, EFAULT);
     memset(ctx->memory + set_off, 0xff, YOS_FBSD_SIGSET_BYTES);
     return 0;
 }
 
 /* FreeBSD sigaddset/sigdelset/sigismember:
  *   bit (signo-1) within __bits[(signo-1)/32], bit (signo-1)%32.
- * Signals are 1..128. Out-of-range returns -EINVAL. */
-static int yos_sigset_op_check(int32_t signo)
+ * Signals are 1..128. Out-of-range -> EINVAL. */
+static int yos_sigset_signo_ok(int32_t signo)
 {
-    return (signo >= 1 && signo <= 128) ? 0 : -EINVAL;
+    return (signo >= 1 && signo <= 128);
 }
 
 int32_t yos_sigaddset(struct yos_exec_ctx *ctx, uint32_t set_off, int32_t signo)
 {
-    if (!yos_sigset_bound(ctx, set_off)) return -EFAULT;
-    int rc = yos_sigset_op_check(signo);
-    if (rc) return rc;
+    if (!yos_sigset_bound(ctx, set_off)) return yos_errno_neg(ctx, EFAULT);
+    if (!yos_sigset_signo_ok(signo))     return yos_errno_neg(ctx, EINVAL);
     uint32_t b = (uint32_t)(signo - 1);
     uint32_t *bits = (uint32_t *)(ctx->memory + set_off);
     bits[b / 32] |= 1u << (b % 32);
@@ -519,9 +523,8 @@ int32_t yos_sigaddset(struct yos_exec_ctx *ctx, uint32_t set_off, int32_t signo)
 
 int32_t yos_sigdelset(struct yos_exec_ctx *ctx, uint32_t set_off, int32_t signo)
 {
-    if (!yos_sigset_bound(ctx, set_off)) return -EFAULT;
-    int rc = yos_sigset_op_check(signo);
-    if (rc) return rc;
+    if (!yos_sigset_bound(ctx, set_off)) return yos_errno_neg(ctx, EFAULT);
+    if (!yos_sigset_signo_ok(signo))     return yos_errno_neg(ctx, EINVAL);
     uint32_t b = (uint32_t)(signo - 1);
     uint32_t *bits = (uint32_t *)(ctx->memory + set_off);
     bits[b / 32] &= ~(1u << (b % 32));
@@ -530,9 +533,8 @@ int32_t yos_sigdelset(struct yos_exec_ctx *ctx, uint32_t set_off, int32_t signo)
 
 int32_t yos_sigismember(struct yos_exec_ctx *ctx, uint32_t set_off, int32_t signo)
 {
-    if (!yos_sigset_bound(ctx, set_off)) return -EFAULT;
-    int rc = yos_sigset_op_check(signo);
-    if (rc) return rc;
+    if (!yos_sigset_bound(ctx, set_off)) return yos_errno_neg(ctx, EFAULT);
+    if (!yos_sigset_signo_ok(signo))     return yos_errno_neg(ctx, EINVAL);
     uint32_t b = (uint32_t)(signo - 1);
     const uint32_t *bits = (const uint32_t *)(ctx->memory + set_off);
     return (bits[b / 32] >> (b % 32)) & 1u;

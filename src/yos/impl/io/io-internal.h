@@ -77,6 +77,20 @@ static inline void *wptr_range(struct yos_exec_ctx *ctx, uint32_t offset, uint64
     return ctx->memory + offset;
 }
 
+/* Validate a guest NUL-terminated string. Returns the host pointer if
+ * the string starts in-range AND a NUL byte is found before
+ * memory_size, else NULL. Use whenever a bridge will pass the pointer
+ * to host strdup/strlen/printf — without this, a non-terminated guest
+ * string can make host code walk off the end of wasm memory. */
+static inline const char *wstr_check(struct yos_exec_ctx *ctx, uint32_t offset)
+{
+    if (offset == 0 || offset >= ctx->memory_size) return 0;
+    const char *p   = (const char *)(ctx->memory + offset);
+    const char *end = (const char *)(ctx->memory + ctx->memory_size);
+    for (const char *q = p; q < end; ++q) if (*q == 0) return p;
+    return 0;
+}
+
 static inline int32_t host_fd(struct yos_exec_ctx *ctx, int32_t fd)
 {
     return yos_fd_translate(ctx, fd);

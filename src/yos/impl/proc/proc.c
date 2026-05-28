@@ -1769,6 +1769,19 @@ static int execvp_path_search(struct yos_exec_ctx *, const char *, char *);
 int32_t yos_execve(struct yos_exec_ctx *ctx, uint32_t filename, uint32_t argv_ptr, uint32_t envp)
 {
     extern const char *yos_path_resolve(struct yos_exec_ctx *, const char *);
+    /* Validate the guest filename string is in-range AND has a NUL
+     * terminator within memory_size. Without this a guest can pass a
+     * bogus offset or an unterminated string and the host's strncpy /
+     * path_resolve / access walks past wasm memory. */
+    if (filename == 0 || filename >= ctx->memory_size)
+        return yos_errno_neg(ctx, EFAULT);
+    {
+        const char *p = (const char *)(ctx->memory + filename);
+        const char *end = (const char *)(ctx->memory + ctx->memory_size);
+        const char *q;
+        for (q = p; q < end; ++q) if (*q == 0) break;
+        if (q == end) return yos_errno_neg(ctx, EFAULT);
+    }
     const char *raw_fn = (const char *)(ctx->memory + filename);
     /* yos_path_resolve returns a TLS pointer — copy because we use
      * it across many subsequent calls (access, open, etc. below). */
@@ -1850,20 +1863,43 @@ int32_t yos_execve(struct yos_exec_ctx *ctx, uint32_t filename, uint32_t argv_pt
         return host_execve_fallback(fn, ctx, argv_ptr);
     }
 
-    /* Count original argv entries */
-    uint32_t *wasm_argv = (uint32_t *)(ctx->memory + argv_ptr);
+    /* Count original argv entries.
+     *
+     * Each iteration reads `wasm_argv[orig_argc]` — a 4-byte slot at
+     * argv_ptr + 4*orig_argc. Validate each slot's range before the
+     * read so a bogus argv_ptr or huge argc can't make us scan past
+     * wasm memory. Likewise validate each string offset and confirm
+     * it points at a NUL-terminated string in-range.
+     *
+     * If argv_ptr is 0 the guest passed NULL — POSIX says "undefined
+     * behaviour" but every real libc treats this as EFAULT. */
+    if (argv_ptr == 0) return yos_errno_neg(ctx, EFAULT);
     int orig_argc = 0;
-    while (wasm_argv[orig_argc] != 0) {
+    for (;;) {
+        uint64_t slot_off = (uint64_t)argv_ptr + (uint64_t)orig_argc * 4ULL;
+        if (slot_off + 4 > (uint64_t)ctx->memory_size)
+            return yos_errno_neg(ctx, EFAULT);
+        uint32_t entry = *(uint32_t *)(ctx->memory + (uint32_t)slot_off);
+        if (entry == 0) break;
+        if (orig_argc > 1024) return yos_errno_neg(ctx, E2BIG);
+        /* Validate the string this slot points at. */
+        if (entry >= ctx->memory_size) return yos_errno_neg(ctx, EFAULT);
+        {
+            const char *p = (const char *)(ctx->memory + entry);
+            const char *end = (const char *)(ctx->memory + ctx->memory_size);
+            const char *q; for (q = p; q < end; ++q) if (*q == 0) break;
+            if (q == end) return yos_errno_neg(ctx, EFAULT);
+        }
         orig_argc++;
-        if (orig_argc > 1024) return -E2BIG;
     }
+    uint32_t *wasm_argv = (uint32_t *)(ctx->memory + argv_ptr);
 
     /* For scripts: argv[0] is replaced, script path inserted after interp */
     int new_argc = is_script ? (extra_args + orig_argc) : orig_argc;
 
     /* Allocate host argv */
     char **host_argv = malloc((new_argc + 1) * sizeof(char *));
-    if (!host_argv) return -ENOMEM;
+    if (!host_argv) return yos_errno_neg(ctx, ENOMEM);
 
     int ai = 0;
 
@@ -1875,13 +1911,12 @@ int32_t yos_execve(struct yos_exec_ctx *ctx, uint32_t filename, uint32_t argv_pt
         }
         /* Insert script path */
         host_argv[ai++] = strdup(fn);
-        /* Copy remaining original args (skip argv[0]) */
+        /* Copy remaining original args (skip argv[0]) — already validated above. */
         for (int i = 1; i < orig_argc; i++) {
             const char *src = (const char *)(ctx->memory + wasm_argv[i]);
             host_argv[ai++] = strdup(src);
         }
     } else {
-        /* Direct exec: copy all original args */
         for (int i = 0; i < orig_argc; i++) {
             const char *src = (const char *)(ctx->memory + wasm_argv[i]);
             host_argv[ai++] = strdup(src);
@@ -1901,16 +1936,50 @@ int32_t yos_execve(struct yos_exec_ctx *ctx, uint32_t filename, uint32_t argv_pt
     char **host_envp = NULL;
     int env_count = 0;
     if (envp != 0) {
-        uint32_t *wasm_envp = (uint32_t *)(ctx->memory + envp);
-        while (wasm_envp[env_count] != 0) {
-            env_count++;
-            if (env_count > 4096) return -E2BIG;
+        /* Same range-walk pattern as argv: validate each slot AND each
+         * env-string before the read. */
+        if (envp >= ctx->memory_size) {
+            for (int i = 0; i < ai; i++) free(host_argv[i]);
+            free(host_argv);
+            return yos_errno_neg(ctx, EFAULT);
         }
+        for (;;) {
+            uint64_t slot_off = (uint64_t)envp + (uint64_t)env_count * 4ULL;
+            if (slot_off + 4 > (uint64_t)ctx->memory_size) {
+                for (int i = 0; i < ai; i++) free(host_argv[i]);
+                free(host_argv);
+                return yos_errno_neg(ctx, EFAULT);
+            }
+            uint32_t entry = *(uint32_t *)(ctx->memory + (uint32_t)slot_off);
+            if (entry == 0) break;
+            if (env_count > 4096) {
+                for (int i = 0; i < ai; i++) free(host_argv[i]);
+                free(host_argv);
+                return yos_errno_neg(ctx, E2BIG);
+            }
+            if (entry >= ctx->memory_size) {
+                for (int i = 0; i < ai; i++) free(host_argv[i]);
+                free(host_argv);
+                return yos_errno_neg(ctx, EFAULT);
+            }
+            {
+                const char *p = (const char *)(ctx->memory + entry);
+                const char *end = (const char *)(ctx->memory + ctx->memory_size);
+                const char *q; for (q = p; q < end; ++q) if (*q == 0) break;
+                if (q == end) {
+                    for (int i = 0; i < ai; i++) free(host_argv[i]);
+                    free(host_argv);
+                    return yos_errno_neg(ctx, EFAULT);
+                }
+            }
+            env_count++;
+        }
+        uint32_t *wasm_envp = (uint32_t *)(ctx->memory + envp);
         host_envp = malloc((env_count + 1) * sizeof(char *));
         if (!host_envp) {
             for (int i = 0; i < ai; i++) free(host_argv[i]);
             free(host_argv);
-            return -ENOMEM;
+            return yos_errno_neg(ctx, ENOMEM);
         }
         for (int i = 0; i < env_count; i++) {
             const char *src = (const char *)(ctx->memory + wasm_envp[i]);

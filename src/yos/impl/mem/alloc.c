@@ -248,7 +248,9 @@ uint32_t yos_reallocarray(struct yos_exec_ctx *ctx, uint32_t off,
 int32_t yos_posix_memalign(struct yos_exec_ctx *ctx, uint32_t memptr_off,
                            uint32_t alignment, uint32_t size)
 {
-    if (memptr_off == 0 || memptr_off + 4 > ctx->memory_size) return EINVAL;
+    if (memptr_off == 0 ||
+        (uint64_t)memptr_off + 4ULL > (uint64_t)ctx->memory_size)
+        return EINVAL;
     /* POSIX: alignment must be a power-of-two AND a multiple of
      * sizeof(void *). On wasm32 sizeof(void *) = 4. */
     if (alignment < sizeof(uint32_t) ||

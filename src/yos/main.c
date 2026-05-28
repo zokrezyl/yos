@@ -1132,7 +1132,12 @@ m3ApiRawFunction(m3_yos_argv_setup)
 
     ydebug("argv_setup: argv_ptr=0x%x mem_size=0x%x heap_end=0x%x\n",
            argv_ptr, mem_size, ctx->heap_end);
-    if (argv_ptr + 4u * (uint32_t)(ctx->argc + 1) > mem_size) {
+    /* 64-bit end calc — `argv_ptr + 4*(argc+1)` in uint32 wraps when
+     * argv_ptr is large, and a wrap-around value could pass the
+     * compare on a bogus pointer. */
+    if (argv_ptr == 0 ||
+        (uint64_t)argv_ptr +
+            4ULL * (uint64_t)((uint32_t)ctx->argc + 1) > (uint64_t)mem_size) {
         fprintf(stderr,
                 "yos: argv_setup: argv_ptr out of range; trapping\n");
         m3ApiTrap("argv_setup: bad argv_ptr");
@@ -1153,7 +1158,8 @@ m3ApiRawFunction(m3_yos_argv_setup)
 
     for (int i = 0; i < ctx->argc; i++) {
         size_t len = strlen(ctx->argv[i]) + 1;
-        if (str_ptr + len > ctx->memory_size) {
+        /* 64-bit end check to catch `str_ptr + len` wrapping uint32. */
+        if ((uint64_t)str_ptr + (uint64_t)len > (uint64_t)ctx->memory_size) {
             fprintf(stderr, "yos: out of memory for argv\n");
             m3ApiTrap("out of memory");
         }
@@ -1195,14 +1201,23 @@ m3ApiRawFunction(m3_yos_envp_setup)
     ctx->memory_size = mem_size;
 
     uint32_t str_ptr = ctx->heap_end;
-    uint32_t *envp_arr = (uint32_t *)(ctx->memory + envp_ptr);
-
     int n = ctx->envc;
     ydebug("envp_setup: envc=%d heap_end=0x%x\n", n, ctx->heap_end);
+    /* Validate the envp array's full [envp_ptr, envp_ptr+4*(n+1)) range
+     * BEFORE writing the per-entry offsets. Without this a guest can
+     * pass a bogus envp_ptr and the writes below stomp past wasm
+     * memory. */
+    if (envp_ptr == 0 ||
+        (uint64_t)envp_ptr +
+            4ULL * (uint64_t)((uint32_t)n + 1) > (uint64_t)ctx->memory_size) {
+        fprintf(stderr, "yos: envp_setup: envp_ptr out of range; trapping\n");
+        m3ApiTrap("envp_setup: bad envp_ptr");
+    }
+    uint32_t *envp_arr = (uint32_t *)(ctx->memory + envp_ptr);
     for (int i = 0; i < n; i++) {
         const char *s = ctx->envp[i];
         size_t len = strlen(s) + 1;
-        if (str_ptr + len > ctx->memory_size) {
+        if ((uint64_t)str_ptr + (uint64_t)len > (uint64_t)ctx->memory_size) {
             fprintf(stderr, "yos: out of memory for envp\n");
             m3ApiTrap("out of memory");
         }

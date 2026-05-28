@@ -54,20 +54,28 @@
 static inline void va_align(uint32_t *off, uint32_t a) {
     *off = (*off + a - 1) & ~(a - 1);
 }
+/* Range-check before reading 4/8 bytes from the va-pack region. The
+ * va-pack itself lives in wasm linear memory, so a guest that hands
+ * us an evil va_list could otherwise make these reads stomp past
+ * memory_size. Return a safe zero on overflow — printf produces a
+ * sensible-shaped output rather than reading garbage. */
 static inline uint32_t va_i32(struct yos_exec_ctx *ctx, uint32_t *off) {
     va_align(off, 4);
+    if ((uint64_t)*off + 4ULL > (uint64_t)ctx->memory_size) { *off += 4; return 0; }
     uint32_t v = *(uint32_t *)(ctx->memory + *off);
     *off += 4;
     return v;
 }
 static inline uint64_t va_i64(struct yos_exec_ctx *ctx, uint32_t *off) {
     va_align(off, 8);
+    if ((uint64_t)*off + 8ULL > (uint64_t)ctx->memory_size) { *off += 8; return 0; }
     uint64_t v = *(uint64_t *)(ctx->memory + *off);
     *off += 8;
     return v;
 }
 static inline double va_f64(struct yos_exec_ctx *ctx, uint32_t *off) {
     va_align(off, 8);
+    if ((uint64_t)*off + 8ULL > (uint64_t)ctx->memory_size) { *off += 8; return 0.0; }
     double v = *(double *)(ctx->memory + *off);
     *off += 8;
     return v;
@@ -224,7 +232,18 @@ static void format_one(struct yos_exec_ctx *ctx,
     }
     case 's': {
         uint32_t s_off = va_i32(ctx, vap);
-        const char *s = s_off ? (const char *)(ctx->memory + s_off) : "(null)";
+        const char *s = "(null)";
+        /* Validate the guest string is in-range AND has a NUL byte
+         * before memory_size. Host snprintf walks the string with
+         * strlen — without bounds, a non-terminated guest string lets
+         * it read past wasm memory. Fall back to "(null)" on bad
+         * pointer so the format output stays well-shaped. */
+        if (s_off && s_off < ctx->memory_size) {
+            const char *p = (const char *)(ctx->memory + s_off);
+            const char *end = (const char *)(ctx->memory + ctx->memory_size);
+            const char *q;
+            for (q = p; q < end; ++q) if (*q == 0) { s = p; break; }
+        }
         n = width_star && prec_star ? snprintf(buf, sizeof(buf), spec, star_w, star_p, s)
           : width_star              ? snprintf(buf, sizeof(buf), spec, star_w, s)
           : prec_star               ? snprintf(buf, sizeof(buf), spec, star_p, s)
@@ -376,6 +395,22 @@ int32_t yos_vsnprintf(struct yos_exec_ctx *ctx,
                       uint32_t dst_off, uint32_t n,
                       uint32_t fmt_off, uint32_t va_off)
 {
+    /* Validate the destination buffer's full [dst_off, dst_off+n)
+     * range before vsnprintf_core writes into it. Without this a
+     * guest can pass an out-of-range dst_off + large n and the
+     * format loop scribbles past wasm memory. n==0 is the "size
+     * probe" form (yos_snprintf(NULL, 0, ...)) — pass through with
+     * dst==NULL so the core's count-only path still works. */
+    if (n == 0) {
+        return yos_vsnprintf_core(ctx, NULL, 0, fmt_off, va_off);
+    }
+    if (dst_off == 0 ||
+        (uint64_t)dst_off + (uint64_t)n > (uint64_t)ctx->memory_size) {
+        /* No safe place to write — drop the call. Standard libc
+         * returns the would-have-written count; we approximate by
+         * running the format-only count path. */
+        return yos_vsnprintf_core(ctx, NULL, 0, fmt_off, va_off);
+    }
     char *dst = (char *)(ctx->memory + dst_off);
     return yos_vsnprintf_core(ctx, dst, n, fmt_off, va_off);
 }
