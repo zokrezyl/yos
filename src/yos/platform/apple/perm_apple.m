@@ -105,9 +105,13 @@ ydev_result_t ydev_perm_request_platform(ydev_capability_t cap)
         }];
         return YDEV_OK;
     case YDEV_CAP_LOCATION:
-        /* The location backend will own the CLLocationManager once we
-         * add it. For now mark the request as accepted; clients should
-         * call ydev_loc_open which will trigger the prompt itself. */
+        /* Location permission is requested by the location backend
+         * (CLLocationManager.requestWhenInUseAuthorization) on its
+         * own at ydev_loc_open time — there is no separate prompt
+         * to fire from here. Return YDEV_UNSUPPORTED so the caller
+         * skips a useless ydev_perm_request() and goes straight to
+         * ydev_loc_open(); the kCLAuthorizationStatus callback then
+         * publishes the result through ydev_perm_set. */
         return YDEV_UNSUPPORTED;
     case YDEV_CAP_MOTION:
         return YDEV_UNSUPPORTED;

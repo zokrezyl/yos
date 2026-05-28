@@ -393,7 +393,14 @@ static void *yos_worker(void *arg) {
         return YES;
     }
     pthread_t rt;
-    pthread_create(&rt, NULL, yos_reader, (void *)(intptr_t)fds[0]);
+    int rc_r = pthread_create(&rt, NULL, yos_reader, (void *)(intptr_t)fds[0]);
+    if (rc_r != 0) {
+        yos_status("reader pthread_create FAILED");
+        yos_append([NSString stringWithFormat:
+                    @"reader pthread_create failed rc=%d\n", rc_r]);
+        close(fds[0]); close(fds[1]);
+        return YES;
+    }
     pthread_detach(rt);
     yos_status("reader spawned");
 
@@ -403,7 +410,14 @@ static void *yos_worker(void *arg) {
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
                    dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         pthread_t wt;
-        pthread_create(&wt, NULL, yos_worker, (void *)(intptr_t)wfd);
+        int rc_w = pthread_create(&wt, NULL, yos_worker, (void *)(intptr_t)wfd);
+        if (rc_w != 0) {
+            yos_status("worker pthread_create FAILED");
+            yos_append([NSString stringWithFormat:
+                        @"worker pthread_create failed rc=%d\n", rc_w]);
+            close(wfd);
+            return;
+        }
         pthread_detach(wt);
         yos_status("yos worker spawned");
     });

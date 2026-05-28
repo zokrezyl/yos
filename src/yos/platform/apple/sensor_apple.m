@@ -197,6 +197,15 @@ ydev_result_t ydev_sensor_stop(ydev_sensor_t *h)
         [m stopMagnetometerUpdates];
         [m stopDeviceMotionUpdates];
     }
+    /* Drain the operation queue so any in-flight handler — which
+     * captured `h` by value and dereferences h->vfd — has finished
+     * before we let the caller (ydev_sensor_close) free `h`. Without
+     * this, stopXxxUpdates returns immediately but a pending block
+     * can still fire and write to freed memory. */
+    if (h->queue) {
+        NSOperationQueue *q = (__bridge NSOperationQueue *)h->queue;
+        [q waitUntilAllOperationsAreFinished];
+    }
     h->started = 0;
     ydev_vfd_close(&h->vfd);
     return YDEV_OK;

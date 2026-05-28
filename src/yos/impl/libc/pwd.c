@@ -644,7 +644,9 @@ int32_t yos_ttyname_r(struct yos_exec_ctx *ctx, int32_t wfd,
 {
     int hfd = yos_fd_get(ctx, wfd);
     if (hfd < 0) return EBADF;
-    if (!buf_off || buf_off + buflen > ctx->memory_size) return EFAULT;
+    if (!buf_off || buflen == 0 ||
+        (uint64_t)buf_off + (uint64_t)buflen > (uint64_t)ctx->memory_size)
+        return EFAULT;
     return ttyname_r(hfd, (char *)(ctx->memory + buf_off), buflen);
 }
 
@@ -656,7 +658,7 @@ uint32_t yos_ctermid(struct yos_exec_ctx *ctx, uint32_t s_off)
     char *p = ctermid(hostbuf);
     if (!p) return 0;
     if (s_off) {
-        if (s_off + strlen(p) + 1 > ctx->memory_size) return 0;
+        if ((uint64_t)s_off + (uint64_t)strlen(p) + 1ULL > (uint64_t)ctx->memory_size) return 0;
         strcpy((char *)(ctx->memory + s_off), p);
         return s_off;
     }
@@ -849,9 +851,13 @@ void yos_endusershell(struct yos_exec_ctx *ctx) { (void)ctx; endusershell(); }
 size_t yos_strftime(struct yos_exec_ctx *ctx, uint32_t buf_off, uint32_t maxsize,
                     uint32_t fmt_off, uint32_t tm_off)
 {
-    if (!buf_off || buf_off + maxsize > ctx->memory_size) return 0;
+    /* 64-bit end calcs so guest-controlled lengths can't wrap past the
+     * memory_size bound. */
+    if (!buf_off ||
+        (uint64_t)buf_off + (uint64_t)maxsize > (uint64_t)ctx->memory_size) return 0;
     if (!fmt_off || fmt_off >= ctx->memory_size) return 0;
-    if (!tm_off  || tm_off + CV_TM_GUEST_SZ > ctx->memory_size) return 0;
+    if (!tm_off  ||
+        (uint64_t)tm_off + (uint64_t)CV_TM_GUEST_SZ > (uint64_t)ctx->memory_size) return 0;
 
     struct tm host_tm;
     memset(&host_tm, 0, sizeof host_tm);
@@ -874,7 +880,8 @@ uint32_t yos_tmpnam(struct yos_exec_ctx *ctx, uint32_t s_off)
     if (!r) return 0;
     if (s_off) {
         size_t n = strlen(r);
-        if (s_off + n + 1 > ctx->memory_size) return 0;
+        if ((uint64_t)s_off + (uint64_t)n + 1ULL > (uint64_t)ctx->memory_size)
+            return 0;
         memcpy(ctx->memory + s_off, r, n + 1);
         return s_off;
     }

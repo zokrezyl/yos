@@ -514,7 +514,11 @@ static void *fork_thread_func(void *arg)
 
     /* Create new wasm3 environment and runtime for child */
     IM3Environment env = m3_NewEnvironment();
-    IM3Runtime rt = m3_NewRuntime(env, 64 * 1024, NULL);
+    /* 4 MiB wasm3 operand stack — matches the initial-process budget
+     * in main.c::load_wasm_module. 64 KiB was too small for nvim's
+     * Vim-script eval chain reached via fork+exec under the
+     * stub-reduction regression that motivated issue #6. */
+    IM3Runtime rt = m3_NewRuntime(env, 4 * 1024 * 1024, NULL);
     if (!rt) {
         pthread_mutex_unlock(&fork_setup_lock);
         release_parent_dups(fork_thread_arg);
@@ -846,7 +850,8 @@ static void *fork_thread_func(void *arg)
         }
 
         env = m3_NewEnvironment();
-        rt = m3_NewRuntime(env, 64 * 1024, NULL);
+        /* Match load_wasm_module / fork's 4 MiB budget. */
+        rt = m3_NewRuntime(env, 4 * 1024 * 1024, NULL);
         if (!rt) {
             ydebug("child exec: failed to create runtime\n");
             child_ctx->proc->state = YOS_PROC_ZOMBIE;

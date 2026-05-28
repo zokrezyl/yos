@@ -23,6 +23,13 @@
 #include "yos/types.h"
 #include <yos/ytrace/ytrace.h>
 
+/* Wrap-safe range check: offset + len fits in [0, memory_size]. uint32+
+ * uint32 addition wraps on overflow; 64-bit promotion catches that. */
+static inline int range_ok(struct yos_exec_ctx *ctx, uint32_t off, uint64_t len)
+{
+    return (uint64_t)off + len <= (uint64_t)ctx->memory_size;
+}
+
 /* FreeBSD sysctl MIB constants (from sys/sysctl.h, sys/proc.h). */
 #define CTL_KERN              1
 #define KERN_PROC            14
@@ -114,7 +121,7 @@ static int32_t do_kern_proc_select(struct yos_exec_ctx *ctx,
 
     uint32_t buflen = 0;
     if (oldlenp_off) {
-        if (oldlenp_off + 4 > ctx->memory_size) return -EFAULT;
+        if (!range_ok(ctx, oldlenp_off, 4)) return -EFAULT;
         buflen = *(uint32_t *)(ctx->memory + oldlenp_off);
     }
 
@@ -137,7 +144,7 @@ static int32_t do_kern_proc_select(struct yos_exec_ctx *ctx,
         if (old_off == 0) return 0;
         return -ENOMEM;
     }
-    if (old_off + need > ctx->memory_size) {
+    if (!range_ok(ctx, old_off, need)) {
         pthread_mutex_unlock(&ctx->rt->proc_lock);
         return -EFAULT;
     }
@@ -189,7 +196,7 @@ static int32_t do_kern_proc_args(struct yos_exec_ctx *ctx, int pid,
 
     uint32_t buflen = 0;
     if (oldlenp_off) {
-        if (oldlenp_off + 4 > ctx->memory_size) {
+        if (!range_ok(ctx, oldlenp_off, 4)) {
             pthread_mutex_unlock(&ctx->rt->proc_lock);
             return -EFAULT;
         }
@@ -203,7 +210,7 @@ static int32_t do_kern_proc_args(struct yos_exec_ctx *ctx, int pid,
         if (old_off == 0) return 0;
         return -ENOMEM;
     }
-    if (old_off + need > ctx->memory_size) {
+    if (!range_ok(ctx, old_off, need)) {
         pthread_mutex_unlock(&ctx->rt->proc_lock);
         return -EFAULT;
     }
@@ -254,7 +261,7 @@ static int32_t do_kern_proc_pathname(struct yos_exec_ctx *ctx,
      * scenario. We treat NULL as "no buffer" too. */
     uint32_t buflen = 0;
     if (oldlenp_off) {
-        if (oldlenp_off + 4 > ctx->memory_size) return -EFAULT;
+        if (!range_ok(ctx, oldlenp_off, 4)) return -EFAULT;
         buflen = *(uint32_t *)(ctx->memory + oldlenp_off);
     }
 
@@ -270,7 +277,7 @@ static int32_t do_kern_proc_pathname(struct yos_exec_ctx *ctx,
             *(uint32_t *)(ctx->memory + oldlenp_off) = (uint32_t)need;
         return -ENOMEM;
     }
-    if (old_off + need > ctx->memory_size) return -EFAULT;
+    if (!range_ok(ctx, old_off, need)) return -EFAULT;
     memcpy(ctx->memory + old_off, path, need);
     if (oldlenp_off)
         *(uint32_t *)(ctx->memory + oldlenp_off) = (uint32_t)need;
@@ -295,7 +302,10 @@ static m3ApiRawFunction(m3_yos_sysctl)
     ctx->memory = m3_GetMemory(runtime, &mem_size, 0);
     ctx->memory_size = mem_size;
 
-    if (namelen < 2 || name_off + 4u * namelen > mem_size) m3ApiReturn(-EINVAL);
+    /* 64-bit math so `4 * namelen` and the sum can't wrap uint32. */
+    if (namelen < 2 ||
+        (uint64_t)name_off + 4ULL * (uint64_t)namelen > (uint64_t)mem_size)
+        m3ApiReturn(-EINVAL);
     int32_t *mib = (int32_t *)(ctx->memory + name_off);
 
     if (mib[0] == CTL_KERN && mib[1] == KERN_PROC && namelen >= 3) {

@@ -456,6 +456,10 @@ void yos_freebsd_userland_link(IM3Module mod)
     m3_LinkRawFunction(mod, "env", "strtonum",      "I(iIIi)",  m3_yos_strtonum);
     m3_LinkRawFunction(mod, "env", "fgetln",        "i(ii)",    m3_yos_fgetln);
     m3_LinkRawFunction(mod, "env", "getprogname",   "i()",      m3_yos_getprogname);
+    /* FreeBSD libc carries an internal weak alias `_getprogname` that
+     * its own .c files use; build-from-source ports import the alias
+     * rather than `getprogname`. Same body. */
+    m3_LinkRawFunction(mod, "env", "_getprogname",  "i()",      m3_yos_getprogname);
     m3_LinkRawFunction(mod, "env", "setprogname",   "v(i)",     m3_yos_setprogname);
     m3_LinkRawFunction(mod, "env", "asprintf",      "i(iii)",   m3_yos_asprintf);
     m3_LinkRawFunction(mod, "env", "vasprintf",     "i(iii)",   m3_yos_vasprintf);

@@ -514,16 +514,33 @@ static m3ApiRawFunction(m3_yos_kevent)
     int kq = yos_fd_get(ctx, kq_wfd);
     if (kq < 0) { write_errno(ctx, EBADF); m3ApiReturn(-1); }
 
-    /* Build host changelist. Cap at 256 to keep the scratch on stack. */
+    /* Reject negative counts AND cap at 256 (stack-array bound) so
+     * `int i < nchanges` can't run past the buffer or sign-overflow. */
+    if (nchanges < 0 || nevents < 0) { write_errno(ctx, EINVAL); m3ApiReturn(-1); }
     if (nchanges > 256) { write_errno(ctx, EINVAL); m3ApiReturn(-1); }
     if (nevents  > 256) nevents = 256;
+    /* Validate the full changelist range up-front (wrap-safe).
+     * Without this, `changelist + i*KE_SZ` in uint32 wraps for large
+     * inputs and lets the per-iteration check pass on a bogus range. */
+    if (nchanges > 0 && changelist != 0) {
+        if ((uint64_t)changelist + (uint64_t)nchanges * KE_SZ > (uint64_t)mem_size) {
+            write_errno(ctx, EFAULT); m3ApiReturn(-1);
+        }
+    } else if (nchanges > 0) {
+        write_errno(ctx, EFAULT); m3ApiReturn(-1);
+    }
+    /* Validate eventlist target buffer the same way. */
+    if (nevents > 0 && eventlist != 0) {
+        if ((uint64_t)eventlist + (uint64_t)nevents * KE_SZ > (uint64_t)mem_size) {
+            write_errno(ctx, EFAULT); m3ApiReturn(-1);
+        }
+    } else if (nevents > 0) {
+        write_errno(ctx, EFAULT); m3ApiReturn(-1);
+    }
     struct kevent host_changes[256];
     struct kevent host_events[256];
     int n_host_changes = 0;
     for (int i = 0; i < nchanges; i++) {
-        if (changelist + (uint32_t)(i+1) * KE_SZ > mem_size) {
-            write_errno(ctx, EFAULT); m3ApiReturn(-1);
-        }
         const uint8_t *ke = ctx->memory + changelist + (uint32_t)i * KE_SZ;
         uint32_t ident  = ke_ident(ke);
         int16_t  filter = ke_filter(ke);

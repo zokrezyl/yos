@@ -1574,8 +1574,17 @@ static int load_wasm_module(struct yos_exec_ctx *ctx, IM3Environment env,
     uint8_t *wasm_bytes = load_file(path, &wasm_size);
     if (!wasm_bytes) return -1;
 
-    /* Create new runtime */
-    IM3Runtime rt = m3_NewRuntime(env, 64 * 1024, 0);
+    /* Create new runtime.
+     *
+     * Stack size: wasm3's operand stack, NOT the guest's linear-memory
+     * data stack. nvim's PTY interactive path (`do_source` → `ex_if`
+     * chain with Lua callbacks invoked through asyncify-rewound calls)
+     * exceeded the original 64 KB and traps with "[trap] stack
+     * overflow" mid-edit-session. 1 MiB matches what wasm3's reference
+     * runners use for serious guests and costs ~1 MB host RAM per
+     * forked guest — yos's 256-proc cap puts the ceiling at 256 MB
+     * worst case, well below anything we'd plausibly run on. */
+    IM3Runtime rt = m3_NewRuntime(env, 4 * 1024 * 1024, 0);
     if (!rt) {
         fprintf(stderr, "yos: failed to create wasm3 runtime\n");
         free(wasm_bytes);

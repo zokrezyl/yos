@@ -54,10 +54,26 @@ int32_t yos_pipe2(struct yos_exec_ctx *ctx, uint32_t fildes, int32_t flags)
     }
     extern int32_t yos_fd_alloc(struct yos_exec_ctx *ctx, int host_fd);
     extern int32_t yos_fd_close(struct yos_exec_ctx *ctx, int32_t wfd);
+    /* yos_fd_alloc(hfds[i]) takes ownership of the host fd:
+     *   - on success it's recorded in fd_map (released by yos_fd_close
+     *     on the returned wfd, or by ctx teardown);
+     *   - on EMFILE failure fd_alloc closes the host fd internally
+     *     before returning the negative errno.
+     * Either way the caller MUST NOT close hfds[i] directly. */
     int32_t r = yos_fd_alloc(ctx, hfds[0]);
-    if (r < 0) { close(hfds[1]); return r; }
+    if (r < 0) {
+        /* hfds[0] already closed by fd_alloc on EMFILE; we only need
+         * to clean up the partner end. */
+        close(hfds[1]);
+        return r;
+    }
     int32_t w = yos_fd_alloc(ctx, hfds[1]);
-    if (w < 0) { yos_fd_close(ctx, r); return w; }
+    if (w < 0) {
+        /* hfds[1] already closed by fd_alloc; release the wfd we
+         * allocated for hfds[0] (yos_fd_close also closes hfds[0]). */
+        yos_fd_close(ctx, r);
+        return w;
+    }
     p[0] = r;
     p[1] = w;
     return 0;

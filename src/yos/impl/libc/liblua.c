@@ -1104,6 +1104,118 @@ static const void *m3_yos_lua_load_stub(IM3Runtime rt, IM3ImportContext _c,
     return NULL;
 }
 
+/* env.lua_getstack — i(L, int level, lua_Debug *ar)
+ *
+ * Lua 5.1's debug API. The guest passes a wasm offset for `ar` and
+ * relies on lua_getinfo to populate it. The host's lua_Debug has a
+ * different layout (8-byte pointers) than the guest's (4-byte). A
+ * full bridge would copy the meaningful int fields and the
+ * `short_src` block back to guest memory.
+ *
+ * Minimal stub: succeed for level 0 (current function) with the
+ * private `i_ci` slot opaque, fail (return 0) for deeper levels.
+ * Returning 0 is the documented "level out of range" behaviour, so
+ * the caller (e.g. nvim's nlua_funcref_str -> lua_getinfo path)
+ * sees "no info" instead of an unresolved-import trap. */
+static const void *m3_yos_lua_getstack(IM3Runtime rt, IM3ImportContext _c,
+                                       uint64_t *_sp, void *_m)
+{
+    (void)_c; (void)_m;
+    /* Signature: int lua_getstack(L_h, level, ar_off) → int */
+    lua_State *L = (lua_State *)lua_handles_resolve(CTX(rt), (uint32_t)_sp[1]);
+    int level = (int)_sp[2];
+    /* Stub: claim success only at level 0 with no further info to
+     * write. Lua treats a 0 return as "level out of range". */
+    _sp[0] = (uint64_t)(uint32_t)((L && level == 0) ? 1 : 0);
+    return NULL;
+}
+
+/* env.lua_getinfo — i(L, const char *what, lua_Debug *ar)
+ *
+ * Same struct-conversion concern as lua_getstack. Stub returns 0
+ * ("error in option") so the caller's path is "we couldn't get
+ * info" — surfaces as a generic "?" function name in nvim's
+ * mapping-key printout rather than crashing the editor.
+ *
+ * TODO: real bridge needs wasm32 lua_Debug layout + per-option
+ * field-copy. Documented in yos issue #6. */
+static const void *m3_yos_lua_getinfo(IM3Runtime rt, IM3ImportContext _c,
+                                      uint64_t *_sp, void *_m)
+{
+    (void)rt; (void)_c; (void)_m;
+    /* Signature: int lua_getinfo(L_h, what_off, ar_off) → int */
+    _sp[0] = (uint64_t)(uint32_t)0;
+    return NULL;
+}
+
+/* env.lua_sethook / lua_gethook / lua_gethookmask / lua_gethookcount
+ * — debug-hook installation. Setting a real hook requires a wasm
+ * callback trampoline (same blocker as lua_pushcclosure). For now
+ * accept the call as a no-op so guests that call sethook at startup
+ * (e.g. nvim's debug glue) don't trap on unresolved-import. */
+static const void *m3_yos_lua_sethook(IM3Runtime rt, IM3ImportContext _c,
+                                      uint64_t *_sp, void *_m)
+{
+    (void)rt; (void)_c; (void)_m;
+    /* Signature: int lua_sethook(L, hook_fn_ref, mask, count) → int */
+    _sp[0] = (uint64_t)(uint32_t)1;
+    return NULL;
+}
+static const void *m3_yos_lua_gethook(IM3Runtime rt, IM3ImportContext _c,
+                                      uint64_t *_sp, void *_m)
+{
+    (void)rt; (void)_c; (void)_m;
+    /* No hook installed → return 0 (NULL fn ref). */
+    _sp[0] = (uint64_t)(uint32_t)0;
+    return NULL;
+}
+static const void *m3_yos_lua_gethookmask(IM3Runtime rt, IM3ImportContext _c,
+                                          uint64_t *_sp, void *_m)
+{
+    (void)rt; (void)_c; (void)_m;
+    _sp[0] = (uint64_t)(uint32_t)0;
+    return NULL;
+}
+static const void *m3_yos_lua_gethookcount(IM3Runtime rt, IM3ImportContext _c,
+                                           uint64_t *_sp, void *_m)
+{
+    (void)rt; (void)_c; (void)_m;
+    _sp[0] = (uint64_t)(uint32_t)0;
+    return NULL;
+}
+
+/* env.lua_getlocal / lua_setlocal — also debug API. Stub to NULL/
+ * "no local" so callers can skip. */
+static const void *m3_yos_lua_getlocal(IM3Runtime rt, IM3ImportContext _c,
+                                       uint64_t *_sp, void *_m)
+{
+    (void)rt; (void)_c; (void)_m;
+    /* Returns wasm offset of the variable name, or 0 if no such local. */
+    _sp[0] = (uint64_t)(uint32_t)0;
+    return NULL;
+}
+static const void *m3_yos_lua_setlocal(IM3Runtime rt, IM3ImportContext _c,
+                                       uint64_t *_sp, void *_m)
+{
+    (void)rt; (void)_c; (void)_m;
+    _sp[0] = (uint64_t)(uint32_t)0;
+    return NULL;
+}
+static const void *m3_yos_lua_getupvalue(IM3Runtime rt, IM3ImportContext _c,
+                                         uint64_t *_sp, void *_m)
+{
+    (void)rt; (void)_c; (void)_m;
+    _sp[0] = (uint64_t)(uint32_t)0;
+    return NULL;
+}
+static const void *m3_yos_lua_setupvalue(IM3Runtime rt, IM3ImportContext _c,
+                                         uint64_t *_sp, void *_m)
+{
+    (void)rt; (void)_c; (void)_m;
+    _sp[0] = (uint64_t)(uint32_t)0;
+    return NULL;
+}
+
 /* ── GC ─────────────────────────────────────────────────────────── */
 BR_INT_L_INT_INT(lua_gc, lua_gc)
 
@@ -1411,6 +1523,21 @@ void yos_liblua_link(IM3Module mod)
     m3_LinkRawFunction(mod, "env", "luaL_loadbuffer",  "i(iiii)",  m3_yos_luaL_loadbuffer);
     m3_LinkRawFunction(mod, "env", "luaL_loadstring",  "i(ii)",    m3_yos_luaL_loadstring);
     m3_LinkRawFunction(mod, "env", "luaL_loadfile",    "i(ii)",    m3_yos_luaL_loadfile);
+
+    /* Debug API — stubs for now (issue #6). Real bridges need wasm32
+     * lua_Debug layout + a per-option field-copy out into guest mem.
+     * Stubs return 0 / no-info so callers fall back gracefully
+     * instead of trapping on unresolved-import at module load. */
+    m3_LinkRawFunction(mod, "env", "lua_getstack",     "i(iii)",  m3_yos_lua_getstack);
+    m3_LinkRawFunction(mod, "env", "lua_getinfo",      "i(iii)",  m3_yos_lua_getinfo);
+    m3_LinkRawFunction(mod, "env", "lua_sethook",      "i(iiii)", m3_yos_lua_sethook);
+    m3_LinkRawFunction(mod, "env", "lua_gethook",      "i(i)",    m3_yos_lua_gethook);
+    m3_LinkRawFunction(mod, "env", "lua_gethookmask",  "i(i)",    m3_yos_lua_gethookmask);
+    m3_LinkRawFunction(mod, "env", "lua_gethookcount", "i(i)",    m3_yos_lua_gethookcount);
+    m3_LinkRawFunction(mod, "env", "lua_getlocal",     "i(iii)",  m3_yos_lua_getlocal);
+    m3_LinkRawFunction(mod, "env", "lua_setlocal",     "i(iii)",  m3_yos_lua_setlocal);
+    m3_LinkRawFunction(mod, "env", "lua_getupvalue",   "i(iii)",  m3_yos_lua_getupvalue);
+    m3_LinkRawFunction(mod, "env", "lua_setupvalue",   "i(iii)",  m3_yos_lua_setupvalue);
 
     /* GC */
     m3_LinkRawFunction(mod, "env", "lua_gc", "i(iii)", m3_yos_lua_gc);

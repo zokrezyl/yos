@@ -170,6 +170,18 @@ libc_tests = [
   # through this and trap with "unresolved import env.readpassphrase"
   # without the hand bridge.
   'test_ssh_readpassphrase',
+  # Issue #15 regression suite — each test pins one of the test ideas
+  # the static review enumerated:
+  #   cwd_after_chdir   — guest cwd resolution survives fopen / openat(AT_FDCWD)
+  #   fdopen_lifetime   — fdopen+fclose+close(stale_fd) does not close a recycled host fd
+  #   boundary_buffers  — read/write/getentropy boundary semantics (NULL+0 OK, NULL+n EFAULT)
+  #   iovec_bounds      — writev rejects negative iovcnt, huge iovcnt, and bad per-iovec ranges
+  #   mkdirat_dirfd     — mkdirat with a real (non-AT_FDCWD) dirfd places the new dir correctly
+  'test_issue15_cwd_after_chdir',
+  'test_issue15_fdopen_lifetime',
+  'test_issue15_boundary_buffers',
+  'test_issue15_iovec_bounds',
+  'test_issue15_mkdirat_dirfd',
 ]
 
 # Path to the generator's output dir, exposed by src/yos/codegen.

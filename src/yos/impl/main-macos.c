@@ -281,6 +281,12 @@ void yos_mach_install_exc_handler(void)
             (void)!write(dbg, b, (size_t)n);
             (void)close(dbg);
         }
+        /* Release the receive port we allocated above. Without this
+         * the port stays in the task's port-name space forever even
+         * though nothing references it. */
+        (void)mach_port_mod_refs(mach_task_self(), yos_mach_exc_port,
+                                 MACH_PORT_RIGHT_RECEIVE, -1);
+        yos_mach_exc_port = MACH_PORT_NULL;
         return;
     }
     kr = task_set_exception_ports(mach_task_self(),
@@ -296,6 +302,13 @@ void yos_mach_install_exc_handler(void)
             (void)!write(dbg, b, (size_t)n);
             (void)close(dbg);
         }
+        /* Drop both rights we installed: the send right we made above
+         * and the original receive right from mach_port_allocate. */
+        (void)mach_port_mod_refs(mach_task_self(), yos_mach_exc_port,
+                                 MACH_PORT_RIGHT_SEND, -1);
+        (void)mach_port_mod_refs(mach_task_self(), yos_mach_exc_port,
+                                 MACH_PORT_RIGHT_RECEIVE, -1);
+        yos_mach_exc_port = MACH_PORT_NULL;
         return;
     }
 
@@ -305,6 +318,32 @@ void yos_mach_install_exc_handler(void)
     pthread_t t;
     int rc = pthread_create(&t, &attr, yos_mach_exc_thread, NULL);
     pthread_attr_destroy(&attr);
+
+    if (rc != 0) {
+        /* No thread to drain the exception port — un-install the
+         * exception handler and free the port so messages don't
+         * queue up forever. The kernel falls back to the host's
+         * default handler (signal-delivery) when there's no port. */
+        (void)task_set_exception_ports(mach_task_self(),
+            EXC_MASK_BAD_INSTRUCTION | EXC_MASK_BAD_ACCESS |
+                EXC_MASK_ARITHMETIC | EXC_MASK_BREAKPOINT,
+            MACH_PORT_NULL,
+            EXCEPTION_DEFAULT | MACH_EXCEPTION_CODES,
+            THREAD_STATE_NONE);
+        (void)mach_port_mod_refs(mach_task_self(), yos_mach_exc_port,
+                                 MACH_PORT_RIGHT_SEND, -1);
+        (void)mach_port_mod_refs(mach_task_self(), yos_mach_exc_port,
+                                 MACH_PORT_RIGHT_RECEIVE, -1);
+        yos_mach_exc_port = MACH_PORT_NULL;
+        if (dbg >= 0) {
+            int n = snprintf(b, sizeof b,
+                             "yos-mach-exc pthread_create failed rc=%d, "
+                             "rolled back exception handler\n", rc);
+            (void)!write(dbg, b, (size_t)n);
+            (void)close(dbg);
+        }
+        return;
+    }
 
     if (dbg >= 0) {
         int n = snprintf(b, sizeof b,

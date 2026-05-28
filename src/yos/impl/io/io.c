@@ -172,6 +172,21 @@ int yos_xlate_dfd(struct yos_exec_ctx *ctx, int32_t wfd)
     return yos_fd_get(ctx, wfd);
 }
 
+/* Ownership contract: yos_fd_alloc takes ownership of `host_fd`.
+ *   - On success the host fd is recorded in fd_map; the caller now
+ *     refers to it via the returned wfd. Release with yos_fd_close,
+ *     which closes the underlying host fd.
+ *   - On EMFILE (table full) yos_fd_alloc CLOSES host_fd internally
+ *     and returns -EMFILE. Callers MUST NOT close the host fd
+ *     themselves on this path — that would double-close (or close
+ *     an unrelated descriptor the kernel has already recycled).
+ *   - If host_fd is negative on entry (a propagated error from an
+ *     upstream open/socket/dup), the same negative is returned
+ *     unchanged; no fd is touched.
+ *
+ * Pipe2 and similar two-fd routines depend on this contract: they
+ * close ONLY the partner end on the first-alloc failure path. See
+ * impl/io/io-darwin.c::yos_pipe2 / io-linux.c::yos_pipe2. */
 int32_t yos_fd_alloc(struct yos_exec_ctx *ctx, int host_fd)
 {
     if (host_fd < 0) return host_fd;

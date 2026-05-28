@@ -85,7 +85,7 @@ def check_long_format(yos, libexec):
         # attribute space stripped because it's whitespace anyway).
         expected = {
             "regular.txt":  ("-rw-r--r--", 6),
-            "runnable.sh":  ("-rwxr-xr-x", 19),
+            "runnable.sh":  ("-rwxr-xr-x", 18),
             "subdir":       ("drwxr-xr-x", None),  # size varies
         }
 

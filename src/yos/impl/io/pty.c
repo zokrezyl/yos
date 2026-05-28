@@ -383,7 +383,10 @@ int32_t yos_ptsname_r(struct yos_exec_ctx *ctx, int32_t wfd,
 {
     int hfd = yos_fd_get(ctx, wfd);
     if (hfd < 0) return EBADF;
-    if (!buf_off || buf_off + buflen > ctx->memory_size) return EFAULT;
+    /* uint32 wrap-safe range check. */
+    if (!buf_off || buflen == 0 ||
+        (uint64_t)buf_off + (uint64_t)buflen > (uint64_t)ctx->memory_size)
+        return EFAULT;
     char *guest = (char *)(ctx->memory + buf_off);
     int rc = ptsname_r(hfd, guest, (size_t)buflen);
     if (rc == 0) return 0;

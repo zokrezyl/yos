@@ -283,7 +283,8 @@ int32_t yos_sig_rt_sigaction(struct yos_exec_ctx *ctx, int32_t signum,
  * upper signums (POSIX realtime sigs aren't delivered anyway). */
 static uint32_t read_fbsd_sigset_lo(struct yos_exec_ctx *ctx, uint32_t off)
 {
-    if (!off || !ctx || off + YOS_FBSD_SIGSET_BYTES > ctx->memory_size)
+    if (!off || !ctx ||
+        (uint64_t)off + (uint64_t)YOS_FBSD_SIGSET_BYTES > (uint64_t)ctx->memory_size)
         return 0;
     return *(uint32_t *)(ctx->memory + off);
 }
@@ -294,7 +295,8 @@ static uint32_t read_fbsd_sigset_lo(struct yos_exec_ctx *ctx, uint32_t off)
 static void write_fbsd_sigset_lo(struct yos_exec_ctx *ctx, uint32_t off,
                                  uint32_t lo)
 {
-    if (!off || !ctx || off + YOS_FBSD_SIGSET_BYTES > ctx->memory_size)
+    if (!off || !ctx ||
+        (uint64_t)off + (uint64_t)YOS_FBSD_SIGSET_BYTES > (uint64_t)ctx->memory_size)
         return;
     uint8_t *p = ctx->memory + off;
     *(uint32_t *)p = lo;

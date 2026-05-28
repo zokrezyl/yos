@@ -509,7 +509,10 @@ int32_t yos_poll(struct yos_exec_ctx *ctx,
 
     if (nfds == 0) return (int32_t)poll(NULL, 0, timeout);
     if (nfds > 1024) return yos_errno_neg(ctx, EINVAL);
-    if (pfds_off == 0 || pfds_off + nfds * 8 > ctx->memory_size)
+    /* 64-bit math — nfds*8 in uint32 wraps for very large nfds, and
+     * nfds itself was capped at 1024 above so the cast is safe. */
+    if (pfds_off == 0 ||
+        (uint64_t)pfds_off + (uint64_t)nfds * 8ULL > (uint64_t)ctx->memory_size)
         return yos_errno_neg(ctx, EFAULT);
 
     /* "Always-ready" sentinel — darwin's poll(2) returns POLLNVAL when
