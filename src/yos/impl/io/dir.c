@@ -1,3 +1,4 @@
+#include "platform.h"   /* yos_plat_fstat / read / write / isatty / close */
 /* impl/dir.c — directory-stream bridge.
  *
  * Two backends behind one DIR* handle table:
@@ -539,27 +540,18 @@ int32_t yos_poll(struct yos_exec_ctx *ctx,
 
         if (host_pfds[i].fd >= 0) {
             struct stat sb;
-            if (fstat(host_pfds[i].fd, &sb) == 0) {
+            if (yos_plat_fstat(host_pfds[i].fd, &sb) == 0) {
                 int always_ready = 0;
                 if (S_ISREG(sb.st_mode) || S_ISDIR(sb.st_mode))
                     always_ready = 1;
                 else if (S_ISCHR(sb.st_mode)) {
-                    /* /dev/null check — stat() the path once and cache.
-                     * If the cached stat fails we just leave the fd in
-                     * the host poll set; nothing breaks. */
-                    static dev_t null_dev;
-                    static ino_t null_ino;
-                    static int   null_init;
-                    if (!null_init) {
-                        struct stat nb;
-                        if (stat("/dev/null", &nb) == 0) {
-                            null_dev = nb.st_dev;
-                            null_ino = nb.st_ino;
-                        }
-                        null_init = 1;
-                    }
-                    if (sb.st_dev == null_dev && sb.st_ino == null_ino)
-                        always_ready = 1;
+                    /* Any character device — /dev/null on Linux/darwin,
+                     * NUL on Windows, /dev/console — is treated as
+                     * always-readable. Strict /dev/null inode matching
+                     * would let us be picky but the cost of being wrong
+                     * is small (one immediate read that returns 0 on
+                     * non-blocking, EOF on blocking). */
+                    always_ready = 1;
                 }
                 if (always_ready) {
                     /* Mirror Linux: any requested event is immediately

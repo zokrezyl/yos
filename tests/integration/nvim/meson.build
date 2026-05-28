@@ -21,10 +21,16 @@ nvim_wasm = meson.project_build_root() / 'wasm-pkgs' / 'nvim-0.10.4' \
 nvim_int_env = environment()
 nvim_int_env.set('YOS_REPO_ROOT', meson.project_source_root())
 # Tell tests where the host yos binary lives (build dir basename, e.g.
-# build-linux on linux, build-darwin on darwin). Tests join repo +
-# build_dir + "src/yos/yos" — defaults to build-linux for back-compat.
-yos_build_basename = run_command('basename', meson.project_build_root(),
-                                 check : true).stdout().strip()
+# build-linux on linux, build-darwin on darwin). POSIX hosts have a
+# native `basename`; on Windows we shell out to Python instead.
+if host_machine.system() == 'windows'
+  yos_build_basename = run_command(
+    py, '-c', 'import sys, os; print(os.path.basename(sys.argv[1]))',
+    meson.project_build_root(), check : true).stdout().strip()
+else
+  yos_build_basename = run_command('basename', meson.project_build_root(),
+                                   check : true).stdout().strip()
+endif
 nvim_int_env.set('YOS_BUILD_DIR', yos_build_basename)
 
 nvim_int_tests = {
@@ -35,6 +41,12 @@ nvim_int_tests = {
   # 'iHELLO<Esc>:q!<CR>' and verifies HELLO appears in the pty output.
   'input'        : {'src' : files('test_input.py'),        'xfail' : false},
 }
+
+# The harness uses Python's `pty` module (Unix-only). Windows would
+# need a ConPTY-based rewrite — skip until that exists.
+if host_machine.system() == 'windows'
+  nvim_int_tests = {}
+endif
 
 foreach name, cfg : nvim_int_tests
   # is_parallel: false — each test drives a full nvim TUI through a

@@ -1,3 +1,4 @@
+#include "platform.h"   /* yos_plat_read / write / isatty / close */
 /* impl/pty.c — pseudo-terminal bridges with sandbox fallback.
  *
  * On Linux/macOS desktop, posix_openpt() opens /dev/ptmx and returns
@@ -89,7 +90,7 @@ static int g_pty_next_id = 1;
  * master socket resolve to the same entry. */
 static struct pty_entry *pty_lookup_by_master_locked(int master_hfd) {
     struct stat ms;
-    if (fstat(master_hfd, &ms) < 0) return NULL;
+    if (yos_plat_fstat(master_hfd, &ms) < 0) return NULL;
     for (struct pty_entry *e = g_pty_head; e; e = e->next)
         if (e->master_ino == ms.st_ino && e->master_dev == ms.st_dev)
             return e;
@@ -107,7 +108,7 @@ static struct pty_entry *pty_lookup_by_path_locked(const char *path) {
  * g_pty_lock held. */
 static struct pty_entry *pty_find_master_locked(int hfd) {
     struct stat ms;
-    if (fstat(hfd, &ms) < 0) return NULL;
+    if (yos_plat_fstat(hfd, &ms) < 0) return NULL;
     for (struct pty_entry *e = g_pty_head; e; e = e->next)
         if (e->master_ino == ms.st_ino && e->master_dev == ms.st_dev)
             return e;
@@ -138,10 +139,10 @@ int yos_pty_set_onlcr(int hfd, int on) {
      * first, then walk for a slave-fd match. */
     if (!e) {
         struct stat ss;
-        if (fstat(hfd, &ss) == 0) {
+        if (yos_plat_fstat(hfd, &ss) == 0) {
             for (struct pty_entry *p = g_pty_head; p; p = p->next) {
                 struct stat ps;
-                if (fstat(p->slave_hfd, &ps) == 0 &&
+                if (yos_plat_fstat(p->slave_hfd, &ps) == 0 &&
                     ps.st_ino == ss.st_ino && ps.st_dev == ss.st_dev) {
                     e = p;
                     break;
@@ -168,7 +169,7 @@ static ssize_t pty_read_expand_onlcr(int hfd, char *out, size_t out_cap)
     if (host_cap == 0) { errno = EINVAL; return -1; }
     char scratch[4096];
     if (host_cap > sizeof scratch) host_cap = sizeof scratch;
-    ssize_t n = read(hfd, scratch, host_cap);
+    ssize_t n = yos_plat_read(hfd, scratch, host_cap);
     if (n <= 0) return n;
     size_t o = 0;
     char prev = 0;
@@ -215,7 +216,7 @@ ssize_t yos_pty_packet_read(int hfd, void *buf, size_t cap) {
     }
 
     /* Raw-mode read — no LF/CRLF transform. */
-    ssize_t n = read(hfd, p + header, cap - header);
+    ssize_t n = yos_plat_read(hfd, p + header, cap - header);
     if (n < 0) return -1;
     return (ssize_t)(header + (size_t)n);
 }
@@ -228,7 +229,7 @@ ssize_t yos_pty_packet_read(int hfd, void *buf, size_t cap) {
  * same socket share the inode/dev pair. */
 int yos_pty_is_pty_fd(int hfd) {
     struct stat ms;
-    if (fstat(hfd, &ms) < 0) return 0;
+    if (yos_plat_fstat(hfd, &ms) < 0) return 0;
     pthread_mutex_lock(&g_pty_lock);
     for (struct pty_entry *e = g_pty_head; e; e = e->next) {
         struct stat ss;
@@ -236,7 +237,7 @@ int yos_pty_is_pty_fd(int hfd) {
             pthread_mutex_unlock(&g_pty_lock);
             return 1;
         }
-        if (fstat(e->slave_hfd, &ss) == 0 &&
+        if (yos_plat_fstat(e->slave_hfd, &ss) == 0 &&
             ss.st_ino == ms.st_ino && ss.st_dev == ms.st_dev) {
             pthread_mutex_unlock(&g_pty_lock);
             return 1;
@@ -269,7 +270,7 @@ int32_t yos_posix_openpt(struct yos_exec_ctx *ctx, int32_t fb_flags)
     int hfd = posix_openpt(host_flags);
     if (hfd >= 0) {
         int wfd = yos_fd_alloc(ctx, hfd);
-        if (wfd < 0) { close(hfd); return yos_errno_neg(ctx, ENFILE); }
+        if (wfd < 0) { yos_plat_close(hfd); return yos_errno_neg(ctx, ENFILE); }
         ydebug("posix_openpt(0x%x→0x%x) = wfd=%d hfd=%d (real)\n",
                fb_flags, host_flags, wfd, hfd);
         return wfd;
@@ -285,7 +286,7 @@ int32_t yos_posix_openpt(struct yos_exec_ctx *ctx, int32_t fb_flags)
     if (!e) { close(sp[0]); close(sp[1]); return yos_errno_neg(ctx, ENOMEM); }
 
     struct stat ms;
-    if (fstat(sp[0], &ms) < 0) {
+    if (yos_plat_fstat(sp[0], &ms) < 0) {
         int saved = errno;
         free(e); close(sp[0]); close(sp[1]);
         return yos_errno_neg(ctx, saved);

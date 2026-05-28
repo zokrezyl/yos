@@ -26,6 +26,7 @@
 #include "wasm3.h"
 #include "m3_env.h"
 #include "impl/proc/pthread.h"   /* yos_pthread_host typedef + destroy */
+#include "platform.h"            /* yos_plat_exit */
 
 /* ============================================================================
  * Asyncify Helpers
@@ -358,8 +359,13 @@ int32_t yos_exit(struct yos_exec_ctx *ctx, int32_t code)
         pthread_exit((void *)(intptr_t)code);
     }
 
-    /* Main process - terminate the whole program */
-    exit(code);
+    /* Main process - terminate the whole program. The platform helper
+     * picks exit() vs _exit() — on POSIX we go through exit() so atexit
+     * + stdio-flush run; on Windows _exit() to skip debug-CRT teardown
+     * that deadlocks when our pthread shim's worker threads are still
+     * alive. fflush(NULL) below covers the stdio side either way. */
+    fflush(NULL);
+    yos_plat_exit(code);
     return 0; /* unreachable */
 }
 

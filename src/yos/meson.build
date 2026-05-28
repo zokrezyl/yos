@@ -41,7 +41,9 @@
 
 threads_dep = dependency('threads')
 cc = meson.get_compiler('c')
-m_dep = cc.find_library('m', required: true)
+# Windows: math functions live in the MSVC CRT (msvcrt / ucrt); there
+# is no separate `libm` to link.
+m_dep = cc.find_library('m', required: host_machine.system() != 'windows')
 # libpython 3.12 (embedded) — links the real CPython interpreter into
 # the yos host so wasm guests can drive it through env.Py_* bridges
 # (impl/libpython.c). Optional: if libpython isn't installed, the
@@ -115,17 +117,19 @@ yos_inc = include_directories(
   '.',                   # `impl/<area>.h`, `vfs/<x>.h`, `generated/<x>.h`
   'generated',           # `host64_structs.h`, `struct_convert.h`
   'vfs',                 # vfs/*.c sees sibling `file.h` etc.
-  'platform/posix',      # `platform.h` (Linux+darwin shared abstraction)
+  host_machine.system() == 'windows' ? 'platform/windows' : 'platform/posix',
 )
 
 # Platform-specific host sources. Anything that diverges between Linux
 # and darwin (gettid, …) lands in platform/posix/<x>-{linux,darwin}.c;
-# Windows port will grow platform/windows/ later.
+# Windows ships its own platform/windows/ slice with the same surface.
 host_os = host_machine.system()
 if host_os == 'linux'
   platform_sources = files('platform/posix/platform-linux.c')
 elif host_os == 'darwin'
   platform_sources = files('platform/posix/platform-darwin.c')
+elif host_os == 'windows'
+  platform_sources = files('platform/windows/platform-windows.c')
 else
   error('yos: unsupported host OS: ' + host_os)
 endif
@@ -192,6 +196,17 @@ elif host_os == 'darwin'
     # sigaltstack.
     impl_platform_sources += files('impl/main-macos.c')
   endif
+elif host_os == 'windows'
+  # Windows host: msvcrt / winsock2 surface. Most Linux-only deep libc
+  # extensions (futex, NUMA mempolicy, AIO, sendfile, statx, getdents,
+  # robust_list, kqueue/epoll, sigwaitinfo) get -ENOSYS stubs for now.
+  impl_platform_sources += files(
+    'impl/proc/sig-windows.c',
+    'impl/libc/kqueue-windows.c',
+    'impl/libc/posix-windows.c',
+    'impl/main-windows.c',
+    'impl/io/io-windows.c',
+  )
 endif
 
 yos_runtime_sources = files(
@@ -290,15 +305,80 @@ if have_liblua
   optional_deps    += liblua_dep
 endif
 
-yos_common_c_args = [
-  '-D_GNU_SOURCE',
-  '-Wno-unused-parameter',
-  '-Wno-unused-but-set-variable',
-  '-Wno-unused-variable',
-  '-Wno-unused-function',
-  '-Wno-implicit-fallthrough',
-  '-Wno-format-overflow',
-] + optional_args
+_yoscc = meson.get_compiler('c')
+_yos_gnu_like  = _yoscc.get_id() in ['gcc', 'clang', 'clang-cl']
+_yos_msvc_like = _yoscc.get_argument_syntax() == 'msvc'
+
+yos_common_c_args = []
+if _yos_gnu_like
+  yos_common_c_args += [
+    '-D_GNU_SOURCE',
+    '-Wno-unused-parameter',
+    '-Wno-unused-but-set-variable',
+    '-Wno-unused-variable',
+    '-Wno-unused-function',
+    '-Wno-implicit-fallthrough',
+    '-Wno-format-overflow',
+  ]
+endif
+if _yos_msvc_like
+  yos_common_c_args += [
+    '/wd4100',  # unused parameter
+    '/wd4101',  # unreferenced local variable
+    '/wd4102',  # unreferenced label
+    '/wd4189',  # initialised but not referenced
+    '/wd4244',  # narrowing conversion
+    '/wd4267',  # size_t narrowing
+    '/wd4456', '/wd4457', '/wd4459',  # name shadowing
+    '/wd4477',  # printf format
+    '/wd4701',  # uninitialised local
+    '/wd4706',  # assignment within conditional
+    '/wd5045',  # spectre mitigation insertion
+    '/Zc:preprocessor',
+    '/experimental:c11atomics',
+    '/D_CRT_SECURE_NO_WARNINGS',
+    '/D_CRT_NONSTDC_NO_WARNINGS',
+    '/DNOMINMAX',
+    '/DWIN32_LEAN_AND_MEAN',
+    # MSVC has no POSIX strcasecmp / strncasecmp; alias to msvcrt's
+    # _stricmp / _strnicmp the same way yetty's Windows target does.
+    '/Dstrcasecmp=_stricmp',
+    '/Dstrncasecmp=_strnicmp',
+    # Force-include POSIX additions (SIGHUP, sigset_t, struct flock, …)
+    # so shared sources that use them keep parsing without touching the
+    # MSVC system headers themselves.
+    '/FIposix_extras.h',
+  ]
+endif
+yos_common_c_args += optional_args
+
+if host_os == 'windows'
+  # Windows SDK / msvcrt lack several POSIX headers (dirent.h, unistd.h,
+  # sys/statvfs.h, sys/un.h, sys/uio.h, sys/utsname.h, sys/mount.h,
+  # poll.h, sys/socket.h, sys/mman.h, ...). The platform/windows/compat
+  # tree provides minimal MSVC-clean replacements so the shared sources
+  # parse; runtime behaviour is ENOSYS via the io-windows.c slice.
+  if _yos_msvc_like
+    yos_common_c_args += [
+      '/external:I' + meson.current_source_dir() / 'platform/windows/compat',
+      '/external:W0',
+    ]
+  else
+    yos_common_c_args += ['-isystem',
+      meson.current_source_dir() / 'platform/windows/compat']
+  endif
+  # compat_stubs.c provides POSIX-named function bodies (sigaction,
+  # sigprocmask, etc.) whose declarations live in compat/posix_extras.h.
+  # pthread_win32.c is the Win32-native pthread implementation backing
+  # the compat/pthread.h surface used by wasm3 + the yos host runtime.
+  # dirent_win32.c is the FindFirstFileW-backed POSIX dirent surface.
+  impl_platform_sources += files(
+    'platform/windows/compat/compat_stubs.c',
+    'platform/windows/compat/compat_libc.c',
+    'platform/windows/compat/pthread_win32.c',
+    'platform/windows/compat/dirent_win32.c',
+  )
+endif
 
 yos_common_deps = [
   wasm3_dep,

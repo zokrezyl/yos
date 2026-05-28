@@ -30,15 +30,44 @@ import sys
 from pathlib import Path
 
 
+def _msvc_include_paths() -> list[Path]:
+    """On Windows under a Developer-prompt-style environment (vcvars
+    has been sourced), %INCLUDE% lists every header search directory
+    the MSVC toolchain would use — MSVC's CRT, the Windows SDK shared
+    + um + ucrt trees, plus any addon SDKs. Use that authoritative list
+    instead of asking a preprocessor."""
+    import os
+    raw = os.environ.get('INCLUDE', '')
+    paths: list[Path] = []
+    for p in raw.split(';'):
+        p = p.strip()
+        if p:
+            paths.append(Path(p))
+    return paths
+
+
 def _clang_include_paths() -> list[Path]:
-    """Ask clang where it would look for system headers."""
-    try:
-        out = subprocess.check_output(
-            ['clang', '-xc', '-E', '-v', '/dev/null'],
-            stderr=subprocess.STDOUT, text=True,
-        )
-    except (FileNotFoundError, subprocess.CalledProcessError) as e:
-        raise SystemExit(f'[host-libc] clang -E -v failed: {e}')
+    """Ask clang (or gcc, cc) where it would look for system headers.
+    On Windows we prefer %INCLUDE% (set by vcvars64) — see
+    `_msvc_include_paths`."""
+    import os
+    if os.name == 'nt':
+        msvc = _msvc_include_paths()
+        if msvc:
+            return msvc
+    devnull = 'NUL' if os.name == 'nt' else '/dev/null'
+    last_err: Exception | None = None
+    for cc in ('clang', 'gcc', 'cc'):
+        try:
+            out = subprocess.check_output(
+                [cc, '-xc', '-E', '-v', devnull],
+                stderr=subprocess.STDOUT, text=True,
+            )
+            break
+        except (FileNotFoundError, subprocess.CalledProcessError) as e:
+            last_err = e
+    else:
+        raise SystemExit(f'[host-libc] no usable preprocessor found: {last_err}')
 
     # The relevant block:
     #   #include <...> search starts here:
@@ -97,7 +126,21 @@ def cmd_snapshot(out_root: Path) -> int:
         # named 'include').
         slug = f'{i:02d}-{p.name or "root"}'
         link = inc / slug
-        link.symlink_to(p)
+        try:
+            link.symlink_to(p, target_is_directory=True)
+        except (OSError, NotImplementedError):
+            # Windows without dev-mode forbids symlinks for unprivileged
+            # users — fall back to a directory junction via `mklink /J`,
+            # which works without admin and is transparent to anything
+            # that walks the file tree.
+            import os, subprocess
+            if os.name == 'nt':
+                rc = subprocess.run(
+                    ['cmd', '/c', 'mklink', '/J', str(link), str(p)],
+                    capture_output=True, text=True).returncode
+                if rc != 0:
+                    print(f'[host-libc] mklink /J failed for {link} → {p}',
+                          file=sys.stderr)
         manifest.append(f'{i:02d} {p}')
 
     (out_root / 'manifest.txt').write_text('\n'.join(manifest) + '\n')

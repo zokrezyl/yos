@@ -2054,6 +2054,15 @@ int main(int argc, char **argv)
      * environment and fall back to defaults that don't match what the
      * user set on the host shell. */
     {
+        /* Windows doesn't usually set PWD; many POSIX scripts and
+         * tests (FreeBSD's libc clearenv suite included) depend on it
+         * being present. Set from getcwd() before the env vector is
+         * snapshotted so the wasm guest sees it. setenv is a no-op
+         * elsewhere if PWD is already set (overwrite=0). */
+        if (!getenv("PWD")) {
+            char cwd[4096];
+            if (getcwd(cwd, sizeof cwd)) setenv("PWD", cwd, 0);
+        }
         int ec = 0;
         if (environ) for (char **p = environ; *p; p++) ec++;
         g_runtime.envc = ec;

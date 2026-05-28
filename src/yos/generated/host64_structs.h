@@ -170,6 +170,7 @@ struct host64_PartitionBlock {
 
 /* PioctlData: 1 bytes, align 1 */
 struct host64_PioctlData {
+    char _yos_empty_pad;
 };
 
 /* RigidDiskBlock: 256 bytes, align 4 */
@@ -224,6 +225,7 @@ struct host64_SMMRegisters {
 
 /* ViceIoctl: 1 bytes, align 1 */
 struct host64_ViceIoctl {
+    char _yos_empty_pad;
 };
 
 /* _ErrorInfo_struct: 48 bytes, align 1 */
@@ -330,6 +332,7 @@ struct host64___kernel_sock_timeval {
 
 /* __kernel_sockaddr_storage: 128 bytes, align 8 */
 struct host64___kernel_sockaddr_storage {
+    char _yos_empty_pad;
 };
 
 /* __kernel_timespec: 16 bytes, align 8 */
@@ -414,6 +417,7 @@ struct host64___sk_buff {
 
 /* __sysctl_args: 1 bytes, align 1 */
 struct host64___sysctl_args {
+    char _yos_empty_pad;
 };
 
 /* __user_cap_data_struct: 12 bytes, align 4 */
@@ -706,10 +710,12 @@ struct host64_arphdr {
 
 /* arpreq: 1 bytes, align 1 */
 struct host64_arpreq {
+    char _yos_empty_pad;
 };
 
 /* arpreq_old: 1 bytes, align 1 */
 struct host64_arpreq_old {
+    char _yos_empty_pad;
 };
 
 /* aspeed_lpc_ctrl_mapping: 16 bytes, align 4 */
@@ -1509,7 +1515,7 @@ struct host64_bpf_list_node {
 /* bpf_lpm_trie_key: 4 bytes, align 4 */
 struct host64_bpf_lpm_trie_key {
     uint32_t prefixlen;
-    uint8_t data[0];
+    uint8_t data[];
 };
 
 /* bpf_lpm_trie_key_hdr: 4 bytes, align 4 */
@@ -1601,7 +1607,7 @@ struct host64_bpf_prog_info {
 
 /* bpf_raw_tracepoint_args: 0 bytes, align 8 */
 struct host64_bpf_raw_tracepoint_args {
-    uint64_t args[0];
+    uint64_t args[];
 };
 
 /* bpf_rb_node: 32 bytes, align 8 */
@@ -1711,6 +1717,7 @@ struct host64_bpf_sock_ops {
 
 /* bpf_sock_tuple: 36 bytes, align 4 */
 struct host64_bpf_sock_tuple {
+    char _yos_empty_pad;
 };
 
 /* bpf_sockopt: 40 bytes, align 8 */
@@ -2550,14 +2557,17 @@ struct host64_clone_args {
 
 /* coda_create_in: 1 bytes, align 1 */
 struct host64_coda_create_in {
+    char _yos_empty_pad;
 };
 
 /* coda_create_out: 1 bytes, align 1 */
 struct host64_coda_create_out {
+    char _yos_empty_pad;
 };
 
 /* coda_getattr_out: 1 bytes, align 1 */
 struct host64_coda_getattr_out {
+    char _yos_empty_pad;
 };
 
 /* coda_in_hdr: 20 bytes, align 4 */
@@ -2571,14 +2581,17 @@ struct host64_coda_in_hdr {
 
 /* coda_ioctl_out: 1 bytes, align 1 */
 struct host64_coda_ioctl_out {
+    char _yos_empty_pad;
 };
 
 /* coda_mkdir_in: 1 bytes, align 1 */
 struct host64_coda_mkdir_in {
+    char _yos_empty_pad;
 };
 
 /* coda_mkdir_out: 1 bytes, align 1 */
 struct host64_coda_mkdir_out {
+    char _yos_empty_pad;
 };
 
 /* coda_mount_data: 8 bytes, align 4 */
@@ -2589,6 +2602,7 @@ struct host64_coda_mount_data {
 
 /* coda_open_out: 1 bytes, align 1 */
 struct host64_coda_open_out {
+    char _yos_empty_pad;
 };
 
 /* coda_out_hdr: 12 bytes, align 4 */
@@ -2600,10 +2614,12 @@ struct host64_coda_out_hdr {
 
 /* coda_readlink_out: 1 bytes, align 1 */
 struct host64_coda_readlink_out {
+    char _yos_empty_pad;
 };
 
 /* coda_setattr_in: 1 bytes, align 1 */
 struct host64_coda_setattr_in {
+    char _yos_empty_pad;
 };
 
 /* coda_statfs: 20 bytes, align 4 */
@@ -2617,14 +2633,17 @@ struct host64_coda_statfs {
 
 /* coda_symlink_in: 1 bytes, align 1 */
 struct host64_coda_symlink_in {
+    char _yos_empty_pad;
 };
 
 /* coda_timespec: 1 bytes, align 1 */
 struct host64_coda_timespec {
+    char _yos_empty_pad;
 };
 
 /* coda_vattr: 1 bytes, align 1 */
 struct host64_coda_vattr {
+    char _yos_empty_pad;
 };
 
 /* comedi_bufconfig: 32 bytes, align 4 */
@@ -3018,10 +3037,12 @@ struct host64_crypto_user_alg {
 
 /* cuse_init_in: 1 bytes, align 1 */
 struct host64_cuse_init_in {
+    char _yos_empty_pad;
 };
 
 /* cuse_init_out: 1 bytes, align 1 */
 struct host64_cuse_init_out {
+    char _yos_empty_pad;
 };
 
 /* cxl_command_info: 16 bytes, align 4 */
@@ -3402,18 +3423,22 @@ struct host64_dns_server_list_v1_server {
 
 /* dsa_completion_record: 1 bytes, align 1 */
 struct host64_dsa_completion_record {
+    char _yos_empty_pad;
 };
 
 /* dsa_hw_desc: 1 bytes, align 1 */
 struct host64_dsa_hw_desc {
+    char _yos_empty_pad;
 };
 
 /* dsa_raw_completion_record: 1 bytes, align 1 */
 struct host64_dsa_raw_completion_record {
+    char _yos_empty_pad;
 };
 
 /* dsa_raw_desc: 1 bytes, align 1 */
 struct host64_dsa_raw_desc {
+    char _yos_empty_pad;
 };
 
 /* dvd_bca: 196 bytes, align 4 */
@@ -4977,298 +5002,372 @@ struct host64_fsxattr {
 
 /* fuse_access_in: 1 bytes, align 1 */
 struct host64_fuse_access_in {
+    char _yos_empty_pad;
 };
 
 /* fuse_attr: 1 bytes, align 1 */
 struct host64_fuse_attr {
+    char _yos_empty_pad;
 };
 
 /* fuse_attr_out: 1 bytes, align 1 */
 struct host64_fuse_attr_out {
+    char _yos_empty_pad;
 };
 
 /* fuse_backing_map: 1 bytes, align 1 */
 struct host64_fuse_backing_map {
+    char _yos_empty_pad;
 };
 
 /* fuse_batch_forget_in: 1 bytes, align 1 */
 struct host64_fuse_batch_forget_in {
+    char _yos_empty_pad;
 };
 
 /* fuse_bmap_in: 1 bytes, align 1 */
 struct host64_fuse_bmap_in {
+    char _yos_empty_pad;
 };
 
 /* fuse_bmap_out: 1 bytes, align 1 */
 struct host64_fuse_bmap_out {
+    char _yos_empty_pad;
 };
 
 /* fuse_copy_file_range_in: 1 bytes, align 1 */
 struct host64_fuse_copy_file_range_in {
+    char _yos_empty_pad;
 };
 
 /* fuse_copy_file_range_out: 1 bytes, align 1 */
 struct host64_fuse_copy_file_range_out {
+    char _yos_empty_pad;
 };
 
 /* fuse_create_in: 1 bytes, align 1 */
 struct host64_fuse_create_in {
+    char _yos_empty_pad;
 };
 
 /* fuse_dirent: 1 bytes, align 1 */
 struct host64_fuse_dirent {
+    char _yos_empty_pad;
 };
 
 /* fuse_direntplus: 1 bytes, align 1 */
 struct host64_fuse_direntplus {
+    char _yos_empty_pad;
 };
 
 /* fuse_entry_out: 1 bytes, align 1 */
 struct host64_fuse_entry_out {
+    char _yos_empty_pad;
 };
 
 /* fuse_ext_header: 1 bytes, align 1 */
 struct host64_fuse_ext_header {
+    char _yos_empty_pad;
 };
 
 /* fuse_fallocate_in: 1 bytes, align 1 */
 struct host64_fuse_fallocate_in {
+    char _yos_empty_pad;
 };
 
 /* fuse_file_lock: 1 bytes, align 1 */
 struct host64_fuse_file_lock {
+    char _yos_empty_pad;
 };
 
 /* fuse_flush_in: 1 bytes, align 1 */
 struct host64_fuse_flush_in {
+    char _yos_empty_pad;
 };
 
 /* fuse_forget_in: 1 bytes, align 1 */
 struct host64_fuse_forget_in {
+    char _yos_empty_pad;
 };
 
 /* fuse_forget_one: 1 bytes, align 1 */
 struct host64_fuse_forget_one {
+    char _yos_empty_pad;
 };
 
 /* fuse_fsync_in: 1 bytes, align 1 */
 struct host64_fuse_fsync_in {
+    char _yos_empty_pad;
 };
 
 /* fuse_getattr_in: 1 bytes, align 1 */
 struct host64_fuse_getattr_in {
+    char _yos_empty_pad;
 };
 
 /* fuse_getxattr_in: 1 bytes, align 1 */
 struct host64_fuse_getxattr_in {
+    char _yos_empty_pad;
 };
 
 /* fuse_getxattr_out: 1 bytes, align 1 */
 struct host64_fuse_getxattr_out {
+    char _yos_empty_pad;
 };
 
 /* fuse_in_header: 1 bytes, align 1 */
 struct host64_fuse_in_header {
+    char _yos_empty_pad;
 };
 
 /* fuse_init_in: 1 bytes, align 1 */
 struct host64_fuse_init_in {
+    char _yos_empty_pad;
 };
 
 /* fuse_init_out: 1 bytes, align 1 */
 struct host64_fuse_init_out {
+    char _yos_empty_pad;
 };
 
 /* fuse_interrupt_in: 1 bytes, align 1 */
 struct host64_fuse_interrupt_in {
+    char _yos_empty_pad;
 };
 
 /* fuse_ioctl_in: 1 bytes, align 1 */
 struct host64_fuse_ioctl_in {
+    char _yos_empty_pad;
 };
 
 /* fuse_ioctl_iovec: 1 bytes, align 1 */
 struct host64_fuse_ioctl_iovec {
+    char _yos_empty_pad;
 };
 
 /* fuse_ioctl_out: 1 bytes, align 1 */
 struct host64_fuse_ioctl_out {
+    char _yos_empty_pad;
 };
 
 /* fuse_kstatfs: 1 bytes, align 1 */
 struct host64_fuse_kstatfs {
+    char _yos_empty_pad;
 };
 
 /* fuse_link_in: 1 bytes, align 1 */
 struct host64_fuse_link_in {
+    char _yos_empty_pad;
 };
 
 /* fuse_lk_in: 1 bytes, align 1 */
 struct host64_fuse_lk_in {
+    char _yos_empty_pad;
 };
 
 /* fuse_lk_out: 1 bytes, align 1 */
 struct host64_fuse_lk_out {
+    char _yos_empty_pad;
 };
 
 /* fuse_lseek_in: 1 bytes, align 1 */
 struct host64_fuse_lseek_in {
+    char _yos_empty_pad;
 };
 
 /* fuse_lseek_out: 1 bytes, align 1 */
 struct host64_fuse_lseek_out {
+    char _yos_empty_pad;
 };
 
 /* fuse_mkdir_in: 1 bytes, align 1 */
 struct host64_fuse_mkdir_in {
+    char _yos_empty_pad;
 };
 
 /* fuse_mknod_in: 1 bytes, align 1 */
 struct host64_fuse_mknod_in {
+    char _yos_empty_pad;
 };
 
 /* fuse_notify_delete_out: 1 bytes, align 1 */
 struct host64_fuse_notify_delete_out {
+    char _yos_empty_pad;
 };
 
 /* fuse_notify_inval_entry_out: 1 bytes, align 1 */
 struct host64_fuse_notify_inval_entry_out {
+    char _yos_empty_pad;
 };
 
 /* fuse_notify_inval_inode_out: 1 bytes, align 1 */
 struct host64_fuse_notify_inval_inode_out {
+    char _yos_empty_pad;
 };
 
 /* fuse_notify_poll_wakeup_out: 1 bytes, align 1 */
 struct host64_fuse_notify_poll_wakeup_out {
+    char _yos_empty_pad;
 };
 
 /* fuse_notify_prune_out: 1 bytes, align 1 */
 struct host64_fuse_notify_prune_out {
+    char _yos_empty_pad;
 };
 
 /* fuse_notify_retrieve_in: 1 bytes, align 1 */
 struct host64_fuse_notify_retrieve_in {
+    char _yos_empty_pad;
 };
 
 /* fuse_notify_retrieve_out: 1 bytes, align 1 */
 struct host64_fuse_notify_retrieve_out {
+    char _yos_empty_pad;
 };
 
 /* fuse_notify_store_out: 1 bytes, align 1 */
 struct host64_fuse_notify_store_out {
+    char _yos_empty_pad;
 };
 
 /* fuse_open_in: 1 bytes, align 1 */
 struct host64_fuse_open_in {
+    char _yos_empty_pad;
 };
 
 /* fuse_open_out: 1 bytes, align 1 */
 struct host64_fuse_open_out {
+    char _yos_empty_pad;
 };
 
 /* fuse_out_header: 1 bytes, align 1 */
 struct host64_fuse_out_header {
+    char _yos_empty_pad;
 };
 
 /* fuse_poll_in: 1 bytes, align 1 */
 struct host64_fuse_poll_in {
+    char _yos_empty_pad;
 };
 
 /* fuse_poll_out: 1 bytes, align 1 */
 struct host64_fuse_poll_out {
+    char _yos_empty_pad;
 };
 
 /* fuse_read_in: 1 bytes, align 1 */
 struct host64_fuse_read_in {
+    char _yos_empty_pad;
 };
 
 /* fuse_release_in: 1 bytes, align 1 */
 struct host64_fuse_release_in {
+    char _yos_empty_pad;
 };
 
 /* fuse_removemapping_in: 1 bytes, align 1 */
 struct host64_fuse_removemapping_in {
+    char _yos_empty_pad;
 };
 
 /* fuse_removemapping_one: 1 bytes, align 1 */
 struct host64_fuse_removemapping_one {
+    char _yos_empty_pad;
 };
 
 /* fuse_rename2_in: 1 bytes, align 1 */
 struct host64_fuse_rename2_in {
+    char _yos_empty_pad;
 };
 
 /* fuse_rename_in: 1 bytes, align 1 */
 struct host64_fuse_rename_in {
+    char _yos_empty_pad;
 };
 
 /* fuse_secctx: 1 bytes, align 1 */
 struct host64_fuse_secctx {
+    char _yos_empty_pad;
 };
 
 /* fuse_secctx_header: 1 bytes, align 1 */
 struct host64_fuse_secctx_header {
+    char _yos_empty_pad;
 };
 
 /* fuse_setattr_in: 1 bytes, align 1 */
 struct host64_fuse_setattr_in {
+    char _yos_empty_pad;
 };
 
 /* fuse_setupmapping_in: 1 bytes, align 1 */
 struct host64_fuse_setupmapping_in {
+    char _yos_empty_pad;
 };
 
 /* fuse_setxattr_in: 1 bytes, align 1 */
 struct host64_fuse_setxattr_in {
+    char _yos_empty_pad;
 };
 
 /* fuse_statfs_out: 1 bytes, align 1 */
 struct host64_fuse_statfs_out {
+    char _yos_empty_pad;
 };
 
 /* fuse_statx: 1 bytes, align 1 */
 struct host64_fuse_statx {
+    char _yos_empty_pad;
 };
 
 /* fuse_statx_in: 1 bytes, align 1 */
 struct host64_fuse_statx_in {
+    char _yos_empty_pad;
 };
 
 /* fuse_statx_out: 1 bytes, align 1 */
 struct host64_fuse_statx_out {
+    char _yos_empty_pad;
 };
 
 /* fuse_supp_groups: 1 bytes, align 1 */
 struct host64_fuse_supp_groups {
+    char _yos_empty_pad;
 };
 
 /* fuse_sx_time: 1 bytes, align 1 */
 struct host64_fuse_sx_time {
+    char _yos_empty_pad;
 };
 
 /* fuse_syncfs_in: 1 bytes, align 1 */
 struct host64_fuse_syncfs_in {
+    char _yos_empty_pad;
 };
 
 /* fuse_uring_cmd_req: 1 bytes, align 1 */
 struct host64_fuse_uring_cmd_req {
+    char _yos_empty_pad;
 };
 
 /* fuse_uring_ent_in_out: 1 bytes, align 1 */
 struct host64_fuse_uring_ent_in_out {
+    char _yos_empty_pad;
 };
 
 /* fuse_uring_req_header: 1 bytes, align 1 */
 struct host64_fuse_uring_req_header {
+    char _yos_empty_pad;
 };
 
 /* fuse_write_in: 1 bytes, align 1 */
 struct host64_fuse_write_in {
+    char _yos_empty_pad;
 };
 
 /* fuse_write_out: 1 bytes, align 1 */
 struct host64_fuse_write_out {
+    char _yos_empty_pad;
 };
 
 /* futex_waitv: 24 bytes, align 8 */
@@ -5834,6 +5933,7 @@ struct host64_gpib_wait_ioctl {
 
 /* group_filter: 272 bytes, align 8 */
 struct host64_group_filter {
+    char _yos_empty_pad;
 };
 
 /* hd_drive_cmd_hdr: 4 bytes, align 1 */
@@ -6281,6 +6381,7 @@ struct host64_hv_vss_hdr {
 
 /* hv_vss_msg: 12 bytes, align 1 */
 struct host64_hv_vss_msg {
+    char _yos_empty_pad;
 };
 
 /* hwtstamp_config: 12 bytes, align 4 */
@@ -6314,14 +6415,17 @@ struct host64_i2c_smbus_ioctl_data {
 
 /* iax_completion_record: 1 bytes, align 1 */
 struct host64_iax_completion_record {
+    char _yos_empty_pad;
 };
 
 /* iax_hw_desc: 1 bytes, align 1 */
 struct host64_iax_hw_desc {
+    char _yos_empty_pad;
 };
 
 /* iax_raw_completion_record: 1 bytes, align 1 */
 struct host64_iax_raw_completion_record {
+    char _yos_empty_pad;
 };
 
 /* icmp6_filter: 32 bytes, align 4 */
@@ -6723,6 +6827,7 @@ struct host64_ifmap {
 
 /* ifreq: 1 bytes, align 1 */
 struct host64_ifreq {
+    char _yos_empty_pad;
 };
 
 /* ifslave: 28 bytes, align 4 */
@@ -6989,6 +7094,7 @@ struct host64_io_uring_buf_reg {
 
 /* io_uring_buf_ring: 16 bytes, align 8 */
 struct host64_io_uring_buf_ring {
+    char _yos_empty_pad;
 };
 
 /* io_uring_buf_status: 40 bytes, align 4 */
@@ -7679,7 +7785,7 @@ struct host64_ipc64_perm {
     uint32_t cuid;
     uint32_t cgid;
     uint32_t mode;
-    uint8_t __pad1[0];
+    uint8_t __pad1[1]; /* was [0]: GCC marker */
     uint16_t seq;
     uint16_t __pad2;
     uint64_t __unused1;
@@ -7739,7 +7845,7 @@ struct host64_ipv6_rpl_sr_hdr {
     uint32_t reserved;
     uint32_t pad;
     uint32_t reserved1;
-    uint8_t segments[0];
+    uint8_t segments[];
 };
 
 /* ipv6_rt_hdr: 4 bytes, align 1 */
@@ -7979,10 +8085,12 @@ struct host64_iw_discarded {
 
 /* iw_encode_ext: 1 bytes, align 1 */
 struct host64_iw_encode_ext {
+    char _yos_empty_pad;
 };
 
 /* iw_event: 1 bytes, align 1 */
 struct host64_iw_event {
+    char _yos_empty_pad;
 };
 
 /* iw_freq: 8 bytes, align 4 */
@@ -7995,6 +8103,7 @@ struct host64_iw_freq {
 
 /* iw_michaelmicfailure: 1 bytes, align 1 */
 struct host64_iw_michaelmicfailure {
+    char _yos_empty_pad;
 };
 
 /* iw_missed: 4 bytes, align 4 */
@@ -8004,6 +8113,7 @@ struct host64_iw_missed {
 
 /* iw_mlme: 1 bytes, align 1 */
 struct host64_iw_mlme {
+    char _yos_empty_pad;
 };
 
 /* iw_param: 8 bytes, align 4 */
@@ -8016,10 +8126,12 @@ struct host64_iw_param {
 
 /* iw_pmkid_cand: 1 bytes, align 1 */
 struct host64_iw_pmkid_cand {
+    char _yos_empty_pad;
 };
 
 /* iw_pmksa: 1 bytes, align 1 */
 struct host64_iw_pmksa {
+    char _yos_empty_pad;
 };
 
 /* iw_point: 16 bytes, align 8 */
@@ -8047,14 +8159,17 @@ struct host64_iw_quality {
 
 /* iw_scan_req: 1 bytes, align 1 */
 struct host64_iw_scan_req {
+    char _yos_empty_pad;
 };
 
 /* iw_thrspy: 1 bytes, align 1 */
 struct host64_iw_thrspy {
+    char _yos_empty_pad;
 };
 
 /* iwreq: 1 bytes, align 1 */
 struct host64_iwreq {
+    char _yos_empty_pad;
 };
 
 /* jailhouse_setup_data: 284 bytes, align 1 */
@@ -8363,7 +8478,7 @@ struct host64_kvm_nested_state {
     uint16_t format;
     uint32_t size;
     uint8_t hdr[120];
-    uint8_t data[0];
+    uint8_t data[];
 };
 
 /* kvm_pic_state: 16 bytes, align 1 */
@@ -9389,6 +9504,7 @@ struct host64_mptcp_info {
 
 /* mptcp_subflow_addrs: 0 bytes, align 1 */
 struct host64_mptcp_subflow_addrs {
+    char _yos_empty_pad;
 };
 
 /* mptcp_subflow_data: 16 bytes, align 8 */
@@ -9433,6 +9549,7 @@ struct host64_mrw_feature_desc {
 
 /* msg: -2 bytes, align -2 */
 struct host64_msg {
+    char _yos_empty_pad;
 };
 
 /* msgbuf: 16 bytes, align 8 */
@@ -9737,10 +9854,12 @@ struct host64_nd_cmd_vendor_tail {
 
 /* nd_papr_pdsm_health: 184 bytes, align 8 */
 struct host64_nd_papr_pdsm_health {
+    char _yos_empty_pad;
 };
 
 /* nd_papr_pdsm_smart_inject: 184 bytes, align 4 */
 struct host64_nd_papr_pdsm_smart_inject {
+    char _yos_empty_pad;
 };
 
 /* nd_pkg_pdsm: 192 bytes, align 1 */
@@ -10570,6 +10689,7 @@ struct host64_omapfb_mem_info {
 
 /* omapfb_memory_read: 1 bytes, align 1 */
 struct host64_omapfb_memory_read {
+    char _yos_empty_pad;
 };
 
 /* omapfb_plane_info: 68 bytes, align 4 */
@@ -10730,6 +10850,7 @@ struct host64_ovs_key_arp {
 
 /* ovs_key_ct_labels: 16 bytes, align 4 */
 struct host64_ovs_key_ct_labels {
+    char _yos_empty_pad;
 };
 
 /* ovs_key_ct_tuple_ipv4: 16 bytes, align 4 */
@@ -11972,6 +12093,7 @@ struct host64_rtattr {
 
 /* rtentry: 1 bytes, align 1 */
 struct host64_rtentry {
+    char _yos_empty_pad;
 };
 
 /* rtgenmsg: 1 bytes, align 1 */
@@ -12462,6 +12584,7 @@ struct host64_sctp_adaptation_event {
 
 /* sctp_add_streams: 1 bytes, align 1 */
 struct host64_sctp_add_streams {
+    char _yos_empty_pad;
 };
 
 /* sctp_assoc_change: 20 bytes, align 4 */
@@ -12495,10 +12618,12 @@ struct host64_sctp_assoc_reset_event {
 
 /* sctp_assoc_stats: 1 bytes, align 1 */
 struct host64_sctp_assoc_stats {
+    char _yos_empty_pad;
 };
 
 /* sctp_assoc_value: 1 bytes, align 1 */
 struct host64_sctp_assoc_value {
+    char _yos_empty_pad;
 };
 
 /* sctp_assocparams: 20 bytes, align 4 */
@@ -12518,6 +12643,7 @@ struct host64_sctp_authchunk {
 
 /* sctp_authchunks: 1 bytes, align 1 */
 struct host64_sctp_authchunks {
+    char _yos_empty_pad;
 };
 
 /* sctp_authinfo: 2 bytes, align 2 */
@@ -12559,6 +12685,7 @@ struct host64_sctp_default_prinfo {
 
 /* sctp_event: 1 bytes, align 1 */
 struct host64_sctp_event {
+    char _yos_empty_pad;
 };
 
 /* sctp_event_subscribe: 14 bytes, align 1 */
@@ -12601,6 +12728,7 @@ struct host64_sctp_hmacalgo {
 
 /* sctp_info: 1 bytes, align 1 */
 struct host64_sctp_info {
+    char _yos_empty_pad;
 };
 
 /* sctp_initmsg: 8 bytes, align 2 */
@@ -12622,22 +12750,27 @@ struct host64_sctp_nxtinfo {
 
 /* sctp_paddr_change: 1 bytes, align 1 */
 struct host64_sctp_paddr_change {
+    char _yos_empty_pad;
 };
 
 /* sctp_paddrinfo: 1 bytes, align 1 */
 struct host64_sctp_paddrinfo {
+    char _yos_empty_pad;
 };
 
 /* sctp_paddrparams: 1 bytes, align 1 */
 struct host64_sctp_paddrparams {
+    char _yos_empty_pad;
 };
 
 /* sctp_paddrthlds: 1 bytes, align 1 */
 struct host64_sctp_paddrthlds {
+    char _yos_empty_pad;
 };
 
 /* sctp_paddrthlds_v2: 1 bytes, align 1 */
 struct host64_sctp_paddrthlds_v2 {
+    char _yos_empty_pad;
 };
 
 /* sctp_pdapi_event: 24 bytes, align 4 */
@@ -12659,6 +12792,7 @@ struct host64_sctp_peeloff_arg_t {
 
 /* sctp_prim: 1 bytes, align 1 */
 struct host64_sctp_prim {
+    char _yos_empty_pad;
 };
 
 /* sctp_prinfo: 8 bytes, align 4 */
@@ -12669,6 +12803,7 @@ struct host64_sctp_prinfo {
 
 /* sctp_probeinterval: 1 bytes, align 1 */
 struct host64_sctp_probeinterval {
+    char _yos_empty_pad;
 };
 
 /* sctp_prstatus: 24 bytes, align 8 */
@@ -12704,6 +12839,7 @@ struct host64_sctp_remote_error {
 
 /* sctp_reset_streams: 1 bytes, align 1 */
 struct host64_sctp_reset_streams {
+    char _yos_empty_pad;
 };
 
 /* sctp_rtoinfo: 16 bytes, align 4 */
@@ -12716,6 +12852,7 @@ struct host64_sctp_rtoinfo {
 
 /* sctp_sack_info: 1 bytes, align 1 */
 struct host64_sctp_sack_info {
+    char _yos_empty_pad;
 };
 
 /* sctp_sender_dry_event: 12 bytes, align 4 */
@@ -12733,6 +12870,7 @@ struct host64_sctp_setadaptation {
 
 /* sctp_setpeerprim: 1 bytes, align 1 */
 struct host64_sctp_setpeerprim {
+    char _yos_empty_pad;
 };
 
 /* sctp_shutdown_event: 12 bytes, align 4 */
@@ -12767,6 +12905,7 @@ struct host64_sctp_sndrcvinfo {
 
 /* sctp_status: 1 bytes, align 1 */
 struct host64_sctp_status {
+    char _yos_empty_pad;
 };
 
 /* sctp_stream_change_event: 16 bytes, align 4 */
@@ -12790,10 +12929,12 @@ struct host64_sctp_stream_reset_event {
 
 /* sctp_stream_value: 1 bytes, align 1 */
 struct host64_sctp_stream_value {
+    char _yos_empty_pad;
 };
 
 /* sctp_udpencaps: 1 bytes, align 1 */
 struct host64_sctp_udpencaps {
+    char _yos_empty_pad;
 };
 
 /* seccomp_data: 64 bytes, align 8 */
@@ -12862,14 +13003,17 @@ struct host64_selnl_msg_setenforce {
 
 /* sem: -2 bytes, align -2 */
 struct host64_sem {
+    char _yos_empty_pad;
 };
 
 /* sem_queue: -2 bytes, align -2 */
 struct host64_sem_queue {
+    char _yos_empty_pad;
 };
 
 /* sem_undo: -2 bytes, align -2 */
 struct host64_sem_undo {
+    char _yos_empty_pad;
 };
 
 /* sembuf: 6 bytes, align 2 */
@@ -13322,6 +13466,7 @@ struct host64_sigevent {
 
 /* siginfo: 128 bytes, align 8 */
 struct host64_siginfo {
+    char _yos_empty_pad;
 };
 
 /* signalfd_siginfo: 128 bytes, align 8 */
@@ -13486,6 +13631,7 @@ struct host64_sock_txtime {
 
 /* sockaddr: -2 bytes, align -2 */
 struct host64_sockaddr {
+    char _yos_empty_pad;
 };
 
 /* sockaddr_alg: 88 bytes, align 4 */
@@ -13585,6 +13731,7 @@ struct host64_sockaddr_pkt {
 
 /* sockaddr_pn: 1 bytes, align 1 */
 struct host64_sockaddr_pn {
+    char _yos_empty_pad;
 };
 
 /* sockaddr_pppox: 30 bytes, align 1 */
@@ -13626,6 +13773,7 @@ struct host64_sockaddr_un {
 
 /* sockaddr_vm: 1 bytes, align 1 */
 struct host64_sockaddr_vm {
+    char _yos_empty_pad;
 };
 
 /* sockaddr_xdp: 16 bytes, align 4 */
@@ -13681,7 +13829,7 @@ struct host64_spi_transfer_result {
 struct host64_sr6_tlv {
     uint8_t type;
     uint8_t len;
-    uint8_t data[0];
+    uint8_t data[1]; /* flex->1 for MSVC nested-flex rule */
 };
 
 /* stat: 144 bytes, align 8 */
@@ -13903,7 +14051,7 @@ struct host64_sysinfo {
     uint64_t totalhigh;
     uint64_t freehigh;
     uint32_t mem_unit;
-    uint8_t _f[0];
+    uint8_t _f[];
 };
 
 /* taskstats: 560 bytes, align 8 */
@@ -15708,6 +15856,7 @@ struct host64_v4l2_bt_timings_cap {
 
 /* v4l2_buffer: 1 bytes, align 1 */
 struct host64_v4l2_buffer {
+    char _yos_empty_pad;
 };
 
 /* v4l2_capability: 104 bytes, align 4 */
@@ -15988,6 +16137,7 @@ struct host64_v4l2_encoder_cmd {
 
 /* v4l2_event: 1 bytes, align 1 */
 struct host64_v4l2_event {
+    char _yos_empty_pad;
 };
 
 /* v4l2_event_ctrl: 40 bytes, align 8 */
@@ -17019,6 +17169,7 @@ struct host64_virtio_admin_cmd_dev_mode_set_data {
 
 /* virtio_admin_cmd_dev_parts_metadata_result: 8 bytes, align 4 */
 struct host64_virtio_admin_cmd_dev_parts_metadata_result {
+    char _yos_empty_pad;
 };
 
 /* virtio_admin_cmd_hdr: 24 bytes, align 8 */
@@ -20632,7 +20783,7 @@ struct host64_mdp_superblock_s {
     uint32_t root_block;
     uint32_t pstate_reserved[60];
     struct host64_mdp_device_descriptor_s disks[27];
-    uint32_t reserved[0];
+    uint32_t reserved[1]; /* was [0]: GCC marker */
     struct host64_mdp_device_descriptor_s this_disk;
 };
 
@@ -21290,7 +21441,7 @@ struct host64_tls12_crypto_info_chacha20_poly1305 {
     struct host64_tls_crypto_info info;
     uint8_t iv[12];
     uint8_t key[32];
-    uint8_t salt[0];
+    uint8_t salt[1]; /* was [0]: GCC marker */
     uint8_t rec_seq[8];
 };
 

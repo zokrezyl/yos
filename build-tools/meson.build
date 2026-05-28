@@ -23,4 +23,7 @@ subdir('host-libc')
 # Tier-2 sidecar removed — all libc fns are resolved as direct yos
 # host bridges (auto-passthrough or hand-written yos_<name>). No
 # second wasm3 instance is loaded at runtime.
-subdir('sysroot')       # wasm sysroot for guest .c compilation
+# wasm sysroot for guest .c compilation. POSIX hosts use skel.sh
+# (bash + llvm-ar + ln -s); Windows uses skel.py (Python + llvm-ar +
+# mklink /J fallback) — picked inside sysroot/meson.build.
+subdir('sysroot')

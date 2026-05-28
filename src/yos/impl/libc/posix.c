@@ -111,7 +111,7 @@ int32_t yos_isatty(struct yos_exec_ctx *ctx, int32_t wfd)
         ydebug("isatty(wfd=%d hfd=%d) -> 1 (fake PTY)\n", wfd, hfd);
         return 1;
     }
-    int r = isatty(hfd);
+    int r = yos_plat_isatty(hfd);
     ydebug("isatty(wfd=%d hfd=%d) -> %d\n", wfd, hfd, r);
     return r;
 }
@@ -269,7 +269,7 @@ int32_t yos_socket(struct yos_exec_ctx *ctx, int32_t domain, int32_t type, int32
     int hfd = socket(domain, htype, protocol);
     if (hfd < 0) return yos_errno_neg(ctx, errno);
     int wfd = yos_fd_alloc(ctx, hfd);
-    if (wfd < 0) { close(hfd); return yos_errno_neg(ctx, EMFILE); }
+    if (wfd < 0) { yos_plat_close(hfd); return yos_errno_neg(ctx, EMFILE); }
     return wfd;
 }
 
@@ -917,9 +917,20 @@ uint32_t yos_realpath(struct yos_exec_ctx *ctx, uint32_t path_off,
     }
     char *buf = (char *)(ctx->memory + resolved_off);
     /* Resolve against ctx->cwd so a relative input to realpath() is
-     * canonicalized from the guest's cwd, not the host process cwd. */
-    const char *resolved = yos_path_resolve(ctx, p);
-    char *r = realpath(resolved, buf);
+     * canonicalized from the guest's cwd, not the host process cwd.
+     * We deliberately compute the POSIX-shape absolute path WITHOUT
+     * the platform path translation (yos_plat_translate_path) — the
+     * wasm guest expects POSIX-shape output ("/tmp/x", not
+     * "%TEMP%\\x"); the platform realpath impl below canonicalises
+     * the POSIX form in place. */
+    char abs[4096];
+    if (p[0] == '/') {
+        snprintf(abs, sizeof abs, "%s", p);
+    } else {
+        snprintf(abs, sizeof abs, "%s/%s",
+                 (ctx && ctx->cwd[0]) ? ctx->cwd : "/", p);
+    }
+    char *r = realpath(abs, buf);
     if (!r) {
         extern int yos_remap_errno_h2g(int);
         if (ctx && ctx->memory && ctx->errno_off)
@@ -951,7 +962,7 @@ int32_t yos_mkstemp(struct yos_exec_ctx *ctx, uint32_t template_off)
     int hfd = mkstemp(t);
     if (hfd < 0) return yos_errno_neg(ctx, errno);
     int wfd = yos_fd_alloc(ctx, hfd);
-    if (wfd < 0) { close(hfd); return yos_errno_neg(ctx, EMFILE); }
+    if (wfd < 0) { yos_plat_close(hfd); return yos_errno_neg(ctx, EMFILE); }
     return wfd;
 }
 
@@ -965,7 +976,7 @@ int32_t yos_mkostemp(struct yos_exec_ctx *ctx, uint32_t template_off, int32_t fl
     int hfd = mkostemp(t, hflags);
     if (hfd < 0) return yos_errno_neg(ctx, errno);
     int wfd = yos_fd_alloc(ctx, hfd);
-    if (wfd < 0) { close(hfd); return yos_errno_neg(ctx, EMFILE); }
+    if (wfd < 0) { yos_plat_close(hfd); return yos_errno_neg(ctx, EMFILE); }
     return wfd;
 }
 
@@ -979,7 +990,7 @@ int32_t yos_mkostemps(struct yos_exec_ctx *ctx, uint32_t template_off,
     int hfd = mkostemps(t, suffixlen, hflags);
     if (hfd < 0) return yos_errno_neg(ctx, errno);
     int wfd = yos_fd_alloc(ctx, hfd);
-    if (wfd < 0) { close(hfd); return yos_errno_neg(ctx, EMFILE); }
+    if (wfd < 0) { yos_plat_close(hfd); return yos_errno_neg(ctx, EMFILE); }
     return wfd;
 }
 
@@ -995,7 +1006,7 @@ int32_t yos_fstat(struct yos_exec_ctx *ctx, int32_t wfd, uint32_t statbuf_off)
     if (hfd < 0) return yos_errno_neg(ctx, EBADF);
     struct stat h;
     memset(&h, 0, sizeof h);
-    if (fstat(hfd, &h) < 0) return yos_errno_neg(ctx, errno);
+    if (yos_plat_fstat(hfd, &h) < 0) return yos_errno_neg(ctx, errno);
     if (ytrace_default_enabled()) {
         const char *kind = "?";
         if (S_ISREG(h.st_mode))  kind = "REG";
@@ -1058,7 +1069,7 @@ int32_t yos_fchdir(struct yos_exec_ctx *ctx, int32_t wfd)
     /* Verify it's actually a directory before committing — fchdir on
      * a non-dir fd must return ENOTDIR. */
     struct stat st;
-    if (fstat(hfd, &st) < 0) return yos_errno_neg(ctx, errno);
+    if (yos_plat_fstat(hfd, &st) < 0) return yos_errno_neg(ctx, errno);
     if (!S_ISDIR(st.st_mode)) return yos_errno_neg(ctx, ENOTDIR);
 
     /* Update ctx->cwd from the path recorded at open-time. yos's
@@ -1975,6 +1986,23 @@ void yos_explicit_bzero(struct yos_exec_ctx *ctx, uint32_t buf_off,
 
 extern uint32_t yos_malloc(struct yos_exec_ctx *ctx, uint32_t size);
 
+/* Copy a NUL-terminated host string into the wasm-side servent slab at
+ * `*cursor` and return its wasm offset (or 0 if no room / NULL). Bumps
+ * *cursor on a successful pack. Replaces a GCC statement-expression
+ * macro that didn't compile on MSVC. */
+static uint32_t yos_servent_pack_str(const char *s, uint8_t *base,
+                                     uint32_t slab_off, uint32_t slab_sz,
+                                     uint32_t *cursor)
+{
+    if (!s) return 0;
+    size_t n = strlen(s) + 1;
+    if (*cursor + n > slab_sz) return 0;
+    memcpy(base + *cursor, s, n);
+    uint32_t off = slab_off + *cursor;
+    *cursor += (uint32_t)n;
+    return off;
+}
+
 static uint32_t pack_servent(struct yos_exec_ctx *ctx,
                              struct yos_exec_ctx *anchor_ctx,
                              struct servent *se)
@@ -1996,24 +2024,14 @@ static uint32_t pack_servent(struct yos_exec_ctx *ctx,
     /* Layout: [0..16) = servent, [16..) = packed strings + aliases array. */
     uint32_t cursor = WASM_SERVENT_SZ;
 
-    /* Helper macro: copy NUL-terminated string `s` into the slab and
-     * return its wasm offset, or 0 if NULL/no room. */
-    #define PACK_STR(s) ({                                           \
-        const char *_s = (s);                                        \
-        uint32_t _off = 0;                                           \
-        if (_s) {                                                    \
-            size_t _n = strlen(_s) + 1;                              \
-            if (cursor + _n <= SLAB_SZ) {                            \
-                memcpy(base + cursor, _s, _n);                       \
-                _off = slab_off + cursor;                            \
-                cursor += (uint32_t)_n;                              \
-            }                                                        \
-        }                                                            \
-        _off;                                                        \
-    })
+    /* Helper: copy NUL-terminated string `s` into the slab at `*cursor`
+     * and return its wasm offset, or 0 if NULL/no room. Bumps *cursor on
+     * success. Written as a regular function (not a GCC statement-
+     * expression macro) so MSVC compiles it. */
+    #define SLAB_PACK(s)  yos_servent_pack_str((s), base, slab_off, SLAB_SZ, &cursor)
 
-    uint32_t name_off  = PACK_STR(se->s_name);
-    uint32_t proto_off = PACK_STR(se->s_proto);
+    uint32_t name_off  = SLAB_PACK(se->s_name);
+    uint32_t proto_off = SLAB_PACK(se->s_proto);
 
     /* Aliases array: NULL-terminated array of char*; pack each alias
      * string, then write a wasm-offset array. Most lookups have no
@@ -2027,13 +2045,13 @@ static uint32_t pack_servent(struct yos_exec_ctx *ctx,
             aliases_off = slab_off + cursor;
             cursor += arr_bytes;
             for (int i = 0; i < n; i++) {
-                uint32_t a_off = PACK_STR(se->s_aliases[i]);
+                uint32_t a_off = SLAB_PACK(se->s_aliases[i]);
                 *(uint32_t *)(base + (aliases_off - slab_off) + (uint32_t)i*4) = a_off;
             }
             *(uint32_t *)(base + (aliases_off - slab_off) + (uint32_t)n*4) = 0;
         }
     }
-    #undef PACK_STR
+    #undef SLAB_PACK
 
     /* s_port is already in network byte order on both host and FreeBSD;
      * no bswap. FreeBSD's s_port is `int` (4 bytes), zero-extended. */

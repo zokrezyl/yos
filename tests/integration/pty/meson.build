@@ -8,8 +8,13 @@
 
 py3_pty = import('python').find_installation('python3')
 
+if host_machine.system() == 'windows'
+  _wasm_clang_basename_pty = 'wasm-clang.cmd'
+else
+  _wasm_clang_basename_pty = 'wasm-clang'
+endif
 wasm_cc_pty  = find_program(meson.project_source_root() / 'build-tools'
-                                                       / 'wasm-clang',
+                                                       / _wasm_clang_basename_pty,
                             required: true)
 sysroot_dir_pty = meson.project_build_root() / 'sysroot'
 
@@ -56,8 +61,14 @@ pty_echo_fork_wasm = custom_target(
 
 pty_int_env = environment()
 pty_int_env.set('YOS_REPO_ROOT', meson.project_source_root())
-yos_build_basename_pty = run_command('basename', meson.project_build_root(),
-                                      check : true).stdout().strip()
+if host_machine.system() == 'windows'
+  yos_build_basename_pty = run_command(
+    py, '-c', 'import sys, os; print(os.path.basename(sys.argv[1]))',
+    meson.project_build_root(), check : true).stdout().strip()
+else
+  yos_build_basename_pty = run_command('basename', meson.project_build_root(),
+                                        check : true).stdout().strip()
+endif
 pty_int_env.set('YOS_BUILD_DIR', yos_build_basename_pty)
 
 pty_int_tests = {
@@ -68,6 +79,12 @@ pty_int_tests = {
   'input-kqueue-cooked' : files('test_input_kqueue_cooked.py'),
   'ctrlc'             : files('test_ctrlc.py'),
 }
+
+# Tests drive yos through Python's `pty` module (Unix-only). Windows
+# port would need a ConPTY-based runner; skip until then.
+if host_machine.system() == 'windows'
+  pty_int_tests = {}
+endif
 
 foreach name, src : pty_int_tests
   test('pty-' + name,

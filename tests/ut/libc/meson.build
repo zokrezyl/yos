@@ -4,7 +4,15 @@
 # The runner script reads the test's `Expected: exit N, stdout contains
 # "..."` header to know what counts as a pass.
 
-wasm_cc  = find_program(meson.project_source_root() / 'build-tools' / 'wasm-clang',
+# Pick the OS-appropriate wasm-clang wrapper. POSIX uses the bash
+# sibling that filters nix-injected darwin flags; Windows uses
+# wasm-clang.cmd which calls wasm-clang.py via the venv python.
+if host_machine.system() == 'windows'
+  _wasm_clang_basename = 'wasm-clang.cmd'
+else
+  _wasm_clang_basename = 'wasm-clang'
+endif
+wasm_cc  = find_program(meson.project_source_root() / 'build-tools' / _wasm_clang_basename,
                         required: true)
 wasm_opt = find_program('wasm-opt', required: true)  # Binaryen — for asyncify
 

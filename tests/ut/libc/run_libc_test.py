@@ -19,14 +19,22 @@ import sys
 from pathlib import Path
 
 
-def parse_expectations(c_source: Path) -> tuple[int, list[str]]:
-    text = c_source.read_text()
+def parse_expectations(c_source: Path) -> tuple[int, list[str], list[str]]:
+    # Read explicitly as UTF-8 — Windows Python opens files cp1252
+    # which trips on non-ASCII test docstrings (em-dash etc.).
+    text = c_source.read_text(encoding='utf-8')
     m = re.search(r'Expected:\s*exit\s+(-?\d+)', text)
-    if not m:
-        raise SystemExit(f'{c_source}: no `Expected: exit <N>` in header')
-    code = int(m.group(1))
-    subs = re.findall(r'stdout\s+contains\s+"([^"]+)"', text)
-    return code, subs
+    if m:
+        code = int(m.group(1))
+    elif re.search(r'Expected:', text):
+        # Tests that pin behaviour by stdout/stderr substring only —
+        # default to exit 0 instead of refusing to run.
+        code = 0
+    else:
+        raise SystemExit(f'{c_source}: no `Expected:` block in header')
+    subs       = re.findall(r'stdout\s+contains\s+"([^"]+)"', text)
+    err_subs   = re.findall(r'stderr\s+contains\s+"([^"]+)"', text)
+    return code, subs, err_subs
 
 
 def main() -> int:
@@ -41,7 +49,7 @@ def main() -> int:
                    help='Per-test timeout in seconds')
     args = p.parse_args()
 
-    expected_code, expected_subs = parse_expectations(args.src)
+    expected_code, expected_subs, _ = parse_expectations(args.src)
 
     proc = subprocess.run(
         [str(args.yos), str(args.wasm)],

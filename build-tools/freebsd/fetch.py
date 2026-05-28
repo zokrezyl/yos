@@ -65,9 +65,36 @@ def cmd_download(args: argparse.Namespace) -> int:
     # Download.
     print(f'[freebsd-fetch] GET {args.url}', file=sys.stderr)
     tmp = tarball.with_suffix('.txz.partial')
+
+    def _open(url, ctx=None):
+        return urllib.request.urlopen(url, context=ctx) if ctx is not None \
+            else urllib.request.urlopen(url)
+
     try:
-        with urllib.request.urlopen(args.url) as resp, tmp.open('wb') as out:
-            shutil.copyfileobj(resp, out, length=1 << 20)
+        try:
+            resp = _open(args.url)
+        except Exception as e:
+            # Windows Python typically lacks an OS-managed CA bundle and
+            # urlopen raises SSL: CERTIFICATE_VERIFY_FAILED. We hash-
+            # verify the downloaded content below, so falling back to
+            # an unverified TLS context is acceptable when a sha256 was
+            # pinned. Without a pin, refuse — there is nothing to
+            # cross-check the response against.
+            msg = str(e).lower()
+            if expected is not None and ('certificate' in msg or 'ssl' in msg):
+                import ssl
+                ctx = ssl._create_unverified_context()
+                print(f'[freebsd-fetch] TLS verify failed ({e}); '
+                      f'retrying with unverified TLS (sha256 pinned)',
+                      file=sys.stderr)
+                resp = _open(args.url, ctx)
+            else:
+                raise
+        try:
+            with tmp.open('wb') as out:
+                shutil.copyfileobj(resp, out, length=1 << 20)
+        finally:
+            resp.close()
     except Exception as e:
         if tmp.exists():
             tmp.unlink()
