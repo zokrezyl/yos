@@ -413,6 +413,20 @@ int32_t yos_read(struct yos_exec_ctx *ctx, int32_t fd, uint32_t buf, uint32_t co
          * second-stage return from its wasm handler. */
         yos_signal_pump(ctx);
     }
+    /* PTY master EOF normalisation. On Linux, a PTY master read after
+     * the slave is fully closed returns -1 / EIO; on FreeBSD/macOS it
+     * returns 0 (EOF). yos's wasm guests are FreeBSD-shaped — telnetd's
+     * main loop interprets EIO as a transient error and retries in a
+     * tight loop, burning a CPU and never releasing the connection.
+     * Translate EIO on a PTY master fd to EOF so the loop terminates.
+     * isatty() is the cheap discriminator: the master IS a tty fd
+     * (`/dev/ptmx`), regular files / sockets aren't, so we don't risk
+     * swallowing a legitimate EIO from a disk read. */
+    if (r < 0 && errno == EIO && hfd >= 0 && isatty(hfd) == 1) {
+        ydebug("read(wfd=%d hfd=%d): PTY-master EIO → 0 (EOF) "
+               "for FreeBSD-shape compatibility\n", fd, hfd);
+        r = 0;
+    }
 read_done:;
     if (ytrace_default_enabled()) {
         pid_t tid = yos_plat_gettid();
