@@ -55,6 +55,20 @@
 #include "yos/types.h"
 #include <yos/ytrace/ytrace.h>
 
+/* Magic header stamped into our lua_newuserdata wrappers so the
+ * luaL_checkudata / lua_touserdata bridges can distinguish OUR
+ * wasm-offset-holding host userdata from host-Lua-created userdata
+ * that happens to be the same size. The wrapper layout is:
+ *
+ *   bytes [0..4)  magic = 0x5957B0FF   ("Yo?" + wasm-offset prefix)
+ *   bytes [4..8)  wasm-offset (uint32)
+ *
+ * Without the magic, a luv-shaped 8-byte host userdata (e.g. a
+ * uv_handle pointer wrapper) could be mistaken for ours and the
+ * guest would dereference uninitialised wasm memory.
+ */
+#define YOS_LUA_UD_MAGIC 0x5957B0FFu
+
 /* Lua 5.1 forward decls. Pin the layout of the things we need
  * without pulling <lua.h> into yos's other TUs. */
 typedef struct lua_State lua_State;
@@ -706,12 +720,17 @@ static const void *m3_yos_lua_touserdata(IM3Runtime rt, IM3ImportContext _c,
         _sp[0] = (uint64_t)(uint32_t)((uint8_t *)p - ctx->memory);
         return NULL;
     }
-    /* Full userdata case: our newuserdata wrapper stores the wasm
-     * offset in the first 4 bytes of the host userdata. */
-    uint32_t wasm_off = *(uint32_t *)p;
-    if (wasm_off && wasm_off < ctx->memory_size) {
-        _sp[0] = (uint64_t)wasm_off;
-        return NULL;
+    /* Full userdata case: our newuserdata wrapper stores a magic
+     * header at [0..4) then the wasm offset at [4..8). Only return
+     * a wasm offset when the magic matches — and only when the
+     * userdata's payload is at least 8 bytes (lua_objlen >= 8) so
+     * we don't read past the end of an unrelated smaller userdata. */
+    if (L && lua_objlen(L, idx) >= 8) {
+        uint32_t *u32 = (uint32_t *)p;
+        if (u32[0] == YOS_LUA_UD_MAGIC && u32[1] && u32[1] < ctx->memory_size) {
+            _sp[0] = (uint64_t)u32[1];
+            return NULL;
+        }
     }
     _sp[0] = 0;
     return NULL;
@@ -1013,16 +1032,20 @@ static const void *m3_yos_lua_newuserdata(IM3Runtime rt, IM3ImportContext _c,
     /* Zero the allocation — lua's lua_newuserdata returns zeroed
      * memory; cjson and many other consumers rely on that. */
     if (sz) memset(ctx->memory + wasm_off, 0, sz);
-    /* Wrap with a host Lua userdata that records the wasm offset.
-     * 4-byte payload is enough for an i32 offset. */
-    void *udata = lua_newuserdata(L, sizeof(uint32_t));
+    /* Wrap with a host Lua userdata that records [magic, wasm_offset].
+     * 8 bytes total — the magic at byte 0 lets us safely identify our
+     * own wrappers in the checkudata / touserdata bridges without
+     * misinterpreting unrelated host-Lua userdata that happens to be
+     * the same size. */
+    uint32_t *udata = (uint32_t *)lua_newuserdata(L, 2 * sizeof(uint32_t));
     if (!udata) {
         /* alloc failed host-side; can't easily yos_free here without
          * a yos_free extern. The wasm bytes leak. */
         _sp[0] = 0;
         return NULL;
     }
-    *(uint32_t *)udata = wasm_off;
+    udata[0] = YOS_LUA_UD_MAGIC;
+    udata[1] = wasm_off;
     _sp[0] = (uint64_t)wasm_off;
     return NULL;
 }
@@ -1435,6 +1458,45 @@ static const void *m3_yos_luaL_checkudata(IM3Runtime rt, IM3ImportContext _c,
     int ud = (int)_sp[2];
     const char *tname = guest_cstr(ctx, (uint32_t)_sp[3]);
     void *p = (L && tname) ? luaL_checkudata(L, ud, tname) : NULL;
+    if (!p) { _sp[0] = 0; return NULL; }
+    /* Three userdata shapes the guest may encounter:
+     *
+     *   1. Light userdata where we stored (ctx->memory + off) — recover
+     *      `off` by subtracting ctx->memory.
+     *   2. Full userdata wrapper our lua_newuserdata created — exactly
+     *      4 bytes payload holding the wasm offset. luv's userdata
+     *      (uv_timer, uv_pipe, uv_signal …) lives in this branch.
+     *   3. Other host-side userdata (legit host Lua libs). The guest
+     *      doesn't actually deref these but its `luaL_checkudata` call
+     *      sites pass the result through to host code on the same call
+     *      (it's an opaque token); return the raw truncated host
+     *      pointer so existing host paths that expect the same low-32
+     *      bits as a token still work. nvim's batch `put` regressed
+     *      when this branch returned anything else.
+     *
+     * Pre-fix this bridge unconditionally did case 3. The guest then
+     * dereferenced the truncated host pointer as a wasm offset and
+     * trapped OOB on luv's uv_timer userdata — issue #6 was the
+     * canonical reproducer. The fix is to recognise our own wrappers
+     * (cases 1 and 2) and translate to the wasm offset only for them. */
+    if (ctx->memory && (uint8_t *)p >= ctx->memory &&
+        (uint8_t *)p < ctx->memory + ctx->memory_size) {
+        _sp[0] = (uint64_t)(uint32_t)((uint8_t *)p - ctx->memory);
+        return NULL;
+    }
+    /* Case 2: our 8-byte wrapper carrying [magic, wasm_offset].
+     * Same payload-size guard as lua_touserdata. */
+    if (L && lua_objlen(L, ud) >= 8) {
+        uint32_t *u32 = (uint32_t *)p;
+        if (u32[0] == YOS_LUA_UD_MAGIC && u32[1] && u32[1] < ctx->memory_size) {
+            _sp[0] = (uint64_t)u32[1];
+            return NULL;
+        }
+    }
+    /* Case 3: host-side userdata we don't own. Leave the truncated
+     * host pointer as the token — preserves the pre-fix behaviour
+     * for paths that pass it back unchanged (nvim's batch `put`
+     * regressed on any other choice). */
     _sp[0] = (uint64_t)(uint32_t)(uintptr_t)p;
     return NULL;
 }
