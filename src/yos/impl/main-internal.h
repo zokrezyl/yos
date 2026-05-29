@@ -19,9 +19,16 @@ extern struct yos_brg_rec yos_brg_ring[YOS_BRG_RING];
 extern _Atomic uint64_t   yos_brg_ring_seq;
 extern const char        *yos_brg_last_call;
 
-/* Per-platform host-signal infrastructure. Slices in
- * impl/main-{macos,linux,darwin-app}.c. */
+/* Per-platform host-signal infrastructure. Slices live in
+ * impl/main-{macos,linux,darwin-app,windows}.c. The "signal infra"
+ * call covers whatever per-OS startup wiring is needed to make
+ * synchronous fault delivery + the host CRT well-behaved:
+ *   - linux:   no-op (kernel delivers to BSD handlers directly)
+ *   - macos:   install the Mach exception port
+ *   - windows: calm the debug CRT (invalid-parameter + abort dialog)
+ *              and WSAStartup
+ *   - darwin-app: same Mach setup as macos */
 void yos_main_install_altstack(void *sp, size_t sz);
-void yos_mach_install_exc_handler(void);
+void yos_main_install_signal_infra(void);
 
 #endif /* YOS_MAIN_INTERNAL_H */

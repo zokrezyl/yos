@@ -2005,7 +2005,7 @@ int main(int argc, char **argv)
      * SIGSEGV/SIGFPE — the POSIX handler above never fires for those
      * on darwin. Linux and sandboxed-app slices (impl/main-linux.c,
      * impl/main-darwin-app.c) provide a no-op stub. */
-    yos_mach_install_exc_handler();
+    yos_main_install_signal_infra();
 
     /* SIGUSR1 → dump the bridge ring buffer (with tid per call) to
      * /tmp/yos-host-ring.log. Lets us peek at what each thread is
@@ -2054,15 +2054,17 @@ int main(int argc, char **argv)
      * environment and fall back to defaults that don't match what the
      * user set on the host shell. */
     {
-        /* Windows doesn't usually set PWD; many POSIX scripts and
-         * tests (FreeBSD's libc clearenv suite included) depend on it
-         * being present. Set from getcwd() before the env vector is
-         * snapshotted so the wasm guest sees it. setenv is a no-op
-         * elsewhere if PWD is already set (overwrite=0). */
+#ifdef _WIN32
+        /* Windows shells don't set PWD by default; many POSIX scripts
+         * and tests (FreeBSD's libc clearenv suite included) depend on
+         * it being present. Inject from getcwd() before the env vector
+         * is snapshotted so the wasm guest sees it. POSIX hosts already
+         * have PWD set by the parent shell. */
         if (!getenv("PWD")) {
             char cwd[4096];
             if (getcwd(cwd, sizeof cwd)) setenv("PWD", cwd, 0);
         }
+#endif
         int ec = 0;
         if (environ) for (char **p = environ; *p; p++) ec++;
         g_runtime.envc = ec;

@@ -20,9 +20,10 @@
 #  undef __align
 #endif
 
-/* See host64_structs.h for why we hide these darwin libc field-name
- * macros while declaring our Linux-shape mirror structs. */
-#ifdef __APPLE__
+/* See host64_structs.h for why we hide these libc field-name macros
+ * while declaring our Linux-shape mirror structs. Shield unconditionally
+ * — glibc rewrites st_atime -> st_atim.tv_sec under _GNU_SOURCE just like
+ * darwin libc does, so include order must not matter. */
 #  pragma push_macro("st_atime")
 #  pragma push_macro("st_mtime")
 #  pragma push_macro("st_ctime")
@@ -37,7 +38,6 @@
 #  undef sa_handler
 #  undef sa_sigaction
 #  undef __unused
-#endif
 
 /* COFF_AOUTHDR: 28 bytes, align 1 */
 struct wasm32_COFF_AOUTHDR {
@@ -1638,7 +1638,7 @@ struct wasm32_bpf_prog_info {
 
 /* bpf_raw_tracepoint_args: 0 bytes, align 4 */
 struct wasm32_bpf_raw_tracepoint_args {
-    uint64_t args[];
+    uint64_t args[0];
 };
 
 /* bpf_rb_node: 32 bytes, align 8 */
@@ -23566,7 +23566,6 @@ struct wasm32_sockaddr_pppol2tpv3 {
     struct wasm32_pppol2tpv3_addr pppol2tp;
 };
 
-#ifdef __APPLE__
 #  pragma pop_macro("__unused")
 #  pragma pop_macro("sa_sigaction")
 #  pragma pop_macro("sa_handler")
@@ -23574,6 +23573,5 @@ struct wasm32_sockaddr_pppol2tpv3 {
 #  pragma pop_macro("st_ctime")
 #  pragma pop_macro("st_mtime")
 #  pragma pop_macro("st_atime")
-#endif
 
 #endif // YOS_WASM32_STRUCTS_H

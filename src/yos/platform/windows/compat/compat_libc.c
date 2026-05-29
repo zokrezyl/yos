@@ -23,6 +23,7 @@
 #include "poll.h"
 
 #include <errno.h>
+#include <direct.h>
 #include <fcntl.h>
 #include <io.h>
 #include <stdarg.h>
@@ -162,34 +163,94 @@ int getpagesize(void)
 
 /* ── filesystem stubs ─────────────────────────────────────────────── */
 
-int chown    (const char *p, uid_t u, gid_t g)            { (void)p;(void)u;(void)g; return 0; }
-int fchown   (int fd, uid_t u, gid_t g)                   { (void)fd;(void)u;(void)g; return 0; }
-int lchown   (const char *p, uid_t u, gid_t g)            { (void)p;(void)u;(void)g; return 0; }
-int fchownat (int dfd, const char *p, uid_t u, gid_t g, int f) { (void)dfd;(void)p;(void)u;(void)g;(void)f; return 0; }
+static int yos_win_is_abs_path(const char *p)
+{
+    if (!p || !p[0]) return 0;
+    if (p[0] == '/' || p[0] == '\\') return 1;
+    return ((p[0] >= 'A' && p[0] <= 'Z') || (p[0] >= 'a' && p[0] <= 'z')) &&
+           p[1] == ':';
+}
+
+static const char *yos_win_strip_nt_prefix(char *p)
+{
+    if (strncmp(p, "\\\\?\\UNC\\", 8) == 0) {
+        p[0] = '\\';
+        p[1] = '\\';
+        memmove(p + 2, p + 8, strlen(p + 8) + 1);
+    } else if (strncmp(p, "\\\\?\\", 4) == 0) {
+        memmove(p, p + 4, strlen(p + 4) + 1);
+    }
+    return p;
+}
+
+static const char *yos_win_at_path(int dfd, const char *p, char *buf, size_t buflen)
+{
+    if (!p) {
+        errno = EFAULT;
+        return NULL;
+    }
+    if (dfd == AT_FDCWD || yos_win_is_abs_path(p)) return p;
+
+    intptr_t osfh = _get_osfhandle(dfd);
+    if (osfh == -1) {
+        errno = EBADF;
+        return NULL;
+    }
+    DWORD n = GetFinalPathNameByHandleA((HANDLE)osfh, buf, (DWORD)buflen,
+                                        FILE_NAME_NORMALIZED);
+    if (n == 0 || n >= buflen) {
+        errno = (n >= buflen) ? ENAMETOOLONG : EBADF;
+        return NULL;
+    }
+    yos_win_strip_nt_prefix(buf);
+    size_t used = strlen(buf);
+    if (used && buf[used - 1] != '\\' && buf[used - 1] != '/') {
+        if (used + 1 >= buflen) {
+            errno = ENAMETOOLONG;
+            return NULL;
+        }
+        buf[used++] = '\\';
+        buf[used] = 0;
+    }
+    if (used + strlen(p) >= buflen) {
+        errno = ENAMETOOLONG;
+        return NULL;
+    }
+    strcpy(buf + used, p);
+    return buf;
+}
+
+extern int yos_plat_open(const char *path, int flags, int mode);
+
+int chown    (const char *p, uid_t u, gid_t g)            { (void)p;(void)u;(void)g; errno = ENOSYS; return -1; }
+int fchown   (int fd, uid_t u, gid_t g)                   { (void)fd;(void)u;(void)g; errno = ENOSYS; return -1; }
+int lchown   (const char *p, uid_t u, gid_t g)            { (void)p;(void)u;(void)g; errno = ENOSYS; return -1; }
+int fchownat (int dfd, const char *p, uid_t u, gid_t g, int f) { (void)dfd;(void)p;(void)u;(void)g;(void)f; errno = ENOSYS; return -1; }
 int fchmod   (int fd, mode_t m)                           { (void)fd;(void)m; errno = ENOSYS; return -1; }
 int fchmodat (int dfd, const char *p, mode_t m, int f)    { (void)dfd;(void)p;(void)m;(void)f; errno = ENOSYS; return -1; }
-int faccessat(int dfd, const char *p, int m, int f)       { (void)dfd; (void)f; return _access(p, m); }
+int faccessat(int dfd, const char *p, int m, int f)       { (void)f; char b[MAX_PATH * 4]; const char *q = yos_win_at_path(dfd, p, b, sizeof b); return q ? _access(q, m) : -1; }
 int fchdir   (int fd)                                     { (void)fd; errno = ENOSYS; return -1; }
 int lstat    (const char *p, struct stat *st)             { return _stat64i32(p, (struct _stat64i32 *)st); }
-int fstatat  (int dfd, const char *p, struct stat *st, int f) { (void)dfd; (void)f; return _stat64i32(p, (struct _stat64i32 *)st); }
-int mkdirat  (int dfd, const char *p, mode_t m)           { (void)dfd;(void)m; return _mkdir(p); }
+int fstatat  (int dfd, const char *p, struct stat *st, int f) { (void)f; char b[MAX_PATH * 4]; const char *q = yos_win_at_path(dfd, p, b, sizeof b); return q ? _stat64i32(q, (struct _stat64i32 *)st) : -1; }
+int mkdirat  (int dfd, const char *p, mode_t m)           { (void)m; char b[MAX_PATH * 4]; const char *q = yos_win_at_path(dfd, p, b, sizeof b); return q ? _mkdir(q) : -1; }
 int mknodat  (int dfd, const char *p, mode_t m, dev_t d)  { (void)dfd;(void)p;(void)m;(void)d; errno = ENOSYS; return -1; }
 int openat   (int dfd, const char *p, int f, ...)         {
-    (void)dfd;
     int mode = 0;
     if (f & _O_CREAT) {
         va_list ap; va_start(ap, f); mode = va_arg(ap, int); va_end(ap);
     }
-    return _open(p, f, mode);
+    char b[MAX_PATH * 4];
+    const char *q = yos_win_at_path(dfd, p, b, sizeof b);
+    return q ? yos_plat_open(q, f, mode) : -1;
 }
 int link     (const char *o, const char *n)               { return CreateHardLinkA(n, o, NULL) ? 0 : (errno = EPERM, -1); }
-int linkat   (int od, const char *o, int nd, const char *n, int f) { (void)od;(void)nd;(void)f; return link(o, n); }
+int linkat   (int od, const char *o, int nd, const char *n, int f) { (void)f; char ob[MAX_PATH * 4], nb[MAX_PATH * 4]; const char *op = yos_win_at_path(od, o, ob, sizeof ob); const char *np = yos_win_at_path(nd, n, nb, sizeof nb); return (op && np) ? link(op, np) : -1; }
 int symlink  (const char *t, const char *p)               { return CreateSymbolicLinkA(p, t, 0) ? 0 : (errno = EPERM, -1); }
-int symlinkat(const char *t, int dfd, const char *p)      { (void)dfd; return symlink(t, p); }
+int symlinkat(const char *t, int dfd, const char *p)      { char b[MAX_PATH * 4]; const char *q = yos_win_at_path(dfd, p, b, sizeof b); return q ? symlink(t, q) : -1; }
 int readlink (const char *p, char *b, size_t n)           { (void)p;(void)b;(void)n; errno = ENOSYS; return -1; }
 int readlinkat(int dfd, const char *p, char *b, size_t n) { (void)dfd;(void)p;(void)b;(void)n; errno = ENOSYS; return -1; }
-int unlinkat (int dfd, const char *p, int f)              { (void)dfd; (void)f; return _unlink(p); }
-int renameat (int od, const char *o, int nd, const char *n) { (void)od;(void)nd; return rename(o, n); }
+int unlinkat (int dfd, const char *p, int f)              { char b[MAX_PATH * 4]; const char *q = yos_win_at_path(dfd, p, b, sizeof b); if (!q) return -1; return (f & AT_REMOVEDIR) ? _rmdir(q) : _unlink(q); }
+int renameat (int od, const char *o, int nd, const char *n) { char ob[MAX_PATH * 4], nb[MAX_PATH * 4]; const char *op = yos_win_at_path(od, o, ob, sizeof ob); const char *np = yos_win_at_path(nd, n, nb, sizeof nb); return (op && np) ? rename(op, np) : -1; }
 int truncate (const char *p, long long len)               {
     int fd = _open(p, _O_RDWR | _O_BINARY); if (fd < 0) return -1;
     int r = _chsize_s(fd, len); _close(fd); return r ? -1 : 0;
@@ -393,49 +454,90 @@ int fcntl(int fd, int cmd, ...) {
  * flag store too so fcntl(F_GETFL) reads it back. */
 int poll(struct pollfd *fds, nfds_t nfds, int timeout_ms)
 {
-    /* Partition the fds: any entry whose fd is a Winsock SOCKET goes
-     * to WSAPoll; non-socket entries (CRT pipes / files) get treated
-     * as "no events available" with revents=0. The yos_poll layer
-     * above this synthesises POLLIN/POLLOUT for regular files and
-     * char devices before reaching us, so the only non-socket fds
-     * that arrive here are pipes — those are reported as quiet (the
-     * caller will see them again on the next tick). */
     if (!fds || nfds == 0) {
         if (timeout_ms > 0) Sleep((DWORD)timeout_ms);
         return 0;
     }
-    WSAPOLLFD wfds[64];
-    int       wmap[64];   /* index in `fds` for each entry in wfds */
-    ULONG     wn = 0;
-    for (nfds_t i = 0; i < nfds && wn < (ULONG)(sizeof wfds / sizeof wfds[0]); i++) {
-        fds[i].revents = 0;
-        int st = 0; int sl = (int)sizeof st;
-        if (fds[i].fd >= 0 &&
-            getsockopt((SOCKET)fds[i].fd, SOL_SOCKET, SO_TYPE,
-                       (char *)&st, &sl) == 0) {
-            wfds[wn].fd      = (SOCKET)fds[i].fd;
-            wfds[wn].events  = fds[i].events;
-            wfds[wn].revents = 0;
-            wmap[wn] = (int)i;
-            wn++;
+
+    DWORD start = GetTickCount();
+    for (;;) {
+        int ready = 0;
+        int saw_pipe = 0;
+
+        for (nfds_t i = 0; i < nfds; i++) {
+            fds[i].revents = 0;
+            if (fds[i].fd < 0) continue;
+
+            int st = 0; int sl = (int)sizeof st;
+            if (getsockopt((SOCKET)fds[i].fd, SOL_SOCKET, SO_TYPE,
+                           (char *)&st, &sl) == 0) {
+                continue;
+            }
+
+            HANDLE h = (HANDLE)_get_osfhandle(fds[i].fd);
+            if (h == INVALID_HANDLE_VALUE) {
+                fds[i].revents = POLLNVAL;
+                ready++;
+                continue;
+            }
+            if (GetFileType(h) != FILE_TYPE_PIPE) {
+                continue;
+            }
+            saw_pipe = 1;
+
+            if (fds[i].events & POLLOUT) {
+                fds[i].revents |= POLLOUT;
+            }
+            if (fds[i].events & POLLIN) {
+                DWORD avail = 0;
+                if (PeekNamedPipe(h, NULL, 0, NULL, &avail, NULL)) {
+                    if (avail > 0) fds[i].revents |= POLLIN;
+                } else {
+                    DWORD e = GetLastError();
+                    if (e == ERROR_BROKEN_PIPE || e == ERROR_PIPE_NOT_CONNECTED)
+                        fds[i].revents |= POLLHUP;
+                    else
+                        fds[i].revents |= POLLERR;
+                }
+            }
+            if (fds[i].revents) ready++;
         }
+
+        WSAPOLLFD wfds[64];
+        int       wmap[64];
+        ULONG     wn = 0;
+        for (nfds_t i = 0; i < nfds && wn < (ULONG)(sizeof wfds / sizeof wfds[0]); i++) {
+            int st = 0; int sl = (int)sizeof st;
+            if (fds[i].fd >= 0 &&
+                getsockopt((SOCKET)fds[i].fd, SOL_SOCKET, SO_TYPE,
+                           (char *)&st, &sl) == 0) {
+                wfds[wn].fd      = (SOCKET)fds[i].fd;
+                wfds[wn].events  = fds[i].events;
+                wfds[wn].revents = 0;
+                wmap[wn] = (int)i;
+                wn++;
+            }
+        }
+
+        if (wn > 0) {
+            int sock_timeout = saw_pipe ? 0 : timeout_ms;
+            int rc = WSAPoll(wfds, wn, sock_timeout);
+            if (rc < 0) {
+                errno = EINVAL;
+                return -1;
+            }
+            for (ULONG j = 0; j < wn; j++) {
+                if (wfds[j].revents) {
+                    fds[wmap[j]].revents = (short)wfds[j].revents;
+                    ready++;
+                }
+            }
+        }
+
+        if (ready || timeout_ms == 0 || (wn > 0 && !saw_pipe)) return ready;
+        if (timeout_ms > 0 && GetTickCount() - start >= (DWORD)timeout_ms) return 0;
+        Sleep(1);
     }
-    int rc = 0;
-    if (wn > 0) {
-        rc = WSAPoll(wfds, wn, timeout_ms);
-        if (rc < 0) {
-            errno = EINVAL;
-            return -1;
-        }
-        for (ULONG j = 0; j < wn; j++) {
-            fds[wmap[j]].revents = (short)wfds[j].revents;
-        }
-    } else if (timeout_ms > 0) {
-        /* No sockets and a positive timeout — sleep the requested
-         * duration so the caller's tick budget is respected. */
-        Sleep((DWORD)timeout_ms);
-    }
-    return rc;
 }
 
 int ioctl(int fd, unsigned long request, ...)
@@ -552,12 +654,20 @@ ssize_t writev(int fd, const struct iovec *iov, int n)             {
     return total;
 }
 ssize_t preadv (int fd, const struct iovec *iov, int n, long long off) {
+    long long save = _lseeki64(fd, 0, SEEK_CUR);
+    if (save < 0) return -1;
     if (_lseeki64(fd, off, SEEK_SET) < 0) return -1;
-    return readv(fd, iov, n);
+    ssize_t r = readv(fd, iov, n);
+    _lseeki64(fd, save, SEEK_SET);
+    return r;
 }
 ssize_t pwritev(int fd, const struct iovec *iov, int n, long long off) {
+    long long save = _lseeki64(fd, 0, SEEK_CUR);
+    if (save < 0) return -1;
     if (_lseeki64(fd, off, SEEK_SET) < 0) return -1;
-    return writev(fd, iov, n);
+    ssize_t r = writev(fd, iov, n);
+    _lseeki64(fd, save, SEEK_SET);
+    return r;
 }
 
 /* ── env ──────────────────────────────────────────────────────────── */

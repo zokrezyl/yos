@@ -56,15 +56,17 @@
 const char *yos_path_resolve(struct yos_exec_ctx *ctx, const char *p)
 {
     if (!p) return NULL;
-    /* Treat as already-absolute:
-     *   - POSIX-style:    "/foo"
-     *   - Windows drive:  "C:\\foo", "c:/foo"
-     *   - UNC path:       "\\\\server\\share"
-     * Pass through to the host as-is in those cases.  */
-    int is_abs = (p[0] == '/')
-              || (p[0] == '\\' && p[1] == '\\')
-              || (((p[0] >= 'A' && p[0] <= 'Z') || (p[0] >= 'a' && p[0] <= 'z'))
-                  && p[1] == ':');
+    /* Treat as already-absolute. POSIX hosts accept only "/foo";
+     * Windows additionally accepts drive-letter and UNC forms. On
+     * POSIX the relaxed pattern would match legitimate relative
+     * filenames like "c:foo" and skip the cwd join. */
+    int is_abs = (p[0] == '/');
+#ifdef _WIN32
+    is_abs = is_abs
+          || (p[0] == '\\' && p[1] == '\\')
+          || (((p[0] >= 'A' && p[0] <= 'Z') || (p[0] >= 'a' && p[0] <= 'z'))
+              && p[1] == ':');
+#endif
     const char *abs = p;
     if (is_abs) {
         /* absolute — passthrough */
@@ -314,7 +316,7 @@ int32_t yos_fd_assign(struct yos_exec_ctx *ctx, int32_t newfd, int host_fd)
     if (old >= 0 && old != host_fd) {
         ydebug("fd_assign: wfd %d evict host_fd=%d (replaced by %d)\n",
                newfd, old, host_fd);
-        close(old);
+        yos_plat_close(old);
     }
     ctx->fd_map[newfd] = host_fd;
     free(ctx->fd_paths[newfd]);
@@ -862,7 +864,7 @@ int32_t yos_pipe(struct yos_exec_ctx *ctx, uint32_t fildes)
     int hfds[2];
     if (pipe(hfds) < 0) return yos_errno_neg(ctx, errno);
     int32_t r = yos_fd_alloc(ctx, hfds[0]);
-    if (r < 0) { close(hfds[1]); return r; }
+    if (r < 0) { yos_plat_close(hfds[1]); return r; }
     int32_t w = yos_fd_alloc(ctx, hfds[1]);
     if (w < 0) { yos_fd_close(ctx, r); return w; }
     p[0] = r;
@@ -1497,7 +1499,7 @@ int32_t yos_openat(struct yos_exec_ctx *ctx, int32_t dfd, uint32_t filename, int
         }
     }
     int wfd = yos_fd_alloc_with_path(ctx, r, record ? record : path);
-    if (wfd < 0) close(r);
+    if (wfd < 0) yos_plat_close(r);
     return wfd;
 }
 
@@ -1742,7 +1744,7 @@ int32_t yos_vfs_socketpair(struct yos_exec_ctx *ctx, int32_t domain,
         }
     }
     int32_t a = yos_fd_alloc(ctx, hfds[0]);
-    if (a < 0) { close(hfds[1]); return a; }
+    if (a < 0) { yos_plat_close(hfds[1]); return a; }
     int32_t b = yos_fd_alloc(ctx, hfds[1]);
     if (b < 0) { yos_fd_close(ctx, a); return b; }
     p[0] = a;
@@ -1775,5 +1777,3 @@ int32_t yos_pwritev(struct yos_exec_ctx *ctx, int32_t fd, uint32_t vec, int32_t 
     ssize_t n = pwritev(hfd, iov, vlen, offset);
     return yos_errno_check(ctx, (int32_t)n);
 }
-
-

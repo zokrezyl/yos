@@ -58,10 +58,10 @@ extern ssize_t yos_plat_write(int hfd, const void *buf, size_t n);
 extern int     yos_plat_isatty(int hfd);
 
 /* Translate POSIX-shape paths the wasm guest hands us to Windows-shape
- * paths the host CRT understands. Maps /dev/null → NUL, /dev/tty → CON,
- * /dev/random + /dev/urandom → NUL (callers fall back to BCryptGenRandom),
- * /tmp/<x> → %TEMP%\<x>. Pure-string translation; result is either
- * `path` itself or a thread-local buffer the caller must not free. */
+ * paths the host CRT understands. Maps POSIX device paths to internal
+ * sentinels handled by yos_plat_open/read/write, and /tmp/<x> to
+ * %TEMP%\<x>. Pure-string translation; result is either `path` itself
+ * or a thread-local buffer the caller must not free. */
 extern const char *yos_plat_translate_path(const char *path);
 
 /* Host open() wrapper. Stamps the per-fd flag table with O_NONBLOCK

@@ -545,13 +545,32 @@ int32_t yos_poll(struct yos_exec_ctx *ctx,
                 if (S_ISREG(sb.st_mode) || S_ISDIR(sb.st_mode))
                     always_ready = 1;
                 else if (S_ISCHR(sb.st_mode)) {
-                    /* Any character device — /dev/null on Linux/darwin,
-                     * NUL on Windows, /dev/console — is treated as
-                     * always-readable. Strict /dev/null inode matching
-                     * would let us be picky but the cost of being wrong
-                     * is small (one immediate read that returns 0 on
-                     * non-blocking, EOF on blocking). */
+#ifdef _WIN32
+                    /* Windows has no st_dev/st_ino on NUL we can match
+                     * against — accept any char device as always-ready.
+                     * Tty fds don't flow through this path on Windows
+                     * (msvcrt fds aren't S_ISCHR). */
                     always_ready = 1;
+#else
+                    /* /dev/null check — stat() the path once and cache.
+                     * If the cached stat fails we just leave the fd in
+                     * the host poll set; nothing breaks. Important to
+                     * keep this scope tight: a /dev/tty fd is also
+                     * S_ISCHR and must keep blocking semantics. */
+                    static dev_t null_dev;
+                    static ino_t null_ino;
+                    static int   null_init;
+                    if (!null_init) {
+                        struct stat nb;
+                        if (stat("/dev/null", &nb) == 0) {
+                            null_dev = nb.st_dev;
+                            null_ino = nb.st_ino;
+                        }
+                        null_init = 1;
+                    }
+                    if (sb.st_dev == null_dev && sb.st_ino == null_ino)
+                        always_ready = 1;
+#endif
                 }
                 if (always_ready) {
                     /* Mirror Linux: any requested event is immediately

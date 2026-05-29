@@ -33,6 +33,19 @@
 extern int32_t yos_fd_get  (struct yos_exec_ctx *ctx, int32_t wfd);
 extern int32_t yos_fd_alloc(struct yos_exec_ctx *ctx, int host_fd);
 
+uint16_t read_host_sa_family(const uint8_t *host_buf);
+
+static void host_sockaddr_to_freebsd(uint8_t *out, const struct sockaddr *src,
+                                     socklen_t len)
+{
+    memcpy(out, src, len);
+    if (len >= 2) {
+        uint16_t fam = read_host_sa_family(out);
+        out[0] = (uint8_t)len;
+        out[1] = (uint8_t)(fam & 0xff);
+    }
+}
+
 uint16_t read_host_sa_family(const uint8_t *host_buf)
 {
     /* Winsock: same as Linux — uint16 little-endian at offset 0|1. */
@@ -72,12 +85,31 @@ void termios_lx_to_fb(uint8_t *w, const struct termios *h)
 int32_t yos_accept4(struct yos_exec_ctx *ctx, int32_t wfd,
                     uint32_t addr_off, uint32_t addrlen_off, int32_t flags)
 {
-    (void)addr_off; (void)addrlen_off;
     int hfd = yos_fd_get(ctx, wfd);
     if (hfd < 0) return yos_errno_neg(ctx, EBADF);
 
+    struct sockaddr_storage ss;
+    int ss_len = (int)sizeof ss;
+    struct sockaddr *addr = NULL;
+    int *guest_lenp = NULL;
+    int guest_len = 0;
+
+    if (addr_off || addrlen_off) {
+        if (!addr_off || !addrlen_off ||
+            addr_off >= ctx->memory_size ||
+            addrlen_off > ctx->memory_size - sizeof(int)) {
+            return yos_errno_neg(ctx, EFAULT);
+        }
+        guest_lenp = (int *)(ctx->memory + addrlen_off);
+        guest_len = *guest_lenp;
+        if (guest_len < 0) return yos_errno_neg(ctx, EINVAL);
+        if ((uint32_t)guest_len > ctx->memory_size - addr_off)
+            return yos_errno_neg(ctx, EFAULT);
+        addr = (struct sockaddr *)&ss;
+    }
+
     SOCKET hsock = (SOCKET)hfd;
-    SOCKET new_sock = accept(hsock, NULL, NULL);
+    SOCKET new_sock = accept(hsock, addr, addr ? &ss_len : NULL);
     if (new_sock == INVALID_SOCKET) return yos_errno_neg(ctx, EINVAL);
 
     if (flags & 0x20000000 /* FreeBSD SOCK_NONBLOCK */) {
@@ -89,6 +121,16 @@ int32_t yos_accept4(struct yos_exec_ctx *ctx, int32_t wfd,
      * bit silently. */
 
     int new_wfd = yos_fd_alloc(ctx, (int)new_sock);
-    if (new_wfd < 0) { closesocket(new_sock); return yos_errno_neg(ctx, EMFILE); }
+    if (new_wfd < 0) return yos_errno_neg(ctx, EMFILE);
+
+    if (addr) {
+        int copy_len = ss_len < guest_len ? ss_len : guest_len;
+        if (copy_len > 0) {
+            host_sockaddr_to_freebsd(ctx->memory + addr_off,
+                                     (const struct sockaddr *)&ss,
+                                     (socklen_t)copy_len);
+        }
+        *guest_lenp = ss_len;
+    }
     return new_wfd;
 }

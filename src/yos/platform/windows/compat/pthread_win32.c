@@ -138,13 +138,18 @@ int pthread_create(pthread_t *t, const pthread_attr_t *attr,
 
     unsigned tid = 0;
     uintptr_t h = _beginthreadex(NULL, stacksize, yos_pthread_thunk, p,
-                                 0, &tid);
+                                 CREATE_SUSPENDED, &tid);
     if (h == 0) {
         free(p);
         return EAGAIN;
     }
     p->handle = (HANDLE)h;
     p->tid    = tid;
+    if (ResumeThread((HANDLE)h) == (DWORD)-1) {
+        CloseHandle((HANDLE)h);
+        free(p);
+        return EAGAIN;
+    }
     *t = p;
     return 0;
 }

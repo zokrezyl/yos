@@ -21,7 +21,8 @@ void yos_main_install_altstack(void *sp, size_t sz)
     (void)sz;
 }
 
-void yos_mach_install_exc_handler(void)
+void yos_main_install_signal_infra(void)
 {
-    /* No Mach on sandboxed Apple apps. */
+    /* No Mach exception ports inside sandboxed Apple apps — host
+     * delivers SIGSEGV/SIGBUS via the regular BSD signal path. */
 }

@@ -1607,7 +1607,7 @@ struct host64_bpf_prog_info {
 
 /* bpf_raw_tracepoint_args: 0 bytes, align 8 */
 struct host64_bpf_raw_tracepoint_args {
-    uint64_t args[];
+    uint64_t args[0];
 };
 
 /* bpf_rb_node: 32 bytes, align 8 */

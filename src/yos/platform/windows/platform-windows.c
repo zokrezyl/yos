@@ -8,12 +8,97 @@
 #include <errno.h>
 #include <io.h>          /* _get_osfhandle */
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <winsock2.h>
+
+#define YOS_WIN_DEV_NULL   "YOS$DEV$NULL"
+#define YOS_WIN_DEV_ZERO   "YOS$DEV$ZERO"
+#define YOS_WIN_DEV_RANDOM "YOS$DEV$RANDOM"
+
+/* Host-side errno value yos_plat_write sets when _write returns EPIPE
+ * on a pipe handle. See the long comment in yos_plat_write below — the
+ * direct host EPIPE=32 collides in the codegen's flat constants_remap
+ * with another constant of the same numeric value, so we use a value
+ * that happens to remap unambiguously to guest-EPIPE=32. The startup
+ * self-check yos_init_epipe_sentinel() asserts the remap still works
+ * the way we think it does. */
+#define YOS_WIN_HOST_EPIPE_SENTINEL 1024
+
+#define YOS_WIN_FDKIND_MAX 65536
+enum {
+    YOS_WIN_FD_REGULAR = 0,
+    YOS_WIN_FD_NULL,
+    YOS_WIN_FD_ZERO,
+    YOS_WIN_FD_RANDOM,
+};
+static volatile long g_fdkind[YOS_WIN_FDKIND_MAX];
+
+static int yos_fdkind_get(int fd)
+{
+    /* Out-of-range fd: treat as REGULAR. Aliasing into slot 0 would
+     * corrupt tracking for fd 0 (stdin). msvcrt can't usually hand
+     * out fds beyond _getmaxstdio() ≤ 8192 but a Winsock SOCKET cast
+     * to int could be arbitrarily large. */
+    if (fd < 0 || fd >= YOS_WIN_FDKIND_MAX) return YOS_WIN_FD_REGULAR;
+    return (int)g_fdkind[fd];
+}
+
+static void yos_fdkind_set(int fd, int kind)
+{
+    if (fd < 0 || fd >= YOS_WIN_FDKIND_MAX) return;
+    g_fdkind[fd] = kind;
+}
+
+typedef LONG (WINAPI *yos_BCryptGenRandom_t)(void *, void *, ULONG, ULONG);
+static yos_BCryptGenRandom_t g_yos_bcrypt_fn;
+static INIT_ONCE             g_yos_bcrypt_once = INIT_ONCE_STATIC_INIT;
+
+static BOOL CALLBACK yos_init_bcrypt(PINIT_ONCE once, PVOID param, PVOID *ctx)
+{
+    (void)once; (void)param; (void)ctx;
+    /* bcrypt.dll is a permanent part of the Win32 surface; we resolve
+     * BCryptGenRandom once and keep the module loaded for the rest of
+     * the process lifetime. No FreeLibrary on a per-read basis. */
+    HMODULE bcrypt = LoadLibraryW(L"bcrypt.dll");
+    if (bcrypt)
+        g_yos_bcrypt_fn = (yos_BCryptGenRandom_t)(uintptr_t)
+                          GetProcAddress(bcrypt, "BCryptGenRandom");
+    return TRUE;
+}
+
+static int yos_win_random(void *buf, size_t n)
+{
+    InitOnceExecuteOnce(&g_yos_bcrypt_once, yos_init_bcrypt, NULL, NULL);
+    yos_BCryptGenRandom_t bg = g_yos_bcrypt_fn;
+    if (!bg) { errno = EIO; return -1; }
+    unsigned char *p = (unsigned char *)buf;
+    while (n > 0) {
+        ULONG chunk = n > 0x40000000u ? 0x40000000u : (ULONG)n;
+        if (bg(NULL, p, chunk, 2) != 0) { errno = EIO; return -1; }
+        p += chunk;
+        n -= chunk;
+    }
+    return 0;
+}
+
+static int yos_win_random(void *buf, size_t n)
+{
+    yos_BCryptGenRandom_t bg = yos_resolve_bcrypt();
+    if (!bg) { errno = EIO; return -1; }
+    unsigned char *p = (unsigned char *)buf;
+    while (n > 0) {
+        ULONG chunk = n > 0x40000000u ? 0x40000000u : (ULONG)n;
+        if (bg(NULL, p, chunk, 2) != 0) { errno = EIO; return -1; }
+        p += chunk;
+        n -= chunk;
+    }
+    return 0;
+}
 
 pid_t yos_plat_gettid(void)
 {
@@ -107,6 +192,7 @@ static int yos_is_socket_fd(int hfd)
 
 int yos_plat_close(int hfd)
 {
+    yos_fdkind_set(hfd, YOS_WIN_FD_REGULAR);
     if (yos_is_socket_fd(hfd)) {
         return closesocket((SOCKET)hfd) == 0 ? 0 : -1;
     }
@@ -115,6 +201,14 @@ int yos_plat_close(int hfd)
 
 ssize_t yos_plat_read(int hfd, void *buf, size_t n)
 {
+    int kind = yos_fdkind_get(hfd);
+    if (kind == YOS_WIN_FD_ZERO) {
+        memset(buf, 0, n);
+        return (ssize_t)n;
+    }
+    if (kind == YOS_WIN_FD_RANDOM) {
+        return yos_win_random(buf, n) == 0 ? (ssize_t)n : -1;
+    }
     if (yos_is_socket_fd(hfd)) {
         int r = recv((SOCKET)hfd, (char *)buf, (int)n, 0);
         return (ssize_t)r;
@@ -124,6 +218,12 @@ ssize_t yos_plat_read(int hfd, void *buf, size_t n)
 
 ssize_t yos_plat_write(int hfd, const void *buf, size_t n)
 {
+    int kind = yos_fdkind_get(hfd);
+    if (kind == YOS_WIN_FD_NULL || kind == YOS_WIN_FD_ZERO ||
+        kind == YOS_WIN_FD_RANDOM) {
+        (void)buf;
+        return (ssize_t)n;
+    }
     if (yos_is_socket_fd(hfd)) {
         int r = send((SOCKET)hfd, (const char *)buf, (int)n, 0);
         return (ssize_t)r;
@@ -132,12 +232,16 @@ ssize_t yos_plat_write(int hfd, const void *buf, size_t n)
     if (r < 0) {
         HANDLE h = (HANDLE)_get_osfhandle(hfd);
         if (h != INVALID_HANDLE_VALUE && GetFileType(h) == FILE_TYPE_PIPE) {
-            /* MSVC's host errno=32 (EPIPE) collides with ECHOK in the
-             * codegen's constants_remap, so setting errno=32 would
-             * remap to FreeBSD 4 instead of FreeBSD 32. MSVC's ECHOPRT
-             * value (1024) has a unique remap path to FreeBSD EPIPE
-             * (32) — use it as our sentinel. */
-            errno = 1024;
+            /* Broken-pipe sentinel for the Windows host-errno → guest-
+             * errno remap path. The codegen merges every numeric constant
+             * into one big remap table, so MSVC's host errno=32 (EPIPE)
+             * collides with ECHOK (also 32 on FreeBSD-side numerically
+             * different) and the table picks ECHOK → guest 4. MSVC's
+             * ECHOPRT value happens to remap unambiguously to guest
+             * EPIPE=32, so we use that as the sentinel — see
+             * yos_init_epipe_sentinel() for a startup-time check that the
+             * remap still produces guest-EPIPE. */
+            errno = YOS_WIN_HOST_EPIPE_SENTINEL;
         }
     }
     return (ssize_t)r;
@@ -163,8 +267,22 @@ extern int  yos_fdmode_get(int fd);
 
 int yos_plat_open(const char *path, int flags, int mode)
 {
-    int fd = open(path, flags, mode);
+    int kind = YOS_WIN_FD_REGULAR;
+    const char *open_path = path;
+    if (strcmp(path, YOS_WIN_DEV_NULL) == 0) {
+        kind = YOS_WIN_FD_NULL;
+        open_path = "NUL";
+    } else if (strcmp(path, YOS_WIN_DEV_ZERO) == 0) {
+        kind = YOS_WIN_FD_ZERO;
+        open_path = "NUL";
+    } else if (strcmp(path, YOS_WIN_DEV_RANDOM) == 0) {
+        kind = YOS_WIN_FD_RANDOM;
+        open_path = "NUL";
+    }
+
+    int fd = open(open_path, flags, mode);
     if (fd >= 0) {
+        yos_fdkind_set(fd, kind);
         yos_fdflags_record_open(fd, flags);
         /* Stamp the POSIX mode for files we created — yos_plat_fstat
          * splices it back into st_mode so umask-then-fstat round-trips
@@ -185,10 +303,10 @@ const char *yos_plat_translate_path(const char *path)
     if (!path) return NULL;
 
     /* Exact-match POSIX device names → Windows null/console devices. */
-    if (strcmp(path, "/dev/null") == 0)         return "NUL";
-    if (strcmp(path, "/dev/zero") == 0)         return "NUL";
-    if (strcmp(path, "/dev/random") == 0)       return "NUL";
-    if (strcmp(path, "/dev/urandom") == 0)      return "NUL";
+    if (strcmp(path, "/dev/null") == 0)         return YOS_WIN_DEV_NULL;
+    if (strcmp(path, "/dev/zero") == 0)         return YOS_WIN_DEV_ZERO;
+    if (strcmp(path, "/dev/random") == 0)       return YOS_WIN_DEV_RANDOM;
+    if (strcmp(path, "/dev/urandom") == 0)      return YOS_WIN_DEV_RANDOM;
     if (strcmp(path, "/dev/tty") == 0)          return "CON";
     if (strcmp(path, "/dev/stdin") == 0)        return "CONIN$";
     if (strcmp(path, "/dev/stdout") == 0)       return "CONOUT$";
