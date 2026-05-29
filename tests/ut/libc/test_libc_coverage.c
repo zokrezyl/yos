@@ -57,12 +57,8 @@
 #include <grp.h>
 #include <regex.h>     /* probe_misc_bridges: regcomp/regexec round-trip */
 #include <sys/mount.h> /* probe_misc_bridges: fstatfs (FreeBSD's struct statfs) */
-/* Top-level <signal.h> pulls in <sys/_ucontext.h> which
- * references mcontext_t — undefined in the wasm32 sysroot's
- * <machine/ucontext.h>. Provide a stub before including signal.h
- * so the rest of the surface (sigset_t, sigaction, sigprocmask,
- * SIG_*) compiles. We never actually USE mcontext_t. */
-typedef struct { int _stub; } mcontext_t;
+/* mcontext_t comes from <machine/ucontext.h> via the sysroot now that
+ * sys/cdefs.h defines __i386__=1. No local stub needed. */
 #include <signal.h>
 #include <time.h>
 #include <termios.h>

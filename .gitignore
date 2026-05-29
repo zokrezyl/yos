@@ -4,6 +4,9 @@ build-darwin/
 build-freebsd/
 build-ios-sim-x86_64/
 build-tvos-arm64/
+build-windows/
+build-windows-debug/
+build-windows-release/
 build/
 
 # Cross-file rendered by build-tools/{ios,tvos}/setup.sh with absolute

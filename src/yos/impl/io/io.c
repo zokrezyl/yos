@@ -56,19 +56,38 @@
 const char *yos_path_resolve(struct yos_exec_ctx *ctx, const char *p)
 {
     if (!p) return NULL;
-    if (p[0] == '/') return p;     /* absolute — passthrough */
-    if (!ctx || ctx->cwd[0] == 0)  /* no cwd yet — let host decide */
-        return p;
-    static _Thread_local char buf[PATH_MAX];
-    size_t cwd_n = strlen(ctx->cwd);
-    if (cwd_n == 0 || cwd_n >= sizeof buf) return p;
-    memcpy(buf, ctx->cwd, cwd_n);
-    size_t pos = cwd_n;
-    if (buf[pos - 1] != '/' && pos + 1 < sizeof buf) buf[pos++] = '/';
-    size_t pn = strlen(p);
-    if (pos + pn + 1 > sizeof buf) return p;   /* too long, give up */
-    memcpy(buf + pos, p, pn + 1);
-    return buf;
+    /* Treat as already-absolute. POSIX hosts accept only "/foo";
+     * Windows additionally accepts drive-letter and UNC forms. On
+     * POSIX the relaxed pattern would match legitimate relative
+     * filenames like "c:foo" and skip the cwd join. */
+    int is_abs = (p[0] == '/');
+#ifdef _WIN32
+    is_abs = is_abs
+          || (p[0] == '\\' && p[1] == '\\')
+          || (((p[0] >= 'A' && p[0] <= 'Z') || (p[0] >= 'a' && p[0] <= 'z'))
+              && p[1] == ':');
+#endif
+    const char *abs = p;
+    if (is_abs) {
+        /* absolute — passthrough */
+    } else if (!ctx || ctx->cwd[0] == 0) {
+        /* no cwd yet — let host decide */
+    } else {
+        static _Thread_local char buf[PATH_MAX];
+        size_t cwd_n = strlen(ctx->cwd);
+        if (cwd_n == 0 || cwd_n >= sizeof buf) return p;
+        memcpy(buf, ctx->cwd, cwd_n);
+        size_t pos = cwd_n;
+        if (buf[pos - 1] != '/' && buf[pos - 1] != '\\' && pos + 1 < sizeof buf) buf[pos++] = '/';
+        size_t pn = strlen(p);
+        if (pos + pn + 1 > sizeof buf) return p;   /* too long */
+        memcpy(buf + pos, p, pn + 1);
+        abs = buf;
+    }
+    /* Map POSIX-shape devices/temps to host equivalents. POSIX hosts
+     * pass through unchanged; Windows substitutes /dev/null → NUL,
+     * /tmp/<x> → %TEMP%\<x>, etc. */
+    return yos_plat_translate_path(abs);
 }
 
 /* For *at()-family bridges: choose the right path-resolution policy
@@ -118,7 +137,7 @@ void yos_fd_table_init(struct yos_exec_ctx *ctx)
      *
      * Why: if the guest's wasm code does `close(1)` (zsh interactive
      * does this routinely when restructuring fds around fork+exec),
-     * yos_fd_close calls `close(host_fd)`. When host_fd is the host's
+     * yos_fd_close calls `yos_plat_close(host_fd)`. When host_fd is the host's
      * literal stdout fd 1, that wipes out yos's own stdout for the
      * rest of its lifetime. The kernel can then reuse fd 1 for the
      * next allocation (a pipe from yos_fork_pump's F_DUPFD loop, for
@@ -187,18 +206,30 @@ int yos_xlate_dfd(struct yos_exec_ctx *ctx, int32_t wfd)
  * Pipe2 and similar two-fd routines depend on this contract: they
  * close ONLY the partner end on the first-alloc failure path. See
  * impl/io/io-darwin.c::yos_pipe2 / io-linux.c::yos_pipe2. */
+/* Slot sentinel: "this slot was released by fclose() of an fdopen'd
+ * stream — refuse close() (return EBADF) and don't reuse for open()".
+ * Without this, the test_issue15_fdopen_lifetime scenario fails:
+ * fdopen(fd_a)+fclose() releases fd_a's slot to -1, the next open()
+ * gets fd_a back from yos_fd_alloc, and the caller's defensive
+ * close(fd_a) (which it expects to EBADF on a stale fd) instead
+ * closes the brand-new open's host fd. */
+#define YOS_FD_FCLOSE_TOMB (-2)
+
 int32_t yos_fd_alloc(struct yos_exec_ctx *ctx, int host_fd)
 {
     if (host_fd < 0) return host_fd;
     for (int i = 0; i < YOS_FD_MAX; i++) {
-        if (ctx->fd_map[i] < 0) {
+        /* Strict -1 match: skip TOMB slots so post-fclose defensive
+         * close(stale_fd) reads EBADF rather than clobbering a
+         * recycled fd. */
+        if (ctx->fd_map[i] == -1) {
             ctx->fd_map[i] = host_fd;
             free(ctx->fd_paths[i]);
             ctx->fd_paths[i] = NULL;
             return i;
         }
     }
-    close(host_fd);
+    yos_plat_close(host_fd);
     return -EMFILE;
 }
 
@@ -290,14 +321,14 @@ int32_t yos_fd_assign(struct yos_exec_ctx *ctx, int32_t newfd, int host_fd)
 {
     if (host_fd < 0) return host_fd;
     if (newfd < 0 || newfd >= YOS_FD_MAX) {
-        close(host_fd);
+        yos_plat_close(host_fd);
         return yos_errno_neg(ctx, EBADF);
     }
     int old = ctx->fd_map[newfd];
     if (old >= 0 && old != host_fd) {
         ydebug("fd_assign: wfd %d evict host_fd=%d (replaced by %d)\n",
                newfd, old, host_fd);
-        close(old);
+        yos_plat_close(old);
     }
     ctx->fd_map[newfd] = host_fd;
     free(ctx->fd_paths[newfd]);
@@ -310,22 +341,25 @@ int32_t yos_fd_close(struct yos_exec_ctx *ctx, int32_t wfd)
     if (wfd < 0 || wfd >= YOS_FD_MAX) return yos_errno_neg(ctx, EBADF);
     int hfd = ctx->fd_map[wfd];
     if (hfd < 0) return yos_errno_neg(ctx, EBADF);
-    int r = close(hfd);
+    int r = yos_plat_close(hfd);
     ctx->fd_map[wfd] = -1;
     free(ctx->fd_paths[wfd]);
     ctx->fd_paths[wfd] = NULL;
     return yos_errno_check(ctx, (int32_t)r);
 }
 
-/* Release a wasm-fd slot WITHOUT calling close(host_fd). Used by
+/* Release a wasm-fd slot WITHOUT calling yos_plat_close(host_fd). Used by
  * impl/io/file.c::free_handle after fclose(host_FILE) has already
  * closed the underlying host fd — calling close on a stale fd would
  * EBADF (or worse, close someone else's freshly-opened fd that got
- * the recycled number). */
+ * the recycled number). The slot is tombstoned (YOS_FD_FCLOSE_TOMB)
+ * so yos_fd_alloc won't recycle it and yos_fd_close on the same wfd
+ * cleanly EBADFs. yos_fd_assign (dup2) clears the tombstone — the
+ * caller is explicitly claiming the slot. */
 void yos_fd_release_slot(struct yos_exec_ctx *ctx, int32_t wfd)
 {
     if (!ctx || wfd < 0 || wfd >= YOS_FD_MAX) return;
-    ctx->fd_map[wfd] = -1;
+    ctx->fd_map[wfd] = YOS_FD_FCLOSE_TOMB;
     free(ctx->fd_paths[wfd]);
     ctx->fd_paths[wfd] = NULL;
 }
@@ -404,7 +438,7 @@ int32_t yos_read(struct yos_exec_ctx *ctx, int32_t fd, uint32_t buf, uint32_t co
         }
     }
     for (;;) {
-        r = read(hfd, p, count);
+        r = yos_plat_read(hfd, p, count);
         if (r >= 0 || errno != EINTR) break;
         /* Signal arrived while we were blocked. Drain the pending
          * bitmask (delivers to the wasm handler) and retry the
@@ -515,7 +549,7 @@ int32_t yos_write(struct yos_exec_ctx *ctx, int32_t fd, uint32_t buf, uint32_t c
      * of which slot it landed in. Pure-0xff is never a legitimate
      * tty payload (no UTF-8, no escape sequence, no protocol). */
     if (count > 0 && count <= 16 && hfd >= 0 &&
-        getenv("YOS_NO_FF_DROP") == NULL && isatty(hfd) == 1) {
+        getenv("YOS_NO_FF_DROP") == NULL && yos_plat_isatty(hfd) == 1) {
         const uint8_t *bp = (const uint8_t *)p;
         int all_ff = 1;
         for (uint32_t i = 0; i < count; i++) {
@@ -525,7 +559,7 @@ int32_t yos_write(struct yos_exec_ctx *ctx, int32_t fd, uint32_t buf, uint32_t c
             return (int32_t)count;
         }
     }
-    ssize_t r = write(hfd, p, count);
+    ssize_t r = yos_plat_write(hfd, p, count);
     int saved_errno = (r < 0) ? errno : 0;
     /* YOS_DUMP_SOCK=<fd>: dump every byte written on that wasm fd —
      * sibling of the read-side dump above for MAC-failure diagnosis. */
@@ -628,7 +662,7 @@ int32_t yos_open(struct yos_exec_ctx *ctx, uint32_t path, int32_t flags, int32_t
          * that may be 0 / past memory. */
         real_mode = 0;
     }
-    int r = open(s, hflags, real_mode);
+    int r = yos_plat_open(s, hflags, real_mode);
     if (ytrace_default_enabled())
         ydebug("open(\"%s\" flags=0x%x->0x%x mode_off=%d real_mode=0%o) = %d%s\n",
                s, flags, hflags, mode, real_mode, r,
@@ -661,7 +695,7 @@ void yos_closefrom(struct yos_exec_ctx *ctx, int32_t lowfd)
     for (int i = lowfd; i < YOS_FD_MAX; i++) {
         int hfd = ctx->fd_map[i];
         if (hfd < 0) continue;
-        close(hfd);
+        yos_plat_close(hfd);
         ctx->fd_map[i] = -1;
         free(ctx->fd_paths[i]);
         ctx->fd_paths[i] = NULL;
@@ -677,7 +711,7 @@ int32_t yos_close_range(struct yos_exec_ctx *ctx, uint32_t lowfd,
     for (uint32_t i = lowfd; i <= hi; i++) {
         int hfd = ctx->fd_map[i];
         if (hfd < 0) continue;
-        close(hfd);
+        yos_plat_close(hfd);
         ctx->fd_map[i] = -1;
         free(ctx->fd_paths[i]);
         ctx->fd_paths[i] = NULL;
@@ -804,7 +838,7 @@ int32_t yos_access(struct yos_exec_ctx *ctx, uint32_t filename, int32_t mode)
     const char *raw = wstr(ctx, filename);
     if (!raw) return yos_errno_neg(ctx, EFAULT);
     const char *s = yos_path_resolve(ctx, raw);
-    return yos_errno_check(ctx, access(s, mode));
+    return yos_errno_check(ctx, yos_plat_access(s, mode));
 }
 
 int32_t yos_rename(struct yos_exec_ctx *ctx, uint32_t oldname, uint32_t newname)
@@ -845,7 +879,7 @@ int32_t yos_pipe(struct yos_exec_ctx *ctx, uint32_t fildes)
     int hfds[2];
     if (pipe(hfds) < 0) return yos_errno_neg(ctx, errno);
     int32_t r = yos_fd_alloc(ctx, hfds[0]);
-    if (r < 0) { close(hfds[1]); return r; }
+    if (r < 0) { yos_plat_close(hfds[1]); return r; }
     int32_t w = yos_fd_alloc(ctx, hfds[1]);
     if (w < 0) { yos_fd_close(ctx, r); return w; }
     p[0] = r;
@@ -949,7 +983,7 @@ int32_t yos_ioctl(struct yos_exec_ctx *ctx, int32_t fd, uint32_t cmd, uint32_t a
      * — non-tty TIOCGPGRP/TIOCSPGRP would just fail with ENOTTY which
      * is the correct kernel behavior. */
     if ((lcmd == LX_TIOCGPGRP || lcmd == LX_TIOCSPGRP)
-        && hfd >= 0 && isatty(hfd)) {
+        && hfd >= 0 && yos_plat_isatty(hfd)) {
         if (!argp) return yos_errno_neg(ctx, EFAULT);
         if (lcmd == LX_TIOCGPGRP) {
             *(int32_t *)argp = ctx->rt->fg_pgid;
@@ -967,7 +1001,7 @@ int32_t yos_ioctl(struct yos_exec_ctx *ctx, int32_t fd, uint32_t cmd, uint32_t a
      * The kernel's bookkeeping is per-host-process and doesn't fit
      * one-pthread-per-guest-proc; just accept and update the
      * virtualized fg pgrp to the caller's pgrp. */
-    if (lcmd == LX_TIOCSCTTY && hfd >= 0 && isatty(hfd)) {
+    if (lcmd == LX_TIOCSCTTY && hfd >= 0 && yos_plat_isatty(hfd)) {
         if (ctx->proc) ctx->rt->fg_pgid = ctx->proc->pgid;
         ydebug("ioctl TIOCSCTTY(virt) fg_pgid <- %d\n", ctx->rt->fg_pgid);
         return 0;
@@ -1480,7 +1514,7 @@ int32_t yos_openat(struct yos_exec_ctx *ctx, int32_t dfd, uint32_t filename, int
         }
     }
     int wfd = yos_fd_alloc_with_path(ctx, r, record ? record : path);
-    if (wfd < 0) close(r);
+    if (wfd < 0) yos_plat_close(r);
     return wfd;
 }
 
@@ -1552,8 +1586,8 @@ int32_t yos_vfs_fstatat64(struct yos_exec_ctx *ctx, int32_t dfd, uint32_t filena
         *(uint32_t *)(buf + 28) = st.st_gid;
         *(uint64_t *)(buf + 32) = st.st_rdev;
         *(int64_t *)(buf + 48) = st.st_size;
-        *(uint32_t *)(buf + 56) = st.st_blksize;
-        *(uint64_t *)(buf + 64) = st.st_blocks;
+        *(uint32_t *)(buf + 56) = (uint32_t)yos_plat_stat_blksize(&st);
+        *(uint64_t *)(buf + 64) = (uint64_t)yos_plat_stat_blocks(&st);
         *(uint32_t *)(buf + 72) = st.st_atime;
         *(uint32_t *)(buf + 80) = st.st_mtime;
         *(uint32_t *)(buf + 88) = st.st_ctime;
@@ -1725,7 +1759,7 @@ int32_t yos_vfs_socketpair(struct yos_exec_ctx *ctx, int32_t domain,
         }
     }
     int32_t a = yos_fd_alloc(ctx, hfds[0]);
-    if (a < 0) { close(hfds[1]); return a; }
+    if (a < 0) { yos_plat_close(hfds[1]); return a; }
     int32_t b = yos_fd_alloc(ctx, hfds[1]);
     if (b < 0) { yos_fd_close(ctx, a); return b; }
     p[0] = a;
@@ -1758,5 +1792,3 @@ int32_t yos_pwritev(struct yos_exec_ctx *ctx, int32_t fd, uint32_t vec, int32_t 
     ssize_t n = pwritev(hfd, iov, vlen, offset);
     return yos_errno_check(ctx, (int32_t)n);
 }
-
-

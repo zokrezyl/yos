@@ -3,9 +3,9 @@
 **A host-side FreeBSD-libc emulator for wasm32 programs.**
 
 yos lets you run unmodified wasm32 binaries — built against FreeBSD
-libc headers — on Linux, macOS / iOS / tvOS, or FreeBSD. The wasm
-guest only ever sees a FreeBSD-shaped userspace; yos translates each
-libc call into the host's native libc on the way through.
+libc headers — on Linux, macOS / iOS / tvOS, FreeBSD, or Windows. The
+wasm guest only ever sees a FreeBSD-shaped userspace; yos translates
+each libc call into the host's native libc on the way through.
 
 ## Why
 
@@ -216,10 +216,18 @@ ninja -C build-linux
 meson test -C build-linux           # runs the integration suite
 ```
 
+On Windows the host runtime builds with MSVC (no Nix, no MinGW):
+
+```bat
+build-tools\windows\build.bat
+tools\yos.cmd path\to\guest.wasm
+```
+
 ## Status
 
-- yos host runtime: building cleanly on Linux, macOS, FreeBSD;
-  most-common bridges either tier-1-passthrough or hand-written.
+- yos host runtime: building cleanly on Linux, macOS, FreeBSD, and
+  Windows (MSVC); most-common bridges either tier-1-passthrough or
+  hand-written.
 - wasm packages: zsh, nvim, freebsd-tools all in the umbrella.
 - Known gaps tracked under `tests/integration/zsh/meson.build` and
   the per-package recipes — see the comments next to `xfail : true`.

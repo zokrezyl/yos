@@ -7,9 +7,23 @@
 
 #include <stdint.h>
 
-/* See host64_structs.h for why we hide these darwin libc field-name
- * macros while declaring our Linux-shape mirror structs. */
-#ifdef __APPLE__
+/* Microsoft's <sal.h> defines __reserved, __pad, __data, __count, etc.
+ * as SAL annotation macros that expand to attribute markup. The Linux
+ * UAPI structs mirrored below use those identifiers as ordinary field
+ * names; undef so the compiler sees them as plain identifiers again. */
+#ifdef _MSC_VER
+#  undef __reserved
+#  undef __pad
+#  undef __data
+#  undef __count
+#  undef __index
+#  undef __align
+#endif
+
+/* See host64_structs.h for why we hide these libc field-name macros
+ * while declaring our Linux-shape mirror structs. Shield unconditionally
+ * — glibc rewrites st_atime -> st_atim.tv_sec under _GNU_SOURCE just like
+ * darwin libc does, so include order must not matter. */
 #  pragma push_macro("st_atime")
 #  pragma push_macro("st_mtime")
 #  pragma push_macro("st_ctime")
@@ -24,7 +38,6 @@
 #  undef sa_handler
 #  undef sa_sigaction
 #  undef __unused
-#endif
 
 /* COFF_AOUTHDR: 28 bytes, align 1 */
 struct wasm32_COFF_AOUTHDR {
@@ -161,6 +174,7 @@ struct wasm32_PartitionBlock {
 
 /* PioctlData: 1 bytes, align 1 */
 struct wasm32_PioctlData {
+    char _yos_empty_pad;
 };
 
 /* RigidDiskBlock: 256 bytes, align 4 */
@@ -215,6 +229,7 @@ struct wasm32_SMMRegisters {
 
 /* ViceIoctl: 1 bytes, align 1 */
 struct wasm32_ViceIoctl {
+    char _yos_empty_pad;
 };
 
 /* _ErrorInfo_struct: 48 bytes, align 1 */
@@ -259,6 +274,7 @@ struct wasm32__RequestBlock_struct {
 
 /* __aio_sigset: -2 bytes, align -2 */
 struct wasm32___aio_sigset {
+    char _yos_empty_pad;
 };
 
 /* __bridge_info: 72 bytes, align 4 */
@@ -325,6 +341,7 @@ struct wasm32___kernel_sock_timeval {
 
 /* __kernel_sockaddr_storage: 128 bytes, align 4 */
 struct wasm32___kernel_sockaddr_storage {
+    char _yos_empty_pad;
 };
 
 /* __kernel_timespec: 16 bytes, align 4 */
@@ -431,6 +448,7 @@ struct wasm32___sk_buff {
 
 /* __sysctl_args: 1 bytes, align 1 */
 struct wasm32___sysctl_args {
+    char _yos_empty_pad;
 };
 
 /* __user_cap_data_struct: 12 bytes, align 4 */
@@ -723,10 +741,12 @@ struct wasm32_arphdr {
 
 /* arpreq: 1 bytes, align 1 */
 struct wasm32_arpreq {
+    char _yos_empty_pad;
 };
 
 /* arpreq_old: 1 bytes, align 1 */
 struct wasm32_arpreq_old {
+    char _yos_empty_pad;
 };
 
 /* aspeed_lpc_ctrl_mapping: 16 bytes, align 4 */
@@ -1526,7 +1546,7 @@ struct wasm32_bpf_list_node {
 /* bpf_lpm_trie_key: 4 bytes, align 4 */
 struct wasm32_bpf_lpm_trie_key {
     uint32_t prefixlen;
-    uint8_t data[0];
+    uint8_t data[];
 };
 
 /* bpf_lpm_trie_key_hdr: 4 bytes, align 4 */
@@ -1728,6 +1748,7 @@ struct wasm32_bpf_sock_ops {
 
 /* bpf_sock_tuple: 36 bytes, align 4 */
 struct wasm32_bpf_sock_tuple {
+    char _yos_empty_pad;
 };
 
 /* bpf_sockopt: 40 bytes, align 8 */
@@ -2567,14 +2588,17 @@ struct wasm32_clone_args {
 
 /* coda_create_in: 1 bytes, align 1 */
 struct wasm32_coda_create_in {
+    char _yos_empty_pad;
 };
 
 /* coda_create_out: 1 bytes, align 1 */
 struct wasm32_coda_create_out {
+    char _yos_empty_pad;
 };
 
 /* coda_getattr_out: 1 bytes, align 1 */
 struct wasm32_coda_getattr_out {
+    char _yos_empty_pad;
 };
 
 /* coda_in_hdr: 20 bytes, align 4 */
@@ -2588,14 +2612,17 @@ struct wasm32_coda_in_hdr {
 
 /* coda_ioctl_out: 1 bytes, align 1 */
 struct wasm32_coda_ioctl_out {
+    char _yos_empty_pad;
 };
 
 /* coda_mkdir_in: 1 bytes, align 1 */
 struct wasm32_coda_mkdir_in {
+    char _yos_empty_pad;
 };
 
 /* coda_mkdir_out: 1 bytes, align 1 */
 struct wasm32_coda_mkdir_out {
+    char _yos_empty_pad;
 };
 
 /* coda_mount_data: 8 bytes, align 4 */
@@ -2606,6 +2633,7 @@ struct wasm32_coda_mount_data {
 
 /* coda_open_out: 1 bytes, align 1 */
 struct wasm32_coda_open_out {
+    char _yos_empty_pad;
 };
 
 /* coda_out_hdr: 12 bytes, align 4 */
@@ -2617,10 +2645,12 @@ struct wasm32_coda_out_hdr {
 
 /* coda_readlink_out: 1 bytes, align 1 */
 struct wasm32_coda_readlink_out {
+    char _yos_empty_pad;
 };
 
 /* coda_setattr_in: 1 bytes, align 1 */
 struct wasm32_coda_setattr_in {
+    char _yos_empty_pad;
 };
 
 /* coda_statfs: 20 bytes, align 4 */
@@ -2634,14 +2664,17 @@ struct wasm32_coda_statfs {
 
 /* coda_symlink_in: 1 bytes, align 1 */
 struct wasm32_coda_symlink_in {
+    char _yos_empty_pad;
 };
 
 /* coda_timespec: 1 bytes, align 1 */
 struct wasm32_coda_timespec {
+    char _yos_empty_pad;
 };
 
 /* coda_vattr: 1 bytes, align 1 */
 struct wasm32_coda_vattr {
+    char _yos_empty_pad;
 };
 
 /* comedi_bufconfig: 32 bytes, align 4 */
@@ -3035,10 +3068,12 @@ struct wasm32_crypto_user_alg {
 
 /* cuse_init_in: 1 bytes, align 1 */
 struct wasm32_cuse_init_in {
+    char _yos_empty_pad;
 };
 
 /* cuse_init_out: 1 bytes, align 1 */
 struct wasm32_cuse_init_out {
+    char _yos_empty_pad;
 };
 
 /* cxl_command_info: 16 bytes, align 4 */
@@ -3419,18 +3454,22 @@ struct wasm32_dns_server_list_v1_server {
 
 /* dsa_completion_record: 1 bytes, align 1 */
 struct wasm32_dsa_completion_record {
+    char _yos_empty_pad;
 };
 
 /* dsa_hw_desc: 1 bytes, align 1 */
 struct wasm32_dsa_hw_desc {
+    char _yos_empty_pad;
 };
 
 /* dsa_raw_completion_record: 1 bytes, align 1 */
 struct wasm32_dsa_raw_completion_record {
+    char _yos_empty_pad;
 };
 
 /* dsa_raw_desc: 1 bytes, align 1 */
 struct wasm32_dsa_raw_desc {
+    char _yos_empty_pad;
 };
 
 /* dvd_bca: 196 bytes, align 4 */
@@ -4663,6 +4702,7 @@ struct wasm32_file_dedupe_range_info {
 
 /* file_handle: -2 bytes, align -2 */
 struct wasm32_file_handle {
+    char _yos_empty_pad;
 };
 
 /* files_stat_struct: 12 bytes, align 4 */
@@ -5003,298 +5043,372 @@ struct wasm32_fsxattr {
 
 /* fuse_access_in: 1 bytes, align 1 */
 struct wasm32_fuse_access_in {
+    char _yos_empty_pad;
 };
 
 /* fuse_attr: 1 bytes, align 1 */
 struct wasm32_fuse_attr {
+    char _yos_empty_pad;
 };
 
 /* fuse_attr_out: 1 bytes, align 1 */
 struct wasm32_fuse_attr_out {
+    char _yos_empty_pad;
 };
 
 /* fuse_backing_map: 1 bytes, align 1 */
 struct wasm32_fuse_backing_map {
+    char _yos_empty_pad;
 };
 
 /* fuse_batch_forget_in: 1 bytes, align 1 */
 struct wasm32_fuse_batch_forget_in {
+    char _yos_empty_pad;
 };
 
 /* fuse_bmap_in: 1 bytes, align 1 */
 struct wasm32_fuse_bmap_in {
+    char _yos_empty_pad;
 };
 
 /* fuse_bmap_out: 1 bytes, align 1 */
 struct wasm32_fuse_bmap_out {
+    char _yos_empty_pad;
 };
 
 /* fuse_copy_file_range_in: 1 bytes, align 1 */
 struct wasm32_fuse_copy_file_range_in {
+    char _yos_empty_pad;
 };
 
 /* fuse_copy_file_range_out: 1 bytes, align 1 */
 struct wasm32_fuse_copy_file_range_out {
+    char _yos_empty_pad;
 };
 
 /* fuse_create_in: 1 bytes, align 1 */
 struct wasm32_fuse_create_in {
+    char _yos_empty_pad;
 };
 
 /* fuse_dirent: 1 bytes, align 1 */
 struct wasm32_fuse_dirent {
+    char _yos_empty_pad;
 };
 
 /* fuse_direntplus: 1 bytes, align 1 */
 struct wasm32_fuse_direntplus {
+    char _yos_empty_pad;
 };
 
 /* fuse_entry_out: 1 bytes, align 1 */
 struct wasm32_fuse_entry_out {
+    char _yos_empty_pad;
 };
 
 /* fuse_ext_header: 1 bytes, align 1 */
 struct wasm32_fuse_ext_header {
+    char _yos_empty_pad;
 };
 
 /* fuse_fallocate_in: 1 bytes, align 1 */
 struct wasm32_fuse_fallocate_in {
+    char _yos_empty_pad;
 };
 
 /* fuse_file_lock: 1 bytes, align 1 */
 struct wasm32_fuse_file_lock {
+    char _yos_empty_pad;
 };
 
 /* fuse_flush_in: 1 bytes, align 1 */
 struct wasm32_fuse_flush_in {
+    char _yos_empty_pad;
 };
 
 /* fuse_forget_in: 1 bytes, align 1 */
 struct wasm32_fuse_forget_in {
+    char _yos_empty_pad;
 };
 
 /* fuse_forget_one: 1 bytes, align 1 */
 struct wasm32_fuse_forget_one {
+    char _yos_empty_pad;
 };
 
 /* fuse_fsync_in: 1 bytes, align 1 */
 struct wasm32_fuse_fsync_in {
+    char _yos_empty_pad;
 };
 
 /* fuse_getattr_in: 1 bytes, align 1 */
 struct wasm32_fuse_getattr_in {
+    char _yos_empty_pad;
 };
 
 /* fuse_getxattr_in: 1 bytes, align 1 */
 struct wasm32_fuse_getxattr_in {
+    char _yos_empty_pad;
 };
 
 /* fuse_getxattr_out: 1 bytes, align 1 */
 struct wasm32_fuse_getxattr_out {
+    char _yos_empty_pad;
 };
 
 /* fuse_in_header: 1 bytes, align 1 */
 struct wasm32_fuse_in_header {
+    char _yos_empty_pad;
 };
 
 /* fuse_init_in: 1 bytes, align 1 */
 struct wasm32_fuse_init_in {
+    char _yos_empty_pad;
 };
 
 /* fuse_init_out: 1 bytes, align 1 */
 struct wasm32_fuse_init_out {
+    char _yos_empty_pad;
 };
 
 /* fuse_interrupt_in: 1 bytes, align 1 */
 struct wasm32_fuse_interrupt_in {
+    char _yos_empty_pad;
 };
 
 /* fuse_ioctl_in: 1 bytes, align 1 */
 struct wasm32_fuse_ioctl_in {
+    char _yos_empty_pad;
 };
 
 /* fuse_ioctl_iovec: 1 bytes, align 1 */
 struct wasm32_fuse_ioctl_iovec {
+    char _yos_empty_pad;
 };
 
 /* fuse_ioctl_out: 1 bytes, align 1 */
 struct wasm32_fuse_ioctl_out {
+    char _yos_empty_pad;
 };
 
 /* fuse_kstatfs: 1 bytes, align 1 */
 struct wasm32_fuse_kstatfs {
+    char _yos_empty_pad;
 };
 
 /* fuse_link_in: 1 bytes, align 1 */
 struct wasm32_fuse_link_in {
+    char _yos_empty_pad;
 };
 
 /* fuse_lk_in: 1 bytes, align 1 */
 struct wasm32_fuse_lk_in {
+    char _yos_empty_pad;
 };
 
 /* fuse_lk_out: 1 bytes, align 1 */
 struct wasm32_fuse_lk_out {
+    char _yos_empty_pad;
 };
 
 /* fuse_lseek_in: 1 bytes, align 1 */
 struct wasm32_fuse_lseek_in {
+    char _yos_empty_pad;
 };
 
 /* fuse_lseek_out: 1 bytes, align 1 */
 struct wasm32_fuse_lseek_out {
+    char _yos_empty_pad;
 };
 
 /* fuse_mkdir_in: 1 bytes, align 1 */
 struct wasm32_fuse_mkdir_in {
+    char _yos_empty_pad;
 };
 
 /* fuse_mknod_in: 1 bytes, align 1 */
 struct wasm32_fuse_mknod_in {
+    char _yos_empty_pad;
 };
 
 /* fuse_notify_delete_out: 1 bytes, align 1 */
 struct wasm32_fuse_notify_delete_out {
+    char _yos_empty_pad;
 };
 
 /* fuse_notify_inval_entry_out: 1 bytes, align 1 */
 struct wasm32_fuse_notify_inval_entry_out {
+    char _yos_empty_pad;
 };
 
 /* fuse_notify_inval_inode_out: 1 bytes, align 1 */
 struct wasm32_fuse_notify_inval_inode_out {
+    char _yos_empty_pad;
 };
 
 /* fuse_notify_poll_wakeup_out: 1 bytes, align 1 */
 struct wasm32_fuse_notify_poll_wakeup_out {
+    char _yos_empty_pad;
 };
 
 /* fuse_notify_prune_out: 1 bytes, align 1 */
 struct wasm32_fuse_notify_prune_out {
+    char _yos_empty_pad;
 };
 
 /* fuse_notify_retrieve_in: 1 bytes, align 1 */
 struct wasm32_fuse_notify_retrieve_in {
+    char _yos_empty_pad;
 };
 
 /* fuse_notify_retrieve_out: 1 bytes, align 1 */
 struct wasm32_fuse_notify_retrieve_out {
+    char _yos_empty_pad;
 };
 
 /* fuse_notify_store_out: 1 bytes, align 1 */
 struct wasm32_fuse_notify_store_out {
+    char _yos_empty_pad;
 };
 
 /* fuse_open_in: 1 bytes, align 1 */
 struct wasm32_fuse_open_in {
+    char _yos_empty_pad;
 };
 
 /* fuse_open_out: 1 bytes, align 1 */
 struct wasm32_fuse_open_out {
+    char _yos_empty_pad;
 };
 
 /* fuse_out_header: 1 bytes, align 1 */
 struct wasm32_fuse_out_header {
+    char _yos_empty_pad;
 };
 
 /* fuse_poll_in: 1 bytes, align 1 */
 struct wasm32_fuse_poll_in {
+    char _yos_empty_pad;
 };
 
 /* fuse_poll_out: 1 bytes, align 1 */
 struct wasm32_fuse_poll_out {
+    char _yos_empty_pad;
 };
 
 /* fuse_read_in: 1 bytes, align 1 */
 struct wasm32_fuse_read_in {
+    char _yos_empty_pad;
 };
 
 /* fuse_release_in: 1 bytes, align 1 */
 struct wasm32_fuse_release_in {
+    char _yos_empty_pad;
 };
 
 /* fuse_removemapping_in: 1 bytes, align 1 */
 struct wasm32_fuse_removemapping_in {
+    char _yos_empty_pad;
 };
 
 /* fuse_removemapping_one: 1 bytes, align 1 */
 struct wasm32_fuse_removemapping_one {
+    char _yos_empty_pad;
 };
 
 /* fuse_rename2_in: 1 bytes, align 1 */
 struct wasm32_fuse_rename2_in {
+    char _yos_empty_pad;
 };
 
 /* fuse_rename_in: 1 bytes, align 1 */
 struct wasm32_fuse_rename_in {
+    char _yos_empty_pad;
 };
 
 /* fuse_secctx: 1 bytes, align 1 */
 struct wasm32_fuse_secctx {
+    char _yos_empty_pad;
 };
 
 /* fuse_secctx_header: 1 bytes, align 1 */
 struct wasm32_fuse_secctx_header {
+    char _yos_empty_pad;
 };
 
 /* fuse_setattr_in: 1 bytes, align 1 */
 struct wasm32_fuse_setattr_in {
+    char _yos_empty_pad;
 };
 
 /* fuse_setupmapping_in: 1 bytes, align 1 */
 struct wasm32_fuse_setupmapping_in {
+    char _yos_empty_pad;
 };
 
 /* fuse_setxattr_in: 1 bytes, align 1 */
 struct wasm32_fuse_setxattr_in {
+    char _yos_empty_pad;
 };
 
 /* fuse_statfs_out: 1 bytes, align 1 */
 struct wasm32_fuse_statfs_out {
+    char _yos_empty_pad;
 };
 
 /* fuse_statx: 1 bytes, align 1 */
 struct wasm32_fuse_statx {
+    char _yos_empty_pad;
 };
 
 /* fuse_statx_in: 1 bytes, align 1 */
 struct wasm32_fuse_statx_in {
+    char _yos_empty_pad;
 };
 
 /* fuse_statx_out: 1 bytes, align 1 */
 struct wasm32_fuse_statx_out {
+    char _yos_empty_pad;
 };
 
 /* fuse_supp_groups: 1 bytes, align 1 */
 struct wasm32_fuse_supp_groups {
+    char _yos_empty_pad;
 };
 
 /* fuse_sx_time: 1 bytes, align 1 */
 struct wasm32_fuse_sx_time {
+    char _yos_empty_pad;
 };
 
 /* fuse_syncfs_in: 1 bytes, align 1 */
 struct wasm32_fuse_syncfs_in {
+    char _yos_empty_pad;
 };
 
 /* fuse_uring_cmd_req: 1 bytes, align 1 */
 struct wasm32_fuse_uring_cmd_req {
+    char _yos_empty_pad;
 };
 
 /* fuse_uring_ent_in_out: 1 bytes, align 1 */
 struct wasm32_fuse_uring_ent_in_out {
+    char _yos_empty_pad;
 };
 
 /* fuse_uring_req_header: 1 bytes, align 1 */
 struct wasm32_fuse_uring_req_header {
+    char _yos_empty_pad;
 };
 
 /* fuse_write_in: 1 bytes, align 1 */
 struct wasm32_fuse_write_in {
+    char _yos_empty_pad;
 };
 
 /* fuse_write_out: 1 bytes, align 1 */
 struct wasm32_fuse_write_out {
+    char _yos_empty_pad;
 };
 
 /* futex_waitv: 24 bytes, align 4 */
@@ -5618,6 +5732,7 @@ struct wasm32_genlmsghdr {
 
 /* getcpu_cache: -2 bytes, align -2 */
 struct wasm32_getcpu_cache {
+    char _yos_empty_pad;
 };
 
 /* gfs2_ea_header: 16 bytes, align 4 */
@@ -5864,6 +5979,7 @@ struct wasm32_gpib_wait_ioctl {
 
 /* group_filter: 268 bytes, align 4 */
 struct wasm32_group_filter {
+    char _yos_empty_pad;
 };
 
 /* hd_drive_cmd_hdr: 4 bytes, align 1 */
@@ -6311,6 +6427,7 @@ struct wasm32_hv_vss_hdr {
 
 /* hv_vss_msg: 12 bytes, align 1 */
 struct wasm32_hv_vss_msg {
+    char _yos_empty_pad;
 };
 
 /* hwtstamp_config: 12 bytes, align 4 */
@@ -6344,14 +6461,17 @@ struct wasm32_i2c_smbus_ioctl_data {
 
 /* iax_completion_record: 1 bytes, align 1 */
 struct wasm32_iax_completion_record {
+    char _yos_empty_pad;
 };
 
 /* iax_hw_desc: 1 bytes, align 1 */
 struct wasm32_iax_hw_desc {
+    char _yos_empty_pad;
 };
 
 /* iax_raw_completion_record: 1 bytes, align 1 */
 struct wasm32_iax_raw_completion_record {
+    char _yos_empty_pad;
 };
 
 /* icmp6_filter: 32 bytes, align 4 */
@@ -6753,6 +6873,7 @@ struct wasm32_ifmap {
 
 /* ifreq: 1 bytes, align 1 */
 struct wasm32_ifreq {
+    char _yos_empty_pad;
 };
 
 /* ifslave: 28 bytes, align 4 */
@@ -7019,6 +7140,7 @@ struct wasm32_io_uring_buf_reg {
 
 /* io_uring_buf_ring: 16 bytes, align 4 */
 struct wasm32_io_uring_buf_ring {
+    char _yos_empty_pad;
 };
 
 /* io_uring_buf_status: 40 bytes, align 4 */
@@ -7769,7 +7891,7 @@ struct wasm32_ipv6_rpl_sr_hdr {
     uint32_t reserved;
     uint32_t pad;
     uint32_t reserved1;
-    uint8_t segments[0];
+    uint8_t segments[];
 };
 
 /* ipv6_rt_hdr: 4 bytes, align 1 */
@@ -8009,10 +8131,12 @@ struct wasm32_iw_discarded {
 
 /* iw_encode_ext: 1 bytes, align 1 */
 struct wasm32_iw_encode_ext {
+    char _yos_empty_pad;
 };
 
 /* iw_event: 1 bytes, align 1 */
 struct wasm32_iw_event {
+    char _yos_empty_pad;
 };
 
 /* iw_freq: 8 bytes, align 4 */
@@ -8025,6 +8149,7 @@ struct wasm32_iw_freq {
 
 /* iw_michaelmicfailure: 1 bytes, align 1 */
 struct wasm32_iw_michaelmicfailure {
+    char _yos_empty_pad;
 };
 
 /* iw_missed: 4 bytes, align 4 */
@@ -8034,6 +8159,7 @@ struct wasm32_iw_missed {
 
 /* iw_mlme: 1 bytes, align 1 */
 struct wasm32_iw_mlme {
+    char _yos_empty_pad;
 };
 
 /* iw_param: 8 bytes, align 4 */
@@ -8046,10 +8172,12 @@ struct wasm32_iw_param {
 
 /* iw_pmkid_cand: 1 bytes, align 1 */
 struct wasm32_iw_pmkid_cand {
+    char _yos_empty_pad;
 };
 
 /* iw_pmksa: 1 bytes, align 1 */
 struct wasm32_iw_pmksa {
+    char _yos_empty_pad;
 };
 
 /* iw_point: 8 bytes, align 4 */
@@ -8077,14 +8205,17 @@ struct wasm32_iw_quality {
 
 /* iw_scan_req: 1 bytes, align 1 */
 struct wasm32_iw_scan_req {
+    char _yos_empty_pad;
 };
 
 /* iw_thrspy: 1 bytes, align 1 */
 struct wasm32_iw_thrspy {
+    char _yos_empty_pad;
 };
 
 /* iwreq: 1 bytes, align 1 */
 struct wasm32_iwreq {
+    char _yos_empty_pad;
 };
 
 /* jailhouse_setup_data: 284 bytes, align 1 */
@@ -8393,7 +8524,7 @@ struct wasm32_kvm_nested_state {
     uint16_t format;
     uint32_t size;
     uint8_t hdr[120];
-    uint8_t data[0];
+    uint8_t data[];
 };
 
 /* kvm_pic_state: 16 bytes, align 1 */
@@ -8800,10 +8931,12 @@ struct wasm32_landlock_ruleset_attr {
 
 /* linux_dirent: -2 bytes, align -2 */
 struct wasm32_linux_dirent {
+    char _yos_empty_pad;
 };
 
 /* linux_dirent64: -2 bytes, align -2 */
 struct wasm32_linux_dirent64 {
+    char _yos_empty_pad;
 };
 
 /* lirc_scancode: 24 bytes, align 4 */
@@ -9325,10 +9458,12 @@ struct wasm32_mixer_vol_table {
 
 /* mmap_arg_struct: -2 bytes, align -2 */
 struct wasm32_mmap_arg_struct {
+    char _yos_empty_pad;
 };
 
 /* mmsghdr: -2 bytes, align -2 */
 struct wasm32_mmsghdr {
+    char _yos_empty_pad;
 };
 
 /* mnt_id_req: 32 bytes, align 4 */
@@ -9435,6 +9570,7 @@ struct wasm32_mptcp_info {
 
 /* mptcp_subflow_addrs: 0 bytes, align 1 */
 struct wasm32_mptcp_subflow_addrs {
+    char _yos_empty_pad;
 };
 
 /* mptcp_subflow_data: 16 bytes, align 8 */
@@ -9479,6 +9615,7 @@ struct wasm32_mrw_feature_desc {
 
 /* msg: -2 bytes, align -2 */
 struct wasm32_msg {
+    char _yos_empty_pad;
 };
 
 /* msgbuf: 8 bytes, align 4 */
@@ -9782,10 +9919,12 @@ struct wasm32_nd_cmd_vendor_tail {
 
 /* nd_papr_pdsm_health: 184 bytes, align 4 */
 struct wasm32_nd_papr_pdsm_health {
+    char _yos_empty_pad;
 };
 
 /* nd_papr_pdsm_smart_inject: 184 bytes, align 4 */
 struct wasm32_nd_papr_pdsm_smart_inject {
+    char _yos_empty_pad;
 };
 
 /* nd_pkg_pdsm: 192 bytes, align 1 */
@@ -10342,26 +10481,32 @@ struct wasm32_nvme_user_io {
 
 /* old_itimerspec32: -2 bytes, align -2 */
 struct wasm32_old_itimerspec32 {
+    char _yos_empty_pad;
 };
 
 /* old_linux_dirent: -2 bytes, align -2 */
 struct wasm32_old_linux_dirent {
+    char _yos_empty_pad;
 };
 
 /* old_timespec32: -2 bytes, align -2 */
 struct wasm32_old_timespec32 {
+    char _yos_empty_pad;
 };
 
 /* old_timeval32: -2 bytes, align -2 */
 struct wasm32_old_timeval32 {
+    char _yos_empty_pad;
 };
 
 /* old_timex32: -2 bytes, align -2 */
 struct wasm32_old_timex32 {
+    char _yos_empty_pad;
 };
 
 /* old_utimbuf32: -2 bytes, align -2 */
 struct wasm32_old_utimbuf32 {
+    char _yos_empty_pad;
 };
 
 /* old_utsname: 325 bytes, align 1 */
@@ -10639,6 +10784,7 @@ struct wasm32_omapfb_mem_info {
 
 /* omapfb_memory_read: 1 bytes, align 1 */
 struct wasm32_omapfb_memory_read {
+    char _yos_empty_pad;
 };
 
 /* omapfb_plane_info: 68 bytes, align 4 */
@@ -10799,6 +10945,7 @@ struct wasm32_ovs_key_arp {
 
 /* ovs_key_ct_labels: 16 bytes, align 4 */
 struct wasm32_ovs_key_ct_labels {
+    char _yos_empty_pad;
 };
 
 /* ovs_key_ct_tuple_ipv4: 16 bytes, align 4 */
@@ -12037,6 +12184,7 @@ struct wasm32_rtattr {
 
 /* rtentry: 1 bytes, align 1 */
 struct wasm32_rtentry {
+    char _yos_empty_pad;
 };
 
 /* rtgenmsg: 1 bytes, align 1 */
@@ -12471,6 +12619,7 @@ struct wasm32_sched_attr {
 
 /* sched_param: -2 bytes, align -2 */
 struct wasm32_sched_param {
+    char _yos_empty_pad;
 };
 
 /* scm_ts_pktinfo: 16 bytes, align 4 */
@@ -12531,6 +12680,7 @@ struct wasm32_sctp_adaptation_event {
 
 /* sctp_add_streams: 1 bytes, align 1 */
 struct wasm32_sctp_add_streams {
+    char _yos_empty_pad;
 };
 
 /* sctp_assoc_change: 20 bytes, align 4 */
@@ -12564,10 +12714,12 @@ struct wasm32_sctp_assoc_reset_event {
 
 /* sctp_assoc_stats: 1 bytes, align 1 */
 struct wasm32_sctp_assoc_stats {
+    char _yos_empty_pad;
 };
 
 /* sctp_assoc_value: 1 bytes, align 1 */
 struct wasm32_sctp_assoc_value {
+    char _yos_empty_pad;
 };
 
 /* sctp_assocparams: 20 bytes, align 4 */
@@ -12587,6 +12739,7 @@ struct wasm32_sctp_authchunk {
 
 /* sctp_authchunks: 1 bytes, align 1 */
 struct wasm32_sctp_authchunks {
+    char _yos_empty_pad;
 };
 
 /* sctp_authinfo: 2 bytes, align 2 */
@@ -12628,6 +12781,7 @@ struct wasm32_sctp_default_prinfo {
 
 /* sctp_event: 1 bytes, align 1 */
 struct wasm32_sctp_event {
+    char _yos_empty_pad;
 };
 
 /* sctp_event_subscribe: 14 bytes, align 1 */
@@ -12670,6 +12824,7 @@ struct wasm32_sctp_hmacalgo {
 
 /* sctp_info: 1 bytes, align 1 */
 struct wasm32_sctp_info {
+    char _yos_empty_pad;
 };
 
 /* sctp_initmsg: 8 bytes, align 2 */
@@ -12691,22 +12846,27 @@ struct wasm32_sctp_nxtinfo {
 
 /* sctp_paddr_change: 1 bytes, align 1 */
 struct wasm32_sctp_paddr_change {
+    char _yos_empty_pad;
 };
 
 /* sctp_paddrinfo: 1 bytes, align 1 */
 struct wasm32_sctp_paddrinfo {
+    char _yos_empty_pad;
 };
 
 /* sctp_paddrparams: 1 bytes, align 1 */
 struct wasm32_sctp_paddrparams {
+    char _yos_empty_pad;
 };
 
 /* sctp_paddrthlds: 1 bytes, align 1 */
 struct wasm32_sctp_paddrthlds {
+    char _yos_empty_pad;
 };
 
 /* sctp_paddrthlds_v2: 1 bytes, align 1 */
 struct wasm32_sctp_paddrthlds_v2 {
+    char _yos_empty_pad;
 };
 
 /* sctp_pdapi_event: 24 bytes, align 4 */
@@ -12728,6 +12888,7 @@ struct wasm32_sctp_peeloff_arg_t {
 
 /* sctp_prim: 1 bytes, align 1 */
 struct wasm32_sctp_prim {
+    char _yos_empty_pad;
 };
 
 /* sctp_prinfo: 8 bytes, align 4 */
@@ -12738,6 +12899,7 @@ struct wasm32_sctp_prinfo {
 
 /* sctp_probeinterval: 1 bytes, align 1 */
 struct wasm32_sctp_probeinterval {
+    char _yos_empty_pad;
 };
 
 /* sctp_prstatus: 24 bytes, align 4 */
@@ -12773,6 +12935,7 @@ struct wasm32_sctp_remote_error {
 
 /* sctp_reset_streams: 1 bytes, align 1 */
 struct wasm32_sctp_reset_streams {
+    char _yos_empty_pad;
 };
 
 /* sctp_rtoinfo: 16 bytes, align 4 */
@@ -12785,6 +12948,7 @@ struct wasm32_sctp_rtoinfo {
 
 /* sctp_sack_info: 1 bytes, align 1 */
 struct wasm32_sctp_sack_info {
+    char _yos_empty_pad;
 };
 
 /* sctp_sender_dry_event: 12 bytes, align 4 */
@@ -12802,6 +12966,7 @@ struct wasm32_sctp_setadaptation {
 
 /* sctp_setpeerprim: 1 bytes, align 1 */
 struct wasm32_sctp_setpeerprim {
+    char _yos_empty_pad;
 };
 
 /* sctp_shutdown_event: 12 bytes, align 4 */
@@ -12836,6 +13001,7 @@ struct wasm32_sctp_sndrcvinfo {
 
 /* sctp_status: 1 bytes, align 1 */
 struct wasm32_sctp_status {
+    char _yos_empty_pad;
 };
 
 /* sctp_stream_change_event: 16 bytes, align 4 */
@@ -12859,10 +13025,12 @@ struct wasm32_sctp_stream_reset_event {
 
 /* sctp_stream_value: 1 bytes, align 1 */
 struct wasm32_sctp_stream_value {
+    char _yos_empty_pad;
 };
 
 /* sctp_udpencaps: 1 bytes, align 1 */
 struct wasm32_sctp_udpencaps {
+    char _yos_empty_pad;
 };
 
 /* seccomp_data: 64 bytes, align 4 */
@@ -12921,6 +13089,7 @@ struct wasm32_seg7_conversion_map {
 
 /* sel_arg_struct: -2 bytes, align -2 */
 struct wasm32_sel_arg_struct {
+    char _yos_empty_pad;
 };
 
 /* selnl_msg_policyload: 4 bytes, align 4 */
@@ -12935,14 +13104,17 @@ struct wasm32_selnl_msg_setenforce {
 
 /* sem: -2 bytes, align -2 */
 struct wasm32_sem {
+    char _yos_empty_pad;
 };
 
 /* sem_queue: -2 bytes, align -2 */
 struct wasm32_sem_queue {
+    char _yos_empty_pad;
 };
 
 /* sem_undo: -2 bytes, align -2 */
 struct wasm32_sem_undo {
+    char _yos_empty_pad;
 };
 
 /* sembuf: 6 bytes, align 2 */
@@ -13388,6 +13560,7 @@ struct wasm32_sigevent {
 
 /* siginfo: 128 bytes, align 4 */
 struct wasm32_siginfo {
+    char _yos_empty_pad;
 };
 
 /* signalfd_siginfo: 128 bytes, align 4 */
@@ -13653,6 +13826,7 @@ struct wasm32_sockaddr_pkt {
 
 /* sockaddr_pn: 1 bytes, align 1 */
 struct wasm32_sockaddr_pn {
+    char _yos_empty_pad;
 };
 
 /* sockaddr_pppox: 30 bytes, align 1 */
@@ -13694,6 +13868,7 @@ struct wasm32_sockaddr_un {
 
 /* sockaddr_vm: 1 bytes, align 1 */
 struct wasm32_sockaddr_vm {
+    char _yos_empty_pad;
 };
 
 /* sockaddr_xdp: 16 bytes, align 4 */
@@ -13749,7 +13924,7 @@ struct wasm32_spi_transfer_result {
 struct wasm32_sr6_tlv {
     uint8_t type;
     uint8_t len;
-    uint8_t data[0];
+    uint8_t data[1]; /* flex->1 for MSVC nested-flex rule */
 };
 
 /* stat: 64 bytes, align 4 */
@@ -15609,6 +15784,7 @@ struct wasm32_user_desc {
 
 /* user_msghdr: -2 bytes, align -2 */
 struct wasm32_user_msghdr {
+    char _yos_empty_pad;
 };
 
 /* user_reg: 28 bytes, align 1 */
@@ -15639,6 +15815,7 @@ struct wasm32_userio_cmd {
 
 /* ustat: -2 bytes, align -2 */
 struct wasm32_ustat {
+    char _yos_empty_pad;
 };
 
 /* utimbuf: 8 bytes, align 4 */
@@ -15806,6 +15983,7 @@ struct wasm32_v4l2_bt_timings_cap {
 
 /* v4l2_buffer: 1 bytes, align 1 */
 struct wasm32_v4l2_buffer {
+    char _yos_empty_pad;
 };
 
 /* v4l2_capability: 104 bytes, align 4 */
@@ -16086,6 +16264,7 @@ struct wasm32_v4l2_encoder_cmd {
 
 /* v4l2_event: 1 bytes, align 1 */
 struct wasm32_v4l2_event {
+    char _yos_empty_pad;
 };
 
 /* v4l2_event_ctrl: 36 bytes, align 4 */
@@ -17117,6 +17296,7 @@ struct wasm32_virtio_admin_cmd_dev_mode_set_data {
 
 /* virtio_admin_cmd_dev_parts_metadata_result: 8 bytes, align 4 */
 struct wasm32_virtio_admin_cmd_dev_parts_metadata_result {
+    char _yos_empty_pad;
 };
 
 /* virtio_admin_cmd_hdr: 24 bytes, align 4 */
@@ -20785,7 +20965,7 @@ struct wasm32_mdp_superblock_s {
     uint32_t root_block;
     uint32_t pstate_reserved[60];
     struct wasm32_mdp_device_descriptor_s disks[27];
-    uint32_t reserved[0];
+    uint32_t reserved[1]; /* was [0]: GCC marker */
     struct wasm32_mdp_device_descriptor_s this_disk;
 };
 
@@ -21443,7 +21623,7 @@ struct wasm32_tls12_crypto_info_chacha20_poly1305 {
     struct wasm32_tls_crypto_info info;
     uint8_t iv[12];
     uint8_t key[32];
-    uint8_t salt[0];
+    uint8_t salt[1]; /* was [0]: GCC marker */
     uint8_t rec_seq[8];
 };
 
@@ -23386,7 +23566,6 @@ struct wasm32_sockaddr_pppol2tpv3 {
     struct wasm32_pppol2tpv3_addr pppol2tp;
 };
 
-#ifdef __APPLE__
 #  pragma pop_macro("__unused")
 #  pragma pop_macro("sa_sigaction")
 #  pragma pop_macro("sa_handler")
@@ -23394,6 +23573,5 @@ struct wasm32_sockaddr_pppol2tpv3 {
 #  pragma pop_macro("st_ctime")
 #  pragma pop_macro("st_mtime")
 #  pragma pop_macro("st_atime")
-#endif
 
 #endif // YOS_WASM32_STRUCTS_H

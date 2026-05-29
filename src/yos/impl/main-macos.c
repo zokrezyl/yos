@@ -253,7 +253,7 @@ static void *yos_mach_exc_thread(void *arg)
     return NULL;
 }
 
-void yos_mach_install_exc_handler(void)
+void yos_main_install_signal_infra(void)
 {
     int dbg = open("/tmp/yos-startup.log",
                    O_WRONLY | O_CREAT | O_APPEND, 0644);

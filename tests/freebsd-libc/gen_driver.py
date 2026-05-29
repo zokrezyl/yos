@@ -24,7 +24,7 @@ def main() -> int:
     if len(sys.argv) != 3:
         print(f'usage: {sys.argv[0]} <test.c> <out.c>', file=sys.stderr)
         return 2
-    src = Path(sys.argv[1]).read_text()
+    src = Path(sys.argv[1]).read_text(encoding='utf-8')
     out = Path(sys.argv[2])
 
     names = re.findall(r'\bATF_TC_BODY\s*\(\s*(\w+)\s*,', src)
@@ -45,7 +45,7 @@ def main() -> int:
         lines.append(f'    {{ "{n}", atf_tc_body_{n} }},')
     lines.append('    { (void *)0, (void *)0 }')
     lines.append('};')
-    out.write_text('\n'.join(lines) + '\n')
+    out.write_text('\n'.join(lines) + '\n', encoding='utf-8')
     print(f'[gen_driver] {len(deduped)} test(s) in {Path(sys.argv[1]).name}',
           file=sys.stderr)
     return 0

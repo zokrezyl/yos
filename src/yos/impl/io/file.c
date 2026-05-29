@@ -1,3 +1,4 @@
+#include "platform.h"   /* yos_plat_read / write / isatty / close */
 /* impl/file.c — host FILE* table shim for the wasm guest.
  *
  * The FreeBSD wasm guest expects `FILE *` values to be opaque pointers
@@ -114,7 +115,14 @@ uint32_t yos_alloc_file_handle_with_mode(struct yos_exec_ctx *ctx,
     for (uint32_t i = 4; i < YOS_FILE_MAX; i++) {
         if (ctx->file_slots[i] == NULL) {
             ctx->file_slots[i] = f;
-            ctx->file_wfds[i]  = wfd;
+            /* fopen / tmpfile etc.: yos owns the wfd, the user never
+             * sees it — so on fclose we release the slot to -1 (free
+             * for reuse). Encode "yos-owned" by negating the wfd
+             * (with -1 offset so a wfd of 0 still maps to a non-
+             * collision negative value). fdopen (the other entry
+             * point) stores the wfd verbatim so free_handle tombs
+             * it, preventing close(stale_fd) clobber. */
+            ctx->file_wfds[i]  = (wfd >= 0) ? -(wfd + 1) : -1;
             /* Record mode so fork can fdopen on the dup'd fd with
              * the right access mode. mode==NULL means "we don't
              * know" (e.g. tmpfile()) — fall back to "r+" which
@@ -140,17 +148,32 @@ uint32_t yos_alloc_file_handle(struct yos_exec_ctx *ctx, FILE *f)
 static void free_handle(struct yos_exec_ctx *ctx, uint32_t h)
 {
     if (h < 4 || h >= YOS_FILE_MAX || !ctx) return;
-    int32_t wfd = ctx->file_wfds[h];
+    int32_t stored = ctx->file_wfds[h];
     ctx->file_slots[h] = NULL;
     ctx->file_wfds[h]  = -1;
     ctx->file_modes[h][0] = '\0';
     /* The host fd is closed by fclose() before we reach this point —
-     * the wasm-fd slot just needs to be released (NOT close again,
-     * which would EBADF). yos_fd_close hits close(hfd) again, so
-     * we release the slot manually. */
-    if (wfd >= 0) {
+     * the wasm-fd slot just needs to be released. Two cases:
+     *   - stored >= 0 : fdopen path (caller passed in the wfd). The
+     *     caller may still hold the same value and try a defensive
+     *     close on it; tombstone the slot so that close cleanly
+     *     EBADFs instead of clobbering an unrelated open() return.
+     *   - stored < 0 : fopen/tmpfile path (yos allocated the wfd
+     *     internally and never exposed it). No defensive-close hazard,
+     *     so release the slot to free (-1) and let yos_fd_alloc reuse
+     *     it. Otherwise a long-running guest doing N fopen+fclose
+     *     cycles exhausts fd_map after N=YOS_FD_MAX iterations. */
+    if (stored >= 0) {
         extern void yos_fd_release_slot(struct yos_exec_ctx *ctx, int32_t wfd);
-        yos_fd_release_slot(ctx, wfd);
+        yos_fd_release_slot(ctx, stored);
+    } else if (stored < -1) {
+        /* yos-owned: decode -(wfd+1) -> wfd, drop to -1 (free). */
+        int32_t wfd = -(stored + 1);
+        if (wfd >= 0 && wfd < YOS_FD_MAX) {
+            ctx->fd_map[wfd] = -1;
+            free(ctx->fd_paths[wfd]);
+            ctx->fd_paths[wfd] = NULL;
+        }
     }
 }
 
@@ -166,7 +189,31 @@ uint32_t yos_fopen(struct yos_exec_ctx *ctx, uint32_t path_off, uint32_t mode_of
      * chdir(), so a raw fopen() on a relative path resolves against
      * the host process cwd, not the guest's. */
     const char *path = yos_path_resolve(ctx, path_in);
-    FILE *f = fopen(path, mode);
+    const char *eff_mode = mode;
+#ifdef _WIN32
+    /* Force binary mode if the guest didn't specify one. Windows
+     * fopen() defaults to text mode and translates \n → \r\n on write,
+     * which inflates the on-disk byte count and breaks the next
+     * fstat() / fread() round-trip. POSIX hosts treat 'b' as a no-op
+     * but appending it would pointlessly mutate every mode string in
+     * traces, so we only do it on Windows. */
+    char mbuf[16];
+    int has_b = 0, has_t = 0;
+    for (int i = 0; mode[i] && i < (int)sizeof mbuf - 1; i++) {
+        if (mode[i] == 'b') has_b = 1;
+        if (mode[i] == 't') has_t = 1;
+    }
+    if (!has_b && !has_t) {
+        int n = (int)strlen(mode);
+        if (n + 2 <= (int)sizeof mbuf) {
+            memcpy(mbuf, mode, n);
+            mbuf[n]   = 'b';
+            mbuf[n+1] = 0;
+            eff_mode = mbuf;
+        }
+    }
+#endif
+    FILE *f = fopen(path, eff_mode);
     if (!f) return 0;
     uint32_t h = yos_alloc_file_handle_with_mode(ctx, f, mode);
     if (!h) fclose(f);
@@ -252,7 +299,7 @@ static inline int yos__drop_0xff_garbage(int hfd, const void *p, size_t n)
 {
     if (n == 0 || n > 16 || hfd < 0) return 0;
     if (getenv("YOS_NO_FF_DROP")) return 0;
-    if (isatty(hfd) != 1) return 0;
+    if (yos_plat_isatty(hfd) != 1) return 0;
     const uint8_t *bp = (const uint8_t *)p;
     for (size_t i = 0; i < n; i++) if (bp[i] != 0xff) return 0;
     return 1;
@@ -271,7 +318,7 @@ uint32_t yos_fwrite(struct yos_exec_ctx *ctx, uint32_t buf, uint32_t size,
         size_t total = (size_t)size * nmemb;
         if (yos__drop_0xff_garbage(hfd, ctx->memory + buf, total))
             return nmemb;
-        ssize_t w = write(hfd, ctx->memory + buf, total);
+        ssize_t w = yos_plat_write(hfd, ctx->memory + buf, total);
         if (w <= 0) return 0;
         return (uint32_t)((size_t)w / size);
     }
@@ -313,7 +360,7 @@ static int stdio_fputc_via_fdmap(struct yos_exec_ctx *ctx, int c, uint32_t fp)
      * stray invalid-UTF-8 codepoint that breaks column accounting
      * (the "backspace inserts a space" symptom under zsh ZLE). */
     if (yos__drop_0xff_garbage(hfd, &ch, 1)) return (int)ch;
-    if (write(hfd, &ch, 1) != 1) return -1;
+    if (yos_plat_write(hfd, &ch, 1) != 1) return -1;
     return (int)ch;
 }
 static int stdio_fgetc_via_fdmap(struct yos_exec_ctx *ctx, uint32_t fp)
@@ -321,7 +368,7 @@ static int stdio_fgetc_via_fdmap(struct yos_exec_ctx *ctx, uint32_t fp)
     int hfd = std_handle_hfd(ctx, fp);
     if (hfd < 0) return -2;
     unsigned char ch;
-    ssize_t n = read(hfd, &ch, 1);
+    ssize_t n = yos_plat_read(hfd, &ch, 1);
     return n == 1 ? (int)ch : -1;  /* EOF on n==0 or error on n<0 */
 }
 
@@ -373,7 +420,7 @@ int32_t yos_fputs(struct yos_exec_ctx *ctx, uint32_t s, uint32_t fp)
     int hfd = std_handle_hfd(ctx, fp);
     if (hfd >= 0) {
         size_t len = strlen((const char *)(ctx->memory + s));
-        ssize_t w = write(hfd, ctx->memory + s, len);
+        ssize_t w = yos_plat_write(hfd, ctx->memory + s, len);
         return w < 0 ? -1 : (int32_t)w;
     }
     FILE *f = handle_to_file(fp);
@@ -426,7 +473,11 @@ int32_t yos_fileno(struct yos_exec_ctx *ctx, uint32_t fp)
     if (fp == 2) return 1;
     if (fp == 3) return 2;
     if (fp < 4 || fp >= YOS_FILE_MAX || !ctx) return -1;
-    return ctx->file_wfds[fp];
+    int32_t stored = ctx->file_wfds[fp];
+    /* Decode yos-owned-wfd marker (see alloc_handle): negative values
+     * other than -1 encode the wfd as -(wfd+1). */
+    if (stored < -1) return -(stored + 1);
+    return stored;
 }
 
 /* ── seek/tell ─────────────────────────────────────────────────── */
@@ -454,7 +505,14 @@ int32_t yos_setvbuf(struct yos_exec_ctx *ctx, uint32_t fp, uint32_t buf,
     (void)ctx; (void)buf; (void)size;
     FILE *f = handle_to_file(fp);
     if (!f) return 0;
+#ifdef _MSC_VER
+    /* MSVC's debug CRT asserts on size < 2 even when buf is NULL —
+     * pass BUFSIZ so the call lands in a benign path. POSIX hosts
+     * keep the original 0 (set mode only). */
+    return setvbuf(f, NULL, mode, BUFSIZ);
+#else
     return setvbuf(f, NULL, mode, 0);
+#endif
 }
 
 int32_t yos_setbuffer(struct yos_exec_ctx *ctx, uint32_t fp, uint32_t buf, uint32_t size)

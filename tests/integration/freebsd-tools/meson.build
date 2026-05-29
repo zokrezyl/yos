@@ -86,6 +86,33 @@ if host_machine.system() == 'darwin'
   }
 endif
 
+# pty-driven tests use Python's `pty` module (Unix-only). On Windows
+# strip just those entries from the iteration; the byte-in/byte-out
+# tests still run.
+if host_machine.system() == 'windows'
+  _skip_windows = ['ls-tty', 'ps-tty', 'backspace', 'nvim-zsh']
+  _filtered = {}
+  foreach _k, _v : ftools_int_tests
+    if not _skip_windows.contains(_k)
+      _filtered += {_k : _v}
+    endif
+  endforeach
+  ftools_int_tests = _filtered
+endif
+
+# Several xfail markers cover known runtime gaps on Linux/darwin that
+# happen NOT to fire on Windows. Flip those off so the meson report
+# shows OK instead of UNEXPECTEDPASS.
+if host_machine.system() == 'windows'
+  _platform_xfail += {
+    'awk'      : false,  'cut'      : false,  'tr'   : false,
+    'grep'     : false,  'sed'      : false,  'sort' : false,
+    'xargs'    : false,  'du'       : false,  'find' : false,
+    'chmod'    : false,  'sleep'    : false,  'kill' : false,
+    'uuidgen'  : false,
+  }
+endif
+
 foreach name, cfg : ftools_int_tests
   xfail = _platform_xfail.has_key(name) ? _platform_xfail[name] : cfg['xfail']
   test('freebsd-tool-' + name,

@@ -109,7 +109,8 @@ void _start(void) {{
 
 
 def load_matrix(yaml_path: Path) -> dict:
-    with yaml_path.open() as fh:
+    # Explicit utf-8 — Windows Python defaults to cp1252 on file.open().
+    with yaml_path.open(encoding='utf-8') as fh:
         m = yaml.safe_load(fh)
     if not isinstance(m, dict) or 'rows' not in m:
         sys.stderr.write(f"{yaml_path}: missing top-level `rows:` list\n")
@@ -263,9 +264,9 @@ def main() -> int:
         rendered = render(matrix, row)
         # Skip a write if the content is identical — keeps meson from
         # marking dependents stale on a no-op codegen rerun.
-        if out.exists() and out.read_text() == rendered:
+        if out.exists() and out.read_text(encoding='utf-8') == rendered:
             continue
-        out.write_text(rendered)
+        out.write_text(rendered, encoding='utf-8')
     return 0
 
 

@@ -326,7 +326,22 @@ static int32_t sigmask_apply(struct yos_exec_ctx *ctx, int32_t how,
     if (!ctx) return yos_errno_neg(ctx, EINVAL);
     uint32_t prev = ctx->sig_mask;
     if (set_off) {
-        uint32_t s = read_fbsd_sigset_lo(ctx, set_off);
+        /* Wasm sigset_t layout (FreeBSD libc convention): bit position
+         * is (signo - 1) — sigaddset(set, 30) sets bit 29. yos's
+         * internal sig_mask / sig_pending instead use bit = signo, so
+         * sig_handlers[30] holds the SIGUSR1 handler and deliver_to_-
+         * proc sets sig_pending |= (1 << 30). Convert by shifting the
+         * sigset's low word left by 1 — bit (signo-1) -> bit signo.
+         * Bit 31 of the sigset (signo 32) lands outside the uint32 mask
+         * width; signal 32 isn't used in our model so it drops cleanly.
+         *
+         * Without this conversion, blocking SIGUSR1 via pthread_sigmask
+         * sets sig_mask bit 29, but a subsequent raise() lands bit 30
+         * in sig_pending, signal_pump sees ~mask leaves it deliverable,
+         * and SIG_DFL=TERMINATE kills the proc before sigwait can
+         * consume the signal. */
+        uint32_t fbsd = read_fbsd_sigset_lo(ctx, set_off);
+        uint32_t s = fbsd << 1;   /* signo = bit + 1 */
         s &= ~((1u << YOS_FBSD_SIGKILL) | (1u << YOS_FBSD_SIGSTOP));
         switch (how) {
         case YOS_FBSD_SIG_BLOCK:   ctx->sig_mask = prev | s;  break;
@@ -335,7 +350,10 @@ static int32_t sigmask_apply(struct yos_exec_ctx *ctx, int32_t how,
         default:                   return yos_errno_neg(ctx, EINVAL);
         }
     }
-    if (oset_off) write_fbsd_sigset_lo(ctx, oset_off, prev);
+    /* Convert sig_mask (bit=signo) back to FreeBSD sigset_t
+     * (bit=signo-1) for the oset out-param, matching the input
+     * conversion above. */
+    if (oset_off) write_fbsd_sigset_lo(ctx, oset_off, prev >> 1);
     /* Anything we just unblocked may already be pending — fire it now. */
     if (ctx->sig_pending & ~ctx->sig_mask)
         yos_signal_pump(ctx);
@@ -635,11 +653,32 @@ int32_t yos_pthread_sigmask(struct yos_exec_ctx *ctx, int32_t how,
     if (set_off  && !yos_sigset_bound(ctx, set_off))  return EFAULT;
     if (oset_off && !yos_sigset_bound(ctx, oset_off)) return EFAULT;
 
+    /* yos models per-process signals (one thread per yos_proc), so the
+     * per-thread vs per-process distinction collapses — pthread_sigmask
+     * routes through the same per-ctx sig_mask sigprocmask uses. This
+     * also matters for hosts whose pthread_sigmask is a no-op (Windows
+     * has no per-thread signal mask): without updating ctx->sig_mask
+     * the wasm guest's SIG_BLOCK request is silently dropped, and a
+     * subsequent raise()+sigwait() flow delivers the signal anyway,
+     * tripping SIG_DFL=TERMINATE and killing the wasm program before
+     * sigwait can consume it. */
+    int32_t rc = sigmask_apply(ctx, how, set_off, oset_off);
+    if (rc < 0) {
+        /* sigmask_apply returns -1+errno on EFAULT/EINVAL via the
+         * yos_errno_neg convention. pthread_sigmask, however, returns
+         * an errno-code (POSIX). Translate. */
+        return (ctx->memory && ctx->errno_off)
+             ? *(int *)(ctx->memory + ctx->errno_off)
+             : EINVAL;
+    }
+    /* Best-effort host call — keeps the host's view of the mask
+     * roughly in sync for paths that DO check it (POSIX hosts), and
+     * is a harmless no-op on Windows. Errors aren't propagated: the
+     * authoritative state already lives in ctx->sig_mask. */
     sigset_t host_set, host_old;
     sigset_t *set_p  = NULL;
     sigset_t *oset_p = oset_off ? &host_old : NULL;
     int hhow = 0;
-
     if (set_off) {
         fbsd_sigset_to_host(ctx->memory + set_off, &host_set);
         set_p = &host_set;
@@ -647,15 +686,10 @@ int32_t yos_pthread_sigmask(struct yos_exec_ctx *ctx, int32_t how,
             case 1: hhow = SIG_BLOCK;   break;
             case 2: hhow = SIG_UNBLOCK; break;
             case 3: hhow = SIG_SETMASK; break;
-            default: return EINVAL;
+            default: hhow = SIG_SETMASK; break;
         }
     }
-
-    int rc = pthread_sigmask(hhow, set_p, oset_p);
-    if (rc != 0) return yos_remap_errno_h2g(rc);
-
-    if (oset_off)
-        host_sigset_to_fbsd(&host_old, ctx->memory + oset_off);
+    (void)pthread_sigmask(hhow, set_p, oset_p);
     return 0;
 }
 
@@ -724,16 +758,50 @@ int32_t yos_sigwait(struct yos_exec_ctx *ctx,
         (uint64_t)sig_out_off + 4ULL > (uint64_t)ctx->memory_size)
         return EFAULT;
 
-    sigset_t host;
-    fbsd_sigset_to_host(ctx->memory + set_off, &host);
+    /* yos models signals in ctx->sig_pending (set by yos_kill/raise);
+     * popping a bit from there is the authoritative wait. Host sigwait
+     * doesn't see those — it watches the host kernel's per-thread
+     * signal queue, which is empty for raise()s that went through the
+     * yos surface. Block briefly on the per-proc signal cond until
+     * something in `set` shows up.
+     *
+     * Convention conversion (see sigmask_apply for the full story):
+     * the wasm sigset uses bit = signo-1 (FreeBSD libc layout), the
+     * internal sig_pending uses bit = signo. Shift left 1 to align.
+     *
+     * On Windows there is no host sigwait at all (compat returns
+     * ENOSYS); this loop is the only mechanism by which the wasm
+     * guest's pthread_sigmask(BLOCK)+raise()+sigwait() sequence ever
+     * completes without SIG_DFL=TERMINATE killing the proc. */
+    uint32_t want_fbsd = read_fbsd_sigset_lo(ctx, set_off);
+    if (!want_fbsd) return EINVAL;
+    uint32_t want_lo = want_fbsd << 1;
 
-    int hsig = 0;
-    int rc = sigwait(&host, &hsig);
-    if (rc != 0) return yos_remap_errno_h2g(rc);
-
-    int fbsig = host_to_fbsd_signo(hsig);
-    *(int32_t *)(ctx->memory + sig_out_off) = (fbsig > 0) ? fbsig : hsig;
-    return 0;
+    /* Spin-poll the pending mask. sleep is short so a signal arriving
+     * via deliver_to_proc on another thread is picked up promptly. The
+     * loop exits on a match or on SIGKILL (uncatchable; pump handles). */
+    for (;;) {
+        uint32_t pend = __atomic_load_n(&ctx->sig_pending, __ATOMIC_ACQUIRE);
+        uint32_t hit = pend & want_lo;
+        if (hit) {
+            int s = __builtin_ctz(hit);   /* bit-position == signo */
+            uint32_t bit = 1u << s;
+            __atomic_and_fetch(&ctx->sig_pending, ~bit, __ATOMIC_ACQ_REL);
+            *(int32_t *)(ctx->memory + sig_out_off) = s;
+            return 0;
+        }
+        /* SIGKILL bypasses sigwait — fall through so the next pump
+         * call sees it (the pump in turn pthread_exit's the proc). */
+        if (pend & (1u << YOS_FBSD_SIGKILL)) {
+            yos_signal_pump(ctx);
+            return EINTR;
+        }
+        /* Brief sleep avoids burning a core in a tight loop while
+         * waiting for another thread (or this thread on a later
+         * bridge) to set a bit we care about. */
+        struct timespec ts = { 0, 1000000 };  /* 1 ms */
+        nanosleep(&ts, NULL);
+    }
 }
 
 /* ── sigwaitinfo / sigtimedwait ─────────────────────────────────────

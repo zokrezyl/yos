@@ -23,11 +23,25 @@
 sysroot_dir         = meson.project_build_root() / 'sysroot'
 sysroot_imports_dir = meson.project_build_root() / 'src' / 'yos' / 'codegen'
 
-sysroot_skel = custom_target(
-  'sysroot-skel',
-  input            : freebsd_headers_i386,
-  output           : 'sysroot.stamp',
-  command          : [files('skel.sh'), '@INPUT@', '@OUTPUT@', sysroot_dir],
-  build_by_default : true,
-  console          : true,
-)
+if host_machine.system() == 'windows'
+  # Windows: Python emitter, no bash needed; mklink /J directory
+  # junctions when symlinks are denied (default for unprivileged users
+  # without dev-mode).
+  sysroot_skel = custom_target(
+    'sysroot-skel',
+    input            : freebsd_headers_i386,
+    output           : 'sysroot.stamp',
+    command          : [py, files('skel.py'), '@INPUT@', '@OUTPUT@', sysroot_dir],
+    build_by_default : true,
+    console          : true,
+  )
+else
+  sysroot_skel = custom_target(
+    'sysroot-skel',
+    input            : freebsd_headers_i386,
+    output           : 'sysroot.stamp',
+    command          : [files('skel.sh'), '@INPUT@', '@OUTPUT@', sysroot_dir],
+    build_by_default : true,
+    console          : true,
+  )
+endif

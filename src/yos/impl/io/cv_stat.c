@@ -21,6 +21,7 @@
 
 #include "yos/types.h"
 #include "impl/io/cv_stat.h"
+#include "platform.h"
 
 #include <stdint.h>
 #include <string.h>
@@ -70,6 +71,15 @@
 #  define H_CTIM(h)      ((h)->st_ctimespec)
 #  define H_HAS_BIRTH    1
 #  define H_BIRTH(h)     ((h)->st_birthtimespec)
+#elif defined(_MSC_VER)
+/* MSVC's <sys/stat.h> exposes st_atime/st_mtime/st_ctime as flat
+ * time_t (no sub-second component). Synthesise a struct-timespec
+ * value via these helper expressions; nsec is always 0. */
+struct yos_win_ts { long long tv_sec; long tv_nsec; };
+#  define H_ATIM(h)      ((struct yos_win_ts){ (long long)(h)->st_atime, 0 })
+#  define H_MTIM(h)      ((struct yos_win_ts){ (long long)(h)->st_mtime, 0 })
+#  define H_CTIM(h)      ((struct yos_win_ts){ (long long)(h)->st_ctime, 0 })
+#  define H_HAS_BIRTH    0
 #else
 #  define H_ATIM(h)      ((h)->st_atim)
 #  define H_MTIM(h)      ((h)->st_mtim)
@@ -109,8 +119,8 @@ void yos_cv_stat_fbi(uint8_t *w, const struct stat *h)
 #endif
 
     *(int64_t  *)(w + FBI_ST_OFF_SIZE)    = (int64_t)h->st_size;
-    *(int64_t  *)(w + FBI_ST_OFF_BLOCKS)  = (int64_t)h->st_blocks;
-    *(int32_t  *)(w + FBI_ST_OFF_BLKSIZE) = (int32_t)h->st_blksize;
+    *(int64_t  *)(w + FBI_ST_OFF_BLOCKS)  = (int64_t)yos_plat_stat_blocks(h);
+    *(int32_t  *)(w + FBI_ST_OFF_BLKSIZE) = (int32_t)yos_plat_stat_blksize(h);
 #if defined(__APPLE__) || defined(__FreeBSD__)
     /* darwin/BSD have st_flags. Linux glibc doesn't — leave 0 there. */
     *(int32_t  *)(w + FBI_ST_OFF_FLAGS)   = (int32_t)h->st_flags;

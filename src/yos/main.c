@@ -1665,7 +1665,25 @@ static int load_wasm_module(struct yos_exec_ctx *ctx, IM3Environment env,
      * 268435456" — every later fork then traps inside asyncify's
      * rewind. 1024 pages = 64 MiB is enough for zsh + the runit
      * supervisor and small enough that 8+ live forks still fit. */
-    uint32_t resize_pages = 4096;
+    /* Default eager-commit: 4096 pages = 256 MiB. Aggressive on
+     * platforms where each fork() snapshot/restore COMMITS the full
+     * size — Windows VirtualAlloc / heap reservations against the
+     * system commit limit cause a tree of forks to exhaust commit
+     * space and the deepest children to crash with access violation.
+     * The default lives below; Windows uses a smaller value to keep
+     * deep fork trees viable. Either default is overridable via the
+     * YOS_WASM_PAGES env var (used by nvim where 256 MiB is needed). */
+#ifdef _WIN32
+    uint32_t resize_pages = 256;   /* 16 MiB — fits typical test guests
+                                    * while keeping the per-fork commit
+                                    * charge bounded across deep recursion. */
+#else
+    uint32_t resize_pages = 4096;  /* 256 MiB — nvim's Lua + module
+                                    * dictionaries blow past 16 MiB
+                                    * during startup; lazy-commit on
+                                    * POSIX makes the upfront size
+                                    * cheap for guests that don't grow. */
+#endif
     {
         const char *env_pages = getenv("YOS_WASM_PAGES");
         if (env_pages && *env_pages) {
@@ -2005,7 +2023,7 @@ int main(int argc, char **argv)
      * SIGSEGV/SIGFPE — the POSIX handler above never fires for those
      * on darwin. Linux and sandboxed-app slices (impl/main-linux.c,
      * impl/main-darwin-app.c) provide a no-op stub. */
-    yos_mach_install_exc_handler();
+    yos_main_install_signal_infra();
 
     /* SIGUSR1 → dump the bridge ring buffer (with tid per call) to
      * /tmp/yos-host-ring.log. Lets us peek at what each thread is
@@ -2054,6 +2072,17 @@ int main(int argc, char **argv)
      * environment and fall back to defaults that don't match what the
      * user set on the host shell. */
     {
+#ifdef _WIN32
+        /* Windows shells don't set PWD by default; many POSIX scripts
+         * and tests (FreeBSD's libc clearenv suite included) depend on
+         * it being present. Inject from getcwd() before the env vector
+         * is snapshotted so the wasm guest sees it. POSIX hosts already
+         * have PWD set by the parent shell. */
+        if (!getenv("PWD")) {
+            char cwd[4096];
+            if (getcwd(cwd, sizeof cwd)) setenv("PWD", cwd, 0);
+        }
+#endif
         int ec = 0;
         if (environ) for (char **p = environ; *p; p++) ec++;
         g_runtime.envc = ec;

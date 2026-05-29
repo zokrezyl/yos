@@ -101,6 +101,13 @@ host_restrict_args = []
 foreach h : api_top_headers + api_top_subdir_headers
   host_restrict_args += ['--restrict-to', h]
 endforeach
+# Windows: also walk our compat aggregator so codegen sees the
+# explicit re-declarations for symbols MSVC hides behind _time64-style
+# macros (time, gmtime, mktime, …) and the POSIX functions MSVC
+# doesn't ship in any header (clock_gettime, sigaction, pipe, …).
+if host_machine.system() == 'windows'
+  host_restrict_args += ['--restrict-to', 'posix_extras.h']
+endif
 
 guest_api_yaml = custom_target(
   'guest-api-i386-freebsd',
@@ -127,6 +134,34 @@ guest_api_yaml = custom_target(
   console          : true,
 )
 
+# Windows / MSVC headers use __declspec(dllimport) + MSVC pragma packs;
+# libclang needs -fms-extensions + a windows-msvc target tuple.
+host_extra_extract_args = []
+if host_machine.system() == 'windows'
+  host_extra_extract_args += [
+    '--target',  'x86_64-pc-windows-msvc',
+    # `=value` form so argparse doesn't misread the leading `-` of the
+    # passthrough argument as the start of another flag.
+    '--clang-arg=-fms-extensions',
+    '--clang-arg=-fms-compatibility',
+    '--clang-arg=-fms-compatibility-version=19.50',
+    '--define',  '_WIN32=1',
+    '--define',  '_M_X64=100',
+    '--define',  'NOMINMAX=1',
+    '--define',  'WIN32_LEAN_AND_MEAN=1',
+    # The yos compat layer adds POSIX functions msvcrt lacks
+    # (clock_gettime, pthread_*, dirent, regex, ...). They live in
+    # src/yos/platform/windows/compat/ and the runtime provides bodies
+    # in compat_libc.c / pthread_win32.c. Add the compat dir as an
+    # include path so libclang picks up the declarations and the
+    # bridge generator emits direct passthrough wrappers.
+    '--include-dir',
+        meson.project_source_root() / 'src' / 'yos' / 'platform'
+                                    / 'windows' / 'compat',
+    '--root-marker', 'compat/',
+  ]
+endif
+
 host_api_yaml = custom_target(
   'host-api',
   input            : host_libc_snapshot,
@@ -144,6 +179,7 @@ host_api_yaml = custom_target(
     '--root-marker',  'include/',
     '--enum',
     host_restrict_args,
+    host_extra_extract_args,
     '--out',          '@OUTPUT@',
   ],
   build_by_default : false,
@@ -270,6 +306,10 @@ yos_impl_inc  = include_directories('..')
 # bridges call those names directly, so we `-include` a shim header
 # only when building the bridge TU, and link in ios-unblock.c. See
 # build-tools/ios/ios-unblock.{h,c}.
+_brcc = meson.get_compiler('c')
+_br_gnu_like  = _brcc.get_id() in ['gcc', 'clang', 'clang-cl']
+_br_msvc_like = _brcc.get_argument_syntax() == 'msvc'
+
 api_bridge_extra_sources = []
 api_bridge_extra_c_args  = []
 if get_option('ios_unblock')
@@ -285,15 +325,9 @@ if get_option('tvos_unblock')
   api_bridge_extra_sources += tvos_unblock_src
 endif
 
-api_bridge_lib = static_library(
-  'yos_api_bridge',
-  api_bridge_outputs[1],         # yos_bridge.c
-  api_generate_outputs[1],       # yos_remap.c
-  api_struct_convert_outputs[1], # yos_struct_convert.c
-  api_bridge_extra_sources,
-  include_directories : [yos_types_inc, yos_inc, yos_impl_inc],
-  dependencies        : [wasm3_dep],
-  c_args : [
+api_bridge_c_args = []
+if _br_gnu_like
+  api_bridge_c_args += [
     '-D_GNU_SOURCE',
     '-Wno-deprecated-declarations',
     '-Wno-implicit-function-declaration',
@@ -303,7 +337,43 @@ api_bridge_lib = static_library(
     '-Wno-int-conversion',
     '-Wno-unused-parameter',
     '-Wno-unused-variable',
-  ] + api_bridge_extra_c_args,
+  ]
+endif
+if _br_msvc_like
+  api_bridge_c_args += [
+    '/Zc:preprocessor',
+    '/experimental:c11atomics',
+    '/D_CRT_SECURE_NO_WARNINGS',
+    '/D_CRT_NONSTDC_NO_WARNINGS',
+    '/DNOMINMAX',
+    '/DWIN32_LEAN_AND_MEAN',
+    '/Dstrcasecmp=_stricmp',
+    '/Dstrncasecmp=_strnicmp',
+    '/external:I' + meson.current_source_dir() / '..' / 'platform' / 'windows' / 'compat',
+    '/external:W0',
+    '/FIposix_extras.h',
+    '/wd4013',  # implicit function declaration
+    '/wd4047',  # incompatible pointer types
+    '/wd4090',  # discarded const qualifier
+    '/wd4133',  # incompatible pointer
+    '/wd4100', '/wd4101', '/wd4189',
+    '/wd4244', '/wd4267', '/wd4477',
+    '/wd4456', '/wd4459', '/wd4701',
+    '/wd4706', '/wd4996',
+    '/wd5045',
+  ]
+endif
+api_bridge_c_args += api_bridge_extra_c_args
+
+api_bridge_lib = static_library(
+  'yos_api_bridge',
+  api_bridge_outputs[1],         # yos_bridge.c
+  api_generate_outputs[1],       # yos_remap.c
+  api_struct_convert_outputs[1], # yos_struct_convert.c
+  api_bridge_extra_sources,
+  include_directories : [yos_types_inc, yos_inc, yos_impl_inc],
+  dependencies        : [wasm3_dep],
+  c_args : api_bridge_c_args,
   install : false,
 )
 

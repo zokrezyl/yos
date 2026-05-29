@@ -64,6 +64,20 @@ def _find_libclang():
     if p and os.path.isfile(p):
         return p
     import glob
+    # The PyPI `libclang` wheel ships its own libclang shared lib
+    # bundled at site-packages/clang/native/. Use that first — it's
+    # what `uv sync` / `pip install libclang` puts in place and it
+    # works cross-platform (Linux .so, macOS .dylib, Windows .dll).
+    try:
+        import clang.native as _cn
+        nat = Path(_cn.__file__).parent
+        for cand in ('libclang.dll', 'libclang.so', 'libclang.so.1',
+                     'libclang.dylib'):
+            f = nat / cand
+            if f.is_file():
+                return str(f)
+    except Exception:
+        pass
     # Order matters. Prefer Nix builds because they bundle their own
     # libstdc++/libffi/libLLVM via embedded RPATH, so loading just
     # works on dev shells where the host /usr/lib has libffi.so.8 but
@@ -94,10 +108,14 @@ def _short_header(path_str: str, root_markers: list[str]) -> str:
     synthetic top file)."""
     if not path_str:
         return ''
+    # Normalise Windows backslashes — the root_markers are written
+    # with forward slashes and `path_str` on Windows comes back with
+    # backslashes from libclang.
+    norm = path_str.replace('\\', '/')
     for marker in root_markers:
-        i = path_str.find(marker)
+        i = norm.find(marker)
         if i >= 0:
-            return path_str[i + len(marker):]
+            return norm[i + len(marker):]
     return ''
 
 
@@ -531,6 +549,10 @@ def main() -> int:
                         'For freestanding-sysroot extraction.')
     p.add_argument('--define', action='append', default=[],
                    help='extra -Dfoo=bar passed to clang')
+    p.add_argument('--clang-arg', action='append', default=[],
+                   help='extra flag passed straight to clang (e.g. '
+                        '-fms-extensions for MSVC-flavoured Windows SDK '
+                        'headers). Repeatable.')
     p.add_argument('--target', default=None,
                    help='clang -target triple (e.g. wasm32-unknown-unknown, '
                         'i386-unknown-freebsd, x86_64-linux-gnu)')
@@ -578,6 +600,7 @@ def main() -> int:
     for d in include_dirs:
         cflags += ['-isystem', str(d)]
     cflags += [f'-D{d}' for d in args.define]
+    cflags += list(args.clang_arg)
 
     if args.enum:
         if args.header:

@@ -1,3 +1,4 @@
+#include "platform.h"   /* yos_plat_fstat / read / write / isatty / close */
 /* impl/dir.c — directory-stream bridge.
  *
  * Two backends behind one DIR* handle table:
@@ -539,14 +540,23 @@ int32_t yos_poll(struct yos_exec_ctx *ctx,
 
         if (host_pfds[i].fd >= 0) {
             struct stat sb;
-            if (fstat(host_pfds[i].fd, &sb) == 0) {
+            if (yos_plat_fstat(host_pfds[i].fd, &sb) == 0) {
                 int always_ready = 0;
                 if (S_ISREG(sb.st_mode) || S_ISDIR(sb.st_mode))
                     always_ready = 1;
                 else if (S_ISCHR(sb.st_mode)) {
+#ifdef _WIN32
+                    /* Windows has no st_dev/st_ino on NUL we can match
+                     * against — accept any char device as always-ready.
+                     * Tty fds don't flow through this path on Windows
+                     * (msvcrt fds aren't S_ISCHR). */
+                    always_ready = 1;
+#else
                     /* /dev/null check — stat() the path once and cache.
                      * If the cached stat fails we just leave the fd in
-                     * the host poll set; nothing breaks. */
+                     * the host poll set; nothing breaks. Important to
+                     * keep this scope tight: a /dev/tty fd is also
+                     * S_ISCHR and must keep blocking semantics. */
                     static dev_t null_dev;
                     static ino_t null_ino;
                     static int   null_init;
@@ -560,6 +570,7 @@ int32_t yos_poll(struct yos_exec_ctx *ctx,
                     }
                     if (sb.st_dev == null_dev && sb.st_ino == null_ino)
                         always_ready = 1;
+#endif
                 }
                 if (always_ready) {
                     /* Mirror Linux: any requested event is immediately

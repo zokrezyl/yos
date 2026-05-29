@@ -91,6 +91,17 @@ elif host_os == 'android'
     '-landroid',
     '-llog',
   ]
+elif host_os == 'windows'
+  # Initial Windows port: every ydev capability returns UNSUPPORTED.
+  # A future iteration may wrap Media Foundation (camera) and the
+  # WinRT Windows.Devices.* surface (sensors / location). miniaudio
+  # ships its own WASAPI/DSound backends — the audio path works as-is.
+  ydev_backend_sources += files(
+    '../../platform/windows/camera_windows.c',
+    '../../platform/windows/sensor_windows.c',
+    '../../platform/windows/location_windows.c',
+    '../../platform/windows/perm_windows.c',
+  )
 else
   error('ydev: unsupported host OS: ' + host_os)
 endif
@@ -102,14 +113,58 @@ ydev_inc = include_directories(
   '.',
 )
 
+_ydcc = meson.get_compiler('c')
+_yd_msvc_like = _ydcc.get_argument_syntax() == 'msvc'
+
+ydev_extra_args = []
+ydev_extra_link = []
+if host_os == 'windows'
+  # Windows SDK / msvcrt have no <poll.h>, no fcntl(), no pipe().
+  # yos_winshim.h routes pipe()/fcntl()/close()/read()/write() through
+  # Winsock loopback socketpair + WSAPoll so the self-pipe wake
+  # primitive ydev uses in core.c / perm.c / audio_miniaudio.c works.
+  if _yd_msvc_like
+    ydev_extra_args += [
+      '/external:I' + meson.current_source_dir() / '../../platform/windows/compat',
+      '/external:W0',
+      '/FIposix_extras.h',
+      '/FIyos_winshim.h',
+      '/Zc:preprocessor',
+      '/experimental:c11atomics',
+      '/D_CRT_SECURE_NO_WARNINGS',
+      '/D_CRT_NONSTDC_NO_WARNINGS',
+      '/DNOMINMAX',
+      '/DWIN32_LEAN_AND_MEAN',
+      '/Dstrcasecmp=_stricmp',
+      '/Dstrncasecmp=_strnicmp',
+      '/wd4100', '/wd4101', '/wd4189', '/wd4244', '/wd4267',
+      '/wd4456', '/wd4459', '/wd4477', '/wd4701', '/wd4706', '/wd5045',
+    ]
+    ydev_extra_link += ['ws2_32.lib']
+  else
+    ydev_extra_args += [
+      '-isystem', meson.current_source_dir() / '../../platform/windows/compat',
+      '-include', 'yos_winshim.h',
+    ]
+    ydev_extra_link += ['-lws2_32']
+  endif
+endif
+
+ydev_base_c_args = []
+ydev_base_objc_args = []
+if not _yd_msvc_like
+  ydev_base_c_args += ['-D_GNU_SOURCE']
+  ydev_base_objc_args += ['-D_GNU_SOURCE']
+endif
+
 ydev_lib = static_library(
   'ydev',
   ydev_core_sources,
   ydev_backend_sources,
   include_directories : ydev_inc,
   dependencies        : ydev_backend_deps,
-  c_args   : ['-D_GNU_SOURCE'] + ydev_backend_args,
-  objc_args: ['-D_GNU_SOURCE'] + ydev_backend_args,
+  c_args   : ydev_base_c_args + ydev_backend_args + ydev_extra_args,
+  objc_args: ydev_base_objc_args + ydev_backend_args,
   install  : false,
 )
 
@@ -117,5 +172,5 @@ ydev_dep = declare_dependency(
   link_with           : ydev_lib,
   include_directories : ydev_inc,
   dependencies        : ydev_backend_deps,
-  link_args           : ydev_backend_link,
+  link_args           : ydev_backend_link + ydev_extra_link,
 )

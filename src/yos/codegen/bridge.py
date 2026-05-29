@@ -2106,9 +2106,16 @@ def main() -> int:
         for gname in sorted(auto_globals):
             ah += f'#undef {gname}\n'
         ah += '\nstruct yos_autoglobals {\n'
-        for gname, gmeta in sorted(auto_globals.items()):
-            ah += f'    /* {gname}: {gmeta["type"]} */\n'
-            ah += f'    {gmeta["type"]} {gname};\n'
+        if not auto_globals:
+            # C requires structs to have at least one member (MSVC errors;
+            # gcc accepts as an extension). Emit a token padding byte when
+            # the build has no libc autoglobals to track (e.g. Windows
+            # builds without libpython / liblua linked).
+            ah += '    char _yos_autoglobals_pad;\n'
+        else:
+            for gname, gmeta in sorted(auto_globals.items()):
+                ah += f'    /* {gname}: {gmeta["type"]} */\n'
+                ah += f'    {gmeta["type"]} {gname};\n'
         ah += '};\n\n'
         # Default initialiser snippet, callable from libc-init.c.
         # memset for struct types (initialiser-list to a struct via cast

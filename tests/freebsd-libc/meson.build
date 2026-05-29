@@ -77,6 +77,10 @@ foreach short_name, src_path : freebsd_tests
   driver_c = custom_target(
     'fbsd-' + short_name + '-driver',
     output : 'fbsd_' + short_name + '_driver.c',
+    # The FreeBSD-upstream test sources are read by path inside gen_driver;
+    # `depends` forces the freebsd-src extract step to run first so the
+    # path exists.
+    depends : [freebsd_src],
     command : [
       py, gen_driver, src_path, '@OUTPUT@',
     ],

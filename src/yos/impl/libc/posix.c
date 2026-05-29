@@ -37,6 +37,7 @@
 #include <fcntl.h>
 #include <termios.h>
 #include <errno.h>
+#include <poll.h>
 
 #include "yos/types.h"
 #include <yos/ytrace/ytrace.h>
@@ -111,7 +112,7 @@ int32_t yos_isatty(struct yos_exec_ctx *ctx, int32_t wfd)
         ydebug("isatty(wfd=%d hfd=%d) -> 1 (fake PTY)\n", wfd, hfd);
         return 1;
     }
-    int r = isatty(hfd);
+    int r = yos_plat_isatty(hfd);
     ydebug("isatty(wfd=%d hfd=%d) -> %d\n", wfd, hfd, r);
     return r;
 }
@@ -269,7 +270,7 @@ int32_t yos_socket(struct yos_exec_ctx *ctx, int32_t domain, int32_t type, int32
     int hfd = socket(domain, htype, protocol);
     if (hfd < 0) return yos_errno_neg(ctx, errno);
     int wfd = yos_fd_alloc(ctx, hfd);
-    if (wfd < 0) { close(hfd); return yos_errno_neg(ctx, EMFILE); }
+    if (wfd < 0) { yos_plat_close(hfd); return yos_errno_neg(ctx, EMFILE); }
     return wfd;
 }
 
@@ -447,26 +448,37 @@ int32_t yos_select(struct yos_exec_ctx *ctx, int32_t nfds,
     FD_ZERO(&hr); FD_ZERO(&hw); FD_ZERO(&he);
     int max_hfd = -1;
 
-    /* Map: wasm-fd → host-fd, AND host-fd → wasm-fd. Indexed by
-     * the LARGER of the two table sizes so we cover both directions. */
-    int w2h[YOS_FD_MAX];
-    int h2w[FD_SETSIZE];
-    for (int i = 0; i < YOS_FD_MAX; i++) w2h[i] = -1;
-    for (int i = 0; i < FD_SETSIZE; i++) h2w[i] = -1;
+    /* The wasm guest's fd_set is FreeBSD i386 layout: a uint32 bitmap
+     * indexed by fd number (bit fd%32 of word fd/32). Win32's host
+     * fd_set is a different struct (fd_count + fd_array), so casting
+     * the wasm-memory bytes to host fd_set* and calling host FD_ISSET
+     * reads garbage. Probe the wasm bitmap by hand instead. */
+    const uint8_t *gr_p = r_off ? (const uint8_t *)(ctx->memory + r_off) : NULL;
+    const uint8_t *gw_p = w_off ? (const uint8_t *)(ctx->memory + w_off) : NULL;
+    const uint8_t *ge_p = e_off ? (const uint8_t *)(ctx->memory + e_off) : NULL;
+    #define YOS_WFDS_ISSET(p, fd) ((p) && ((p)[(fd)/8] & (1u << ((fd)%8))))
 
-    fd_set *guest_r = r_off ? (fd_set *)(ctx->memory + r_off) : NULL;
-    fd_set *guest_w = w_off ? (fd_set *)(ctx->memory + w_off) : NULL;
-    fd_set *guest_e = e_off ? (fd_set *)(ctx->memory + e_off) : NULL;
+    /* Walk the guest sets, build a flat (wfd, hfd) list of fds we care
+     * about, and populate the host sets. The h2w lookup is a linear
+     * walk over this list — array indexing by hfd doesn't work on
+     * Windows where fds are raw SOCKET handle integers that can lie
+     * well outside any reasonable array bound. */
+    struct { int wfd; int hfd; int in_r; int in_w; int in_e; } pairs[YOS_FD_MAX];
+    int npairs = 0;
 
     for (int wfd = 0; wfd < nfds; wfd++) {
-        int in_r = guest_r && FD_ISSET(wfd, guest_r);
-        int in_w = guest_w && FD_ISSET(wfd, guest_w);
-        int in_e = guest_e && FD_ISSET(wfd, guest_e);
+        int in_r = YOS_WFDS_ISSET(gr_p, wfd);
+        int in_w = YOS_WFDS_ISSET(gw_p, wfd);
+        int in_e = YOS_WFDS_ISSET(ge_p, wfd);
         if (!(in_r || in_w || in_e)) continue;
         int hfd = yos_fd_get(ctx, wfd);
-        if (hfd < 0 || hfd >= FD_SETSIZE) continue;
-        w2h[wfd] = hfd;
-        h2w[hfd] = wfd;
+        if (hfd < 0) continue;
+        pairs[npairs].wfd = wfd;
+        pairs[npairs].hfd = hfd;
+        pairs[npairs].in_r = in_r;
+        pairs[npairs].in_w = in_w;
+        pairs[npairs].in_e = in_e;
+        npairs++;
         if (in_r) FD_SET(hfd, &hr);
         if (in_w) FD_SET(hfd, &hw);
         if (in_e) FD_SET(hfd, &he);
@@ -503,8 +515,48 @@ int32_t yos_select(struct yos_exec_ctx *ctx, int32_t nfds,
      * just woke us up. */
     extern void yos_signal_pump(struct yos_exec_ctx *);
     yos_signal_pump(ctx);
+#ifdef _WIN32
+    /* Windows select() only watches winsock SOCKETs — anonymous pipes
+     * (msvcrt _pipe) and other CRT handles silently fail with
+     * WSAENOTSOCK. Hand-roll a hybrid: convert the (wfd, hfd) list to
+     * pollfds and call our own poll() shim (compat_libc.c) which
+     * partitions sockets through WSAPoll and pipes through
+     * PeekNamedPipe. The fd_set bits are reconstructed after. */
+    int rc;
+    {
+        struct pollfd pfds[64];
+        int pn = 0;
+        for (int i = 0; i < npairs && pn < 64; i++) {
+            short events = 0;
+            if (pairs[i].in_r) events |= POLLIN;
+            if (pairs[i].in_w) events |= POLLOUT;
+            /* select's "exception" set has no clean POSIX poll
+             * equivalent — POLLERR is reported unconditionally. */
+            pfds[pn].fd = pairs[i].hfd;
+            pfds[pn].events = events;
+            pfds[pn].revents = 0;
+            pn++;
+        }
+        int ms;
+        if (!tv) ms = -1;
+        else ms = (int)(tv->tv_sec * 1000 + tv->tv_usec / 1000);
+        rc = poll(pfds, pn, ms);
+        if (rc >= 0) {
+            FD_ZERO(&hr); FD_ZERO(&hw); FD_ZERO(&he);
+            for (int i = 0; i < pn; i++) {
+                int hfd = pfds[i].fd;
+                if (pfds[i].revents & POLLIN)  FD_SET(hfd, &hr);
+                if (pfds[i].revents & POLLOUT) FD_SET(hfd, &hw);
+                if (pfds[i].revents & (POLLERR | POLLHUP | POLLNVAL))
+                    FD_SET(hfd, &he);
+            }
+        }
+    }
+    int saved_errno = (rc < 0) ? errno : 0;
+#else
     int rc = select(max_hfd + 1, &hr, &hw, &he, tv);
     int saved_errno = (rc < 0) ? errno : 0;
+#endif
     if (rc < 0 && saved_errno == EINTR) {
         /* Drain the pending bitmask — the signal that interrupted us
          * needs to reach its wasm handler before the guest's libc
@@ -517,17 +569,26 @@ int32_t yos_select(struct yos_exec_ctx *ctx, int32_t nfds,
         return yos_errno_neg(ctx, errno);
     }
 
-    /* Rebuild the guest fd_sets with only the wasm-fd bits set. */
-    if (guest_r) FD_ZERO(guest_r);
-    if (guest_w) FD_ZERO(guest_w);
-    if (guest_e) FD_ZERO(guest_e);
-    for (int hfd = 0; hfd <= max_hfd; hfd++) {
-        int wfd = h2w[hfd];
-        if (wfd < 0) continue;
-        if (guest_r && FD_ISSET(hfd, &hr)) FD_SET(wfd, guest_r);
-        if (guest_w && FD_ISSET(hfd, &hw)) FD_SET(wfd, guest_w);
-        if (guest_e && FD_ISSET(hfd, &he)) FD_SET(wfd, guest_e);
+    /* Rebuild the guest fd_sets with only the wasm-fd bits set. The
+     * wasm fd_set is the FreeBSD i386 bitmap; clear the requested-bit
+     * area (16 uint32 words covers the whole 1024-fd set) and re-OR
+     * in the bits for fds that came back ready. */
+    uint8_t *gr_w = r_off ? (uint8_t *)(ctx->memory + r_off) : NULL;
+    uint8_t *gw_w = w_off ? (uint8_t *)(ctx->memory + w_off) : NULL;
+    uint8_t *ge_w = e_off ? (uint8_t *)(ctx->memory + e_off) : NULL;
+    if (gr_w) memset(gr_w, 0, 128);
+    if (gw_w) memset(gw_w, 0, 128);
+    if (ge_w) memset(ge_w, 0, 128);
+    #define YOS_WFDS_SET(p, fd) do { if (p) (p)[(fd)/8] |= (uint8_t)(1u << ((fd)%8)); } while (0)
+    for (int i = 0; i < npairs; i++) {
+        int hfd = pairs[i].hfd;
+        int wfd = pairs[i].wfd;
+        if (gr_w && FD_ISSET(hfd, &hr)) YOS_WFDS_SET(gr_w, wfd);
+        if (gw_w && FD_ISSET(hfd, &hw)) YOS_WFDS_SET(gw_w, wfd);
+        if (ge_w && FD_ISSET(hfd, &he)) YOS_WFDS_SET(ge_w, wfd);
     }
+    #undef YOS_WFDS_SET
+    #undef YOS_WFDS_ISSET
     return rc;
 }
 
@@ -538,12 +599,28 @@ int32_t yos_getpeername(struct yos_exec_ctx *ctx, int32_t fd,
     if (hfd < 0) return hfd;
     if (!addr_off || !addrlen_off) return yos_errno_neg(ctx, EFAULT);
     if (!posix_wptr_range(ctx, addrlen_off, 4)) return yos_errno_neg(ctx, EFAULT);
-    socklen_t hlen = (socklen_t)*(uint32_t *)(ctx->memory + addrlen_off);
-    if (!posix_wptr_range(ctx, addr_off, hlen))
+    socklen_t cap = (socklen_t)*(uint32_t *)(ctx->memory + addrlen_off);
+    if (cap > 256) cap = 256;
+    if (!posix_wptr_range(ctx, addr_off, cap))
         return yos_errno_neg(ctx, EFAULT);
-    if (getpeername(hfd, (struct sockaddr *)(ctx->memory + addr_off), &hlen) < 0)
+    /* Fetch into a host-shaped scratch, then re-emit in FreeBSD layout
+     * (sa_len byte 0, sa_family byte 1, sa_data byte 2+). Without this
+     * step the guest reads sa_family from the wrong byte and the test's
+     * sin_family / ss_family checks fail. */
+    uint8_t host_buf[256];
+    socklen_t host_len = cap;
+    if (getpeername(hfd, (struct sockaddr *)host_buf, &host_len) < 0)
         return yos_errno_neg(ctx, errno);
-    *(uint32_t *)(ctx->memory + addrlen_off) = (uint32_t)hlen;
+    uint16_t host_fam = read_host_sa_family(host_buf);
+    uint8_t *w = ctx->memory + addr_off;
+    socklen_t out = host_len < cap ? host_len : cap;
+    if (out >= 2) {
+        w[0] = (uint8_t)out;
+        w[1] = (uint8_t)(host_fam & 0xff);
+        if (out > 2)
+            memcpy(w + 2, host_buf + 2, out - 2);
+    }
+    *(uint32_t *)(ctx->memory + addrlen_off) = (uint32_t)host_len;
     return 0;
 }
 
@@ -917,9 +994,20 @@ uint32_t yos_realpath(struct yos_exec_ctx *ctx, uint32_t path_off,
     }
     char *buf = (char *)(ctx->memory + resolved_off);
     /* Resolve against ctx->cwd so a relative input to realpath() is
-     * canonicalized from the guest's cwd, not the host process cwd. */
-    const char *resolved = yos_path_resolve(ctx, p);
-    char *r = realpath(resolved, buf);
+     * canonicalized from the guest's cwd, not the host process cwd.
+     * We deliberately compute the POSIX-shape absolute path WITHOUT
+     * the platform path translation (yos_plat_translate_path) — the
+     * wasm guest expects POSIX-shape output ("/tmp/x", not
+     * "%TEMP%\\x"); the platform realpath impl below canonicalises
+     * the POSIX form in place. */
+    char abs[4096];
+    if (p[0] == '/') {
+        snprintf(abs, sizeof abs, "%s", p);
+    } else {
+        snprintf(abs, sizeof abs, "%s/%s",
+                 (ctx && ctx->cwd[0]) ? ctx->cwd : "/", p);
+    }
+    char *r = realpath(abs, buf);
     if (!r) {
         extern int yos_remap_errno_h2g(int);
         if (ctx && ctx->memory && ctx->errno_off)
@@ -951,7 +1039,7 @@ int32_t yos_mkstemp(struct yos_exec_ctx *ctx, uint32_t template_off)
     int hfd = mkstemp(t);
     if (hfd < 0) return yos_errno_neg(ctx, errno);
     int wfd = yos_fd_alloc(ctx, hfd);
-    if (wfd < 0) { close(hfd); return yos_errno_neg(ctx, EMFILE); }
+    if (wfd < 0) { yos_plat_close(hfd); return yos_errno_neg(ctx, EMFILE); }
     return wfd;
 }
 
@@ -965,7 +1053,7 @@ int32_t yos_mkostemp(struct yos_exec_ctx *ctx, uint32_t template_off, int32_t fl
     int hfd = mkostemp(t, hflags);
     if (hfd < 0) return yos_errno_neg(ctx, errno);
     int wfd = yos_fd_alloc(ctx, hfd);
-    if (wfd < 0) { close(hfd); return yos_errno_neg(ctx, EMFILE); }
+    if (wfd < 0) { yos_plat_close(hfd); return yos_errno_neg(ctx, EMFILE); }
     return wfd;
 }
 
@@ -979,7 +1067,7 @@ int32_t yos_mkostemps(struct yos_exec_ctx *ctx, uint32_t template_off,
     int hfd = mkostemps(t, suffixlen, hflags);
     if (hfd < 0) return yos_errno_neg(ctx, errno);
     int wfd = yos_fd_alloc(ctx, hfd);
-    if (wfd < 0) { close(hfd); return yos_errno_neg(ctx, EMFILE); }
+    if (wfd < 0) { yos_plat_close(hfd); return yos_errno_neg(ctx, EMFILE); }
     return wfd;
 }
 
@@ -995,7 +1083,7 @@ int32_t yos_fstat(struct yos_exec_ctx *ctx, int32_t wfd, uint32_t statbuf_off)
     if (hfd < 0) return yos_errno_neg(ctx, EBADF);
     struct stat h;
     memset(&h, 0, sizeof h);
-    if (fstat(hfd, &h) < 0) return yos_errno_neg(ctx, errno);
+    if (yos_plat_fstat(hfd, &h) < 0) return yos_errno_neg(ctx, errno);
     if (ytrace_default_enabled()) {
         const char *kind = "?";
         if (S_ISREG(h.st_mode))  kind = "REG";
@@ -1058,7 +1146,7 @@ int32_t yos_fchdir(struct yos_exec_ctx *ctx, int32_t wfd)
     /* Verify it's actually a directory before committing — fchdir on
      * a non-dir fd must return ENOTDIR. */
     struct stat st;
-    if (fstat(hfd, &st) < 0) return yos_errno_neg(ctx, errno);
+    if (yos_plat_fstat(hfd, &st) < 0) return yos_errno_neg(ctx, errno);
     if (!S_ISDIR(st.st_mode)) return yos_errno_neg(ctx, ENOTDIR);
 
     /* Update ctx->cwd from the path recorded at open-time. yos's
@@ -1975,6 +2063,23 @@ void yos_explicit_bzero(struct yos_exec_ctx *ctx, uint32_t buf_off,
 
 extern uint32_t yos_malloc(struct yos_exec_ctx *ctx, uint32_t size);
 
+/* Copy a NUL-terminated host string into the wasm-side servent slab at
+ * `*cursor` and return its wasm offset (or 0 if no room / NULL). Bumps
+ * *cursor on a successful pack. Replaces a GCC statement-expression
+ * macro that didn't compile on MSVC. */
+static uint32_t yos_servent_pack_str(const char *s, uint8_t *base,
+                                     uint32_t slab_off, uint32_t slab_sz,
+                                     uint32_t *cursor)
+{
+    if (!s) return 0;
+    size_t n = strlen(s) + 1;
+    if (*cursor + n > slab_sz) return 0;
+    memcpy(base + *cursor, s, n);
+    uint32_t off = slab_off + *cursor;
+    *cursor += (uint32_t)n;
+    return off;
+}
+
 static uint32_t pack_servent(struct yos_exec_ctx *ctx,
                              struct yos_exec_ctx *anchor_ctx,
                              struct servent *se)
@@ -1996,24 +2101,14 @@ static uint32_t pack_servent(struct yos_exec_ctx *ctx,
     /* Layout: [0..16) = servent, [16..) = packed strings + aliases array. */
     uint32_t cursor = WASM_SERVENT_SZ;
 
-    /* Helper macro: copy NUL-terminated string `s` into the slab and
-     * return its wasm offset, or 0 if NULL/no room. */
-    #define PACK_STR(s) ({                                           \
-        const char *_s = (s);                                        \
-        uint32_t _off = 0;                                           \
-        if (_s) {                                                    \
-            size_t _n = strlen(_s) + 1;                              \
-            if (cursor + _n <= SLAB_SZ) {                            \
-                memcpy(base + cursor, _s, _n);                       \
-                _off = slab_off + cursor;                            \
-                cursor += (uint32_t)_n;                              \
-            }                                                        \
-        }                                                            \
-        _off;                                                        \
-    })
+    /* Helper: copy NUL-terminated string `s` into the slab at `*cursor`
+     * and return its wasm offset, or 0 if NULL/no room. Bumps *cursor on
+     * success. Written as a regular function (not a GCC statement-
+     * expression macro) so MSVC compiles it. */
+    #define SLAB_PACK(s)  yos_servent_pack_str((s), base, slab_off, SLAB_SZ, &cursor)
 
-    uint32_t name_off  = PACK_STR(se->s_name);
-    uint32_t proto_off = PACK_STR(se->s_proto);
+    uint32_t name_off  = SLAB_PACK(se->s_name);
+    uint32_t proto_off = SLAB_PACK(se->s_proto);
 
     /* Aliases array: NULL-terminated array of char*; pack each alias
      * string, then write a wasm-offset array. Most lookups have no
@@ -2027,13 +2122,13 @@ static uint32_t pack_servent(struct yos_exec_ctx *ctx,
             aliases_off = slab_off + cursor;
             cursor += arr_bytes;
             for (int i = 0; i < n; i++) {
-                uint32_t a_off = PACK_STR(se->s_aliases[i]);
+                uint32_t a_off = SLAB_PACK(se->s_aliases[i]);
                 *(uint32_t *)(base + (aliases_off - slab_off) + (uint32_t)i*4) = a_off;
             }
             *(uint32_t *)(base + (aliases_off - slab_off) + (uint32_t)n*4) = 0;
         }
     }
-    #undef PACK_STR
+    #undef SLAB_PACK
 
     /* s_port is already in network byte order on both host and FreeBSD;
      * no bswap. FreeBSD's s_port is `int` (4 bytes), zero-extended. */

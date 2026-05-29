@@ -34,14 +34,17 @@ message('Building for host OS: @0@ (recommended dir: @1@)'.format(host_os, recom
 # Use the project's uv-managed venv for python helpers — it has the
 # `yaml` and `clang.cindex` modules pre-installed (see pyproject.toml).
 # `python3` from a bare nix profile won't have them.
-project_venv_py = meson.current_source_dir() / '.venv/bin/python3'
 fs = import('fs')
-if fs.exists(project_venv_py)
-  py = find_program(project_venv_py, required: true)
+project_venv_py_posix = meson.current_source_dir() / '.venv/bin/python3'
+project_venv_py_win   = meson.current_source_dir() / '.venv/Scripts/python.exe'
+if fs.exists(project_venv_py_posix)
+  py = find_program(project_venv_py_posix, required: true)
+elif fs.exists(project_venv_py_win)
+  py = find_program(project_venv_py_win, required: true)
 else
   py = import('python').find_installation('python3')
-  msg = 'No .venv/ found at @0@. Falling back to system python3 — helper scripts will fail if pyyaml / libclang aren\'t available. Run `uv venv && uv sync` in the source root.'
-  warning(msg.format(project_venv_py))
+  msg = 'No .venv/ found at @0@ or @1@. Falling back to system python3 — helper scripts will fail if pyyaml / libclang aren\'t available. Run `uv venv && uv sync` (or `python -m venv .venv && .venv/Scripts/pip install pyyaml clang libclang`) in the source root.'
+  warning(msg.format(project_venv_py_posix, project_venv_py_win))
 endif
 
 subdir('build-tools')

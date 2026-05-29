@@ -12,8 +12,14 @@ py3 = import('python').find_installation('python3')
 
 zsh_int_env = environment()
 zsh_int_env.set('YOS_REPO_ROOT', meson.project_source_root())
-zsh_build_basename = run_command('basename', meson.project_build_root(),
-                                 check : true).stdout().strip()
+if host_machine.system() == 'windows'
+  zsh_build_basename = run_command(
+    py, '-c', 'import sys, os; print(os.path.basename(sys.argv[1]))',
+    meson.project_build_root(), check : true).stdout().strip()
+else
+  zsh_build_basename = run_command('basename', meson.project_build_root(),
+                                   check : true).stdout().strip()
+endif
 zsh_int_env.set('YOS_BUILD_DIR', zsh_build_basename)
 
 zsh_int_tests = {
@@ -156,6 +162,26 @@ if host_machine.system() == 'darwin'
   _platform_xfail = {
     'ssh-no-args-help'      : false,
   }
+endif
+if host_machine.system() == 'windows'
+  _platform_xfail = {
+    'ssh-no-args-help'      : false,
+  }
+endif
+
+# Strip pty-using tests on Windows (Python's pty is Unix-only). The
+# non-pty ones (script-mode, grammar, env-inherit, …) keep running.
+if host_machine.system() == 'windows'
+  _zsh_skip_windows = ['backspace', 'external-tty-survival',
+                       'interactive-ssh-clean', 'ctrl-c-cancel',
+                       'runhookdef-trap']
+  _zsh_filtered = {}
+  foreach _k, _v : zsh_int_tests
+    if not _zsh_skip_windows.contains(_k)
+      _zsh_filtered += {_k : _v}
+    endif
+  endforeach
+  zsh_int_tests = _zsh_filtered
 endif
 
 foreach name, cfg : zsh_int_tests
