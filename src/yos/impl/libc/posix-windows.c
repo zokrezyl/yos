@@ -110,7 +110,14 @@ int32_t yos_accept4(struct yos_exec_ctx *ctx, int32_t wfd,
 
     SOCKET hsock = (SOCKET)hfd;
     SOCKET new_sock = accept(hsock, addr, addr ? &ss_len : NULL);
-    if (new_sock == INVALID_SOCKET) return yos_errno_neg(ctx, EINVAL);
+    if (new_sock == INVALID_SOCKET) {
+        /* Preserve the underlying Winsock error category — collapsing
+         * everything to EINVAL hides EWOULDBLOCK (which non-blocking
+         * event loops MUST distinguish), ECONNABORTED, EBADF /
+         * ENOTSOCK / EMFILE etc. */
+        extern int yos_wsa_to_errno(int wsa);
+        return yos_errno_neg(ctx, yos_wsa_to_errno(WSAGetLastError()));
+    }
 
     if (flags & 0x20000000 /* FreeBSD SOCK_NONBLOCK */) {
         u_long nb = 1;
@@ -121,7 +128,15 @@ int32_t yos_accept4(struct yos_exec_ctx *ctx, int32_t wfd,
      * bit silently. */
 
     int new_wfd = yos_fd_alloc(ctx, (int)new_sock);
-    if (new_wfd < 0) return yos_errno_neg(ctx, EMFILE);
+    if (new_wfd < 0) {
+        /* yos_fd_alloc only auto-closes the host fd on the EMFILE table-
+         * full path; here new_sock is a SOCKET (not a CRT fd) and the
+         * generic alloc path doesn't know to call closesocket. Release
+         * it ourselves to keep accept under fd pressure from leaking
+         * kernel socket objects. */
+        closesocket(new_sock);
+        return yos_errno_neg(ctx, EMFILE);
+    }
 
     if (addr) {
         int copy_len = ss_len < guest_len ? ss_len : guest_len;

@@ -385,18 +385,104 @@ int pipe(int fds[2]) {
 /* Per-fd flag store. POSIX fcntl(F_GETFL/F_SETFL/F_GETFD/F_SETFD)
  * needs a place to record O_NONBLOCK / O_CLOEXEC per-fd; Windows has
  * no native equivalent — SOCKETs track non-block via ioctlsocket and
- * CRT fds track nothing. Use a simple direct-mapped table keyed by
- * the host fd; the table is fixed-size (covers all reasonable fd
- * ranges in a yos process). */
-#define YOS_WIN_FDFLAGS_MAX 65536
-static volatile long g_fdflags[YOS_WIN_FDFLAGS_MAX];
+ * CRT fds track nothing.
+ *
+ * CRT fds always fit in the direct-mapped array (msvcrt's _nhandle is
+ * bounded to <8192). Winsock SOCKET handles, however, are raw kernel
+ * object integers and can land anywhere in the uintptr_t range —
+ * larger than YOS_WIN_FDFLAGS_MAX, sometimes much larger. Mapping
+ * those into bucket 0 corrupted stdin's flag state and aliased
+ * unrelated large sockets onto each other (reviewer finding #5).
+ *
+ * Layout: direct-mapped array for the low fd range (fast path) + a
+ * small linear-probed open-addressed hash for out-of-range fds. The
+ * hash is sized to hold a few hundred concurrent SOCKETs; insertions
+ * past capacity fall back to "no record" (F_GETFL returns 0 / F_SETFL
+ * is dropped) — that's strictly better than the corruption it
+ * replaces. */
+#define YOS_WIN_FDFLAGS_MAX     65536
+#define YOS_WIN_HASH_FLAGS_CAP  512   /* power of two */
 
+static volatile long g_fdflags[YOS_WIN_FDFLAGS_MAX];
+static volatile long g_fdmode [YOS_WIN_FDFLAGS_MAX];
+
+struct yos_fd_hash_entry {
+    int  fd;       /* 0 = empty */
+    long flags;
+    long mode;
+};
+static struct yos_fd_hash_entry g_fdflags_hash[YOS_WIN_HASH_FLAGS_CAP];
+static SRWLOCK g_fdflags_hash_lock = SRWLOCK_INIT;
+
+static unsigned yos_fdflags_hash_probe(int fd)
+{
+    /* Knuth-style multiplicative hash; fd is uintptr-shaped so cast
+     * through unsigned to drop sign-extension noise. */
+    unsigned h = ((unsigned)fd * 2654435761u);
+    return h & (YOS_WIN_HASH_FLAGS_CAP - 1);
+}
+
+/* Look up an out-of-range fd in the hash. Returns a pointer to the
+ * entry (which may be empty / freshly-claimed) or NULL if the table
+ * is full AND the fd isn't already present. Lock held by caller. */
+static struct yos_fd_hash_entry *yos_fdflags_hash_locate(int fd, int create)
+{
+    unsigned h = yos_fdflags_hash_probe(fd);
+    for (unsigned i = 0; i < YOS_WIN_HASH_FLAGS_CAP; i++) {
+        unsigned j = (h + i) & (YOS_WIN_HASH_FLAGS_CAP - 1);
+        struct yos_fd_hash_entry *e = &g_fdflags_hash[j];
+        if (e->fd == fd) return e;
+        if (e->fd == 0) {
+            if (!create) return NULL;
+            e->fd = fd;
+            return e;
+        }
+    }
+    return NULL;
+}
+
+/* Direct-array index for low fds. -1 means "use hash path". */
 static int yos_fdflags_idx(int fd) {
-    /* Out-of-range fds (huge SOCKETs) get bucket 0; harmless because
-     * the table is per-process and 0 is always-stdin which never has
-     * dynamic flags set. */
-    if (fd < 0 || fd >= YOS_WIN_FDFLAGS_MAX) return 0;
-    return fd;
+    if (fd >= 0 && fd < YOS_WIN_FDFLAGS_MAX) return fd;
+    return -1;
+}
+
+static long yos_fdflags_load(int fd) {
+    int idx = yos_fdflags_idx(fd);
+    if (idx >= 0) return g_fdflags[idx];
+    AcquireSRWLockShared(&g_fdflags_hash_lock);
+    struct yos_fd_hash_entry *e = yos_fdflags_hash_locate(fd, 0);
+    long v = e ? e->flags : 0;
+    ReleaseSRWLockShared(&g_fdflags_hash_lock);
+    return v;
+}
+
+static void yos_fdflags_store(int fd, long v) {
+    int idx = yos_fdflags_idx(fd);
+    if (idx >= 0) { _InterlockedExchange(&g_fdflags[idx], v); return; }
+    AcquireSRWLockExclusive(&g_fdflags_hash_lock);
+    struct yos_fd_hash_entry *e = yos_fdflags_hash_locate(fd, 1);
+    if (e) e->flags = v;
+    ReleaseSRWLockExclusive(&g_fdflags_hash_lock);
+}
+
+static long yos_fdmode_load(int fd) {
+    int idx = yos_fdflags_idx(fd);
+    if (idx >= 0) return g_fdmode[idx];
+    AcquireSRWLockShared(&g_fdflags_hash_lock);
+    struct yos_fd_hash_entry *e = yos_fdflags_hash_locate(fd, 0);
+    long v = e ? e->mode : 0;
+    ReleaseSRWLockShared(&g_fdflags_hash_lock);
+    return v;
+}
+
+static void yos_fdmode_store(int fd, long v) {
+    int idx = yos_fdflags_idx(fd);
+    if (idx >= 0) { _InterlockedExchange(&g_fdmode[idx], v); return; }
+    AcquireSRWLockExclusive(&g_fdflags_hash_lock);
+    struct yos_fd_hash_entry *e = yos_fdflags_hash_locate(fd, 1);
+    if (e) e->mode = v;
+    ReleaseSRWLockExclusive(&g_fdflags_hash_lock);
 }
 
 /* Called from yos_plat_open after a successful host open(); records the
@@ -404,30 +490,28 @@ static int yos_fdflags_idx(int fd) {
  * back. Reset the slot completely (old fd values may have leaked
  * non-zero bits from a previous fd assignment). */
 void yos_fdflags_record_open(int fd, int flags) {
-    int idx = yos_fdflags_idx(fd);
     /* Store O_NONBLOCK / O_APPEND / O_ACCMODE etc. — the bits POSIX
      * fcntl(F_GETFL) reads back. CLOEXEC lives in a separate high bit
      * (0x40000000) so the same long carries both fields. */
     long v = flags & (O_NONBLOCK | O_ACCMODE | O_APPEND);
     if (flags & O_CLOEXEC) v |= 0x40000000;
-    _InterlockedExchange(&g_fdflags[idx], v);
+    yos_fdflags_store(fd, v);
 }
 
-/* Parallel table tracking the POSIX permission bits of files we opened
- * with O_CREAT. Windows' file system stores only the readonly attribute,
- * so a later fstat() would return _S_IREAD | _S_IWRITE (0666) regardless
- * of the umask-masked mode the caller asked for. We remember the mode
- * here and yos_plat_fstat splices it back. */
-static volatile long g_fdmode[YOS_WIN_FDFLAGS_MAX];
+/* g_fdmode (declared with g_fdflags above) tracks the POSIX permission
+ * bits of files we opened with O_CREAT. Windows' filesystem stores
+ * only the readonly attribute, so a later fstat() would return
+ * _S_IREAD | _S_IWRITE (0666) regardless of the umask-masked mode the
+ * caller asked for. We remember the mode here and yos_plat_fstat
+ * splices it back. Routes through yos_fdmode_load/store so out-of-
+ * range SOCKETs use the hash side and don't trample fd 0's bucket. */
 
 void yos_fdmode_record(int fd, int mode) {
-    int idx = yos_fdflags_idx(fd);
-    _InterlockedExchange(&g_fdmode[idx], mode & 0777);
+    yos_fdmode_store(fd, mode & 0777);
 }
 
 int yos_fdmode_get(int fd) {
-    int idx = yos_fdflags_idx(fd);
-    return (int)g_fdmode[idx];
+    return (int)yos_fdmode_load(fd);
 }
 
 /* fdkind tracking (declared in platform-windows.c). Forward-declared
@@ -437,15 +521,14 @@ extern int  yos_fdkind_get(int fd);
 extern void yos_fdkind_set(int fd, int kind);
 
 int fcntl(int fd, int cmd, ...) {
-    int idx = yos_fdflags_idx(fd);
     if (cmd == F_GETFL) {
-        return (int)g_fdflags[idx];
+        return (int)yos_fdflags_load(fd);
     }
     if (cmd == F_SETFL) {
         va_list ap; va_start(ap, cmd);
         int flags = va_arg(ap, int);
         va_end(ap);
-        _InterlockedExchange(&g_fdflags[idx], flags);
+        yos_fdflags_store(fd, flags);
         /* Push through to the SOCKET side too so the kernel knows. */
         int sock_type = 0; int slen = (int)sizeof sock_type;
         if (getsockopt((SOCKET)fd, SOL_SOCKET, SO_TYPE,
@@ -456,15 +539,15 @@ int fcntl(int fd, int cmd, ...) {
         return 0;
     }
     if (cmd == F_GETFD) {
-        return (g_fdflags[idx] & 0x40000000) ? FD_CLOEXEC : 0;
+        return (yos_fdflags_load(fd) & 0x40000000) ? FD_CLOEXEC : 0;
     }
     if (cmd == F_SETFD) {
         va_list ap; va_start(ap, cmd);
         int fdflag = va_arg(ap, int);
         va_end(ap);
-        long cur = g_fdflags[idx];
+        long cur = yos_fdflags_load(fd);
         long new_v = (fdflag & FD_CLOEXEC) ? (cur | 0x40000000) : (cur & ~0x40000000);
-        _InterlockedExchange(&g_fdflags[idx], new_v);
+        yos_fdflags_store(fd, new_v);
         return 0;
     }
     if (cmd == F_DUPFD || cmd == F_DUPFD_CLOEXEC) {
@@ -488,8 +571,7 @@ int fcntl(int fd, int cmd, ...) {
             if (ns == INVALID_SOCKET) { errno = EIO; return -1; }
             int nfd = (int)ns;
             if (cmd == F_DUPFD_CLOEXEC) {
-                int nidx = yos_fdflags_idx(nfd);
-                _InterlockedExchange(&g_fdflags[nidx], 0x40000000);
+                yos_fdflags_store(nfd, 0x40000000);
             }
             return nfd;
         }
@@ -498,8 +580,7 @@ int fcntl(int fd, int cmd, ...) {
             int kind = yos_fdkind_get(fd);
             if (kind != 0) yos_fdkind_set(nfd, kind);
             if (cmd == F_DUPFD_CLOEXEC) {
-                int nidx = yos_fdflags_idx(nfd);
-                _InterlockedExchange(&g_fdflags[nidx], 0x40000000);
+                yos_fdflags_store(nfd, 0x40000000);
             }
         }
         return nfd;
@@ -699,10 +780,9 @@ int ioctl(int fd, unsigned long request, ...)
         int *pv = va_arg(ap, int *);
         va_end(ap);
         int nb = pv ? (*pv != 0) : 0;
-        int idx = yos_fdflags_idx(fd);
-        long cur = g_fdflags[idx];
+        long cur = yos_fdflags_load(fd);
         long new_v = nb ? (cur | O_NONBLOCK) : (cur & ~O_NONBLOCK);
-        _InterlockedExchange(&g_fdflags[idx], new_v);
+        yos_fdflags_store(fd, new_v);
         /* If this is a Winsock SOCKET, push the bit through. Otherwise
          * the flag is tracked purely in our table — Windows pipes can't
          * be made non-blocking via ioctl natively, but yos's read/write

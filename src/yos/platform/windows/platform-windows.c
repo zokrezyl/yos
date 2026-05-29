@@ -179,14 +179,65 @@ static int yos_is_socket_fd(int hfd)
                       (char *)&t, &len) == 0;
 }
 
+/* Map a Winsock error to a POSIX errno value usable with the codegen's
+ * h2g remap. Only the codes that actually surface in our bridge layer
+ * are listed; everything else falls back to EIO so the call still
+ * reports a failure but doesn't lie about the kind. */
+int yos_wsa_to_errno(int wsa)
+{
+    switch (wsa) {
+    case WSAEWOULDBLOCK:  return EAGAIN;       /* same value POSIX uses */
+    case WSAEINTR:        return EINTR;
+    case WSAEBADF:        return EBADF;
+    case WSAEACCES:       return EACCES;
+    case WSAEFAULT:       return EFAULT;
+    case WSAEINVAL:       return EINVAL;
+    case WSAEMFILE:       return EMFILE;
+    case WSAENOTSOCK:     return ENOTSOCK;
+    case WSAEMSGSIZE:     return EMSGSIZE;
+    case WSAEADDRINUSE:   return EADDRINUSE;
+    case WSAEADDRNOTAVAIL:return EADDRNOTAVAIL;
+    case WSAENETDOWN:     return ENETDOWN;
+    case WSAENETUNREACH:  return ENETUNREACH;
+    case WSAENETRESET:    return ENETRESET;
+    case WSAECONNABORTED: return ECONNABORTED;
+    case WSAECONNRESET:   return ECONNRESET;
+    case WSAENOBUFS:      return ENOBUFS;
+    case WSAEISCONN:      return EISCONN;
+    case WSAENOTCONN:     return ENOTCONN;
+    case WSAESHUTDOWN:    return EPIPE;
+    case WSAETIMEDOUT:    return ETIMEDOUT;
+    case WSAECONNREFUSED: return ECONNREFUSED;
+    case WSAEHOSTUNREACH: return EHOSTUNREACH;
+    case WSAEINPROGRESS:  return EINPROGRESS;
+    case WSAEALREADY:     return EALREADY;
+    case WSAEAFNOSUPPORT: return EAFNOSUPPORT;
+    case WSAEPROTONOSUPPORT: return EPROTONOSUPPORT;
+    case WSAEOPNOTSUPP:   return EOPNOTSUPP;
+    case WSAEPROTOTYPE:   return EPROTOTYPE;
+    case WSANOTINITIALISED:
+    case WSAENOTEMPTY:
+    default:              return EIO;
+    }
+}
+
 int yos_plat_close(int hfd)
 {
     yos_fdkind_set(hfd, YOS_WIN_FD_REGULAR);
     if (yos_is_socket_fd(hfd)) {
-        return closesocket((SOCKET)hfd) == 0 ? 0 : -1;
+        if (closesocket((SOCKET)hfd) == 0) return 0;
+        errno = yos_wsa_to_errno(WSAGetLastError());
+        return -1;
     }
     return _close(hfd);
 }
+
+/* Cap a single recv/send/_read/_write call to a value that fits in the
+ * underlying API's `int` / `unsigned` count parameter. Larger guest
+ * requests get chunked at the caller (impl/io/io.c); from yos_plat_*
+ * the caller only sees as many bytes as the host actually moved, which
+ * is also the POSIX contract (short read/write is allowed). */
+#define YOS_WIN_IO_CHUNK ((size_t)0x40000000)  /* 1 GiB — safely < INT_MAX */
 
 ssize_t yos_plat_read(int hfd, void *buf, size_t n)
 {
@@ -198,11 +249,16 @@ ssize_t yos_plat_read(int hfd, void *buf, size_t n)
     if (kind == YOS_WIN_FD_RANDOM) {
         return yos_win_random(buf, n) == 0 ? (ssize_t)n : -1;
     }
+    size_t chunk = n > YOS_WIN_IO_CHUNK ? YOS_WIN_IO_CHUNK : n;
     if (yos_is_socket_fd(hfd)) {
-        int r = recv((SOCKET)hfd, (char *)buf, (int)n, 0);
+        int r = recv((SOCKET)hfd, (char *)buf, (int)chunk, 0);
+        if (r == SOCKET_ERROR) {
+            errno = yos_wsa_to_errno(WSAGetLastError());
+            return -1;
+        }
         return (ssize_t)r;
     }
-    return (ssize_t)_read(hfd, buf, (unsigned)n);
+    return (ssize_t)_read(hfd, buf, (unsigned)chunk);
 }
 
 ssize_t yos_plat_write(int hfd, const void *buf, size_t n)
@@ -213,11 +269,21 @@ ssize_t yos_plat_write(int hfd, const void *buf, size_t n)
         (void)buf;
         return (ssize_t)n;
     }
+    size_t chunk = n > YOS_WIN_IO_CHUNK ? YOS_WIN_IO_CHUNK : n;
     if (yos_is_socket_fd(hfd)) {
-        int r = send((SOCKET)hfd, (const char *)buf, (int)n, 0);
+        int r = send((SOCKET)hfd, (const char *)buf, (int)chunk, 0);
+        if (r == SOCKET_ERROR) {
+            int wsa = WSAGetLastError();
+            /* SHUTDOWN → guest EPIPE; reuse the same sentinel the pipe
+             * path uses below so the h2g remap lands on guest EPIPE=32. */
+            errno = (wsa == WSAESHUTDOWN || wsa == WSAECONNABORTED ||
+                     wsa == WSAECONNRESET) ? YOS_WIN_HOST_EPIPE_SENTINEL
+                                           : yos_wsa_to_errno(wsa);
+            return -1;
+        }
         return (ssize_t)r;
     }
-    int r = _write(hfd, buf, (unsigned)n);
+    int r = _write(hfd, buf, (unsigned)chunk);
     if (r < 0) {
         HANDLE h = (HANDLE)_get_osfhandle(hfd);
         if (h != INVALID_HANDLE_VALUE && GetFileType(h) == FILE_TYPE_PIPE) {
