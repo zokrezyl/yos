@@ -245,7 +245,29 @@ int openat   (int dfd, const char *p, int f, ...)         {
 }
 int link     (const char *o, const char *n)               { return CreateHardLinkA(n, o, NULL) ? 0 : (errno = EPERM, -1); }
 int linkat   (int od, const char *o, int nd, const char *n, int f) { (void)f; char ob[MAX_PATH * 4], nb[MAX_PATH * 4]; const char *op = yos_win_at_path(od, o, ob, sizeof ob); const char *np = yos_win_at_path(nd, n, nb, sizeof nb); return (op && np) ? link(op, np) : -1; }
-int symlink  (const char *t, const char *p)               { return CreateSymbolicLinkA(p, t, 0) ? 0 : (errno = EPERM, -1); }
+int symlink  (const char *t, const char *p)               {
+    /* Probe target type and pass SYMBOLIC_LINK_FLAG_DIRECTORY when
+     * appropriate. SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE (0x2)
+     * lets unprivileged processes create symlinks on Windows 10 1703+
+     * when Developer Mode is on — without the bit, the call fails
+     * with ERROR_PRIVILEGE_NOT_HELD on a stock user account. */
+    DWORD flags = 0x2;  /* SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE */
+    DWORD attrs = GetFileAttributesA(t);
+    if (attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_DIRECTORY))
+        flags |= 0x1;  /* SYMBOLIC_LINK_FLAG_DIRECTORY */
+    if (CreateSymbolicLinkA(p, t, flags)) return 0;
+    DWORD err = GetLastError();
+    /* Retry without the unprivileged flag for hosts that don't grok
+     * the bit (Windows 8.1 / unpatched Win10). */
+    if (err == ERROR_INVALID_PARAMETER &&
+        CreateSymbolicLinkA(p, t, flags & ~0x2u)) return 0;
+    errno = (err == ERROR_PRIVILEGE_NOT_HELD) ? EPERM
+          : (err == ERROR_PATH_NOT_FOUND)     ? ENOENT
+          : (err == ERROR_FILE_NOT_FOUND)     ? ENOENT
+          : (err == ERROR_ALREADY_EXISTS)     ? EEXIST
+          :                                     EIO;
+    return -1;
+}
 int symlinkat(const char *t, int dfd, const char *p)      { char b[MAX_PATH * 4]; const char *q = yos_win_at_path(dfd, p, b, sizeof b); return q ? symlink(t, q) : -1; }
 int readlink (const char *p, char *b, size_t n)           { (void)p;(void)b;(void)n; errno = ENOSYS; return -1; }
 int readlinkat(int dfd, const char *p, char *b, size_t n) { (void)dfd;(void)p;(void)b;(void)n; errno = ENOSYS; return -1; }
@@ -408,6 +430,12 @@ int yos_fdmode_get(int fd) {
     return (int)g_fdmode[idx];
 }
 
+/* fdkind tracking (declared in platform-windows.c). Forward-declared
+ * here so the fcntl(F_DUPFD) and dup wrappers below can copy the
+ * synthetic device kind across the dup. */
+extern int  yos_fdkind_get(int fd);
+extern void yos_fdkind_set(int fd, int kind);
+
 int fcntl(int fd, int cmd, ...) {
     int idx = yos_fdflags_idx(fd);
     if (cmd == F_GETFL) {
@@ -440,15 +468,112 @@ int fcntl(int fd, int cmd, ...) {
         return 0;
     }
     if (cmd == F_DUPFD || cmd == F_DUPFD_CLOEXEC) {
+        /* Socket fds aren't in the CRT's fd table — _dup() on them
+         * asserts in the debug CRT (dup.cpp: "fh >= 0 && (unsigned)fh
+         * < (unsigned)_nhandle"). Detect via getsockopt(SO_TYPE) and
+         * use WSADuplicateSocketW + WSASocketW to obtain a fresh
+         * SOCKET that references the same underlying transport. */
+        int st = 0; int sl = (int)sizeof st;
+        if (getsockopt((SOCKET)fd, SOL_SOCKET, SO_TYPE,
+                       (char *)&st, &sl) == 0) {
+            WSAPROTOCOL_INFOW pi;
+            if (WSADuplicateSocketW((SOCKET)fd,
+                                    GetCurrentProcessId(), &pi) != 0) {
+                errno = EBADF;
+                return -1;
+            }
+            SOCKET ns = WSASocketW(pi.iAddressFamily, pi.iSocketType,
+                                   pi.iProtocol, &pi, 0,
+                                   WSA_FLAG_OVERLAPPED);
+            if (ns == INVALID_SOCKET) { errno = EIO; return -1; }
+            int nfd = (int)ns;
+            if (cmd == F_DUPFD_CLOEXEC) {
+                int nidx = yos_fdflags_idx(nfd);
+                _InterlockedExchange(&g_fdflags[nidx], 0x40000000);
+            }
+            return nfd;
+        }
         int nfd = _dup(fd);
-        if (nfd >= 0 && cmd == F_DUPFD_CLOEXEC) {
-            int nidx = yos_fdflags_idx(nfd);
-            _InterlockedExchange(&g_fdflags[nidx], 0x40000000);
+        if (nfd >= 0) {
+            int kind = yos_fdkind_get(fd);
+            if (kind != 0) yos_fdkind_set(nfd, kind);
+            if (cmd == F_DUPFD_CLOEXEC) {
+                int nidx = yos_fdflags_idx(nfd);
+                _InterlockedExchange(&g_fdflags[nidx], 0x40000000);
+            }
         }
         return nfd;
     }
     return 0;
 }
+
+/* Socket-aware dup/dup2: msvcrt's _dup asserts in the debug CRT for any
+ * fd that isn't a registered CRT file descriptor. Winsock SOCKETs are
+ * such fds (they're raw kernel object handles cast to int), so we route
+ * them through WSADuplicateSocketW + WSASocketW instead. */
+#undef dup
+#undef dup2
+
+int yos_compat_dup(int fd)
+{
+    int st = 0; int sl = (int)sizeof st;
+    if (getsockopt((SOCKET)fd, SOL_SOCKET, SO_TYPE,
+                   (char *)&st, &sl) == 0) {
+        WSAPROTOCOL_INFOW pi;
+        if (WSADuplicateSocketW((SOCKET)fd,
+                                GetCurrentProcessId(), &pi) != 0) {
+            errno = EBADF; return -1;
+        }
+        SOCKET ns = WSASocketW(pi.iAddressFamily, pi.iSocketType,
+                               pi.iProtocol, &pi, 0,
+                               WSA_FLAG_OVERLAPPED);
+        if (ns == INVALID_SOCKET) { errno = EIO; return -1; }
+        return (int)ns;
+    }
+    int newfd = _dup(fd);
+    if (newfd >= 0) {
+        /* Carry the synthetic device kind (YOS_WIN_FD_NULL etc) across
+         * the dup so a later fstat/poll on the dup'd fd still gets the
+         * S_IFCHR fast-path. Without this propagation the dup'd fd
+         * appears as YOS_WIN_FD_REGULAR and tests that dup /dev/null
+         * and poll the dup miss the "always ready" synthesis. */
+        int kind = yos_fdkind_get(fd);
+        if (kind != 0) yos_fdkind_set(newfd, kind);
+    }
+    return newfd;
+}
+
+int yos_compat_dup2(int oldfd, int newfd)
+{
+    int st = 0; int sl = (int)sizeof st;
+    if (getsockopt((SOCKET)oldfd, SOL_SOCKET, SO_TYPE,
+                   (char *)&st, &sl) == 0) {
+        /* Source is a SOCKET. There's no native dup2 for SOCKETs; we
+         * emulate by closing the existing newfd handle (whichever kind
+         * it is) and duplicating the source SOCKET into a fresh handle.
+         * Caller's fd table treats both ints uniformly.
+         *
+         * NB: this can't actually place the new SOCKET at the exact
+         * numeric value `newfd` because Windows allocates handles
+         * itself. yos's fd-table layer (yos_fd_assign) takes a host
+         * fd and remaps it into the wasm-side slot the caller wants,
+         * so the host's numeric identity doesn't have to match. */
+        int sst = 0; int ssl = (int)sizeof sst;
+        if (getsockopt((SOCKET)newfd, SOL_SOCKET, SO_TYPE,
+                       (char *)&sst, &ssl) == 0) {
+            closesocket((SOCKET)newfd);
+        } else {
+            /* Best-effort close of a CRT fd; _close asserts on invalid
+             * fds, so probe with _get_osfhandle first. */
+            HANDLE h = (HANDLE)_get_osfhandle(newfd);
+            if (h != INVALID_HANDLE_VALUE) _close(newfd);
+        }
+        return yos_compat_dup(oldfd);
+    }
+    return _dup2(oldfd, newfd);
+}
+#define dup  yos_compat_dup
+#define dup2 yos_compat_dup2
 
 /* ioctl(FIONBIO) on a SOCKET works natively; track the bit in our
  * flag store too so fcntl(F_GETFL) reads it back. */
@@ -503,6 +628,19 @@ int poll(struct pollfd *fds, nfds_t nfds, int timeout_ms)
             if (fds[i].revents) ready++;
         }
 
+        /* WSAPoll uses Winsock event constants (POLLIN=0x300, POLLOUT
+         * =0x010, etc.) that disagree with the FreeBSD/Linux values we
+         * present to callers via poll.h. Translate at the boundary. */
+        #define YOS_WIN_POLLRDNORM 0x0100
+        #define YOS_WIN_POLLRDBAND 0x0200
+        #define YOS_WIN_POLLIN     (YOS_WIN_POLLRDNORM | YOS_WIN_POLLRDBAND)
+        #define YOS_WIN_POLLPRI    0x0400
+        #define YOS_WIN_POLLWRNORM 0x0010
+        #define YOS_WIN_POLLOUT    YOS_WIN_POLLWRNORM
+        #define YOS_WIN_POLLWRBAND 0x0020
+        #define YOS_WIN_POLLERR    0x0001
+        #define YOS_WIN_POLLHUP    0x0002
+        #define YOS_WIN_POLLNVAL   0x0004
         WSAPOLLFD wfds[64];
         int       wmap[64];
         ULONG     wn = 0;
@@ -511,8 +649,13 @@ int poll(struct pollfd *fds, nfds_t nfds, int timeout_ms)
             if (fds[i].fd >= 0 &&
                 getsockopt((SOCKET)fds[i].fd, SOL_SOCKET, SO_TYPE,
                            (char *)&st, &sl) == 0) {
+                short e = fds[i].events;
+                SHORT we = 0;
+                if (e & POLLIN)  we |= YOS_WIN_POLLIN;
+                if (e & POLLPRI) we |= YOS_WIN_POLLPRI;
+                if (e & POLLOUT) we |= YOS_WIN_POLLOUT;
                 wfds[wn].fd      = (SOCKET)fds[i].fd;
-                wfds[wn].events  = fds[i].events;
+                wfds[wn].events  = we;
                 wfds[wn].revents = 0;
                 wmap[wn] = (int)i;
                 wn++;
@@ -527,8 +670,17 @@ int poll(struct pollfd *fds, nfds_t nfds, int timeout_ms)
                 return -1;
             }
             for (ULONG j = 0; j < wn; j++) {
-                if (wfds[j].revents) {
-                    fds[wmap[j]].revents = (short)wfds[j].revents;
+                SHORT wr = wfds[j].revents;
+                if (wr) {
+                    short r = 0;
+                    if (wr & (YOS_WIN_POLLRDNORM | YOS_WIN_POLLRDBAND))
+                        r |= POLLIN;
+                    if (wr & YOS_WIN_POLLPRI)    r |= POLLPRI;
+                    if (wr & YOS_WIN_POLLWRNORM) r |= POLLOUT;
+                    if (wr & YOS_WIN_POLLERR)    r |= POLLERR;
+                    if (wr & YOS_WIN_POLLHUP)    r |= POLLHUP;
+                    if (wr & YOS_WIN_POLLNVAL)   r |= POLLNVAL;
+                    fds[wmap[j]].revents = r;
                     ready++;
                 }
             }
@@ -796,9 +948,67 @@ void cfmakeraw(struct termios *t) { if (t) memset(t, 0, sizeof *t); }
 
 /* ── networking helpers ───────────────────────────────────────────── */
 
+/* AF_UNIX socketpair loopback: bind a unix-domain listener to a unique
+ * temp path, connect a client, accept, return [accepted, client]. Used
+ * when the caller asked for AF_UNIX (the FreeBSD wasm guest's libuv /
+ * channel pipes do). Returns 0 on success and fills sv[].
+ *
+ * Windows native AF_UNIX (Win10 1803+) doesn't expose socketpair() but
+ * does support the bind/listen/connect/accept dance over filesystem
+ * paths. Using real AF_UNIX sockets is what makes getsockname /
+ * uv_guess_handle / SO_TYPE behave like FreeBSD on these fds. */
+static int yos_socketpair_unix(int sv[2]) {
+    static volatile LONG s_inited;
+    if (InterlockedCompareExchange(&s_inited, 1, 0) == 0) {
+        WSADATA d; WSAStartup(MAKEWORD(2, 2), &d);
+    }
+    SOCKET l = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (l == INVALID_SOCKET) return -1;
+    struct sockaddr_un {
+        unsigned short sun_family;
+        char           sun_path[108];
+    } addr = {0};
+    addr.sun_family = AF_UNIX;
+    char tmpdir[MAX_PATH];
+    DWORD n = GetTempPathA((DWORD)sizeof tmpdir, tmpdir);
+    if (n == 0 || n >= sizeof tmpdir) { closesocket(l); return -1; }
+    snprintf(addr.sun_path, sizeof addr.sun_path,
+             "%syos-spw-%lu-%lu.sock",
+             tmpdir, (unsigned long)GetCurrentProcessId(),
+             (unsigned long)GetTickCount());
+    DeleteFileA(addr.sun_path);
+    int alen = (int)(sizeof(unsigned short) + strlen(addr.sun_path) + 1);
+    if (bind(l, (struct sockaddr *)&addr, alen) != 0 ||
+        listen(l, 1) != 0) {
+        closesocket(l); DeleteFileA(addr.sun_path); return -1;
+    }
+    SOCKET c = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (c == INVALID_SOCKET) {
+        closesocket(l); DeleteFileA(addr.sun_path); return -1;
+    }
+    if (connect(c, (struct sockaddr *)&addr, alen) != 0) {
+        closesocket(c); closesocket(l);
+        DeleteFileA(addr.sun_path); return -1;
+    }
+    SOCKET s = accept(l, NULL, NULL);
+    closesocket(l);
+    DeleteFileA(addr.sun_path);
+    if (s == INVALID_SOCKET) { closesocket(c); return -1; }
+    sv[0] = (int)s; sv[1] = (int)c;
+    return 0;
+}
+
 int socketpair(int dom, int type, int proto, int sv[2]) {
-    (void)dom; (void)type; (void)proto;
-    /* Same loopback dance as yos_winshim.h's yos_socketpair. */
+    (void)type; (void)proto;
+    /* AF_UNIX caller: use real AF_UNIX sockets so getsockname reports
+     * AF_UNIX (1) instead of AF_INET (2), matching the FreeBSD wasm
+     * guest's libuv / channel-pipe expectations. Fall back to AF_INET
+     * loopback only on systems too old to support AF_UNIX (Win10 <1803,
+     * pre-2018). */
+    if (dom == AF_UNIX) {
+        if (yos_socketpair_unix(sv) == 0) return 0;
+        /* fall through to AF_INET loopback */
+    }
     static volatile LONG s_inited;
     if (InterlockedCompareExchange(&s_inited, 1, 0) == 0) {
         WSADATA d; WSAStartup(MAKEWORD(2, 2), &d);

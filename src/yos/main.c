@@ -1665,7 +1665,25 @@ static int load_wasm_module(struct yos_exec_ctx *ctx, IM3Environment env,
      * 268435456" — every later fork then traps inside asyncify's
      * rewind. 1024 pages = 64 MiB is enough for zsh + the runit
      * supervisor and small enough that 8+ live forks still fit. */
-    uint32_t resize_pages = 4096;
+    /* Default eager-commit: 4096 pages = 256 MiB. Aggressive on
+     * platforms where each fork() snapshot/restore COMMITS the full
+     * size — Windows VirtualAlloc / heap reservations against the
+     * system commit limit cause a tree of forks to exhaust commit
+     * space and the deepest children to crash with access violation.
+     * The default lives below; Windows uses a smaller value to keep
+     * deep fork trees viable. Either default is overridable via the
+     * YOS_WASM_PAGES env var (used by nvim where 256 MiB is needed). */
+#ifdef _WIN32
+    uint32_t resize_pages = 256;   /* 16 MiB — fits typical test guests
+                                    * while keeping the per-fork commit
+                                    * charge bounded across deep recursion. */
+#else
+    uint32_t resize_pages = 4096;  /* 256 MiB — nvim's Lua + module
+                                    * dictionaries blow past 16 MiB
+                                    * during startup; lazy-commit on
+                                    * POSIX makes the upfront size
+                                    * cheap for guests that don't grow. */
+#endif
     {
         const char *env_pages = getenv("YOS_WASM_PAGES");
         if (env_pages && *env_pages) {

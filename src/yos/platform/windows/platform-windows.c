@@ -8,11 +8,14 @@
 #include <errno.h>
 #include <io.h>          /* _get_osfhandle */
 #include <stdint.h>
+#include <stdio.h>       /* snprintf */
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 
+#ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
+#endif
 #include <windows.h>
 #include <winsock2.h>
 
@@ -38,7 +41,7 @@ enum {
 };
 static volatile long g_fdkind[YOS_WIN_FDKIND_MAX];
 
-static int yos_fdkind_get(int fd)
+int yos_fdkind_get(int fd)
 {
     /* Out-of-range fd: treat as REGULAR. Aliasing into slot 0 would
      * corrupt tracking for fd 0 (stdin). msvcrt can't usually hand
@@ -48,7 +51,7 @@ static int yos_fdkind_get(int fd)
     return (int)g_fdkind[fd];
 }
 
-static void yos_fdkind_set(int fd, int kind)
+void yos_fdkind_set(int fd, int kind)
 {
     if (fd < 0 || fd >= YOS_WIN_FDKIND_MAX) return;
     g_fdkind[fd] = kind;
@@ -75,20 +78,6 @@ static int yos_win_random(void *buf, size_t n)
 {
     InitOnceExecuteOnce(&g_yos_bcrypt_once, yos_init_bcrypt, NULL, NULL);
     yos_BCryptGenRandom_t bg = g_yos_bcrypt_fn;
-    if (!bg) { errno = EIO; return -1; }
-    unsigned char *p = (unsigned char *)buf;
-    while (n > 0) {
-        ULONG chunk = n > 0x40000000u ? 0x40000000u : (ULONG)n;
-        if (bg(NULL, p, chunk, 2) != 0) { errno = EIO; return -1; }
-        p += chunk;
-        n -= chunk;
-    }
-    return 0;
-}
-
-static int yos_win_random(void *buf, size_t n)
-{
-    yos_BCryptGenRandom_t bg = yos_resolve_bcrypt();
     if (!bg) { errno = EIO; return -1; }
     unsigned char *p = (unsigned char *)buf;
     while (n > 0) {
@@ -280,6 +269,47 @@ int yos_plat_open(const char *path, int flags, int mode)
         open_path = "NUL";
     }
 
+    /* Force binary mode unless the caller explicitly asked for text:
+     * the wasm guest expects POSIX byte-for-byte read/write semantics,
+     * and msvcrt's default text mode translates \n → \r\n on write
+     * (and the reverse on read), inflating byte counts and breaking
+     * every fstat / lseek / read-loop the guest does on a file it
+     * just wrote. */
+    if (!(flags & (_O_BINARY | _O_TEXT))) flags |= _O_BINARY;
+
+    /* O_DIRECTORY: msvcrt's open(2) does not accept directory paths —
+     * it returns EACCES (or EINVAL) and fails. The wasm guest, however,
+     * uses open(dir, O_RDONLY|O_DIRECTORY) as the standard way to mint
+     * a dirfd for mkdirat/openat/fstatat. We satisfy that by opening
+     * the directory via CreateFileA with FILE_FLAG_BACKUP_SEMANTICS
+     * (the documented way to obtain a directory handle on Win32), then
+     * wrapping the HANDLE in a CRT fd via _open_osfhandle so the rest
+     * of the io path (yos_plat_close, fstat, etc.) sees a normal int
+     * file descriptor. */
+    if (flags & 0x10000 /* O_DIRECTORY */) {
+        HANDLE h = CreateFileA(open_path,
+                               GENERIC_READ,
+                               FILE_SHARE_READ | FILE_SHARE_WRITE |
+                                   FILE_SHARE_DELETE,
+                               NULL,
+                               OPEN_EXISTING,
+                               FILE_FLAG_BACKUP_SEMANTICS,
+                               NULL);
+        if (h == INVALID_HANDLE_VALUE) {
+            DWORD err = GetLastError();
+            errno = (err == ERROR_FILE_NOT_FOUND ||
+                     err == ERROR_PATH_NOT_FOUND) ? ENOENT
+                  : (err == ERROR_ACCESS_DENIED)  ? EACCES
+                  :                                 EIO;
+            return -1;
+        }
+        int fd = _open_osfhandle((intptr_t)h, _O_BINARY | _O_RDONLY);
+        if (fd < 0) { CloseHandle(h); errno = EMFILE; return -1; }
+        yos_fdkind_set(fd, kind);
+        yos_fdflags_record_open(fd, flags);
+        return fd;
+    }
+
     int fd = open(open_path, flags, mode);
     if (fd >= 0) {
         yos_fdkind_set(fd, kind);
@@ -355,6 +385,21 @@ int yos_plat_fstat(int hfd, struct stat *out)
          * 0140000 in posix_extras.h. Apply it directly to st_mode here
          * so S_ISSOCK(st_mode) on the wasm side reads as true. */
         out->st_mode = (unsigned short)((out->st_mode & ~0170000u) | 0140000u);
+        return 0;
+    }
+
+    /* yos's emulated character devices (the open-time path translation
+     * mapped /dev/null, /dev/zero, /dev/random to a "NUL" CRT fd with
+     * a recorded fdkind). msvcrt's _fstat on NUL may report _S_IFCHR
+     * or _S_IFREG depending on UCRT version; cover the contract here
+     * by stamping S_IFCHR explicitly so yos_poll's "always-ready"
+     * synthesis picks them up regardless. */
+    int kind = yos_fdkind_get(hfd);
+    if (kind == YOS_WIN_FD_NULL || kind == YOS_WIN_FD_ZERO ||
+        kind == YOS_WIN_FD_RANDOM) {
+        memset(out, 0, sizeof *out);
+        out->st_mode = (unsigned short)(_S_IFCHR | 0666);
+        out->st_nlink = 1;
         return 0;
     }
 

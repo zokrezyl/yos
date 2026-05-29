@@ -206,11 +206,23 @@ int yos_xlate_dfd(struct yos_exec_ctx *ctx, int32_t wfd)
  * Pipe2 and similar two-fd routines depend on this contract: they
  * close ONLY the partner end on the first-alloc failure path. See
  * impl/io/io-darwin.c::yos_pipe2 / io-linux.c::yos_pipe2. */
+/* Slot sentinel: "this slot was released by fclose() of an fdopen'd
+ * stream — refuse close() (return EBADF) and don't reuse for open()".
+ * Without this, the test_issue15_fdopen_lifetime scenario fails:
+ * fdopen(fd_a)+fclose() releases fd_a's slot to -1, the next open()
+ * gets fd_a back from yos_fd_alloc, and the caller's defensive
+ * close(fd_a) (which it expects to EBADF on a stale fd) instead
+ * closes the brand-new open's host fd. */
+#define YOS_FD_FCLOSE_TOMB (-2)
+
 int32_t yos_fd_alloc(struct yos_exec_ctx *ctx, int host_fd)
 {
     if (host_fd < 0) return host_fd;
     for (int i = 0; i < YOS_FD_MAX; i++) {
-        if (ctx->fd_map[i] < 0) {
+        /* Strict -1 match: skip TOMB slots so post-fclose defensive
+         * close(stale_fd) reads EBADF rather than clobbering a
+         * recycled fd. */
+        if (ctx->fd_map[i] == -1) {
             ctx->fd_map[i] = host_fd;
             free(ctx->fd_paths[i]);
             ctx->fd_paths[i] = NULL;
@@ -340,11 +352,14 @@ int32_t yos_fd_close(struct yos_exec_ctx *ctx, int32_t wfd)
  * impl/io/file.c::free_handle after fclose(host_FILE) has already
  * closed the underlying host fd — calling close on a stale fd would
  * EBADF (or worse, close someone else's freshly-opened fd that got
- * the recycled number). */
+ * the recycled number). The slot is tombstoned (YOS_FD_FCLOSE_TOMB)
+ * so yos_fd_alloc won't recycle it and yos_fd_close on the same wfd
+ * cleanly EBADFs. yos_fd_assign (dup2) clears the tombstone — the
+ * caller is explicitly claiming the slot. */
 void yos_fd_release_slot(struct yos_exec_ctx *ctx, int32_t wfd)
 {
     if (!ctx || wfd < 0 || wfd >= YOS_FD_MAX) return;
-    ctx->fd_map[wfd] = -1;
+    ctx->fd_map[wfd] = YOS_FD_FCLOSE_TOMB;
     free(ctx->fd_paths[wfd]);
     ctx->fd_paths[wfd] = NULL;
 }

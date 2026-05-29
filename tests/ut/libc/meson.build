@@ -315,6 +315,23 @@ test('test_libc_coverage',
 libc_tests_xfail = [
 ]
 
+# Windows-specific expected failures: tests that depend on host
+# primitives Windows doesn't provide and can't reasonably emulate.
+if host_machine.system() == 'windows'
+  libc_tests_xfail += [
+    # kqueue is BSD/macOS-only — Windows IOCP is the rough equivalent
+    # but the wasm guest's wire format is FreeBSD kqueue, and a full
+    # IOCP-shim is out of scope. These tests all assert kqueue() != -1.
+    'test_kqueue_evfilt_read',
+    'test_nvim_channel_from_stdio',
+    'test_fork_channel_from_stdio',
+    # symlink(2) on Windows requires either Administrator or Developer
+    # Mode (Win10 1703+). On a stock unprivileged shell CreateSymbolicLink
+    # fails with ERROR_PRIVILEGE_NOT_HELD; the test then exits 1.
+    'test_symlink_lstat_perms',
+  ]
+endif
+
 foreach t : libc_tests
   src = files(t + '.c')
 
@@ -346,6 +363,7 @@ foreach t : libc_tests
   # wasm call stack. Plain stateless tests skip the pass.
   needs_asyncify = t in ['test_fork_basic',
                          'test_fork_channel_from_stdio',
+                         'test_fork_fprintf_stderr',
                          'test_post_fork_stderr_clean']
 
   if needs_asyncify
@@ -465,11 +483,17 @@ foreach n : fork_row_names
       '--yos',  yos_bin,
       '--src',  src,
       '--wasm', wasm,
+      # Inner runner default is 30 s — the stress rows (100 sequential
+      # fork+exit cycles, 363-process tree) routinely brush past it on
+      # Windows where each fork pays a Binaryen-asyncify rewind cost.
+      '--timeout', '90',
     ],
     suite       : 'libc',
     # Each row forks + waits; on a loaded CI box that can creep past
-    # the default per-test timeout. 45 s is comfortable headroom.
-    timeout     : 45,
+    # the default per-test timeout. The outer meson timeout must stay
+    # above the inner runner timeout so the runner gets a chance to
+    # produce a report rather than being SIGKILL'd by meson first.
+    timeout     : 120,
     # `xfail: true` in the YAML row pins a known yos bug — the test
     # PASSES the suite by failing the assertion, and UNEXPECTEDPASSes
     # (suite-failing) the day the underlying bridge is fixed.

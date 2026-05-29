@@ -94,6 +94,14 @@ static __inline int yos_compat_mkdir2(const char *p, int mode) {
  * above and let them resolve naturally. lseek() returns a 32-bit offset
  * on MSVC; for 64-bit we use _lseeki64 directly. */
 
+/* dup / dup2: msvcrt's _dup asserts in the debug CRT when fd is not a
+ * CRT-tracked file descriptor (sockets aren't). Our wrappers detect
+ * Winsock SOCKETs and use WSADuplicateSocketW for those. */
+extern int   yos_compat_dup(int fd);
+extern int   yos_compat_dup2(int oldfd, int newfd);
+#define dup  yos_compat_dup
+#define dup2 yos_compat_dup2
+
 extern int   pipe(int fds[2]);
 extern int   ftruncate(int fd, long long len);
 extern int   truncate(const char *path, long long len);

@@ -27,6 +27,9 @@
 #include <stdint.h>
 #include <stddef.h>
 
+#define WIN32_LEAN_AND_MEAN
+#include <winsock2.h>
+
 #ifndef _O_NOINHERIT
 #define _O_NOINHERIT 0x0080
 #endif

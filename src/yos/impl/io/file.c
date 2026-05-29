@@ -115,7 +115,14 @@ uint32_t yos_alloc_file_handle_with_mode(struct yos_exec_ctx *ctx,
     for (uint32_t i = 4; i < YOS_FILE_MAX; i++) {
         if (ctx->file_slots[i] == NULL) {
             ctx->file_slots[i] = f;
-            ctx->file_wfds[i]  = wfd;
+            /* fopen / tmpfile etc.: yos owns the wfd, the user never
+             * sees it — so on fclose we release the slot to -1 (free
+             * for reuse). Encode "yos-owned" by negating the wfd
+             * (with -1 offset so a wfd of 0 still maps to a non-
+             * collision negative value). fdopen (the other entry
+             * point) stores the wfd verbatim so free_handle tombs
+             * it, preventing close(stale_fd) clobber. */
+            ctx->file_wfds[i]  = (wfd >= 0) ? -(wfd + 1) : -1;
             /* Record mode so fork can fdopen on the dup'd fd with
              * the right access mode. mode==NULL means "we don't
              * know" (e.g. tmpfile()) — fall back to "r+" which
@@ -141,17 +148,32 @@ uint32_t yos_alloc_file_handle(struct yos_exec_ctx *ctx, FILE *f)
 static void free_handle(struct yos_exec_ctx *ctx, uint32_t h)
 {
     if (h < 4 || h >= YOS_FILE_MAX || !ctx) return;
-    int32_t wfd = ctx->file_wfds[h];
+    int32_t stored = ctx->file_wfds[h];
     ctx->file_slots[h] = NULL;
     ctx->file_wfds[h]  = -1;
     ctx->file_modes[h][0] = '\0';
     /* The host fd is closed by fclose() before we reach this point —
-     * the wasm-fd slot just needs to be released (NOT close again,
-     * which would EBADF). yos_fd_close hits yos_plat_close(hfd) again, so
-     * we release the slot manually. */
-    if (wfd >= 0) {
+     * the wasm-fd slot just needs to be released. Two cases:
+     *   - stored >= 0 : fdopen path (caller passed in the wfd). The
+     *     caller may still hold the same value and try a defensive
+     *     close on it; tombstone the slot so that close cleanly
+     *     EBADFs instead of clobbering an unrelated open() return.
+     *   - stored < 0 : fopen/tmpfile path (yos allocated the wfd
+     *     internally and never exposed it). No defensive-close hazard,
+     *     so release the slot to free (-1) and let yos_fd_alloc reuse
+     *     it. Otherwise a long-running guest doing N fopen+fclose
+     *     cycles exhausts fd_map after N=YOS_FD_MAX iterations. */
+    if (stored >= 0) {
         extern void yos_fd_release_slot(struct yos_exec_ctx *ctx, int32_t wfd);
-        yos_fd_release_slot(ctx, wfd);
+        yos_fd_release_slot(ctx, stored);
+    } else if (stored < -1) {
+        /* yos-owned: decode -(wfd+1) -> wfd, drop to -1 (free). */
+        int32_t wfd = -(stored + 1);
+        if (wfd >= 0 && wfd < YOS_FD_MAX) {
+            ctx->fd_map[wfd] = -1;
+            free(ctx->fd_paths[wfd]);
+            ctx->fd_paths[wfd] = NULL;
+        }
     }
 }
 
@@ -451,7 +473,11 @@ int32_t yos_fileno(struct yos_exec_ctx *ctx, uint32_t fp)
     if (fp == 2) return 1;
     if (fp == 3) return 2;
     if (fp < 4 || fp >= YOS_FILE_MAX || !ctx) return -1;
-    return ctx->file_wfds[fp];
+    int32_t stored = ctx->file_wfds[fp];
+    /* Decode yos-owned-wfd marker (see alloc_handle): negative values
+     * other than -1 encode the wfd as -(wfd+1). */
+    if (stored < -1) return -(stored + 1);
+    return stored;
 }
 
 /* ── seek/tell ─────────────────────────────────────────────────── */

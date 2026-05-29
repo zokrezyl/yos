@@ -7,6 +7,14 @@
 
 $ErrorActionPreference = 'Stop'
 
+# PowerShell 5.1's `2>&1` on a native exe wraps each stderr line in an
+# ErrorRecord (NativeCommandError), which then trips `Stop` even when the
+# command's actual exit code is 0 (ninja prints benign progress like
+# "[freebsd-fetch] cached" on stderr). Drop down to `Continue` for the
+# duration of the native invocation below so caller-side `2>&1` piping
+# survives those benign stderr lines.
+$origErrorActionPreference = $ErrorActionPreference
+
 # All args via $args so flags like -C / -G aren't swallowed by PS's
 # parameter parser (-C is otherwise treated as a script parameter).
 $Cmd = $args
@@ -14,7 +22,9 @@ $Cmd = $args
 # Already inside a Developer prompt? Skip re-loading.
 if (Get-Command cl.exe -ErrorAction SilentlyContinue) {
     if ($Cmd.Count -gt 0) {
+        $ErrorActionPreference = 'Continue'
         & $Cmd[0] @($Cmd | Select-Object -Skip 1)
+        $ErrorActionPreference = $origErrorActionPreference
         exit $LASTEXITCODE
     }
     return
@@ -60,5 +70,7 @@ foreach ($p in $ExtraPathCandidates) {
 
 if ($Cmd.Count -eq 0) { return }
 
+$ErrorActionPreference = 'Continue'
 & $Cmd[0] @($Cmd | Select-Object -Skip 1)
+$ErrorActionPreference = $origErrorActionPreference
 exit $LASTEXITCODE

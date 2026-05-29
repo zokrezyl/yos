@@ -12,21 +12,33 @@
 #define WIN32_LEAN_AND_MEAN
 #include <winsock2.h>
 
-#ifndef POLLIN
+/* Winsock declares POLLIN as POLLRDNORM|POLLRDBAND (0x0300), POLLOUT
+ * as 0x0010, etc. — values that disagree with FreeBSD and Linux. yos's
+ * wasm guest is FreeBSD-shaped, so the bridge in impl/io/dir.c passes
+ * FreeBSD POLLIN=0x0001 / POLLOUT=0x0004 through `events`. We force
+ * the FreeBSD/Linux values here so callers see consistent constants
+ * across platforms; the compat poll() body in compat_libc.c translates
+ * to Windows poll codes only where it actually calls WSAPoll. */
+#undef POLLIN
+#undef POLLPRI
+#undef POLLOUT
+#undef POLLERR
+#undef POLLHUP
+#undef POLLNVAL
+#undef POLLRDNORM
+#undef POLLRDBAND
+#undef POLLWRNORM
+#undef POLLWRBAND
 #define POLLIN      0x0001
-#endif
-#ifndef POLLOUT
+#define POLLPRI     0x0002
 #define POLLOUT     0x0004
-#endif
-#ifndef POLLERR
 #define POLLERR     0x0008
-#endif
-#ifndef POLLHUP
 #define POLLHUP     0x0010
-#endif
-#ifndef POLLNVAL
 #define POLLNVAL    0x0020
-#endif
+#define POLLRDNORM  0x0040
+#define POLLRDBAND  0x0080
+#define POLLWRNORM  0x0100
+#define POLLWRBAND  0x0200
 
 /* MinGW's winsock2.h declares `struct pollfd` whenever
  * _WIN32_WINNT >= 0x600 (the default on modern MinGW). We pull

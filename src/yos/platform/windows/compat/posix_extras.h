@@ -155,6 +155,22 @@ extern void *memrchr(const void *s, int c, size_t n);
 extern void *mempcpy(void *dst, const void *src, size_t n);
 extern char *strndup(const char *s, size_t n);
 extern char *strchrnul(const char *s, int c);
+extern char *strsignal(int sig);
+extern char *hstrerror(int err);
+extern char *l64a(long v);
+extern char *ttyname(int fd);
+extern char *ctermid(char *s);
+extern char *ptsname(int fd);
+extern char *getusershell(void);
+extern char *strtok_r(char *str, const char *delim, char **saveptr);
+extern char *realpath(const char *path, char *resolved);
+extern char *mkdtemp(char *template_);
+/* off_t variants — MSVC has no fseeko/ftello, our shim returns long
+ * long. Declared so call sites don't truncate the return. */
+extern long long fseeko(void *f, long long offset, int whence);
+extern long long ftello(void *f);
+extern void setbuffer(void *f, char *buf, size_t n);
+extern void setlinebuf(void *f);
 extern int   timingsafe_bcmp (const void *a, const void *b, size_t n);
 extern int   timingsafe_memcmp(const void *a, const void *b, size_t n);
 extern size_t strlcpy(char *dst, const char *src, size_t sz);
