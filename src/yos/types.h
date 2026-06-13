@@ -395,6 +395,16 @@ struct yos_exec_ctx {
     void   **lua_handles;
     uint32_t lua_handles_cap;
 
+    /* libarchive per-guest state. libarchive is the textbook reentrant
+     * case (build-tools/libbridge analysis: ZERO writable globals; all
+     * state lives in the caller-owned `struct archive *` /
+     * `struct archive_entry *`). So the bridge just maps the i32 handle
+     * the guest holds to the host pointer. Both archive and entry
+     * pointers share this table; slot 0 reserved. See
+     * impl/libc/libarchive.c. */
+    void   **arc_handles;
+    uint32_t arc_handles_cap;
+
     /* "Did this ctx write to stderr (wfd=2) since the last failed exec?"
      * Used by yos_exit to detect a forked child that died after exec
      * failure without printing — under asyncify-fork, zsh's zwarning code

@@ -62,6 +62,11 @@
             meson
             ninja
             pkg-config
+            # Host libarchive for the env.archive_* bridges
+            # (src/yos/impl/libc/libarchive.c) + the libc unit test.
+            # Without it meson's with_libarchive=auto resolves to off
+            # and the archive_* surface is absent from a local build.
+            libarchive
             # Need wasm-ld to cross-link wasm32 test binaries. The system's
             # /usr/local/bin/wasm-ld (homebrew) is the one picked up by
             # default and on this machine its lld+llvm versions don't

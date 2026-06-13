@@ -1419,6 +1419,17 @@ void yos_link_imports(IM3Module module, struct yos_exec_ctx *ctx)
     yos_liblua_link(module);
 #endif
 
+    /* libarchive — env.archive_*. The host yos links host libarchive;
+     * the wasm guest (bsdtar, or a libarchive driver) imports these
+     * names and yos resolves them via per-ctx handles in
+     * ctx->arc_handles[]. See impl/libc/libarchive.c. When
+     * -Dwith_libarchive=disabled (or the host lacks libarchive), this
+     * is compiled out and archive_* imports trap unresolved. */
+#ifdef YOS_HAVE_LIBARCHIVE
+    extern void yos_libarchive_link(IM3Module mod);
+    yos_libarchive_link(module);
+#endif
+
     /* Auto-generated bridges for the FreeBSD-libc-name import surface.
      * For guests that import each libc fn by name (env.write, env.read,
      * env.exit, …) instead of going through __yos_syscall. Bridges

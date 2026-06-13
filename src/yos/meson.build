@@ -87,6 +87,22 @@ else
   endif
   have_liblua = liblua_dep.found()
 endif
+
+# libarchive (host) — embedded into the yos binary so wasm guests can
+# call env.archive_* (impl/libc/libarchive.c) for tar/cpio/unzip-class
+# tools. pkg-config name is `libarchive` (nixpkgs + every distro). The
+# bridge forward-declares the API it uses, so we don't actually need
+# libarchive's headers — but the .pc gives robust link flags across
+# hosts (and avoids the missing-unversioned-.so problem find_library
+# hits on systems that ship only libarchive.so.13).
+with_libarchive_opt = get_option('with_libarchive')
+if with_libarchive_opt.disabled()
+  libarchive_dep = dependency('', required: false)
+  have_libarchive = false
+else
+  libarchive_dep = dependency('libarchive', required: with_libarchive_opt)
+  have_libarchive = libarchive_dep.found()
+endif
 # iconv: glibc folds it into libc; darwin/BSD ship a separate libiconv
 # whose symbols start with `iconv_*` (and `__iconv_*` for the GNU
 # extras). yos's bridge calls those names, so we need explicit linkage
@@ -303,6 +319,11 @@ if have_liblua
   optional_sources += files('impl/libc/liblua.c')
   optional_args    += '-DYOS_HAVE_LIBLUA=1'
   optional_deps    += liblua_dep
+endif
+if have_libarchive
+  optional_sources += files('impl/libc/libarchive.c')
+  optional_args    += '-DYOS_HAVE_LIBARCHIVE=1'
+  optional_deps    += libarchive_dep
 endif
 
 _yoscc = meson.get_compiler('c')

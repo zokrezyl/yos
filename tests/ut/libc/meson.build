@@ -190,6 +190,12 @@ libc_tests = [
   'test_issue15_boundary_buffers',
   'test_issue15_iovec_bounds',
   'test_issue15_mkdirat_dirfd',
+  # libarchive surface (env.archive_*, src/yos/impl/libc/libarchive.c):
+  # build a ustar in linear memory and round-trip it through host
+  # libarchive. Requires the yos build to have found libarchive
+  # (with_libarchive=auto); the devShell + nix yos derivation provide
+  # it, so a default build runs this for real.
+  'test_libarchive_read_memory',
 ]
 
 # Path to the generator's output dir, exposed by src/yos/codegen.
