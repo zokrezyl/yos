@@ -92,12 +92,39 @@ static int alloc_init_locked(struct yos_exec_ctx *ctx)
     return 0;
 }
 
+/* Walk the free list and log it — diagnostic for the rare case where
+ * do_alloc returns 0 (out of memory) on a heap that should have space. */
+static void dump_free_list(struct yos_exec_ctx *ctx, uint32_t need)
+{
+    yerror("alloc OOM: need=%u head=0x%x lo=0x%x hi=0x%x",
+           need, ctx->alloc_free_head, ctx->alloc_lo, ctx->alloc_hi);
+    uint32_t cur = ctx->alloc_free_head;
+    uint32_t n = 0;
+    uint64_t total = 0;
+    while (cur && n < 16u) {
+        uint32_t bsz = blk_size(ctx, cur);
+        yerror("  free[%u] off=0x%x size=%u next=0x%x", n, cur, bsz,
+               blk_next(ctx, cur));
+        total += bsz;
+        cur = blk_next(ctx, cur);
+        n++;
+    }
+    yerror("alloc OOM: walked %u blocks, %llu bytes (truncated at 16)",
+           n, (unsigned long long)total);
+}
+
 static inline uint32_t do_alloc(struct yos_exec_ctx *ctx, uint32_t need)
 {
-    /* First-fit walk. */
+    /* First-fit walk. A corrupt free list can form a cycle; bound the
+     * walk so a bad node can't spin forever, and so we can report it. */
     uint32_t prev_off = 0;
     uint32_t cur = ctx->alloc_free_head;
+    uint32_t guard = 0;
     while (cur) {
+        if (++guard > (1u << 22)) {        /* > 4M nodes ⇒ a cycle */
+            yerror("alloc: free-list cycle at off=0x%x — aborting walk", cur);
+            return 0;
+        }
         uint32_t bsz   = blk_size(ctx, cur);
         uint32_t bnext = blk_next(ctx, cur);
         if (bsz >= need) {
@@ -119,6 +146,7 @@ static inline uint32_t do_alloc(struct yos_exec_ctx *ctx, uint32_t need)
         prev_off = cur;
         cur = bnext;
     }
+    dump_free_list(ctx, need);
     return 0;  /* out of memory */
 }
 
@@ -221,8 +249,26 @@ void yos_free(struct yos_exec_ctx *ctx, uint32_t off)
     uint32_t prev = 0;
     uint32_t cur  = ctx->alloc_free_head;
     while (cur && cur < blk_off) {
+        /* Double-free / free-into-a-free-region guard: if blk_off is the
+         * start of, or lies inside, an already-free block, re-inserting
+         * it corrupts the list (duplicate node or cycle) and silently
+         * loses the rest of the heap. Detect and drop the bogus free. */
+        if (blk_off < cur + blk_size(ctx, cur)) {
+            ydebug("free: 0x%x already inside free block 0x%x (sz=%u) — "
+                   "ignoring double free", blk_off, cur, blk_size(ctx, cur));
+            pthread_mutex_unlock(&g_alloc_lock);
+            return;
+        }
         prev = cur;
         cur  = blk_next(ctx, cur);
+    }
+    /* `cur` is now the first free block with cur >= blk_off. If they are
+     * equal, the block is already free (double free of a list head/node). */
+    if (cur == blk_off) {
+        ydebug("free: 0x%x already free (head/node) — ignoring double free",
+               blk_off);
+        pthread_mutex_unlock(&g_alloc_lock);
+        return;
     }
     /* Try coalescing with the previous block (prev + prev->size == blk). */
     if (prev) {

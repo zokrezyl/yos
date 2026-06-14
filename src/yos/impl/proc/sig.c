@@ -272,9 +272,15 @@ int32_t yos_sig_rt_sigaction(struct yos_exec_ctx *ctx, int32_t signum,
         uint32_t handler = *(uint32_t *)(ctx->memory + act);
         record_handler(ctx, signum, handler);
     }
-    if (oldact && ctx->memory && oldact + 32 <= ctx->memory_size) {
+    /* FreeBSD i386 struct sigaction is exactly 24 bytes:
+     *   sa_handler (4) + sa_flags (4) + sa_mask/sigset_t __bits[4] (16).
+     * The guest allocates sizeof(struct sigaction) == 24 for oldact;
+     * writing 32 here overran the buffer by 8 bytes and corrupted the
+     * adjacent allocation (it clobbered the heap free-list header,
+     * which silently destroyed the whole guest heap). Write 24. */
+    if (oldact && ctx->memory && oldact + 24 <= ctx->memory_size) {
         uint8_t *p = ctx->memory + oldact;
-        memset(p, 0, 32);
+        memset(p, 0, 24);
         *(uint32_t *)p = prev_abi;   /* sa_handler in FreeBSD-ABI encoding */
     }
     return 0;

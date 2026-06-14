@@ -231,6 +231,22 @@ void yos_proc_post_exit_cleanup(struct yos_exec_ctx *ctx)
 int32_t yos_exit(struct yos_exec_ctx *ctx, int32_t code)
 {
     ydebug("exit(%d) is_child=%d\n", code, ctx->is_child);
+
+    /* Release any libarchive handles the guest leaked, BEFORE the fd
+     * table is torn down (yos_proc_post_exit_cleanup, below, closes the
+     * archive's read fd). Doing it first lets each leaked archive close
+     * its own yos fd + read scratch cleanly via archive_read_free; the
+     * fd-table sweep then has nothing of ours left to double-close. This
+     * single early call covers every exit shape — forked-child
+     * pthread_exit and main-process yos_plat_exit alike — both of which
+     * bypass main()'s post-run teardown. */
+#ifdef YOS_HAVE_LIBARCHIVE
+    {
+        extern void yos_libarchive_ctx_free(struct yos_exec_ctx *);
+        yos_libarchive_ctx_free(ctx);
+    }
+#endif
+
     /* Asyncify-fork-child silence workaround.
      *
      * When a forked child wasm-zsh tries to exec a missing command it
@@ -250,9 +266,18 @@ int32_t yos_exit(struct yos_exec_ctx *ctx, int32_t code)
      * host fd 2 ourselves. Without this the user sees dead silence on
      * every `bad-cmd; <anything>` invocation — interactive zsh, scripts
      * with multiple commands, anything that forces a fork. */
+    /* This synthesized diagnostic is an asyncify-fork compatibility
+     * shim, NOT generic exit semantics — under a correct fork the child
+     * would emit its own "command not found" via stderr stdio. It is on
+     * by default so interactive shells stay usable; YOS_NO_FORK_DIAG=1
+     * disables it to observe the raw (silent) corruption the regression
+     * tests pin (tests/integration/zsh/external-{missing,diagnostic}).
+     * Remove this whole block once the proc-side fork-snapshot bug that
+     * swallows the child's own stderr is rooted out. */
     if (ctx->is_child && code != 0 &&
         ctx->last_failed_exec_path[0] != '\0' &&
-        !ctx->stderr_written_since_exec) {
+        !ctx->stderr_written_since_exec &&
+        getenv("YOS_NO_FORK_DIAG") == NULL) {
         const char *path = ctx->last_failed_exec_path;
         const char *base = strrchr(path, '/');
         base = base ? base + 1 : path;

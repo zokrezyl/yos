@@ -62,6 +62,18 @@ custom_proc:
   - recv
   - sendto
   - recvfrom
+  # impl/posix.c — msghdr is pointer-heavy (msg_name/msg_iov/msg_control
+  # are guest offsets) and the auto-bridge both passes the wasm fd raw
+  # AND casts the guest msghdr as a host one. Hand bridge translates the
+  # fd, the iovec array, and SCM_RIGHTS fds (imsg/tmux pass fds this way).
+  - sendmsg
+  - recvmsg
+  # impl/posix.c — glob_t is pointer-heavy and the errfunc arg is a guest
+  # function index; the auto-bridge made host glob call ctx->memory+0 as
+  # the errfunc (crash) and filled gl_pathv with host pointers. Hand
+  # bridge forces errfunc NULL and copies matches into guest memory.
+  - glob
+  - globfree
   - shutdown
   - getpeername
   # impl/posix.c — fd_set bitmap is indexed by raw fd number; auto-

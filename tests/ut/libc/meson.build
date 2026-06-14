@@ -196,6 +196,30 @@ libc_tests = [
   # (with_libarchive=auto); the devShell + nix yos derivation provide
   # it, so a default build runs this for real.
   'test_libarchive_read_memory',
+  # Issue #20 hardening suite — OS-boundary validation pins:
+  #   unterminated_path     — path bridges reject a guest string that
+  #                           runs to the end of linear memory with no
+  #                           NUL (wstr_check, finding 1)
+  #   mmap_fixed            — MAP_FIXED carve/zero, heap-overlap refusal,
+  #                           free-region coalescing, repeated munmap
+  #                           (mem.c, finding 4)
+  #   libarchive_filename   — archive_read_open_filename routed through
+  #                           yos_open + a yos-fd-backed read callback
+  #                           (libarchive.c, finding 2)
+  'test_issue20_unterminated_path',
+  'test_issue20_mmap_fixed',
+  'test_issue20_libarchive_filename',
+  #   libarchive_kinds      — archive/entry handle-kind enforcement:
+  #                           freeing an entry-as-archive is a no-op, and
+  #                           entry handles are invalidated once their
+  #                           owning archive is freed (libarchive.c,
+  #                           finding 3)
+  'test_issue20_libarchive_kinds',
+  #   libarchive_leak_teardown — a filename-opened archive left unfreed
+  #                           is reclaimed by the runtime teardown
+  #                           (yos_libarchive_ctx_free is now actually
+  #                           invoked) without crashing (finding 4)
+  'test_issue20_libarchive_leak_teardown',
 ]
 
 # Path to the generator's output dir, exposed by src/yos/codegen.

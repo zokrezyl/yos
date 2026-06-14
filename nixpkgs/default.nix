@@ -90,6 +90,7 @@ let
   unibilium    = pkgs.callPackage ./pkgs/unibilium    { inherit buildRecipe; };
   tree-sitter  = pkgs.callPackage ./pkgs/tree-sitter  { inherit buildRecipe; };
   libvterm     = pkgs.callPackage ./pkgs/libvterm     { inherit buildRecipe; };
+  libevent     = pkgs.callPackage ./pkgs/libevent     { inherit buildRecipe; };
 
   # Lua-side bindings (depend on lua / libuv).
   lpeg         = pkgs.callPackage ./pkgs/lpeg         { inherit buildRecipe lua; };
@@ -121,6 +122,12 @@ let
   # via the standard buildRecipe pattern. Each carries its own
   # build-tools/wasm-pkg/configs/<name>/build.sh recipe.
   zsh = pkgs.callPackage ./pkgs/zsh { inherit buildRecipe; };
+
+  # tmux — terminal multiplexer. autoconf cross-build to wasm32; depends
+  # on our wasm libevent (event loop) and a minimal terminfo/curses stub
+  # the recipe compiles in (same approach zsh uses for termcap). Output:
+  # $out/bin/tmux.wasm.
+  tmux = pkgs.callPackage ./pkgs/tmux { inherit buildRecipe libevent; };
 
   # CPython 3.12 wasm — DISABLED. The compile-to-wasm path has expat
   # FASTCALL collisions vs our -D__i386__=1 (build-tools/wasm-pkg/
@@ -222,7 +229,7 @@ let
   # sandbox boundary.
   all = pkgs.symlinkJoin {
     name = "yos-all";
-    paths = [ yos zsh nvim freebsd-tools openssh perf-stress runit telnetd yos-tcpserver ytrace-wasm yperf-wasm yctl-wasm yctl-host ];  # cpython disabled — see above
+    paths = [ yos zsh tmux nvim freebsd-tools openssh perf-stress runit telnetd yos-tcpserver ytrace-wasm yperf-wasm yctl-wasm yctl-host ];  # cpython disabled — see above
     postBuild = ''
       cat > $out/bin/yos-shell <<RUNNER_EOF
       #!/usr/bin/env bash
@@ -299,10 +306,10 @@ let
   };
 in {
   inherit yos sysroot toolchain freebsd-src buildRecipe buildFreebsdTool
-          lua libuv msgpack-c unibilium tree-sitter libvterm
+          lua libuv msgpack-c unibilium tree-sitter libvterm libevent
           lpeg lua-mpack luv nvim
           freebsd-tools
-          zsh  # cpython disabled — see above
+          zsh tmux  # cpython disabled — see above
           zlib openssl openssh
           perf-stress
           runit

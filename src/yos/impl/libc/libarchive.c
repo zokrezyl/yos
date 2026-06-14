@@ -49,6 +49,29 @@
 #include "yos/types.h"
 #include <yos/ytrace/ytrace.h>
 
+/* ── yos subsystem entry points (impl/io) ────────────────────────────
+ * Declared here the same way the sibling bridges do (posix.c, pwd.c):
+ * the host build links these from impl/io, we just forward-declare the
+ * prototypes we use rather than pull in an internal header. These are
+ * what keep guest paths/fds from reaching host libarchive directly —
+ * yos_open honours ctx->cwd + the VFS mount table + fake fifo/pty
+ * routing; yos_fd_get translates a guest fd to the host fd it owns. */
+extern int32_t yos_open    (struct yos_exec_ctx *ctx, uint32_t path,
+                            int32_t flags, int32_t mode);
+extern int32_t yos_read    (struct yos_exec_ctx *ctx, int32_t fd,
+                            uint32_t buf, uint32_t count);
+extern int32_t yos_fd_get  (struct yos_exec_ctx *ctx, int32_t wfd);
+extern int32_t yos_fd_close(struct yos_exec_ctx *ctx, int32_t wfd);
+/* Guest-heap allocator — used to carve a read-scratch region inside the
+ * guest's own linear memory so the archive read callback can route bytes
+ * through yos_read (virtual-fd aware) instead of a raw host read(). */
+extern uint32_t yos_malloc (struct yos_exec_ctx *ctx, uint32_t size);
+extern void     yos_free   (struct yos_exec_ctx *ctx, uint32_t off);
+
+/* FreeBSD O_RDONLY — yos_open takes FreeBSD oflags and remaps them to
+ * the host's. 0 on every BSD/Linux flavour; spelled out for clarity. */
+#define YOS_ARC_O_RDONLY 0x0000
+
 /* ── host libarchive forward decls ───────────────────────────────────
  * Declared here rather than via <archive.h> so the host build needs
  * only the shared library (-larchive), not libarchive's -dev headers
@@ -62,9 +85,22 @@ extern int   archive_read_support_format_empty(struct archive *);
 extern int   archive_read_support_format_raw(struct archive *);
 extern int   archive_read_support_filter_all(struct archive *);
 extern int   archive_read_open_memory(struct archive *, const void *, size_t);
-extern int   archive_read_open_filename(struct archive *, const char *, size_t);
 extern int   archive_read_close(struct archive *);
 extern int64_t archive_read_data_into_fd(struct archive *, int);
+
+/* Callback-based open. We use this instead of archive_read_open_filename
+ * so the bytes come from a yos-opened fd (cwd/VFS/path-translation
+ * honoured) rather than a guest path handed straight to host libarchive.
+ * la_int64_t / la_ssize_t are 64-bit on every host we target. */
+typedef int64_t la_arc_read_cb(struct archive *, void *client,
+                               const void **buffer);
+typedef int64_t la_arc_skip_cb(struct archive *, void *client,
+                               int64_t request);
+typedef int     la_arc_open_cb(struct archive *, void *client);
+typedef int     la_arc_close_cb(struct archive *, void *client);
+extern int   archive_read_open2(struct archive *, void *client,
+                                la_arc_open_cb *, la_arc_read_cb *,
+                                la_arc_skip_cb *, la_arc_close_cb *);
 extern const char *archive_version_details(void);
 extern int   archive_read_next_header(struct archive *, struct archive_entry **);
 extern int64_t archive_read_data(struct archive *, void *, size_t);
@@ -81,15 +117,35 @@ extern int   archive_entry_filetype(struct archive_entry *);
 #define YOS_ARC_HANDLES_INIT 16
 #define YOS_ARC_HANDLES_GROW 16
 
-/* ── handle table (struct archive * and struct archive_entry *) ─────── */
+/* Slot kind tags (ctx->arc_handle_kinds[]). archive and entry pointers
+ * share one table, but teardown must free only the archives — an entry
+ * pointer is owned by its parent archive and freeing it directly would
+ * double-free. */
+enum {
+    YOS_ARC_KIND_EMPTY   = 0,
+    YOS_ARC_KIND_ARCHIVE = 1,
+    YOS_ARC_KIND_ENTRY   = 2,
+};
+
+/* ── handle table (struct archive * and struct archive_entry *) ───────
+ * Three parallel arrays indexed 1..cap-1 (slot 0 reserved): the pointer,
+ * its kind, and — for ENTRY slots — the archive handle that owns it (so
+ * freeing an archive can invalidate its dangling entries). */
 
 static int arc_handles_reserve(struct yos_exec_ctx *ctx)
 {
     if (ctx->arc_handles_cap == 0) {
         size_t cap = YOS_ARC_HANDLES_INIT;
         void **slots = calloc(cap, sizeof(void *));
-        if (!slots) return -1;
+        uint8_t *kinds = calloc(cap, sizeof(uint8_t));
+        uint32_t *owner = calloc(cap, sizeof(uint32_t));
+        if (!slots || !kinds || !owner) {
+            free(slots); free(kinds); free(owner);
+            return -1;
+        }
         ctx->arc_handles = slots;
+        ctx->arc_handle_kinds = kinds;
+        ctx->arc_handle_owner = owner;
         ctx->arc_handles_cap = (uint32_t)cap;
     }
     for (uint32_t i = 1; i < ctx->arc_handles_cap; ++i)
@@ -97,37 +153,67 @@ static int arc_handles_reserve(struct yos_exec_ctx *ctx)
     size_t newcap = (size_t)ctx->arc_handles_cap + YOS_ARC_HANDLES_GROW;
     void **next = realloc(ctx->arc_handles, newcap * sizeof(void *));
     if (!next) return -1;
+    ctx->arc_handles = next;
+    uint8_t *next_kinds = realloc(ctx->arc_handle_kinds,
+                                  newcap * sizeof(uint8_t));
+    if (!next_kinds) return -1;
+    ctx->arc_handle_kinds = next_kinds;
+    uint32_t *next_owner = realloc(ctx->arc_handle_owner,
+                                   newcap * sizeof(uint32_t));
+    if (!next_owner) return -1;
+    ctx->arc_handle_owner = next_owner;
     memset(next + ctx->arc_handles_cap, 0,
            (newcap - ctx->arc_handles_cap) * sizeof(void *));
-    ctx->arc_handles = next;
+    memset(next_kinds + ctx->arc_handles_cap, 0,
+           (newcap - ctx->arc_handles_cap) * sizeof(uint8_t));
+    memset(next_owner + ctx->arc_handles_cap, 0,
+           (newcap - ctx->arc_handles_cap) * sizeof(uint32_t));
     ctx->arc_handles_cap = (uint32_t)newcap;
     return 0;
 }
 
-static uint32_t arc_handles_wrap(struct yos_exec_ctx *ctx, void *p)
+static uint32_t arc_handles_wrap(struct yos_exec_ctx *ctx, void *p,
+                                 uint8_t kind, uint32_t owner)
 {
     if (!p) return 0;
     if (arc_handles_reserve(ctx) < 0) return 0;
     for (uint32_t i = 1; i < ctx->arc_handles_cap; ++i)
-        if (!ctx->arc_handles[i]) { ctx->arc_handles[i] = p; return i; }
+        if (!ctx->arc_handles[i]) {
+            ctx->arc_handles[i] = p;
+            ctx->arc_handle_kinds[i] = kind;
+            ctx->arc_handle_owner[i] = owner;
+            return i;
+        }
     return 0;
 }
 
 /* Wrap p, reusing an existing handle if p is already in the table.
  * archive_read_next_header reuses one internal archive_entry across
- * calls, so without this the table would grow one slot per entry. */
-static uint32_t arc_handles_wrap_unique(struct yos_exec_ctx *ctx, void *p)
+ * calls, so without this the table would grow one slot per entry. The
+ * owner is refreshed so the slot always points at the live archive. */
+static uint32_t arc_handles_wrap_unique(struct yos_exec_ctx *ctx, void *p,
+                                        uint8_t kind, uint32_t owner)
 {
     if (!p) return 0;
     for (uint32_t i = 1; i < ctx->arc_handles_cap; ++i)
-        if (ctx->arc_handles[i] == p) return i;
-    return arc_handles_wrap(ctx, p);
+        if (ctx->arc_handles[i] == p) {
+            ctx->arc_handle_kinds[i] = kind;
+            ctx->arc_handle_owner[i] = owner;
+            return i;
+        }
+    return arc_handles_wrap(ctx, p, kind, owner);
 }
 
-static void *arc_handles_resolve(struct yos_exec_ctx *ctx, uint32_t h)
+/* Resolve a handle ONLY if it is of the expected kind. A guest that
+ * passes an entry handle where an archive is expected (or vice versa, or
+ * a handle whose owning archive was already freed) gets NULL — never a
+ * cross-type pointer cast. */
+static void *arc_handles_resolve_kind(struct yos_exec_ctx *ctx, uint32_t h,
+                                      uint8_t kind)
 {
     if (!ctx || !ctx->arc_handles || h == 0 || h >= ctx->arc_handles_cap)
         return NULL;
+    if (ctx->arc_handle_kinds[h] != kind) return NULL;
     return ctx->arc_handles[h];
 }
 
@@ -137,7 +223,28 @@ static void *arc_handles_release(struct yos_exec_ctx *ctx, uint32_t h)
         return NULL;
     void *p = ctx->arc_handles[h];
     ctx->arc_handles[h] = NULL;
+    ctx->arc_handle_kinds[h] = YOS_ARC_KIND_EMPTY;
+    ctx->arc_handle_owner[h] = 0;
     return p;
+}
+
+/* Release an archive slot AND invalidate every entry slot it owns — the
+ * entry pointers belong to the archive and dangle once it is freed.
+ * Returns the archive pointer, or NULL if h is not a live archive slot
+ * (so the caller never frees an entry handle as an archive). */
+static struct archive *arc_release_archive(struct yos_exec_ctx *ctx, uint32_t h)
+{
+    void *p = arc_handles_resolve_kind(ctx, h, YOS_ARC_KIND_ARCHIVE);
+    if (!p) return NULL;
+    for (uint32_t i = 1; i < ctx->arc_handles_cap; ++i)
+        if (ctx->arc_handle_kinds[i] == YOS_ARC_KIND_ENTRY &&
+            ctx->arc_handle_owner[i] == h) {
+            ctx->arc_handles[i] = NULL;
+            ctx->arc_handle_kinds[i] = YOS_ARC_KIND_EMPTY;
+            ctx->arc_handle_owner[i] = 0;
+        }
+    arc_handles_release(ctx, h);
+    return (struct archive *)p;
 }
 
 /* ── guest-memory helpers ───────────────────────────────────────────── */
@@ -189,8 +296,8 @@ static uint32_t guest_stash_string(struct yos_exec_ctx *ctx, const char *s)
  * Reusable shorthands: A(slot) resolves an archive handle, E(slot) an
  * entry handle (same table). For "i(...)"/"I(...)" sigs args begin at
  * _sp[1]; the result is written to _sp[0]. */
-#define A(slot) ((struct archive *)arc_handles_resolve(CTX(rt), (uint32_t)_sp[slot]))
-#define E(slot) ((struct archive_entry *)arc_handles_resolve(CTX(rt), (uint32_t)_sp[slot]))
+#define A(slot) ((struct archive *)arc_handles_resolve_kind(CTX(rt), (uint32_t)_sp[slot], YOS_ARC_KIND_ARCHIVE))
+#define E(slot) ((struct archive_entry *)arc_handles_resolve_kind(CTX(rt), (uint32_t)_sp[slot], YOS_ARC_KIND_ENTRY))
 
 /* env.archive_read_new — i(). Returns an i32 handle (0 on failure). */
 static const void *m3_yos_archive_read_new(IM3Runtime rt, IM3ImportContext _c,
@@ -198,7 +305,7 @@ static const void *m3_yos_archive_read_new(IM3Runtime rt, IM3ImportContext _c,
 {
     (void)_c; (void)_m;
     struct archive *a = archive_read_new();
-    _sp[0] = (uint64_t)arc_handles_wrap(CTX(rt), a);
+    _sp[0] = (uint64_t)arc_handles_wrap(CTX(rt), a, YOS_ARC_KIND_ARCHIVE, 0);
     return NULL;
 }
 
@@ -242,11 +349,65 @@ static const void *m3_yos_archive_read_support_filter_all(IM3Runtime rt,
     return NULL;
 }
 
+/* ── yos-fd-backed read client for archive_read_open2 ────────────────
+ * archive_read_open_filename would hand a guest path straight to host
+ * libarchive, bypassing ctx->cwd, the VFS mount table, fake fifo/pty
+ * routing and platform path translation — and a guest fd is not a host
+ * fd. Instead we open the path through yos_open (full yos semantics),
+ * then feed libarchive from that yos fd via these callbacks. The client
+ * owns a host-side read buffer and is freed in the close callback
+ * (which libarchive invokes exactly once, on close or free — so a
+ * leaked archive freed at teardown also releases the client). */
+#define YOS_ARC_SCRATCH_LEN 65536u
+
+struct yos_arc_file_client {
+    struct yos_exec_ctx *ctx;
+    int32_t  wfd;            /* yos wasm fd backing the archive          */
+    int      owns_fd;        /* did WE open wfd? (vs a borrowed std fd)  */
+    uint32_t scratch_off;    /* guest-memory read scratch (yos_malloc'd) */
+    uint32_t scratch_len;
+};
+
+/* Read callback: route bytes through yos_read so the full yos fd model
+ * applies — virtual fds (procfs etc.), fd translation, signal pumping —
+ * instead of a raw host read() on a translated host fd. We read into a
+ * scratch region of the guest's OWN linear memory and hand libarchive a
+ * pointer into it (ctx->memory is host-addressable). */
+static int64_t arc_file_read(struct archive *a, void *client,
+                             const void **buffer)
+{
+    (void)a;
+    struct yos_arc_file_client *fc = client;
+    if (!fc->scratch_off) return -1;
+    int32_t n = yos_read(fc->ctx, fc->wfd, fc->scratch_off, fc->scratch_len);
+    if (n < 0) return -1;                 /* yos_read returns -errno      */
+    *buffer = fc->ctx->memory + fc->scratch_off;
+    return (int64_t)n;                    /* 0 == EOF                      */
+}
+
+static int arc_file_close(struct archive *a, void *client)
+{
+    (void)a;
+    struct yos_arc_file_client *fc = client;
+    if (fc) {
+        if (fc->scratch_off) yos_free(fc->ctx, fc->scratch_off);
+        /* Only close a fd we opened ourselves; never a borrowed std
+         * stream (the NULL-filename=stdin path). The explicit owns_fd
+         * flag — not a wfd>2 guess — is authoritative even if yos_open
+         * ever recycles a low fd number. */
+        if (fc->owns_fd && fc->wfd >= 0) yos_fd_close(fc->ctx, fc->wfd);
+        free(fc);
+    }
+    return 0; /* ARCHIVE_OK */
+}
+
 /* env.archive_read_open_filename — i(a, filename_off, block_size).
- * A 0 offset means NULL = read stdin. The host opens the path through
- * host libc; for yos's passthrough filesystem that is the same file
- * the guest sees. (fd-table/vfs-routed open via a read callback is a
- * later refinement; the passthrough path is correct for real files.) */
+ * A 0 offset means NULL = stdin (wasm fd 0). block_size is ignored: our
+ * read callback supplies its own guest-memory scratch. The guest path is
+ * opened through yos_open so cwd/VFS/fake-device routing all apply, and
+ * the archive is fed via yos_read — it never sees a raw guest path or a
+ * raw host fd. Skip is left NULL so libarchive read-skips through the
+ * same yos_read path rather than seeking a host fd behind yos's back. */
 static const void *m3_yos_archive_read_open_filename(IM3Runtime rt,
         IM3ImportContext _c, uint64_t *_sp, void *_m)
 {
@@ -254,10 +415,44 @@ static const void *m3_yos_archive_read_open_filename(IM3Runtime rt,
     struct yos_exec_ctx *ctx = CTX(rt);
     struct archive *a = A(1);
     uint32_t fn_off = (uint32_t)_sp[2];
-    size_t block = (size_t)(uint32_t)_sp[3];
-    const char *fn = fn_off ? guest_str(ctx, fn_off) : NULL;
     if (!a) { _sp[0] = (uint64_t)(uint32_t)-1; return NULL; }
-    _sp[0] = (uint64_t)(uint32_t)archive_read_open_filename(a, fn, block);
+
+    int32_t wfd;
+    int owns_fd;
+    if (fn_off == 0) {
+        wfd = 0;        /* NULL filename → borrow the guest's stdin */
+        owns_fd = 0;
+    } else {
+        /* Validate the guest string is bounded before yos_open walks
+         * it (yos_open re-validates, but reject here so a bad pointer
+         * never reaches the open path). */
+        if (!guest_str(ctx, fn_off)) { _sp[0] = (uint64_t)(uint32_t)-1; return NULL; }
+        wfd = yos_open(ctx, fn_off, YOS_ARC_O_RDONLY, 0);
+        if (wfd < 0) { _sp[0] = (uint64_t)(uint32_t)-1; return NULL; }
+        owns_fd = 1;
+    }
+
+    struct yos_arc_file_client *fc = calloc(1, sizeof *fc);
+    uint32_t scratch = fc ? yos_malloc(ctx, YOS_ARC_SCRATCH_LEN) : 0;
+    if (!fc || !scratch) {
+        if (scratch) yos_free(ctx, scratch);
+        free(fc);
+        if (owns_fd) yos_fd_close(ctx, wfd);
+        _sp[0] = (uint64_t)(uint32_t)-1;
+        return NULL;
+    }
+    fc->ctx = ctx;
+    fc->wfd = wfd;
+    fc->owns_fd = owns_fd;
+    fc->scratch_off = scratch;
+    fc->scratch_len = YOS_ARC_SCRATCH_LEN;
+
+    int r = archive_read_open2(a, fc, NULL, arc_file_read, NULL,
+                               arc_file_close);
+    /* On failure libarchive still invokes arc_file_close (freeing fc,
+     * the scratch and the fd); on success it owns fc until close/free.
+     * Either way we must not touch fc again here. */
+    _sp[0] = (uint64_t)(uint32_t)r;
     return NULL;
 }
 
@@ -272,15 +467,20 @@ static const void *m3_yos_archive_read_close(IM3Runtime rt,
 }
 
 /* env.archive_read_data_into_fd — I(a, fd). Streams the current
- * entry's data straight to a (guest == host, for std streams) fd.
- * Returns ARCHIVE_OK/_FATAL etc. as an int64. */
+ * entry's data to a fd. The guest passes a yos wasm fd, which is NOT a
+ * host fd — translate it through yos_fd_get before handing it to host
+ * libarchive. Returns ARCHIVE_OK/_FATAL etc. as an int64. */
 static const void *m3_yos_archive_read_data_into_fd(IM3Runtime rt,
         IM3ImportContext _c, uint64_t *_sp, void *_m)
 {
     (void)_c; (void)_m;
+    struct yos_exec_ctx *ctx = CTX(rt);
     struct archive *a = A(1);
-    int fd = (int)_sp[2];
-    _sp[0] = (uint64_t)(a ? archive_read_data_into_fd(a, fd) : -1);
+    int32_t wfd = (int32_t)_sp[2];
+    if (!a) { _sp[0] = (uint64_t)(int64_t)-1; return NULL; }
+    int hfd = yos_fd_get(ctx, wfd);
+    if (hfd < 0) { _sp[0] = (uint64_t)(int64_t)-1; return NULL; }
+    _sp[0] = (uint64_t)archive_read_data_into_fd(a, hfd);
     return NULL;
 }
 
@@ -320,13 +520,17 @@ static const void *m3_yos_archive_read_next_header(IM3Runtime rt,
 {
     (void)_c; (void)_m;
     struct yos_exec_ctx *ctx = CTX(rt);
+    uint32_t arc_handle = (uint32_t)_sp[1];
     struct archive *a = A(1);
     uint32_t slot_off = (uint32_t)_sp[2];
     if (!a) { _sp[0] = (uint64_t)(uint32_t)-1; return NULL; }
     struct archive_entry *e = NULL;
     int r = archive_read_next_header(a, &e);
     if (r == 0 && e) {
-        uint32_t h = arc_handles_wrap_unique(ctx, e);
+        /* Tag the entry with its owning archive handle so freeing the
+         * archive invalidates it (the entry pointer is the archive's). */
+        uint32_t h = arc_handles_wrap_unique(ctx, e, YOS_ARC_KIND_ENTRY,
+                                             arc_handle);
         uint32_t *slot = (uint32_t *)guest_buf_rw(ctx, slot_off,
                                                   sizeof(uint32_t));
         if (slot) *slot = h;
@@ -361,14 +565,16 @@ static const void *m3_yos_archive_read_data_skip(IM3Runtime rt,
     return NULL;
 }
 
-/* env.archive_read_free — i(a). Releases the handle too. */
+/* env.archive_read_free — i(a). Releases the handle and invalidates any
+ * entry handles it owns. arc_release_archive refuses a non-archive
+ * handle, so a guest that passes an entry (or stale) handle here gets a
+ * no-op instead of an entry pointer cast to struct archive * and freed. */
 static const void *m3_yos_archive_read_free(IM3Runtime rt,
         IM3ImportContext _c, uint64_t *_sp, void *_m)
 {
     (void)_c; (void)_m;
     struct yos_exec_ctx *ctx = CTX(rt);
-    struct archive *a = (struct archive *)arc_handles_release(ctx,
-                                                       (uint32_t)_sp[1]);
+    struct archive *a = arc_release_archive(ctx, (uint32_t)_sp[1]);
     _sp[0] = (uint64_t)(uint32_t)(a ? archive_read_free(a) : 0);
     return NULL;
 }
@@ -431,12 +637,29 @@ static const void *m3_yos_archive_entry_filetype(IM3Runtime rt,
 /* ── teardown ───────────────────────────────────────────────────────
  * Free any archive handles the guest leaked (didn't archive_read_free)
  * and drop the table. archive_entry pointers are owned by their parent
- * archive, so freeing the archives is enough; we just NULL the slots. */
+ * archive, so we free ONLY the slots tagged YOS_ARC_KIND_ARCHIVE;
+ * freeing an entry pointer directly would double-free. archive_read_free
+ * also runs the registered close callback, releasing any yos fd /
+ * read-client backing a filename-opened archive. */
 void yos_libarchive_ctx_free(struct yos_exec_ctx *ctx)
 {
     if (!ctx || !ctx->arc_handles) return;
+    if (ctx->arc_handle_kinds) {
+        for (uint32_t i = 1; i < ctx->arc_handles_cap; ++i) {
+            if (ctx->arc_handles[i] &&
+                ctx->arc_handle_kinds[i] == YOS_ARC_KIND_ARCHIVE) {
+                archive_read_free((struct archive *)ctx->arc_handles[i]);
+                ctx->arc_handles[i] = NULL;
+                ctx->arc_handle_kinds[i] = YOS_ARC_KIND_EMPTY;
+            }
+        }
+    }
     free(ctx->arc_handles);
+    free(ctx->arc_handle_kinds);
+    free(ctx->arc_handle_owner);
     ctx->arc_handles = NULL;
+    ctx->arc_handle_kinds = NULL;
+    ctx->arc_handle_owner = NULL;
     ctx->arc_handles_cap = 0;
 }
 

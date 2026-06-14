@@ -2271,6 +2271,17 @@ int main(int argc, char **argv)
             ctx.pthread_host = NULL;
         }
 
+        /* execve replaces the image but keeps ctx: release any archive
+         * handles the old image leaked (frees host archives + their yos
+         * fds/scratch) and reset the table before the new program runs,
+         * while the old linear memory + fd table are still valid. */
+#ifdef YOS_HAVE_LIBARCHIVE
+        {
+            extern void yos_libarchive_ctx_free(struct yos_exec_ctx *);
+            yos_libarchive_ctx_free(&ctx);
+        }
+#endif
+
         m3_FreeRuntime(ctx.runtime);
         free(wasm_bytes);
 
@@ -2347,6 +2358,15 @@ int main(int argc, char **argv)
         }
         pthread_mutex_unlock(&g_runtime.proc_lock);
     }
+
+    /* Release any archive handles the guest leaked before the runtime
+     * (and the linear memory the read clients point into) is freed. */
+#ifdef YOS_HAVE_LIBARCHIVE
+    {
+        extern void yos_libarchive_ctx_free(struct yos_exec_ctx *);
+        yos_libarchive_ctx_free(&ctx);
+    }
+#endif
 
     m3_FreeRuntime(ctx.runtime);
     m3_FreeEnvironment(env);

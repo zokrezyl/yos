@@ -38,9 +38,11 @@ static uint32_t find_free_region(struct yos_exec_ctx *ctx, uint32_t len)
     return addr;
 }
 
-/* Add region to ctx's free list. Caller must hold ctx->mem_lock. */
-static void add_free_region(struct yos_exec_ctx *ctx, uint32_t addr, uint32_t len)
+/* Append a region to the free list verbatim, no coalescing. Caller must
+ * hold ctx->mem_lock. */
+static void free_list_push_raw(struct yos_exec_ctx *ctx, uint32_t addr, uint32_t len)
 {
+    if (len == 0) return;
     if (ctx->free_count >= YOS_MAX_FREE_REGIONS) {
         /* List full, drop oldest */
         ctx->free_list[0] = ctx->free_list[--ctx->free_count];
@@ -48,6 +50,129 @@ static void add_free_region(struct yos_exec_ctx *ctx, uint32_t addr, uint32_t le
     ctx->free_list[ctx->free_count].addr = addr;
     ctx->free_list[ctx->free_count].len = len;
     ctx->free_count++;
+}
+
+/* Add a region to ctx's free list, coalescing with any adjacent regions
+ * first. Without coalescing, repeated map/unmap of neighbouring blocks
+ * fragments the tiny wasm address space and eventually overflows the
+ * fixed free_list (dropping live free space on the floor). Caller must
+ * hold ctx->mem_lock. */
+static void add_free_region(struct yos_exec_ctx *ctx, uint32_t addr, uint32_t len)
+{
+    if (len == 0) return;
+    /* Merge with adjacent free regions. Repeat until no more merges so a
+     * freshly-freed block can bridge two existing ones into a single
+     * larger region. */
+    int merged = 1;
+    while (merged) {
+        merged = 0;
+        for (int i = 0; i < ctx->free_count; i++) {
+            uint32_t region_addr = ctx->free_list[i].addr;
+            uint32_t region_len  = ctx->free_list[i].len;
+            if (region_addr + region_len == addr) {        /* existing ends at new */
+                addr = region_addr;
+                len += region_len;
+            } else if (addr + len == region_addr) {        /* new ends at existing */
+                len += region_len;
+            } else {
+                continue;
+            }
+            ctx->free_list[i] = ctx->free_list[--ctx->free_count];
+            merged = 1;
+            break;
+        }
+    }
+    free_list_push_raw(ctx, addr, len);
+}
+
+/* Remove [addr, addr+len) from the free list, splitting any region that
+ * partially overlaps so its non-overlapping remainder(s) stay free. Used
+ * by MAP_FIXED so a fixed mapping that lands on previously-freed space
+ * can't later be handed out a second time by find_free_region. Caller
+ * must hold ctx->mem_lock. */
+static void carve_free_range(struct yos_exec_ctx *ctx, uint32_t addr, uint32_t len)
+{
+    uint64_t end = (uint64_t)addr + len;
+    for (int i = 0; i < ctx->free_count; ) {
+        uint32_t region_addr = ctx->free_list[i].addr;
+        uint32_t region_len  = ctx->free_list[i].len;
+        uint64_t region_end  = (uint64_t)region_addr + region_len;
+        if (region_end <= addr || region_addr >= end) { i++; continue; }
+        /* Overlap: drop region i (swap-remove), re-add the remainders. */
+        ctx->free_list[i] = ctx->free_list[--ctx->free_count];
+        if (region_addr < addr)
+            free_list_push_raw(ctx, region_addr, addr - region_addr);
+        if (region_end > end)
+            free_list_push_raw(ctx, (uint32_t)end, (uint32_t)(region_end - end));
+        /* slot i now holds a swapped-in region — re-examine it */
+    }
+}
+
+/* Does [addr, addr+len) touch any region currently on the free list?
+ * Used to make munmap idempotent — a second munmap of an already-freed
+ * range must NOT push a duplicate free region (which would let
+ * find_free_region hand the same address out twice). Caller holds
+ * ctx->mem_lock. */
+static int range_overlaps_free(struct yos_exec_ctx *ctx, uint32_t addr, uint32_t len)
+{
+    uint64_t end = (uint64_t)addr + len;
+    for (int i = 0; i < ctx->free_count; i++) {
+        uint64_t region_addr = ctx->free_list[i].addr;
+        uint64_t region_end  = region_addr + ctx->free_list[i].len;
+        if (region_addr < end && addr < region_end) return 1;
+    }
+    return 0;
+}
+
+/* Record [addr, addr+len) as a live (owned) mapping. Best-effort: on
+ * overflow the mapping just isn't tracked — no corruption, since the
+ * free-list double-free guard is the hard invariant and munmap of an
+ * untracked-but-live range still frees correctly. Caller holds mem_lock. */
+static void live_add(struct yos_exec_ctx *ctx, uint32_t addr, uint32_t len)
+{
+    if (len == 0) return;
+    if (ctx->live_count >= YOS_MAX_LIVE_REGIONS) {
+        ydebug("mmap: live-region table full, not tracking 0x%x+0x%x\n", addr, len);
+        return;
+    }
+    ctx->live_list[ctx->live_count].addr = addr;
+    ctx->live_list[ctx->live_count].len = len;
+    ctx->live_count++;
+}
+
+/* Drop [addr, addr+len) from the live list, splitting any region that
+ * only partially overlaps so the surviving remainder(s) stay tracked.
+ * Used by munmap (the range is being freed) and by MAP_FIXED (the range
+ * is being re-owned, i.e. the old live mapping is replaced). Caller holds
+ * mem_lock. */
+static void live_remove(struct yos_exec_ctx *ctx, uint32_t addr, uint32_t len)
+{
+    uint64_t end = (uint64_t)addr + len;
+    for (int i = 0; i < ctx->live_count; ) {
+        uint32_t region_addr = ctx->live_list[i].addr;
+        uint32_t region_len  = ctx->live_list[i].len;
+        uint64_t region_end  = (uint64_t)region_addr + region_len;
+        if (region_end <= addr || region_addr >= end) { i++; continue; }
+        ctx->live_list[i] = ctx->live_list[--ctx->live_count];
+        if (region_addr < addr)
+            live_add(ctx, region_addr, addr - region_addr);
+        if (region_end > end)
+            live_add(ctx, (uint32_t)end, (uint32_t)(region_end - end));
+        /* slot i now holds a swapped-in region — re-examine it */
+    }
+}
+
+/* Does [addr, addr+len) touch any live mapping? Lets MAP_FIXED tell a
+ * live range apart from a hole. Caller holds mem_lock. */
+static int range_overlaps_live(struct yos_exec_ctx *ctx, uint32_t addr, uint32_t len)
+{
+    uint64_t end = (uint64_t)addr + len;
+    for (int i = 0; i < ctx->live_count; i++) {
+        uint64_t region_addr = ctx->live_list[i].addr;
+        uint64_t region_end  = region_addr + ctx->live_list[i].len;
+        if (region_addr < end && addr < region_end) return 1;
+    }
+    return 0;
 }
 
 int32_t yos_brk(struct yos_exec_ctx *ctx, uint32_t addr)
@@ -103,14 +228,28 @@ int32_t yos_munmap(struct yos_exec_ctx *ctx, uint32_t addr, uint32_t len)
         return -EINVAL;
     }
 
+    pthread_mutex_lock(&ctx->mem_lock);
+
+    /* Idempotent: if the range is already (partly) on the free list this
+     * is a double-unmap. Pushing it again would create a duplicate free
+     * region and let find_free_region hand the same address out twice.
+     * POSIX makes munmap of an unmapped range a successful no-op, so
+     * return 0 without touching the lists. */
+    if (range_overlaps_free(ctx, addr, (uint32_t)aligned)) {
+        pthread_mutex_unlock(&ctx->mem_lock);
+        ydebug("munmap(0x%x, 0x%x) -> 0 (already unmapped)\n",
+               addr, (uint32_t)aligned);
+        return 0;
+    }
+
     ydebug("munmap(0x%x, 0x%x) -> 0\n", addr, (uint32_t)aligned);
 
-    /* Zero out the memory region. */
+    /* Zero the region, drop our ownership of it, and return it to the
+     * free list (coalescing with neighbours). */
     memset(ctx->memory + addr, 0, (size_t)aligned);
-
-    /* Add to free list for reuse */
-    pthread_mutex_lock(&ctx->mem_lock);
+    live_remove(ctx, addr, (uint32_t)aligned);
     add_free_region(ctx, addr, (uint32_t)aligned);
+
     pthread_mutex_unlock(&ctx->mem_lock);
 
     return 0;
@@ -217,12 +356,45 @@ int32_t yos_mmap2(struct yos_exec_ctx *ctx, uint32_t addr, uint32_t length,
     }
     length = (uint32_t)aligned;
 
-    /* MAP_FIXED: use the requested address if it fits in memory */
+    /* MAP_FIXED: use the requested address if it fits in memory. */
     if ((flags & MAP_FIXED) && addr != 0) {
         if ((uint64_t)addr + (uint64_t)length > ctx->memory_size) {
             ydebug("mmap2: MAP_FIXED addr=0x%x len=0x%x -> ENOMEM\n", addr, length);
             return -ENOMEM;
         }
+
+        pthread_mutex_lock(&ctx->mem_lock);
+
+        /* Refuse a fixed mapping that overlaps the live brk heap
+         * [0, heap_end). The old code blindly zeroed the range, which
+         * silently clobbered heap data the guest still owned. */
+        if (addr < ctx->heap_end) {
+            pthread_mutex_unlock(&ctx->mem_lock);
+            ydebug("mmap2: MAP_FIXED addr=0x%x len=0x%x overlaps heap_end=0x%x -> EINVAL\n",
+                   addr, length, ctx->heap_end);
+            return -EINVAL;
+        }
+
+        /* Take ownership of the range. If it lands on a live mapping we
+         * are replacing it (POSIX MAP_FIXED semantics) — drop the old
+         * ownership; if it lands on a hole, carve it out of the free
+         * list. Either way record the new live region and push mmap_top
+         * past it so neither find_free_region nor the bump allocator can
+         * hand the same bytes out again. */
+        if (range_overlaps_live(ctx, addr, length))
+            ydebug("mmap2: MAP_FIXED 0x%x+0x%x replaces a live mapping\n",
+                   addr, length);
+        live_remove(ctx, addr, length);
+        carve_free_range(ctx, addr, length);
+        live_add(ctx, addr, length);
+        if (ctx->mmap_top == 0)
+            ctx->mmap_top = ctx->memory_size / 2;
+        uint64_t fixed_end = (uint64_t)addr + (uint64_t)length;
+        if (fixed_end > ctx->mmap_top)
+            ctx->mmap_top = (uint32_t)fixed_end;
+
+        pthread_mutex_unlock(&ctx->mem_lock);
+
         /* anonymous mmap must return zeroed memory */
         memset(ctx->memory + addr, 0, length);
         ydebug("mmap2: MAP_FIXED addr=0x%x len=0x%x -> 0x%x\n", addr, length, addr);
@@ -234,6 +406,7 @@ int32_t yos_mmap2(struct yos_exec_ctx *ctx, uint32_t addr, uint32_t length,
     /* Try to reuse a freed region first */
     uint32_t result = find_free_region(ctx, length);
     if (result) {
+        live_add(ctx, result, length);
         pthread_mutex_unlock(&ctx->mem_lock);
         /* Reusing freed region - already zeroed by munmap */
         ydebug("mmap2: length=0x%x -> 0x%x (reused)\n", length, result);
@@ -262,6 +435,7 @@ int32_t yos_mmap2(struct yos_exec_ctx *ctx, uint32_t addr, uint32_t length,
     }
 
     ctx->mmap_top = (uint32_t)new_end;
+    live_add(ctx, result, length);
     pthread_mutex_unlock(&ctx->mem_lock);
 
     /* anonymous mmap must return zeroed memory */
