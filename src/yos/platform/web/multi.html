@@ -1,8 +1,7 @@
 <!doctype html>
 <meta charset="utf-8" />
 <title>yos — multiple shells (a poor-man's multiplexer)</title>
-<link rel="stylesheet" crossorigin="anonymous"
-      href="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/css/xterm.min.css" />
+<link rel="stylesheet" href="./vendor/xterm.min.css" />
 <style>
   html, body { height: 100%; margin: 0; background: #06090c; }
   body { display: grid; grid-template-columns: 1fr 1fr; grid-template-rows: 1fr 1fr; gap: 2px; padding: 2px; box-sizing: border-box; }
@@ -15,7 +14,7 @@
 <div class="pane" id="p1"><span class="title">pane 1 — watch with ps / ls here</span><div class="term"></div></div>
 <div class="pane" id="p2"><span class="title">pane 2</span><div class="term"></div></div>
 <div class="pane" id="p3"><span class="title">pane 3</span><div class="term"></div></div>
-<script crossorigin="anonymous" src="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/lib/xterm.min.js"></script>
+<script src="./vendor/xterm.min.js"></script>
 <script type="module">
   window.addEventListener("error", (e) => { window.__err = String(e.error?.stack || e.message); });
   import { createShell, loadShared } from "./zsh_shell.mjs";

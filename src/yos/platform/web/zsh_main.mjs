@@ -1,80 +1,128 @@
-// External module entry for zsh.html. Real zsh.wasm, one command per
-// line: each Enter runs the typed line through `zsh -f -c '<line>'` on
-// the browser's wasm engine via the host bridges in zsh_host.mjs.
-// (Per-command instance — shell state like cd / vars does not persist
-// across lines yet; that needs the interactive-session step: PTY +
-// termios + asyncify blocking read.)
-import { runProgram as runZsh } from "./yos_proc.mjs";
+// External module entry for zsh.html. Runs the UNIVERSAL zsh.wasm (the
+// same binary desktop yos runs) as a LONG-LIVED INTERACTIVE process on the
+// browser's own wasm engine. stdin is a real terminal: zsh's line editor
+// blocks on read()/poll(), and the page resumes it on each keystroke via
+// the asyncify suspend/rewind the binary already carries for fork. Shell
+// state — cwd, variables, history, pipelines — persists across commands,
+// because it is one continuous zsh process, not one-zsh-per-line.
+import { runInteractive } from "./yos_proc.mjs";
 
 const term = new Terminal({
   fontFamily: "ui-monospace, monospace", fontSize: 14,
   theme: { background: "#0b1014", foreground: "#e0e5e4", cursor: "#74c5a5" },
-  cursorBlink: true, convertEol: false,
+  cursorBlink: true, convertEol: false, scrollback: 5000,
 });
-term.open(document.getElementById("term"));
-term.focus();
+const fit = typeof FitAddon !== "undefined" ? new FitAddon.FitAddon() : null;
+if (fit) term.loadAddon(fit);
+const host = document.getElementById("term");
+term.open(host);
+if (fit) try { fit.fit(); } catch {}
+// Make the whole page grab keyboard input: clicking anywhere focuses the
+// terminal, and we re-focus on load so typing works without a click.
+const grabFocus = () => term.focus();
+host.addEventListener("mousedown", grabFocus);
+document.addEventListener("mousedown", grabFocus);
+window.addEventListener("focus", grabFocus);
+grabFocus();
 
+// Live input diagnostic (top-right). Proves which build is loaded and whether
+// keystrokes are reaching the page at all. If "keys" stays 0 while you type,
+// the keyboard event never fired (focus/cache); if it climbs but nothing
+// happens in the shell, it's the engine.
+const diag = document.createElement("div");
+diag.style.cssText = "position:fixed;top:4px;right:6px;z-index:9999;font:11px ui-monospace,monospace;color:#74c5a5;background:#0008;padding:2px 6px;border-radius:4px;pointer-events:none";
+document.body.appendChild(diag);
+let keyCount = 0, outBytes = 0, lastKey = "";
+const renderDiag = () => { diag.textContent = `BUILD det-clock-3 · keys:${keyCount}(${lastKey}) · out:${outBytes}B`; };
+renderDiag();
+const bumpDiag = (k) => { keyCount++; lastKey = JSON.stringify(k); renderDiag(); };
+
+term.write("\x1b[38;2;107;168;146mloading universal zsh.wasm …\x1b[0m\r\n");
 const mod = await WebAssembly.compile(await (await fetch("./zsh.wasm")).arrayBuffer());
 
 // Load the freebsd-tool wasms so zsh can exec external commands.
-const TOOL_NAMES = ["pwd", "id", "hostname", "echo", "cat", "ls", "ps", "date", "true", "false", "forkdemo", "forkstress", "perfstress"];
+const TOOL_NAMES = ["pwd", "id", "hostname", "echo", "cat", "ls", "ps", "date", "true", "false", "tmux", "forkdemo", "forkstress", "perfstress"];
 const tools = new Map();
 await Promise.all(TOOL_NAMES.map(async (name) => {
   try { tools.set(name, await WebAssembly.compile(await (await fetch(`./tools/${name}.wasm`)).arrayBuffer())); } catch {}
 }));
+// zsh.wasm IS the shell: wire it as `sh`/`zsh` too so a tmux you launch from
+// this prompt can spawn a real shell in its pane (tmux's default-shell is
+// /bin/sh → basename `sh`). Without this, `tmux` opens but its pane is dead.
+tools.set("sh", mod);
+tools.set("zsh", mod);
 
-const PROMPT = "\x1b[38;2;107;168;146mzsh%\x1b[0m ";
-let line = "";
-let transcript = "";
-const out = (text) => { transcript += text; term.write(text.replace(/\n/g, "\r\n")); };
-
-const banner = () => {
-  let v = "";
-  runZsh(mod, ["zsh", "-f", "-c", "echo $ZSH_VERSION"], (fd, t) => { v += t; }, () => {}, { tools });
-  out(`real zsh ${v.trim()} on the wasm engine, with real fork() — one command per line\r\n`);
-  out(`builtins + external tools: ${[...tools.keys()].join(" ")}\r\n`);
-  out("try:  echo $((6*7))   ·   pwd   ·   id   ·   for i in 1 2 3; do echo $i; done\r\n");
-  out("processes:  forkdemo  ·  forkstress (100 forks)\r\n");
-  out("perfstress  ·  full stress test: 111-proc tree + /proc + REAL threads (mutex/condvar/rwlock)\r\n\r\n");
-  term.write(PROMPT);
-};
-
-// perfstress runs with REAL fork + REAL threads, so it executes in a
-// coordinator Worker (where Atomics.wait is allowed) that spawns a pool
-// of thread Workers over shared memory.
-const runPerfstressMt = (cmd) => new Promise((resolve) => {
-  const argv = cmd.trim().split(/\s+/);
-  const coord = new Worker(new URL("./mt_coordinator_browser.mjs", import.meta.url), { type: "module" });
-  coord.onmessage = (e) => {
-    if (e.data.out) { out(e.data.out); return; }
-    if (e.data.done) { if (e.data.error) out(`[mt error: ${e.data.error}]\n`); coord.terminate(); resolve(); }
-  };
-  coord.postMessage({ wasmUrl: new URL("./tools/perfstress_mt.wasm", import.meta.url).href, argv });
+let exited = false;
+let raw = "";
+const ctl = runInteractive(mod, ["zsh", "-f", "+o", "promptsp"], {
+  onOutput: (fd, text) => { raw += text; outBytes += text.length; renderDiag(); term.write(text); },
+  onExit: (code) => { exited = true; term.write(`\r\n\x1b[38;2;85;97;98m[zsh exited ${code}] — reload to restart\x1b[0m\r\n`); },
+  onUnimpl: () => {},
+  tools,
+  env: ["PATH=/bin:/usr/bin", "HOME=/", "TERM=xterm-256color", "PWD=/", "SHELL=/bin/sh"],
+  cols: term.cols, rows: term.rows,
 });
 
-let busy = false;
-const runLine = async (cmd) => {
-  if (cmd.trim()) {
-    if (/^perfstress(\s|$)/.test(cmd.trim())) {
-      await runPerfstressMt(cmd);
-    } else {
-      const res = runZsh(mod, ["zsh", "-f", "-c", cmd], (fd, t) => out(t), () => {}, { tools });
-      if (res.exitCode !== 0 && res.error) out(`[zsh exit ${res.exitCode}: ${res.error}]\n`);
-    }
+// INPUT: capture the keyboard at the window level (capture phase) and send
+// raw bytes to zsh. This does NOT depend on the xterm element having focus
+// — real browsers ignore programmatic focus on load, and clicking can miss
+// the rows — so capturing on window guarantees keystrokes reach the shell.
+// zsh's line editor echoes; we never echo here (that would double chars).
+function keyToBytes(e) {
+  // Paste shortcut (Ctrl+V / Cmd+V): return null WITHOUT mapping it to a control
+  // byte, so the keydown handler skips preventDefault() and the browser emits
+  // its native `paste` event — which the paste handler below forwards to the
+  // shell. Must come before the generic Ctrl-letter mapping, which would
+  // otherwise swallow Ctrl+V as ^V (0x16) and preventDefault away the paste.
+  if ((e.ctrlKey || e.metaKey) && (e.key === "v" || e.key === "V")) return null;
+  if (e.altKey || e.metaKey) return null;
+  const k = e.key;
+  if (e.ctrlKey) {
+    if (k.length === 1) { const u = k.toUpperCase().charCodeAt(0); if (u >= 64 && u <= 95) return String.fromCharCode(u & 0x1f); } // ^A.. ^_
+    return null;
   }
-  term.write(PROMPT);
-};
-
-const handleData = async (data) => {
-  for (const ch of data) {
-    if (ch === "\r" || ch === "\n") { term.write("\r\n"); if (!busy) { busy = true; await runLine(line); busy = false; } line = ""; }
-    else if (ch === "\x7f" || ch === "\b") { if (line) { line = line.slice(0, -1); term.write("\b \b"); } }
-    else if (ch >= " ") { line += ch; term.write(ch); }
+  switch (k) {
+    case "Enter": return "\r";
+    case "Backspace": return "\x7f";
+    case "Tab": return "\t";
+    case "Escape": return "\x1b";
+    case "ArrowUp": return "\x1b[A";
+    case "ArrowDown": return "\x1b[B";
+    case "ArrowRight": return "\x1b[C";
+    case "ArrowLeft": return "\x1b[D";
+    case "Home": return "\x1b[H";
+    case "End": return "\x1b[F";
+    case "Delete": return "\x1b[3~";
+    case "PageUp": return "\x1b[5~";
+    case "PageDown": return "\x1b[6~";
+    default: return k.length === 1 ? k : null; // printable
   }
+}
+window.addEventListener("keydown", (e) => {
+  if (exited) return;
+  bumpDiag(e.key);
+  const bytes = keyToBytes(e);
+  if (bytes == null) return; // let the browser keep shortcuts we don't map
+  e.preventDefault();
+  e.stopPropagation();
+  ctl.write(bytes);
+}, true); // capture phase: intercept before anything else
+// Paste support (Ctrl/Cmd-V): forward pasted text to the shell.
+window.addEventListener("paste", (e) => { if (exited) return; const text = (e.clipboardData || window.clipboardData).getData("text"); if (text) { e.preventDefault(); ctl.write(text); } });
+
+term.onResize(({ cols, rows }) => ctl.resize(cols, rows));
+if (fit) { try { fit.fit(); } catch {} ctl.resize(term.cols, term.rows); }
+window.addEventListener("resize", () => { if (fit) { try { fit.fit(); } catch {} ctl.resize(term.cols, term.rows); } });
+grabFocus();
+
+// Headless test hook: feeds keystrokes through the exact interactive path.
+window.__term = term;
+window.__zsh = {
+  type: (s) => ctl.write(s),
+  running: () => ctl.running(),
+  raw: () => raw,
+  state: () => ({ blocked: ctl.proc.blocked, inbuf: ctl.mgr.tty.inbuf.length, exited: ctl.proc.exited, pendingRewind: ctl.proc.pendingRewind }),
+  size: () => ({ termCols: term.cols, termRows: term.rows, ttyCols: ctl.mgr.tty.cols, ttyRows: ctl.mgr.tty.rows }),
+  procs: () => ctl.mgr.procs.map((p) => `${p.pid}:${p.comm}:${p.exited ? "x" + p.exitCode : p.sched}${p.error ? "(" + p.error.slice(0, 30) + ")" : ""}`),
+  screen: () => { const b = term.buffer.active; let s = ""; for (let y = 0; y < b.length; y++) { const ln = b.getLine(y); if (ln) s += ln.translateToString(true) + "\n"; } return s; },
 };
-
-banner();
-term.onData(handleData);
-
-// Headless test hook: drives the exact same path as real typing.
-window.__zsh = { type: (s) => handleData(s), captured: () => transcript, busy: () => busy };

@@ -1,3 +1,10 @@
+// PROTOTYPE (issue #21, milestone 1). This is a hand-written JS libc, NOT
+// the production yos surface. The production direction reuses the shared
+// yos C bridge/subsystems and keeps JS to browser effects only. Treat this
+// file as a prototype boundary: it is frozen against silent expansion, and
+// imports it does not implement fail loudly via strictImportEnv (see
+// import_manifest.mjs), never via a catch-all return-0 fallback.
+//
 // Shared libc env for the multi-thread engine. Used by BOTH the
 // coordinator (runs the main process + fork) and the pool workers (run
 // thread functions). Everything operates on ONE shared linear memory.
@@ -50,7 +57,10 @@ export function buildEnv(memory, ctx) {
   const putStr = (s) => { const b = enc.encode(s + "\0"); const p = alloc(b.length, 1); u8.set(b, p); return p; };
   const fmt = (f, vp) => ctx.format(memory, f, vp);
 
-  const fdOfFile = (fp) => (fp >= 1 && fp <= 3 ? fp - 1 : 1);
+  // FILE* 1/2/3 are stdin/stdout/stderr → fd 0/1/2; a fopen()'d FILE* IS its
+  // fd (vfs.nextFd starts at 5, so no collision), so it maps to itself.
+  const mmFree = []; // freed anonymous-mmap regions, reused by mmap (per instance)
+  const fdOfFile = (fp) => (fp >= 1 && fp <= 3 ? fp - 1 : fp);
   const writeBytes = (fd, p, n) => ctx.write(fd, p, n);
   const emit = (fd, t) => ctx.emit(fd, t);
 
@@ -83,11 +93,18 @@ export function buildEnv(memory, ctx) {
     snprintf: (d, n, f, vp) => { const s = fmt(f, vp); const b = enc.encode(s).subarray(0, Math.max(0, n - 1)); u8.set(b, d); u8[d + b.length] = 0; return s.length; },
     vsnprintf: (d, n, f, vp) => env.snprintf(d, n, f, vp),
     sprintf: (d, f, vp) => { const s = fmt(f, vp); const b = enc.encode(s); u8.set(b, d); u8[d + b.length] = 0; return s.length; },
-    fputc: (c, fp) => { emit(fdOfFile(fp), String.fromCharCode(c & 0xff)); return c & 0xff; }, putc: (c, fp) => env.fputc(c, fp),
-    fputs: (s, fp) => { emit(fdOfFile(fp), cstr(s)); return 1; }, puts: (s) => { emit(1, cstr(s) + "\n"); return 1; },
+    // fputc/fputs route through ctx.write (via fdOfFile) so a fopen()'d FILE*
+    // writes to the file, not just stdout.
+    fputc: (c, fp) => { const b = alloc(1, 1); u8[b] = c & 0xff; writeBytes(fdOfFile(fp), b, 1); return c & 0xff; }, putc: (c, fp) => env.fputc(c, fp),
+    fputs: (s, fp) => { writeBytes(fdOfFile(fp), s, env.strlen(s)); return 1; }, puts: (s) => { emit(1, cstr(s) + "\n"); return 1; },
     fwrite: (p, sz, nm, fp) => { writeBytes(fdOfFile(fp), p, sz * nm); return nm; },
     fflush: () => 0, fileno: (fp) => fp, setvbuf: () => 0, setbuf: () => 0, __swbuf: (c, fp) => { emit(fdOfFile(fp), String.fromCharCode(c & 0xff)); return c & 0xff; },
     clearerr: () => 0, ferror: () => 0, feof: () => 0,
+    // FILE* over the VFS: a fopen()'d handle IS its fd. fwrite/fprintf/fputs
+    // above already route through fdOfFile → ctx.write, so they hit the file.
+    fopen: (p, m) => { const mode = cstr(m); const fl = mode[0] === "a" ? (1 | 0x200 | 8) : mode[0] === "w" ? (1 | 0x200 | 0x400) : (mode.includes("+") ? 2 : 0); const fd = ctx.open(cstr(p), fl); return fd < 0 ? 0 : fd; },
+    fclose: (fp) => ctx.close(fp),
+    fread: (ptr, sz, nm, fp) => { const got = ctx.read(fp, ptr, sz * nm); return sz ? Math.floor(got / sz) : 0; },
 
     strlen: (p) => { let n = 0; while (u8[p + n]) n++; return n; },
     strcmp: (a, b) => { let i = 0; for (;;) { const x = u8[a + i], y = u8[b + i]; if (x !== y) return x - y; if (!x) return 0; i++; } },
@@ -104,14 +121,30 @@ export function buildEnv(memory, ctx) {
     strtol: (s, endp, base) => env.strtoul(s, endp, base) | 0,
     atoi: (s) => parseInt(cstr(s), 10) || 0,
     strerror: (n) => putStr("Error " + n), qsort: () => 0,
-    abs: (x) => Math.abs(x | 0), rand: () => (Atomics.add(ia, (ALLOC_PTR - 8) >> 2, 1103515245) >>> 1), srand: () => 0,
+    // Seedable LCG (glibc-style) over a shared state word, so srand(seed)
+    // resets the sequence — srand(N);rand() twice yields the same first value.
+    abs: (x) => Math.abs(x | 0),
+    rand: () => { const a = (ALLOC_PTR - 8) >> 2; const s = (Math.imul(Atomics.load(ia, a) >>> 0, 1103515245) + 12345) >>> 0; Atomics.store(ia, a, s); return (s >>> 16) & 0x7fff; },
+    srand: (seed) => { Atomics.store(ia, (ALLOC_PTR - 8) >> 2, seed >>> 0); return 0; },
 
     // time
     time: (t) => { const s = Math.floor(ctx.now() / 1000); if (t) v.setUint32(t, s, true); return s; },
     gettimeofday: (tv) => { const ms = ctx.now(); if (tv) { v.setUint32(tv, Math.floor(ms / 1000), true); v.setUint32(tv + 4, (ms % 1000) * 1000, true); } return 0; },
     clock_gettime: (id, ts) => { const ms = ctx.now(); if (ts) { v.setUint32(ts, Math.floor(ms / 1000), true); v.setUint32(ts + 4, Math.floor((ms % 1000) * 1e6), true); } return 0; },
     nanosleep: () => 0, sleep: () => 0, usleep: () => 0,
-    localtime: () => 0, mktime: () => 0, strftime: (d) => { u8[d] = 0; return 0; },
+    // tm from a time_t: tm_sec@0 min@4 hour@8 mday@12 mon@16 year@20(since 1900)
+    // wday@24 yday@28. No timezone in the sandbox, so localtime == gmtime (UTC).
+    gmtime: (tp) => {
+      const t = tp ? v.getUint32(tp, true) : 0; const d = new Date(t * 1000);
+      const tm = alloc(44, 4); u8.fill(0, tm, tm + 44);
+      v.setUint32(tm, d.getUTCSeconds(), true); v.setUint32(tm + 4, d.getUTCMinutes(), true); v.setUint32(tm + 8, d.getUTCHours(), true);
+      v.setUint32(tm + 12, d.getUTCDate(), true); v.setUint32(tm + 16, d.getUTCMonth(), true); v.setUint32(tm + 20, d.getUTCFullYear() - 1900, true);
+      v.setUint32(tm + 24, d.getUTCDay(), true);
+      return tm;
+    },
+    localtime: (tp) => env.gmtime(tp),
+    ctime: () => putStr("Thu Jan  1 00:00:00 1970\n"), asctime: () => putStr("Thu Jan  1 00:00:00 1970\n"),
+    mktime: () => 0, strftime: (d) => { u8[d] = 0; return 0; },
     gethostname: (b, l) => { u8.set(enc.encode("yos-web".slice(0, l - 1) + "\0"), b); return 0; },
 
     // process: fork via asyncify (host hook), exec, wait, signals
@@ -126,16 +159,37 @@ export function buildEnv(memory, ctx) {
     read: (fd, b, n) => ctx.read(fd, b, n), lseek: (fd, o, w) => ctx.lseek(fd, o, w),
     stat: (p, b) => ctx.stat(cstr(p), b), lstat: (p, b) => ctx.stat(cstr(p), b), fstat: (fd, b) => ctx.fstat(fd, b), fstatat: (d, p, b) => ctx.stat(cstr(p), b),
     fstatfs: (fd, b) => { u8.fill(0, b, b + 256); return 0; }, statfs: () => 0, access: (p) => ctx.access(cstr(p)), unlink: (p) => ctx.unlink(cstr(p)),
-    fcntl: () => 0, dup: () => ctx.dupfd(), dup2: (a, b) => b, pipe: (p) => { v.setUint32(p, ctx.dupfd(), true); v.setUint32(p + 4, ctx.dupfd(), true); return 0; },
+    fcntl: () => 0, dup: (fd) => ctx.dup(fd), dup2: (a, b) => ctx.dup2(a, b), pipe: (p) => { v.setUint32(p, ctx.dupfd(), true); v.setUint32(p + 4, ctx.dupfd(), true); return 0; },
     opendir: (p) => ctx.opendir(cstr(p)), fdopendir: (fd) => ctx.fdopendir(fd), readdir: (h) => ctx.readdir(h), closedir: (h) => ctx.close(h), dirfd: (h) => h,
-    getcwd: (b) => { u8.set(enc.encode("/\0"), b); return b; }, chdir: () => 0, fchdir: () => 0, umask: () => 0o22, mkdir: () => 0, rmdir: () => 0, readlink: () => -1, realpath: (p, o) => { u8.set(enc.encode(cstr(p) + "\0"), o); return o; },
+    // scandir: enumerate the dir, copy each dirent (readdir reuses one buffer),
+    // run the optional filter, and build the namelist array.
+    scandir: (pathPtr, namelistPtr, filterIdx, comparIdx) => {
+      const h = ctx.opendir(cstr(pathPtr)); if (h < 0) return -1;
+      const dents = [];
+      for (;;) { const d = ctx.readdir(h); if (!d) break; if (filterIdx) { try { if (!ctx.callIndirect(filterIdx, d)) continue; } catch {} } const copy = alloc(280, 8); u8.copyWithin(copy, d, d + 280); dents.push(copy); }
+      ctx.close(h);
+      const arr = alloc(Math.max(1, dents.length) * 4, 4);
+      for (let i = 0; i < dents.length; i++) v.setUint32(arr + i * 4, dents[i], true);
+      v.setUint32(namelistPtr, arr, true);
+      return dents.length;
+    },
+    getcwd: (b, n) => { u8.set(enc.encode(ctx.getcwd().slice(0, (n || 4096) - 1) + "\0"), b); return b; }, chdir: (p) => ctx.chdir(cstr(p)), fchdir: () => 0, umask: () => 0o22, mkdir: () => 0, rmdir: () => 0, readlink: () => -1, realpath: (p, o) => { u8.set(enc.encode(cstr(p) + "\0"), o); return o; },
     ttyname: () => 0, tcgetattr: () => -1, tcsetattr: () => 0, ioctl: () => -1, poll: () => 0, select: () => 0,
-    mmap: () => -1, munmap: () => 0, mprotect: () => 0, madvise: () => 0,
+    // anonymous mmap over the shared bump heap, zeroed. A small free list lets
+    // munmap RECLAIM so a mmap→munmap loop reuses one region instead of
+    // exhausting the (small, fixed) heap and trampling the control region.
+    mmap: (addr, len, prot, flags, fd, off) => {
+      const n = ((len >>> 0) + 0xfff) & ~0xfff; if (n === 0) return -1;
+      for (let i = 0; i < mmFree.length; i++) { if (mmFree[i].len >= n) { const a = mmFree[i].addr; mmFree.splice(i, 1); u8.fill(0, a, a + n); return a; } }
+      const p = alloc(n, 0x1000); if (p + n > ASYNC_BUF) return -1; u8.fill(0, p, p + n); return p;
+    },
+    munmap: (addr, len) => { if ((addr >>> 0) > 0) mmFree.push({ addr: addr >>> 0, len: ((len >>> 0) + 0xfff) & ~0xfff }); return 0; },
+    mprotect: () => 0, madvise: () => 0,
     mbrtowc: (pw, s) => { if (!s) return 0; const c = u8[s]; if (pw) v.setUint32(pw, c, true); return c ? 1 : 0; }, wcwidth: () => 1,
 
     // --- REAL threads ---
     pthread_create: (out, attr, fnIdx, arg) => ctx.threadCreate(out, fnIdx, arg),
-    pthread_join: (tid) => ctx.threadJoin(tid), pthread_detach: () => 0, pthread_self: () => ctx.pid, pthread_exit: () => { const e = new Error("texit"); e.isThreadExit = true; throw e; },
+    pthread_join: (tid, retvalPtr) => ctx.threadJoin(tid, retvalPtr), pthread_detach: () => 0, pthread_self: () => ctx.pid, pthread_exit: () => { const e = new Error("texit"); e.isThreadExit = true; throw e; },
     pthread_mutex_init: (m) => { if (OK(m)) Atomics.store(ia, m >> 2, 0); return 0; }, pthread_mutex_destroy: () => 0,
     pthread_mutex_lock: (m) => { if (!OK(m)) return 0; const i = m >> 2; for (;;) { if (Atomics.compareExchange(ia, i, 0, 1) === 0) return 0; Atomics.wait(ia, i, 1, 2000); } },
     pthread_mutex_unlock: (m) => { if (!OK(m)) return 0; const i = m >> 2; Atomics.store(ia, i, 0); Atomics.notify(ia, i, 1); return 0; },
@@ -154,6 +208,9 @@ export function buildEnv(memory, ctx) {
     pthread_attr_init: () => 0, pthread_attr_destroy: () => 0, pthread_attr_setdetachstate: () => 0, pthread_attr_setstacksize: () => 0,
   };
 
-  // Any import we forgot → logged no-op (so a missing fn doesn't trap).
-  return new Proxy(env, { get(t, k) { if (k in t) return t[k]; if (typeof k === "string" && k !== "memory") { return (...a) => { ctx.unimpl && ctx.unimpl(k); return 0; }; } return t[k]; } });
+  // The plain real env: only the functions the prototype actually
+  // implements. Missing imports are NOT silently stubbed here — the caller
+  // hardens this env with strictImportEnv() so an unimplemented import fails
+  // loudly instead of returning 0 (see import_manifest.mjs / issue #21).
+  return env;
 }

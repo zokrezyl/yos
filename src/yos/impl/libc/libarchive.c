@@ -60,6 +60,8 @@ extern int32_t yos_open    (struct yos_exec_ctx *ctx, uint32_t path,
                             int32_t flags, int32_t mode);
 extern int32_t yos_read    (struct yos_exec_ctx *ctx, int32_t fd,
                             uint32_t buf, uint32_t count);
+extern int32_t yos_write   (struct yos_exec_ctx *ctx, int32_t fd,
+                            uint32_t buf, uint32_t count);
 extern int32_t yos_fd_get  (struct yos_exec_ctx *ctx, int32_t wfd);
 extern int32_t yos_fd_close(struct yos_exec_ctx *ctx, int32_t wfd);
 /* Guest-heap allocator — used to carve a read-scratch region inside the
@@ -86,7 +88,6 @@ extern int   archive_read_support_format_raw(struct archive *);
 extern int   archive_read_support_filter_all(struct archive *);
 extern int   archive_read_open_memory(struct archive *, const void *, size_t);
 extern int   archive_read_close(struct archive *);
-extern int64_t archive_read_data_into_fd(struct archive *, int);
 
 /* Callback-based open. We use this instead of archive_read_open_filename
  * so the bytes come from a yos-opened fd (cwd/VFS/path-translation
@@ -466,10 +467,15 @@ static const void *m3_yos_archive_read_close(IM3Runtime rt,
     return NULL;
 }
 
-/* env.archive_read_data_into_fd — I(a, fd). Streams the current
- * entry's data to a fd. The guest passes a yos wasm fd, which is NOT a
- * host fd — translate it through yos_fd_get before handing it to host
- * libarchive. Returns ARCHIVE_OK/_FATAL etc. as an int64. */
+/* env.archive_read_data_into_fd — I(a, fd). Streams the current entry's
+ * data to a yos wasm fd. The guest fd is NOT a host fd, so we must not
+ * hand it to host libarchive's archive_read_data_into_fd (which would
+ * write to a translated host fd behind yos's back, skipping virtual-fd
+ * handling, yos_write's error/short-write semantics, stderr tracking and
+ * tty/fork output filtering). Instead pull the decompressed bytes into a
+ * guest-memory scratch with archive_read_data and push them out through
+ * yos_write — the same yos fd model the read side already routes through.
+ * Returns ARCHIVE_OK(0)/_FATAL etc. as an int64. */
 static const void *m3_yos_archive_read_data_into_fd(IM3Runtime rt,
         IM3ImportContext _c, uint64_t *_sp, void *_m)
 {
@@ -478,9 +484,29 @@ static const void *m3_yos_archive_read_data_into_fd(IM3Runtime rt,
     struct archive *a = A(1);
     int32_t wfd = (int32_t)_sp[2];
     if (!a) { _sp[0] = (uint64_t)(int64_t)-1; return NULL; }
-    int hfd = yos_fd_get(ctx, wfd);
-    if (hfd < 0) { _sp[0] = (uint64_t)(int64_t)-1; return NULL; }
-    _sp[0] = (uint64_t)archive_read_data_into_fd(a, hfd);
+
+    uint32_t scratch = yos_malloc(ctx, YOS_ARC_SCRATCH_LEN);
+    if (!scratch) { _sp[0] = (uint64_t)(int64_t)-1; return NULL; }
+
+    int64_t status = 0;  /* ARCHIVE_OK */
+    for (;;) {
+        int64_t n = archive_read_data(a, ctx->memory + scratch,
+                                      YOS_ARC_SCRATCH_LEN);
+        if (n == 0) break;                     /* end of entry data        */
+        if (n < 0) { status = n; break; }      /* ARCHIVE_FATAL/_WARN etc. */
+        /* Honour short writes — yos_write may return fewer than asked. */
+        uint32_t done = 0;
+        while (done < (uint32_t)n) {
+            int32_t w = yos_write(ctx, wfd, scratch + done,
+                                  (uint32_t)n - done);
+            if (w <= 0) { status = -1; break; }   /* ARCHIVE_FATAL         */
+            done += (uint32_t)w;
+        }
+        if (status != 0) break;
+    }
+
+    yos_free(ctx, scratch);
+    _sp[0] = (uint64_t)status;
     return NULL;
 }
 

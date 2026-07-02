@@ -11,7 +11,9 @@ import { tmpdir } from "node:os";
 const CHROME = process.env.YOS_CHROME || "google-chrome-stable";
 const PORT = 8137;
 const here = new URL(".", import.meta.url);
-const types = { ".html": "text/html", ".wasm": "application/wasm", ".mjs": "text/javascript" };
+// .css must be text/css or the browser refuses xterm's stylesheet (leaving its
+// hidden helper textarea visible as a stray box at the cursor).
+const types = { ".html": "text/html", ".wasm": "application/wasm", ".mjs": "text/javascript", ".css": "text/css", ".js": "text/javascript", ".json": "application/json", ".svg": "image/svg+xml" };
 
 const server = createServer(async (req, res) => {
   const path = new URL("." + (req.url === "/" ? "/zsh.html" : req.url.split("?")[0]), here);
@@ -100,7 +102,7 @@ if (!up) {
 const script = "perfstress -d 4,4\r";
 await evaluate(`window.__zsh.type(${JSON.stringify(script)})`);
 await new Promise((r) => setTimeout(r, 4000));
-const text = await evaluate("window.__zsh.captured()");
+const text = await evaluate("window.__zsh.raw()");
 
 const checks = [
   ["page up", up],

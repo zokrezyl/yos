@@ -15,6 +15,10 @@ const res = await runMtProgram(module, args, {
   onUnimpl: (n) => { if (!globalThis.__seen) globalThis.__seen = new Set(); if (!globalThis.__seen.has(n)) { globalThis.__seen.add(n); process.stderr.write(`[unimpl ${n}]\n`); } },
   spawnPoolWorker: ({ module, memory, slot }) => new Worker(workerURL, { workerData: { module, memory, slot } }),
 });
-console.error(`\n=== exit ${res.exitCode}, procs ${res.procs}${res.error ? ", error " + res.error : ""} ===`);
+// The full perf-stress workload (fork + real worker-thread mutex/cond/rwlock +
+// file/stat/dup/dir/mmap/time/rand) must finish with the "perf-stress ok"
+// verdict — this is the regression net for real threads in the browser engine.
+const ok = out.includes("perf-stress ok");
+console.error(`\n=== exit ${res.exitCode}, procs ${res.procs}${res.error ? ", error " + res.error : ""} — ${ok ? "PASS perf-stress ok" : "FAIL"} ===`);
 // pool workers keep the event loop alive; exit explicitly.
-process.exit(0);
+process.exit(ok ? 0 : 1);

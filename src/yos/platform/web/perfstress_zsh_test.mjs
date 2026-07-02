@@ -36,7 +36,7 @@ for (let i = 0; i < 150; i++) { if (await evl("!!(window.__zsh && window.__zsh.t
 await evl(`window.__zsh.type("perfstress\\r")`);
 // wait until the run finishes (perf-stress summary line appears) or timeout
 let text = "";
-for (let i = 0; i < 200; i++) { text = await evl("window.__zsh.captured()"); if (/perf-stress (ok|FAILED)/.test(text)) break; await new Promise((r) => setTimeout(r, 500)); }
+for (let i = 0; i < 200; i++) { text = await evl("window.__zsh.raw()"); if (/perf-stress (ok|FAILED)/.test(text)) break; await new Promise((r) => setTimeout(r, 500)); }
 
 if (process.env.YOS_SHOT) { const shot = await send("Page.captureScreenshot", { format: "png" }); await writeFile(process.env.YOS_SHOT, Buffer.from(shot.data, "base64")); console.error("screenshot: " + process.env.YOS_SHOT); }
 

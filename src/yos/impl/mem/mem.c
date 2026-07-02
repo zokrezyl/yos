@@ -125,9 +125,13 @@ static int range_overlaps_free(struct yos_exec_ctx *ctx, uint32_t addr, uint32_t
 }
 
 /* Record [addr, addr+len) as a live (owned) mapping. Best-effort: on
- * overflow the mapping just isn't tracked — no corruption, since the
- * free-list double-free guard is the hard invariant and munmap of an
- * untracked-but-live range still frees correctly. Caller holds mem_lock. */
+ * overflow the mapping just isn't tracked — no corruption. The trade-off
+ * is that munmap only frees ranges it can find on the live list, so an
+ * untracked-but-live mapping is NOT reclaimed by munmap; it is released
+ * wholesale when the image is replaced (execve) or the proc exits. This
+ * only bites past YOS_MAX_LIVE_REGIONS simultaneous mappings, and is far
+ * preferable to the alternative (munmap clobbering heap/static data).
+ * Caller holds mem_lock. */
 static void live_add(struct yos_exec_ctx *ctx, uint32_t addr, uint32_t len)
 {
     if (len == 0) return;
@@ -242,13 +246,39 @@ int32_t yos_munmap(struct yos_exec_ctx *ctx, uint32_t addr, uint32_t len)
         return 0;
     }
 
-    ydebug("munmap(0x%x, 0x%x) -> 0\n", addr, (uint32_t)aligned);
-
-    /* Zero the region, drop our ownership of it, and return it to the
-     * free list (coalescing with neighbours). */
-    memset(ctx->memory + addr, 0, (size_t)aligned);
-    live_remove(ctx, addr, (uint32_t)aligned);
-    add_free_region(ctx, addr, (uint32_t)aligned);
+    /* Only the portions of [addr, end) that are tracked as LIVE mmap
+     * regions may be zeroed and returned to the free list. A guest
+     * munmap that lands on the brk heap, on static data, or on a hole
+     * the bump allocator never handed out must not clobber those bytes
+     * or feed them to find_free_region — that would zero live
+     * heap/static data and later let mmap alias it (the mirror of the
+     * MAP_FIXED-overlaps-heap guard in yos_mmap2). POSIX makes munmap of
+     * an unmapped range a successful no-op, so non-live bytes are
+     * silently skipped. Read the live list first (zero + free each
+     * overlap; add_free_region only touches the free list, so iterating
+     * live_list here is stable), then drop the whole requested span from
+     * the live list in one pass — live_remove keeps any non-overlapping
+     * remainders tracked. */
+    uint64_t end = (uint64_t)addr + aligned;
+    int freed_any = 0;
+    for (int i = 0; i < ctx->live_count; i++) {
+        uint32_t region_addr = ctx->live_list[i].addr;
+        uint64_t region_end  = (uint64_t)region_addr + ctx->live_list[i].len;
+        uint32_t overlap_lo  = region_addr > addr ? region_addr : addr;
+        uint64_t overlap_hi  = region_end < end ? region_end : end;
+        if (overlap_lo >= overlap_hi) continue;
+        uint32_t overlap_len = (uint32_t)(overlap_hi - overlap_lo);
+        memset(ctx->memory + overlap_lo, 0, overlap_len);
+        add_free_region(ctx, overlap_lo, overlap_len);
+        freed_any = 1;
+    }
+    if (freed_any) {
+        live_remove(ctx, addr, (uint32_t)aligned);
+        ydebug("munmap(0x%x, 0x%x) -> 0\n", addr, (uint32_t)aligned);
+    } else {
+        ydebug("munmap(0x%x, 0x%x) -> 0 (no live mapping; no-op)\n",
+               addr, (uint32_t)aligned);
+    }
 
     pthread_mutex_unlock(&ctx->mem_lock);
 

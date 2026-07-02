@@ -58,6 +58,124 @@ nix develop ../../../../#default --command \
   bash -c 'YOS_CHROME=google-chrome-stable node browser_test.mjs'
 ```
 
+## Interactive universal zsh in the browser
+
+`zsh.html` runs the **universal** `zsh.wasm` — the exact binary desktop
+`yos` runs, no special build — as a **long-lived interactive shell**.
+`cd`, variables, history, pipelines and loops persist across commands,
+because it is one continuous zsh process, not one-zsh-per-line.
+
+The enabling trick: the universal binaries are fully `--asyncify`
+instrumented (for fork). That same suspend/rewind lets `read()`/`poll()`/
+`select()` on the terminal **block** — the guest unwinds, yields to the
+browser, and the page rewinds it back into the blocked syscall on the next
+keystroke. `runInteractive()` in `yos_proc.mjs` drives this; the page just
+pipes xterm keystrokes in and guest output out. CR→NL translation mimics a
+tty's `ICRNL`; `isatty`/`tcgetattr`/`ioctl(TIOCGWINSZ)` report a real
+terminal so zsh enables its line editor.
+
+Proof (real headless Chrome, typing real keystrokes):
+`node iterm_check.mjs` — boots zsh.html, asserts `cd`/variables persist and
+loops run. `tmux -V` execs the universal tmux (`tmux 3.4`) from the shell.
+
+## Real interactive tmux in the browser
+
+`tmux.html` runs a **full interactive tmux 3.4 session** — the same wasm
+binary desktop yos runs — with a real **zsh in the pane**. tmux forks its
+server over a named unix socket, hands it the client tty via `sendmsg`
+SCM_RIGHTS, spawns the pane shell on a pty, and renders the screen (status
+bar, window list, clock) back to the client. Server, client and pane shell
+all run **concurrently** under the cooperative scheduler; keystrokes
+(including the `C-b` prefix) flow client→server→pty→shell, output flows
+back, and it all draws into xterm. `node tmux_browser_test.mjs` proves it in
+headless Chrome (status bar renders, a typed command runs in the pane and
+draws back). What made this work, in `yos_proc.mjs`: real FreeBSD
+`struct __sFILE` so the inlined `getc`/`feof` macros don't trap; a real
+`sysconf(_SC_OPEN_MAX)` (without it tmux's imsg layer spins, never reading
+the socket); `isatty` over the SCM_RIGHTS-passed tty fd; bidirectional tty
+char writes; and a virtual clock so libevent's redraw timers fire under the
+synchronous scheduler.
+
+What does NOT run interactively yet: **nvim**. The universal binary imports
+405 functions including the whole Lua 5.1 C API (~120 `lua_*`/`luaL_*` — the
+guest carries no Lua bodies and expects the host to supply a Lua VM; desktop
+yos bridges to native liblua, which the browser has no equivalent for), plus
+`kqueue`/`kevent` (libuv's event loop), `forkpty`, `scandir`, `dlopen`. It
+instantiates and reaches libuv init (`kqueue`) today; the Lua-VM bridge is
+the remaining wall and a milestone of its own.
+
+## Prototype boundary (issue #21, milestone 1)
+
+The `.mjs` files here that hand-implement a libc/process model in
+JavaScript — `mt_libc.mjs`, `mt_engine.mjs`, `yos_proc.mjs`,
+`zsh_host.mjs` and the pool workers — are **prototypes**, not the
+production yos surface. The production direction is the opposite of
+growing this JS libc: a shared yos runtime/bridge layer owns the
+FreeBSD/yos ABI semantics (compiled from the existing C subsystems), and
+JavaScript only supplies the browser effects wasm cannot perform —
+Worker lifecycle, terminal I/O, persistent storage, timers, event
+notification.
+
+To stop the prototype boundary from silently drifting, the silent
+return-0 fallbacks are gone. There is no longer a catch-all
+`new Proxy(env, …)` (was `mt_libc.mjs`) and no "pre-fill every guest
+import with a no-op that returns 0" loop (was `yos_proc.mjs` /
+`zsh_host.mjs`). Instead every engine hardens its `env` through
+`strictImportEnv()` in **`import_manifest.mjs`**:
+
+- imports the prototype implements run normally;
+- imports it does **not** implement get a loud-failure stub — the first
+  call throws a clear `unsupported libc import 'env.<name>'` diagnostic
+  instead of returning a silent 0, so missing semantics are test-visible;
+- `PROTOTYPE_PARTIAL` lists the imports that are implemented but with
+  known non-faithful semantics (`pipe`, `dup2`, `poll`, `select`, `mmap`,
+  `ioctl`/tty, signals, …), so reviewers and parity tests can see exactly
+  which behaviours are placeholders.
+
+`import_manifest_test.mjs` is the self-test for this (`node
+import_manifest_test.mjs`). A concrete demonstration: `node
+mt_test_node.mjs` runs the prototype phases green and then fails loudly
+the moment the guest reaches `env.fopen` (unimplemented) — that gap used
+to be hidden behind the catch-all.
+
+## Browser-parity harness (issue #21, milestone 2)
+
+`parity_runner.mjs` is the contract: it runs the SAME wasm guests against
+both backends — the native `yos` host binary (source of truth) and the
+node `yos_proc.mjs` process engine — and compares stdout + exit code. The
+desktop result is the baseline; a guest "passes parity" when the browser
+engine reproduces it exactly. This is the real proof of process-model
+correctness, not the zsh/tmux demos.
+
+```sh
+node parity_runner.mjs          # curated contract (fork, pipe, dup2, cwd,
+                                # pthread, poll/ppoll, fd inheritance, …)
+node parity_runner.mjs --sweep  # broad sweep over every fork-matrix guest
+```
+
+To make the contract pass, `yos_proc.mjs` grew a real **per-process I/O
+model**, mirroring the desktop runtime rather than faking results:
+
+- a per-process fd table of open file descriptions, shared on `dup`/`dup2`
+  and across `fork` (refcounted), copied-not-shared for cwd/env/umask/rand
+  so a child cannot perturb the parent;
+- real `pipe`/`socketpair` buffers with `EPIPE` on a closed reader and
+  `poll`/`ppoll`/`select` readiness;
+- a `FILE*` layer (`fopen`/`fread`/`fwrite`/`fgets`/`getline`/`fseek`/…)
+  over that fd table;
+- cooperative `pthread_create`/`join`/`mutex`/`once` (one JS thread, so a
+  created thread runs inline to completion).
+
+Current status: the curated contract passes **12/13** (the one gap,
+`fork_channel_from_stdio`, needs concurrent fork scheduling + kqueue
+readiness — see below); the broad sweep reproduces **75/91** fork-matrix
+guests exactly. The remaining misses are honest, named gaps, not silent
+passes: live signal delivery, `mmap`, sockets, `scandir`, `getpwuid`/
+`getrusage` struct fills, and anything that needs two processes running at
+once (the cooperative engine runs a forked child to completion before the
+parent resumes — concurrent scheduling is the M3 Worker-backed model in
+`mt_engine.mjs`).
+
 ## The gap to real zsh (measured, not guessed)
 
 `nix build .#zsh` produces a 2 MB wasm32 zsh that **imports 169

@@ -232,17 +232,28 @@ let
                  stageDirs   = [ "libxo" "locale-stub" ];
                  extraCflags = [ "-I$STAGE/libxo" ]; };
 
-    # ── yos-native ps ────────────────────────────────────────────────
-    # FreeBSD's bin/ps is ~3000 lines and pulls in libkvm; libkvm
-    # itself reads /dev/kmem and a kernel proc table that yos doesn't
-    # have. yos exposes its process state through /proc (synthesised
-    # by src/yos/vfs/procfs.c, mounted at startup in src/yos/main.c),
-    # so the user-facing fix is a small ps that reads /proc directly.
-    # Source is staged in $STAGE/yos-ps from buildPhase below.
-    ps       = { srcDir = "bin"; /* unused — all srcs come from stageDirs */
-                 srcs = [ "yos_ps.c" ];
-                 stageDirs = [ "yos-ps" ];
-                 libcExtras = [ ]; };
+    # ── real FreeBSD ps ──────────────────────────────────────────────
+    # The real bin/ps, FreeBSD source verbatim (ps.c fmt.c keyword.c
+    # nlist.c print.c). It gets the process list the STANDARD FreeBSD way:
+    # kvm_getprocs(), which the ps-compat shim routes to
+    # sysctl(CTL_KERN, KERN_PROC, KERN_PROC_*) — served by yos's libc
+    # sysctl bridge (src/yos/impl/libc/sysctl.c). No /proc, no toy. The
+    # ps-compat/ dir (copied verbatim, not a heredoc) is a self-contained
+    # stand-in for the libs ps links that the wasm sysroot lacks:
+    # libkvm/libxo/libutil/libjail + devname/strvis + a small sysctlbyname.
+    ps       = { srcDir = "bin/ps";
+                 srcs = [ "ps.c" "fmt.c" "keyword.c" "nlist.c" "print.c"
+                          "yos_ps_compat.c" "yos_locale_stub.c" ];
+                 libcExtras  = defaultLibcExtras ++ [ "qsort" ];
+                 # keyword.c folds option keywords with tolower(); without the
+                 # C-locale rune table that derefs a NULL locale and the lookup
+                 # fails (the browser engine has no host ctype to fall back on).
+                 stageDirs   = [ "ps-compat" "locale-stub" ];
+                 extraCflags = [ "-I${freebsd-src}/usr/src/bin/ps"
+                                 "-I$STAGE/ps-compat"
+                                 "-Wno-incompatible-pointer-types"
+                                 "-Wno-pointer-sign"
+                                 "-Wno-implicit-function-declaration" ]; };
 
     # ── real FreeBSD top ─────────────────────────────────────────────
     # The interactive William-LeFebvre top, built from FreeBSD source
@@ -585,95 +596,13 @@ stdenv.mkDerivation {
     # actual bin/ps.
     #
     # Reads the process list via FreeBSD's standard
-    # sysctl(CTL_KERN, KERN_PROC, KERN_PROC_PROC) — yos's libc bridge in
-    # src/yos/impl/libc/sysctl.c serves that from ctx->rt->procs[].
-    # FreeBSD does NOT ship /proc (procfs(5) is a deprecated, disabled-
-    # by-default Linux-compat shim), so opendir("/proc") would return
-    # ENOENT — sysctl is the right contract.
-    mkdir -p "$STAGE/yos-ps"
-    cat > "$STAGE/yos-ps/yos_ps.c" <<'YOSPS_EOF'
-    /* yos-native ps(1) — FreeBSD-shaped, sysctl(KERN_PROC_PROC).
-     *
-     * Output columns: PID  PPID  STAT  COMMAND
-     *
-     * Each record is a struct kinfo_proc; we read the fields we need
-     * at the hand-baked FreeBSD-i386 offsets (sizeof(kinfo_proc) = 768
-     * on that ABI; see tools/struct-offsets.py kinfo_proc to verify).
-     * Doing it this way means ps doesn't need to know the full struct
-     * — just the four byte offsets it actually reads.
-     */
-    #include <errno.h>
-    #include <stdint.h>
-    #include <stdio.h>
-    #include <stdlib.h>
-    #include <string.h>
-    #include <sys/sysctl.h>
-
-    /* FreeBSD-i386 struct kinfo_proc field offsets. */
-    #define KP_SIZE         768
-    #define KP_OFF_PID       40
-    #define KP_OFF_PPID      44
-    #define KP_OFF_STAT     308   /* char */
-    #define KP_OFF_COMM     367   /* char[20] */
-
-    /* FreeBSD ki_stat → letter, mirroring real ps's STAT column. */
-    static char stat_letter(unsigned char s)
-    {
-        switch (s) {
-        case 1: return 'I';  /* SIDL  */
-        case 2: return 'R';  /* SRUN  */
-        case 3: return 'S';  /* SSLEEP */
-        case 4: return 'T';  /* SSTOP */
-        case 5: return 'Z';  /* SZOMB */
-        case 6: return 'W';  /* SWAIT */
-        case 7: return 'L';  /* SLOCK */
-        default: return '?';
-        }
-    }
-
-    int main(int argc, char **argv)
-    {
-        (void)argc; (void)argv;
-
-        int mib[3] = { CTL_KERN, KERN_PROC, KERN_PROC_PROC };
-
-        /* Two-call sysctl idiom: NULL buffer first to learn the size. */
-        size_t buflen = 0;
-        if (sysctl(mib, 3, NULL, &buflen, NULL, 0) < 0) {
-            fprintf(stderr, "ps: sysctl(KERN_PROC_PROC) size: %s\n",
-                    strerror(errno));
-            return 1;
-        }
-        void *buf = malloc(buflen);
-        if (!buf) {
-            fprintf(stderr, "ps: malloc(%zu) failed\n", buflen);
-            return 1;
-        }
-        if (sysctl(mib, 3, buf, &buflen, NULL, 0) < 0) {
-            fprintf(stderr, "ps: sysctl(KERN_PROC_PROC) fill: %s\n",
-                    strerror(errno));
-            free(buf);
-            return 1;
-        }
-
-        printf("  PID  PPID S COMMAND\n");
-        size_t n = buflen / KP_SIZE;
-        int rows = 0;
-        for (size_t i = 0; i < n; i++) {
-            const unsigned char *kp = (const unsigned char *)buf + i * KP_SIZE;
-            int  pid  = *(const int32_t *)(kp + KP_OFF_PID);
-            int  ppid = *(const int32_t *)(kp + KP_OFF_PPID);
-            char st   = stat_letter(kp[KP_OFF_STAT]);
-            const char *comm = (const char *)(kp + KP_OFF_COMM);
-            printf("%5d %5d %c %s\n", pid, ppid, st, comm);
-            rows++;
-        }
-        free(buf);
-        if (rows == 0)
-            fprintf(stderr, "ps: KERN_PROC_PROC returned 0 records\n");
-        return 0;
-    }
-    YOSPS_EOF
+    # ── real ps compat shim (copied verbatim from ps-compat/) ────────
+    # libkvm/libxo/libutil/libjail stand-in routing the process list
+    # through sysctl(CTL_KERN, KERN_PROC, KERN_PROC_*). FreeBSD does NOT
+    # ship /proc; sysctl is the right contract.
+    mkdir -p "$STAGE/ps-compat"
+    cp -r ${./ps-compat}/. "$STAGE/ps-compat/"
+    chmod -R u+w "$STAGE/ps-compat"
 
     # ── real FreeBSD top: shims + retargeted machine.c ────────────────
     # Only machine.c is replaced (yos has no libkvm); the rest of top

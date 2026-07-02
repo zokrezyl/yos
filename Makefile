@@ -37,6 +37,8 @@ NINJA    := $(NIX_DEV) ninja -C $(BUILD)
         libs wasm3 yos-api-bridge \
         libc-pure yos run \
         test test-libc test-freebsd test-list testlog \
+        test-browser test-browser-chrome test-browser-engine test-browser-libc \
+        test-browser-tmux-render test-browser-tmux-xterm serve-zsh \
         nvim-build nvim-deps \
         format check
 
@@ -80,6 +82,14 @@ help:
 	@printf '    make test-freebsd   — yos:freebsd-libc tests only (FreeBSD libc/tests)\n'
 	@printf '    make test-list      — list available test names\n'
 	@printf '    make testlog        — tail meson-logs/testlog.txt\n'
+	@printf '\n  Browser-runtime tests (headless; issue #21 — needs node + google-chrome-stable)\n'
+	@printf '    make test-browser-libc   — run the ENTIRE yos:libc unit-test suite through the browser engine\n'
+	@printf '    make test-browser        — in-page browser suite (headless Chrome + node engine)\n'
+	@printf '    make test-browser-chrome — headless-Chrome page tests only\n'
+	@printf '    make test-browser-engine — node process-engine page tests only (no Chrome)\n'
+	@printf '    make test-browser-tmux-render — assess tmux rendering via libvterm (faithful 80x24 grid)\n'
+	@printf '    make test-browser-tmux-xterm  — assess tmux in real xterm.js at non-24 height (pins status-bar/size bug)\n'
+	@printf '    make serve-zsh           — serve the interactive browser zsh at http://127.0.0.1:8099/zsh.html (PORT=… to override)\n'
 	@printf '\n  External wasm packages\n'
 	@printf '    make nvim-build     — neovim 0.10.4 → wasm32 (needs nvim-deps first)\n'
 	@printf '    make nvim-deps      — fetch + build all 9 nvim deps\n'
@@ -180,6 +190,63 @@ test-list:
 
 testlog:
 	@cat $(BUILD)/meson-logs/testlog.txt
+
+# ─── Browser-runtime tests (issue #21) ─────────────────────────────────
+# Headless-Chrome + node-engine tests for the browser process engine in
+# src/yos/platform/web. These are prototypes OUTSIDE the meson build graph:
+# they run with the SYSTEM `node` + `google-chrome-stable` against the
+# prebuilt wasm already in the web dir, so they need neither `make all` nor
+# nix. Override the browser with YOS_CHROME, per-test timeout with
+# YOS_TEST_TIMEOUT (seconds). The Chrome tests bind fixed debug ports, so the
+# runner is strictly sequential.
+WEB := src/yos/platform/web
+
+# Run the ENTIRE yos:libc unit-test corpus (the same tests `make test-libc`
+# runs on the native host binary) against the BROWSER process engine
+# (yos_proc.mjs), via a CLI shim. Discovers the test set + each test's
+# (src, wasm) from `meson introspect`, runs each through the browser engine
+# with the exact `Expected:`-header pass criterion, and classifies any failure
+# against the native binary (BROWSER-GAP = native passes but browser fails).
+#
+# Runs against the ALREADY-BUILT suite (it does not rebuild — a broken native
+# build shouldn't block the browser run, and the driver reports any unbuilt
+# wasm). Build the corpus first if needed: `make test-libc` (or `make all`).
+# Needs system `node` + `meson` on PATH.
+test-browser-libc:
+	@node $(WEB)/browser-libc-suite.mjs
+
+test-browser:
+	@node $(WEB)/browser-test-runner.mjs
+
+test-browser-chrome:
+	@node $(WEB)/browser-test-runner.mjs --chrome
+
+test-browser-engine:
+	@node $(WEB)/browser-test-runner.mjs --engine
+
+# Assess tmux's RENDERED screen on the browser engine using libvterm as an
+# independent oracle: capture the exact byte stream xterm.js receives, render it
+# into a faithful 80x24 grid via the bundled libvterm sources (src/libvterm), and
+# assert the layout (status bar, straight centred pane divider, splits, windows).
+# Compiles the libvterm grid tool on first run.
+test-browser-tmux-render:
+	@node $(WEB)/tmux_render_test.mjs
+
+# Real-xterm.js assessment of tmux in headless Chrome: boots zsh.html at a
+# non-24 height, launches tmux, and checks WHERE the status bar lands in the
+# xterm.js buffer. Guards the variadic-ioctl winsize fix (tmux must size to the
+# real terminal, status bar on the last row). Needs google-chrome-stable.
+test-browser-tmux-xterm:
+	@node $(WEB)/tmux_xterm_render_test.mjs
+
+# Serve the web dir over HTTP so you can open the interactive zsh terminal
+# (zsh.html → zsh_main.mjs → the long-lived browser zsh) in a real browser.
+# Foreground, Ctrl-C to stop. Override the port: `make serve-zsh PORT=8137`.
+# Runs against the prebuilt wasm already in the web dir — no nix, no `make all`.
+PORT ?= 8099
+serve-zsh:
+	@printf '\n  open  http://127.0.0.1:$(PORT)/zsh.html\n\n'
+	@cd $(WEB) && ./serve.sh $(PORT)
 
 # ─── External wasm packages ────────────────────────────────────────────
 

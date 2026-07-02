@@ -9,6 +9,7 @@ import {
 } from "./mt_libc.mjs";
 import { format } from "./mt_format.mjs";
 import { HEAP_START } from "./mt_libc.mjs";
+import { strictImportEnv } from "./import_manifest.mjs";
 
 const ASYNCIFY_REWINDING = 2;
 const enc = new TextEncoder();
@@ -17,7 +18,7 @@ const dec = new TextDecoder();
 // Minimal in-memory VFS shared across the tree (host-side JS).
 function makeVfs() {
   const now = Math.floor(Date.now() / 1000);
-  return { files: new Map(), fds: new Map(), dirs: new Map(), nextFd: 5, now };
+  return { files: new Map(), fds: new Map(), dirs: new Map(), nextFd: 5, cwd: "/", now };
 }
 
 export async function runMtProgram(module, argv, opts) {
@@ -45,7 +46,8 @@ export async function runMtProgram(module, argv, opts) {
     const proc = { pid, ppid, argv: av, comm: (av[0] || "?").replace(/.*\//, ""), exited: false, reaped: false, exitCode: 0, mem, forkReturn: 0, forkPending: false, pendingRewind: false, argc: 0, argvPtr: 0 };
     procs.push(proc);
     proc.ctx = makeCtx(proc, mod);
-    proc.inst = new WebAssembly.Instance(mod, { env: buildEnv(proc.mem, proc.ctx) });
+    const { env } = strictImportEnv(buildEnv(proc.mem, proc.ctx), mod, { label: "mt", onCall: proc.ctx.unimpl });
+    proc.inst = new WebAssembly.Instance(mod, { env });
     proc.ctx.inst = proc.inst;
     proc.ctx.errnoPtr = allocIn(proc.mem, 4);
     if (fresh) {
@@ -90,9 +92,14 @@ export async function runMtProgram(module, argv, opts) {
       read: (fd, b, n) => { const f = vfs.fds.get(fd); if (!f || !f.file) return 0; const end = Math.min(f.off + n, f.file.data.length); u8.set(f.file.data.subarray(f.off, end), b); const g = end - f.off; f.off = end; return g; },
       close: (fd) => { vfs.fds.delete(fd); vfs.dirs.delete(fd); return 0; },
       lseek: (fd, o, w) => { const f = vfs.fds.get(fd); if (!f) return -1; f.off = w === 2 ? f.file.data.length + o : w === 1 ? f.off + o : o; return f.off; },
+      // dup/dup2 share the SAME open file description (same entry object), so
+      // the file offset is shared — sequential writes via dup'd fds append.
+      dup: (fd) => { const f = vfs.fds.get(fd); if (!f) return -1; const n = vfs.nextFd++; vfs.fds.set(n, f); return n; },
+      dup2: (oldfd, newfd) => { const f = vfs.fds.get(oldfd); if (!f) return -1; vfs.fds.set(newfd, f); return newfd; },
+      chdir: (path) => { vfs.cwd = path; return 0; }, getcwd: () => vfs.cwd,
       unlink: (path) => { vfs.files.delete(path); return 0; },
       stat: (path, b) => { const f = vfs.files.get(path); u8.fill(0, b, b + 128); if (f) { v.setUint16(b + 24, 0o100644, true); v.setUint32(b + 96, f.data.length, true); return 0; } if (path === "/" || path === "/tmp" || path === ".") { v.setUint16(b + 24, 0o040755, true); return 0; } v.setUint32(ctx.errnoPtr, 2, true); return -1; },
-      fstat: (fd, b) => { u8.fill(0, b, b + 128); v.setUint16(b + 24, 0o020666, true); return 0; },
+      fstat: (fd, b) => { u8.fill(0, b, b + 128); const f = vfs.fds.get(fd); if (f && f.file) { v.setUint16(b + 24, 0o100644, true); v.setUint32(b + 96, f.file.data.length, true); } else { v.setUint16(b + 24, 0o020666, true); } return 0; },
       access: (path) => (vfs.files.has(path) ? 0 : -1),
       dupfd: () => vfs.nextFd++,
       opendir: (path) => { const names = [...vfs.files.keys()].filter((p) => p.startsWith((path === "/" ? "/" : path + "/")) && !p.slice((path === "/" ? 1 : path.length + 1)).includes("/")).map((p) => p.slice(path === "/" ? 1 : path.length + 1)); const h = vfs.nextFd++; vfs.dirs.set(h, { names: [".", "..", ...names], idx: 0, buf: 0 }); return h; },
@@ -118,24 +125,42 @@ export async function runMtProgram(module, argv, opts) {
       kill: (pid, sig) => { const p = procs.find((q) => q.pid === pid); if (p && !p.exited) { p.exited = true; p.exitCode = 128 + sig; } return 0; },
       // ---- threads ----
       threadCreate: (out, fnIdx, arg) => {
-        const tid = ++nextTid; const slot = (tid - 1) % POOL_SIZE; const flagAddr = FLAG_BASE + tid * 4;
-        Atomics.store(ia, flagAddr >> 2, 0); v.setUint32(out, tid, true);
+        // 8 bytes per thread in the flag region: [done flag @0, return value @4]
+        // so pthread_join can hand the thread's return value back to the guest.
+        const tid = ++nextTid; const slot = (tid - 1) % POOL_SIZE; const flagAddr = FLAG_BASE + tid * 8;
+        Atomics.store(ia, flagAddr >> 2, 0); Atomics.store(ia, (flagAddr >> 2) + 1, 0); v.setUint32(out, tid, true);
         const slotI = (POOL_BASE >> 2) + slot * 4;
         Atomics.store(ia, slotI + 1, fnIdx); Atomics.store(ia, slotI + 2, arg); Atomics.store(ia, slotI + 3, flagAddr);
         Atomics.store(ia, slotI, 1); Atomics.notify(ia, slotI);
         proc.threads = proc.threads || new Map(); proc.threads.set(tid, flagAddr); return 0;
       },
-      threadJoin: (tid) => { const fa = proc.threads && proc.threads.get(tid); if (fa == null) return -1; const idx = fa >> 2; let n = 0; while (Atomics.load(ia, idx) === 0) { Atomics.wait(ia, idx, 0, 4000); if (++n > 4) break; } return 0; },
+      threadJoin: (tid, retvalPtr) => { const fa = proc.threads && proc.threads.get(tid); if (fa == null) return -1; const idx = fa >> 2; let n = 0; while (Atomics.load(ia, idx) === 0) { Atomics.wait(ia, idx, 0, 4000); if (++n > 4) break; } if (retvalPtr) v.setUint32(retvalPtr, Atomics.load(ia, idx + 1) >>> 0, true); proc.threads.delete(tid); return 0; },
     };
     return ctx;
   }
 
   function getAsyncifyState(proc) { const f = proc.inst.exports.asyncify_get_state; return f ? f() : -1; }
 
+  // A process's threads are "live" until joined. Used to keep fork() safe.
+  function liveThreadCount(proc) {
+    if (!proc.threads) return 0;
+    let n = 0;
+    for (const fa of proc.threads.values()) if (Atomics.load(ia, fa >> 2) === 0) n++;
+    return n;
+  }
+
   function doFork(parent) {
     const st = getAsyncifyState(parent);
     if (((typeof process!=='undefined'&&process.env.MT_DEBUG))) console.error(`doFork pid=${parent.pid} state=${st} (procs=${procs.length})`);
     if (st < 0) return -1;
+    // SAFETY (codex review #4): fork() in a multithreaded process is only safe
+    // if the OTHER threads are quiescent. A worker mid-write would make the
+    // memory snapshot torn, and POSIX says the child must come up with ONLY the
+    // calling thread. We don't preempt running workers, so rather than silently
+    // snapshot inconsistent memory we refuse with EAGAIN while any sibling
+    // thread is still live (the common cases — fork before any pthread_create,
+    // or after the threads are joined — are unaffected).
+    if (st === 0 && liveThreadCount(parent) > 0) return -11; // EAGAIN
     // soft cap: too many live procs → fork fails with EAGAIN (the guest
     // handles fork-fail), rather than throwing and killing the run.
     if (st === 0 && procs.filter((p) => !p.reaped).length > 64) return -11;

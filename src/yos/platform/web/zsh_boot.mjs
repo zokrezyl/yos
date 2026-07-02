@@ -5,7 +5,12 @@
 // IS the prioritized worklist toward an interactive prompt.
 //
 // Run: node zsh_boot.mjs [path-to-zsh.wasm]
+//
+// PROTOTYPE (issue #21, milestone 1): superseded by zsh_main.mjs /
+// zsh_host.mjs. Kept as a probe; missing imports fail loudly via
+// strictImportEnv rather than the old silent return-0 auto-stub.
 import { readFile } from "node:fs/promises";
+import { strictImportEnv } from "./import_manifest.mjs";
 
 const wasmPath = process.argv[2] || new URL("../../../../tmp/zsh.wasm", import.meta.url);
 const bytes = await readFile(wasmPath);
@@ -107,19 +112,10 @@ const emit = (fd, text) => { const p = putStr(text); writeBytes(fd, p, enc.encod
 const fdOfFile = (fp) => (fp >= 1 && fp <= 3 ? fp - 1 : 1);
 let nextFd = 10; // fake fds for dup/pipe/fcntl(F_DUPFD)
 
-// --- build import object: auto-stub everything, then override ---
-const imports = WebAssembly.Module.imports(mod).filter((i) => i.kind === "function");
+// --- build import object: only what we implement; missing imports fail
+// loudly via strictImportEnv at instantiation (no silent return-0). ---
 const seenUnimpl = new Set();
 const env = {};
-for (const { name } of imports) {
-  env[name] = (...args) => {
-    if (!seenUnimpl.has(name)) {
-      seenUnimpl.add(name);
-      console.error(`  UNIMPL env.${name}(${args.join(",")})`);
-    }
-    return 0;
-  };
-}
 
 Object.assign(env, {
   // clang command model: zsh's _start calls env.__main_argc_argv, which
@@ -230,6 +226,15 @@ Object.assign(env, {
 });
 
 // --- instantiate + run ---
+strictImportEnv(env, mod, {
+  label: "zsh-boot",
+  onCall: (name, args) => {
+    if (!seenUnimpl.has(name)) {
+      seenUnimpl.add(name);
+      console.error(`  UNIMPL env.${name}(${args.join(",")})`);
+    }
+  },
+});
 let inst;
 try {
   inst = await WebAssembly.instantiate(mod, { env });

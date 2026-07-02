@@ -208,6 +208,11 @@ libc_tests = [
   #                           (libarchive.c, finding 2)
   'test_issue20_unterminated_path',
   'test_issue20_mmap_fixed',
+  #   munmap_heap_guard     — munmap() only releases live mmap regions;
+  #                           a munmap landing on static/.bss or the brk
+  #                           heap is a no-op (does not zero the bytes nor
+  #                           donate them to the mmap free list) (mem.c)
+  'test_munmap_heap_guard',
   'test_issue20_libarchive_filename',
   #   libarchive_kinds      — archive/entry handle-kind enforcement:
   #                           freeing an entry-as-archive is a no-op, and
@@ -220,6 +225,12 @@ libc_tests = [
   #                           (yos_libarchive_ctx_free is now actually
   #                           invoked) without crashing (finding 4)
   'test_issue20_libarchive_leak_teardown',
+  #   libarchive_into_fd    — archive_read_data_into_fd streams the entry
+  #                           through yos_write to a yos wasm fd (not a
+  #                           translated host fd); payload exceeds the
+  #                           64 KiB scratch so the read/write loop and
+  #                           short-write handling are exercised (libarchive.c)
+  'test_libarchive_into_fd',
 ]
 
 # Path to the generator's output dir, exposed by src/yos/codegen.
@@ -266,6 +277,41 @@ perf_stress_wasm = custom_target(
   # main. -O2 shrinks the asyncify-instrumented frame enough that
   # _start fits. The other (smaller) libc tests get away without
   # -O2 because their _start frame is already compact.
+  command          : [wasm_opt, '--asyncify', '-O2', '-o', '@OUTPUT@', '@INPUT@'],
+  build_by_default : true,
+)
+
+# Shared-memory (-pthread) build of the SAME source. The host-threaded
+# wasm above exports its own non-shared memory (native yos / wasm3 sets
+# the per-thread stack pointer); the browser cannot do that, so its
+# real-thread engine (mt_engine: Web Workers + SharedArrayBuffer) needs a
+# wasm that IMPORTS a shared memory and uses wasm-native atomics. Same .c,
+# different ABI: -matomics -mbulk-memory + --import-memory --shared-memory
+# + --export-table. The browser libc suite (src/yos/platform/web) runs THIS
+# variant for perf_stress, where it passes with real threads; native keeps
+# running the host-threaded one.
+perf_stress_mt_raw = custom_target(
+  'test_perf_stress-mt-raw.wasm',
+  input            : files('test_perf_stress.c'),
+  output           : 'test_perf_stress-mt-raw.wasm',
+  depends          : sysroot_skel,
+  command          : [wasm_cc,
+                      '-target', 'wasm32-unknown-unknown', '-nostdlib', '-O2', '-fno-builtin',
+                      '--sysroot=' + sysroot_dir,
+                      '-isystem', sysroot_dir / 'usr' / 'include',
+                      '-L', sysroot_dir / 'usr' / 'lib',
+                      '-matomics', '-mbulk-memory',
+                      '-Wl,--no-entry', '-Wl,--allow-undefined',
+                      '-Wl,--import-memory', '-Wl,--shared-memory', '-Wl,--max-memory=67108864',
+                      '-Wl,--export-table', '-Wl,--export-all', '-Wl,--table-base=2',
+                      sysroot_dir / 'usr' / 'lib' / 'crt1.o',
+                      '-o', '@OUTPUT@', '@INPUT0@'],
+  build_by_default : true,
+)
+perf_stress_mt_wasm = custom_target(
+  'test_perf_stress-mt.wasm',
+  input            : perf_stress_mt_raw,
+  output           : 'test_perf_stress-mt.wasm',
   command          : [wasm_opt, '--asyncify', '-O2', '-o', '@OUTPUT@', '@INPUT@'],
   build_by_default : true,
 )

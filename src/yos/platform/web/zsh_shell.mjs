@@ -1,7 +1,10 @@
 // One zsh shell bound to a DOM container — the reusable unit behind the
-// single-pane (zsh.html) and split-pane (multi.html) terminals. Each
-// shell is independent: its own xterm + its own per-command engine.
-import { runProgram as runZsh } from "./yos_proc.mjs";
+// split-pane terminal (multi.html). Each pane is an INDEPENDENT long-lived
+// zsh process: its own xterm + its own interactive session, so cwd,
+// variables, history and running jobs persist across commands within a pane
+// and never leak between panes. This is the same persistent-shell model as
+// zsh.html (runInteractive), not one-zsh-per-line.
+import { runInteractive } from "./yos_proc.mjs";
 
 export async function createShell(container, shared, label) {
   const term = new Terminal({
@@ -12,47 +15,26 @@ export async function createShell(container, shared, label) {
   term.open(container);
 
   const { mod, tools } = shared;
-  const PROMPT = `\x1b[38;2;107;168;146m${label || "zsh"}%\x1b[0m `;
-  let line = "";
-  const out = (text) => term.write(text.replace(/\n/g, "\r\n"));
-
-  const runPerfstressMt = (cmd) => new Promise((resolve) => {
-    const argv = cmd.trim().split(/\s+/);
-    const coord = new Worker(new URL("./mt_coordinator_browser.mjs", import.meta.url), { type: "module" });
-    coord.onmessage = (e) => {
-      if (e.data.out) { out(e.data.out); return; }
-      if (e.data.done) { if (e.data.error) out(`[mt error: ${e.data.error}]\n`); coord.terminate(); resolve(); }
-    };
-    coord.postMessage({ wasmUrl: new URL("./tools/perfstress_mt.wasm", import.meta.url).href, argv });
+  let exited = false;
+  let raw = "";
+  const ctl = runInteractive(mod, ["zsh", "-f", "+o", "promptsp"], {
+    onOutput: (fd, text) => { raw += text; term.write(text); },
+    onExit: (code) => { exited = true; term.write(`\r\n\x1b[38;2;85;97;98m[zsh exited ${code}]\x1b[0m\r\n`); },
+    tools,
+    cols: term.cols, rows: term.rows,
   });
 
-  let busy = false;
-  const runLine = async (cmd) => {
-    if (cmd.trim()) {
-      if (/^perfstress(\s|$)/.test(cmd.trim())) await runPerfstressMt(cmd);
-      else {
-        const res = runZsh(mod, ["zsh", "-f", "-c", cmd], (fd, t) => out(t), () => {}, { tools });
-        if (res.exitCode !== 0 && res.error) out(`[zsh exit ${res.exitCode}: ${res.error}]\n`);
-      }
-    }
-    term.write(PROMPT);
-  };
+  // xterm encodes keystrokes (printable, arrows, ^C, …) into the right
+  // terminal bytes; forward them straight to the interactive shell, which
+  // echoes and line-edits itself.
+  term.onData((data) => { if (!exited) ctl.write(data); });
+  term.onResize(({ cols, rows }) => ctl.resize(cols, rows));
 
-  const handleData = async (data) => {
-    for (const ch of data) {
-      if (ch === "\r" || ch === "\n") { term.write("\r\n"); if (!busy) { busy = true; await runLine(line); busy = false; } line = ""; }
-      else if (ch === "\x7f" || ch === "\b") { if (line) { line = line.slice(0, -1); term.write("\b \b"); } }
-      else if (ch >= " ") { line += ch; term.write(ch); }
-    }
-  };
-
-  out(`zsh on the wasm engine — pane "${label}". try: ps · ls / · perfstress · echo $((6*7))\r\n`);
-  term.write(PROMPT);
-  term.onData(handleData);
-  return { term, type: (s) => handleData(s) };
+  return { term, ctl, type: (s) => ctl.write(s), running: () => ctl.running(), raw: () => raw };
 }
 
-// Compile the zsh module + tools once; shells share them.
+// Compile the zsh module + tools once; every pane shares the compiled
+// modules (cheap) but gets its own process/memory via runInteractive.
 export async function loadShared() {
   const mod = await WebAssembly.compile(await (await fetch("./zsh.wasm")).arrayBuffer());
   const names = ["pwd", "id", "hostname", "echo", "cat", "ls", "ps", "date", "true", "false", "forkdemo", "forkstress", "perfstress"];

@@ -1,15 +1,14 @@
 <!doctype html>
 <meta charset="utf-8" />
 <title>real tmux.wasm in the browser</title>
-<link rel="stylesheet" crossorigin="anonymous"
-      href="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/css/xterm.min.css" />
+<link rel="stylesheet" href="./vendor/xterm.min.css" />
 <style>
-  body { background: #0b1014; margin: 0; padding: 1rem; }
-  #term { height: calc(100vh - 2rem); }
+  html, body { margin: 0; height: 100%; background: #0b1014; }
+  #term { width: 100vw; height: 100vh; }
 </style>
 <div id="term"></div>
-<script crossorigin="anonymous"
-        src="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/lib/xterm.min.js"></script>
+<script src="./vendor/xterm.min.js"></script>
+<script src="./vendor/addon-fit.min.js"></script>
 <script>
   window.addEventListener("error", (e) => { window.__err = String(e.error?.stack || e.message); });
   window.addEventListener("unhandledrejection", (e) => { window.__err = String(e.reason?.stack || e.reason); });

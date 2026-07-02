@@ -8,6 +8,12 @@
 // stubbed to non-interactive defaults — enough for builtins like echo,
 // print, [[ ]], arithmetic, parameter expansion. onUnimpl reports the
 // first hit of anything not yet implemented (the worklist).
+//
+// PROTOTYPE (issue #21, milestone 1): hand-written JS libc, not the
+// production yos surface. Imports it does not implement fail loudly via
+// strictImportEnv, never via a catch-all return-0 fallback.
+
+import { strictImportEnv } from "./import_manifest.mjs";
 
 export function runZsh(mod, argv, onOutput, onUnimpl, opts = {}) {
   const tools = opts.tools || new Map(); // name -> compiled WebAssembly.Module
@@ -63,10 +69,10 @@ export function runZsh(mod, argv, onOutput, onUnimpl, opts = {}) {
     return out;
   }
 
+  // Only the functions the prototype actually implements. Missing imports
+  // are hardened by strictImportEnv() at instantiation time (fail loudly),
+  // not pre-filled with silent return-0 stubs (issue #21).
   const env = {};
-  for (const { name } of WebAssembly.Module.imports(mod).filter((i) => i.kind === "function")) {
-    env[name] = (() => { let seen = false; return (...a) => { if (!seen) { seen = true; onUnimpl && onUnimpl(name, a); } return 0; }; })();
-  }
 
   Object.assign(env, {
     __main_argc_argv: (argc, argv2) => state.main(argc, argv2),
@@ -179,7 +185,7 @@ export function runZsh(mod, argv, onOutput, onUnimpl, opts = {}) {
   });
 
   let inst;
-  try { inst = new WebAssembly.Instance(mod, { env }); }
+  try { strictImportEnv(env, mod, { label: "zsh", onCall: onUnimpl }); inst = new WebAssembly.Instance(mod, { env }); }
   catch (e) { return { exitCode: "instantiate-failed", error: e.message }; }
   state.mem = inst.exports.memory;
   state.main = inst.exports.main;

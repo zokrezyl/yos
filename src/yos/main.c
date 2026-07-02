@@ -2303,7 +2303,17 @@ int main(int argc, char **argv)
         }
         ctx.wasm_bytes = wasm_bytes;
         ctx.wasm_bytes_size = wasm_size;
+        /* The mmap/free-list/live-list bookkeeping in impl/mem.c indexes
+         * the OLD linear memory that load_wasm_module just replaced.
+         * Carrying it over lets yos_mmap2 reuse a stale mmap_top and hand
+         * the new image a region the bump allocator already considers
+         * taken, and leaves stale live/free regions pointing at addresses
+         * that no longer mean anything. heap_end was reset inside
+         * load_wasm_module; clear the rest so the new image starts from a
+         * clean memory map. (The alloc.c bookmarks are reset below.) */
         ctx.free_count = 0;
+        ctx.live_count = 0;
+        ctx.mmap_top = 0;
 
         /* execve(2) replaces the process image — update comm and exe
          * on the yos_proc so /proc/<pid>/{stat,comm,exe} reflect the

@@ -6,6 +6,7 @@
 import { workerData, parentPort } from "node:worker_threads";
 import { buildEnv, POOL_BASE, READY_OFF, ALLOC_PTR } from "./mt_libc.mjs";
 import { format } from "./mt_format.mjs";
+import { strictImportEnv } from "./import_manifest.mjs";
 
 const { module, memory, slot } = workerData;
 const ia = new Int32Array(memory.buffer);
@@ -37,7 +38,7 @@ const ctx = {
 };
 
 let inst;
-try { inst = new WebAssembly.Instance(module, { env: buildEnv(memory, ctx) }); }
+try { const { env } = strictImportEnv(buildEnv(memory, ctx), module, { label: "mt-pool", onCall: ctx.unimpl }); inst = new WebAssembly.Instance(module, { env }); }
 catch (e) { parentPort.postMessage({ error: "pool instantiate: " + e.message }); }
 const table = inst && inst.exports.__indirect_function_table;
 const slotI = (POOL_BASE >> 2) + slot * 4;
@@ -47,7 +48,9 @@ for (;;) {
   Atomics.wait(ia, slotI, 0);
   if (Atomics.load(ia, slotI) === 0) continue;
   const fnIdx = Atomics.load(ia, slotI + 1), arg = Atomics.load(ia, slotI + 2), flagAddr = Atomics.load(ia, slotI + 3);
-  try { table.get(fnIdx)(arg); } catch (e) { if (!e.isThreadExit) parentPort.postMessage({ error: "thread: " + e.message }); }
+  let rv = 0;
+  try { rv = table.get(fnIdx)(arg) >>> 0; } catch (e) { if (e.isThreadExit) rv = e.code | 0; else parentPort.postMessage({ error: "thread: " + e.message }); }
+  Atomics.store(ia, (flagAddr >> 2) + 1, rv >>> 0);   // return value for pthread_join
   Atomics.store(ia, flagAddr >> 2, 1); Atomics.notify(ia, flagAddr >> 2);
   Atomics.store(ia, slotI, 0);
 }
