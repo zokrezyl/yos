@@ -28,7 +28,14 @@
 /* Max free regions for mmap reuse */
 #define YOS_MAX_FREE_REGIONS 64
 
-/* Freed memory region (for mmap reuse in WASM linear memory) */
+/* Max tracked LIVE mmap regions. Auxiliary bookkeeping so MAP_FIXED can
+ * tell a live mapping apart from a hole and munmap can drop ownership.
+ * Best-effort: on overflow a mapping simply isn't tracked (no corruption
+ * — the free-list double-free guard is the hard invariant). */
+#define YOS_MAX_LIVE_REGIONS 128
+
+/* A memory region [addr, addr+len) in WASM linear memory. Used for both
+ * the free list (reusable holes) and the live list (owned mappings). */
 struct yos_free_region {
     uint32_t addr;
     uint32_t len;
@@ -138,9 +145,14 @@ struct yos_exec_ctx {
     uint8_t *wasm_bytes;  /* raw wasm binary (kept for fork) */
     size_t wasm_bytes_size;
 
-    /* Memory free list (for mmap reuse) */
+    /* Memory free list (reusable holes) + live list (owned mappings).
+     * free_list feeds find_free_region; live_list lets munmap drop the
+     * exact mapping and lets MAP_FIXED distinguish a live range from a
+     * hole instead of blindly clobbering it. Both guarded by mem_lock. */
     struct yos_free_region free_list[YOS_MAX_FREE_REGIONS];
     int free_count;
+    struct yos_free_region live_list[YOS_MAX_LIVE_REGIONS];
+    int live_count;
     pthread_mutex_t mem_lock;
 
     /* Per-ctx host-side pthread implementation. MUST be per-ctx (not
@@ -394,6 +406,24 @@ struct yos_exec_ctx {
      * See impl/libc/liblua.c and policies/lua.yaml. */
     void   **lua_handles;
     uint32_t lua_handles_cap;
+
+    /* libarchive per-guest state. libarchive is the textbook reentrant
+     * case (build-tools/libbridge analysis: ZERO writable globals; all
+     * state lives in the caller-owned `struct archive *` /
+     * `struct archive_entry *`). So the bridge just maps the i32 handle
+     * the guest holds to the host pointer. Both archive and entry
+     * pointers share this table; slot 0 reserved. See
+     * impl/libc/libarchive.c.
+     *
+     * arc_handle_kinds is a parallel byte array (same cap, same index)
+     * tagging each live slot as archive vs entry. Teardown needs it to
+     * archive_read_free() only the leaked archive handles — entry
+     * pointers are owned by their parent archive and must not be freed
+     * directly. 0 = empty, see YOS_ARC_KIND_* in libarchive.c. */
+    void   **arc_handles;
+    uint8_t *arc_handle_kinds;
+    uint32_t *arc_handle_owner;   /* for ENTRY slots: owning archive handle */
+    uint32_t arc_handles_cap;
 
     /* "Did this ctx write to stderr (wfd=2) since the last failed exec?"
      * Used by yos_exit to detect a forked child that died after exec

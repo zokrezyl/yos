@@ -289,7 +289,7 @@ int32_t yos_vfs_getdents64(struct yos_exec_ctx *ctx, int32_t fd, uint32_t dirent
 int32_t yos_vfs_statx(struct yos_exec_ctx *ctx, int32_t dfd, uint32_t pathname,
                       int32_t flags, uint32_t mask, uint32_t buffer)
 {
-    const char *path = wstr(ctx, pathname);
+    const char *path = wstr_check(ctx, pathname);
     if (!path) return yos_errno_neg(ctx, EFAULT);
 
     uint8_t *buf = wptr(ctx, buffer);
@@ -692,7 +692,7 @@ int32_t yos_vfs_execveat(struct yos_exec_ctx *ctx, int32_t dirfd, uint32_t pathn
     /* Resolve dirfd-relative pathname to an absolute path so we can
      * reuse yos_execve. AT_EMPTY_PATH means "use whatever dirfd
      * points to" (Linux 3.18+). */
-    const char *p = wstr(ctx, pathname);
+    const char *p = wstr_check(ctx, pathname);
     if (!p) return yos_errno_neg(ctx, EFAULT);
     char resolved[PATH_MAX];
     if (dirfd == -100 /* AT_FDCWD */ || p[0] == '/') {

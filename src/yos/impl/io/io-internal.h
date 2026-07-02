@@ -13,7 +13,10 @@
  * the other way. */
 
 #include "yos/types.h"
+#include "platform.h"   /* yos_plat_isatty — used by the compat shim below */
 #include <stdint.h>
+#include <stddef.h>
+#include <stdlib.h>
 
 extern int32_t yos_fd_translate(struct yos_exec_ctx *ctx, int32_t fd);
 extern int32_t yos_fd_get      (struct yos_exec_ctx *ctx, int32_t wfd);
@@ -94,6 +97,31 @@ static inline const char *wstr_check(struct yos_exec_ctx *ctx, uint32_t offset)
 static inline int32_t host_fd(struct yos_exec_ctx *ctx, int32_t fd)
 {
     return yos_fd_translate(ctx, fd);
+}
+
+/* ── fork/asyncify compatibility shim ─────────────────────────────────
+ * NOT generic OS semantics. A forked child under yos's asyncify-based
+ * fork can dribble short runs of all-0xff bytes onto a dup'd tty fd
+ * (the snapshot/rewind corrupts a small scratch area — see impl/proc).
+ * Those bytes are invalid UTF-8 and render as replacement glyphs,
+ * breaking zsh ZLE's `\b \b` column accounting ("backspace inserts a
+ * space"). Until the proc-side snapshot bug is rooted out, the write
+ * bridges drop pure-0xff payloads (≤16 B) aimed at a terminal.
+ *
+ * Kept behind this single explicit, named gate so it reads as the
+ * temporary compat shim it is, not as unconditional write semantics.
+ * Pure-0xff is never a legitimate tty payload (no protocol, escape
+ * sequence, or UTF-8), so this can't suppress real output. Set
+ * YOS_NO_FF_DROP=1 to disable it and observe the raw corruption the
+ * regression tests pin (tests/ut/libc/test_post_fork_stderr_clean). */
+static inline int yos_compat_drop_fork_tty_garbage(int hfd, const void *p, size_t n)
+{
+    if (n == 0 || n > 16 || hfd < 0) return 0;
+    if (getenv("YOS_NO_FF_DROP")) return 0;
+    if (yos_plat_isatty(hfd) != 1) return 0;
+    const uint8_t *bytes = (const uint8_t *)p;
+    for (size_t i = 0; i < n; i++) if (bytes[i] != 0xff) return 0;
+    return 1;
 }
 
 /* ── platform-slice contract ──────────────────────────────────────── */

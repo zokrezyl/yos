@@ -306,9 +306,15 @@ in stdenv.mkDerivation {
     { (void)bp; (void)name; return 1; }
     int   tgetnum(const char *id)
     {
-        /* Width and height come from TIOCGWINSZ at runtime; nothing
-         * to advertise here. Negative = "no entry". */
-        (void)id; return -1;
+        /* Advertise a default 80x24 so tools that gate "smart terminal"
+         * on the presence of li/co (e.g. top's screen.c, which goes dumb
+         * if tgetnum("li") <= 0) proceed. The real size is read from
+         * TIOCGWINSZ at runtime and overrides these. */
+        if (id && id[0] && id[1] && id[2] == 0) {
+            if (id[0] == 'l' && id[1] == 'i') return 24;   /* lines   */
+            if (id[0] == 'c' && id[1] == 'o') return 80;   /* columns */
+        }
+        return -1;
     }
     int   tgetflag(const char *id)
     {
@@ -341,11 +347,27 @@ in stdenv.mkDerivation {
             if (id[0] == 'c' && id[1] == 'd') return (char *)"\x1b[J";    /* clear to EOS */
             if (id[0] == 'c' && id[1] == 'l') return (char *)"\x1b[H\x1b[J"; /* clear screen */
             if (id[0] == 'k' && id[1] == 'b') return (char *)"\x7f";      /* key for backspace */
+            /* Cursor addressing + standout, needed by full-screen tools
+             * (top). cm is a template only — tgoto below emits the real
+             * CSI sequence from (col,row), so its content is ignored. */
+            if (id[0] == 'c' && id[1] == 'm') return (char *)"\x1b[%i%d;%dH"; /* cursor motion */
+            if (id[0] == 'h' && id[1] == 'o') return (char *)"\x1b[H";    /* home */
+            if (id[0] == 's' && id[1] == 'o') return (char *)"\x1b[7m";   /* standout start */
+            if (id[0] == 's' && id[1] == 'e') return (char *)"\x1b[27m";  /* standout end */
+            if (id[0] == 't' && id[1] == 'i') return (char *)"";          /* term init */
+            if (id[0] == 't' && id[1] == 'e') return (char *)"";          /* term end */
         }
         return 0;
     }
     char *tgoto(const char *cap, int col, int row)
-    { (void)col; (void)row; return (char *)cap; }
+    {
+        /* All our cursor-addressing strings are ANSI; emit CSI row;colH
+         * (1-based) directly instead of expanding a termcap template. */
+        static char buf[32];
+        (void)cap;
+        snprintf(buf, sizeof buf, "\x1b[%d;%dH", row + 1, col + 1);
+        return buf;
+    }
     int   tputs(const char *str, int affcnt, int (*putcfn)(int))
     {
         (void)affcnt;

@@ -4,6 +4,7 @@
 , msgpack-c
 , openssl
 , lua5_1
+, libarchive
 , src
 }:
 
@@ -100,6 +101,11 @@ in stdenv.mkDerivation {
     # it up. Disable with -Dwith_liblua=disabled if a target SDK
     # doesn't have lua-5.1.
     lua5_1
+    # Host libarchive — linked into yos so wasm guests (tar/cpio/unzip
+    # class) can call env.archive_* via src/yos/impl/libc/libarchive.c.
+    # pkg-config name is `libarchive`; meson's `with_libarchive=auto`
+    # picks it up. Disable with -Dwith_libarchive=disabled.
+    libarchive
   ] ++ lib.optionals stdenv.isDarwin [
     libiconv
     # Without this, nix's stdenv on darwin gates libSystem at the 10.12

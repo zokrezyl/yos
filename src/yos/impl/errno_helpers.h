@@ -80,6 +80,14 @@ static inline int32_t yos__errno_check(struct yos_exec_ctx *ctx, int rc, int e,
  * not the helper. */
 #define yos_errno_neg(ctx, e)   yos__errno_neg((ctx), (e), __func__)
 #define yos_errno_null(ctx, e)  yos__errno_null((ctx), (e), __func__)
-#define yos_errno_check(ctx, rc) yos__errno_check((ctx), (rc), errno, __func__)
+/* `rc` is typically the host libc call itself (e.g. connect(...)), which
+ * sets `errno` as a side effect. Function-argument evaluation order is
+ * unspecified in C, so `yos__errno_check((ctx), (rc), errno, ...)` may read
+ * `errno` BEFORE evaluating `rc` — capturing a stale errno (0) instead of
+ * the one the call just set. Sequence `rc` first via a temporary so `errno`
+ * is read only after the call has run. */
+#define yos_errno_check(ctx, rc) \
+    __extension__({ int32_t yos_errno_rc_ = (rc); \
+                    yos__errno_check((ctx), yos_errno_rc_, errno, __func__); })
 
 #endif /* YOS_IMPL_ERRNO_HELPERS_H */

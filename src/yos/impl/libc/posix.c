@@ -38,6 +38,7 @@
 #include <termios.h>
 #include <errno.h>
 #include <poll.h>
+#include <glob.h>
 
 #include "yos/types.h"
 #include <yos/ytrace/ytrace.h>
@@ -49,6 +50,8 @@ extern int  yos_fd_alloc(struct yos_exec_ctx *ctx, int host_fd);
 extern int  yos_fd_get  (struct yos_exec_ctx *ctx, int wasm_fd);
 extern void yos_fd_close(struct yos_exec_ctx *ctx, int wasm_fd);
 extern const char *yos_path_resolve(struct yos_exec_ctx *ctx, const char *p);
+extern uint32_t yos_malloc(struct yos_exec_ctx *ctx, uint32_t size);
+extern void     yos_free  (struct yos_exec_ctx *ctx, uint32_t off);
 
 /* Validated [offset, offset+len) range → host pointer. Mirrors the
  * same-named helper in impl/io/io-internal.h. Returns NULL when the
@@ -422,6 +425,344 @@ int32_t yos_shutdown(struct yos_exec_ctx *ctx, int32_t fd, int32_t how)
     int hfd = yos_fd_get(ctx, fd);
     if (hfd < 0) return hfd;
     return yos_errno_check(ctx, shutdown(hfd, how));
+}
+
+/* ── sendmsg / recvmsg ─────────────────────────────────────────────
+ *
+ * struct msghdr is pointer-heavy and the FreeBSD-i386 layout differs
+ * from the host's, so the auto-bridge can't handle it: it passed the
+ * wasm fd straight to the host call and treated the guest msghdr (whose
+ * msg_name / msg_iov / msg_control are GUEST offsets) as a host struct.
+ *
+ * FreeBSD-i386 struct msghdr — seven 4-byte fields, 28 bytes total:
+ *   0  msg_name (ptr)       4  msg_namelen (socklen_t)
+ *   8  msg_iov (ptr)       12  msg_iovlen (int)
+ *  16  msg_control (ptr)   20  msg_controllen (socklen_t)
+ *  24  msg_flags (int)
+ * FreeBSD struct iovec: iov_base @0, iov_len @4 (both 4 bytes).
+ * FreeBSD struct cmsghdr: cmsg_len @0 (socklen_t), cmsg_level @4,
+ *   cmsg_type @8; data at offset 12, cmsg objects aligned to 4 bytes.
+ *
+ * SOL_SOCKET differs between the ABIs (FreeBSD 0xffff, host typically 1);
+ * SCM_RIGHTS is 0x01 on both. fds carried in an SCM_RIGHTS control
+ * message are wasm fds on the guest side and must be translated to/from
+ * host fds — this is exactly how tmux/imsg hands the pty and stdio fds
+ * to the server. */
+enum {
+    YOS_FBMSG_NAME = 0, YOS_FBMSG_NAMELEN = 4,
+    YOS_FBMSG_IOV = 8, YOS_FBMSG_IOVLEN = 12,
+    YOS_FBMSG_CONTROL = 16, YOS_FBMSG_CONTROLLEN = 20,
+    YOS_FBMSG_FLAGS = 24, YOS_FBMSG_SIZE = 28,
+};
+#define YOS_FBSD_SOL_SOCKET 0xffff
+#define YOS_FBSD_SCM_RIGHTS 0x01
+/* imsg (tmux's client/server transport) batches many buffers into one
+ * sendmsg, up to the host IOV_MAX. Match that so large message bursts
+ * aren't rejected with EINVAL. 1024 × sizeof(struct iovec) = 16 KiB of
+ * stack — acceptable for the fork-thread stacks. */
+#ifdef IOV_MAX
+#define YOS_MSG_MAX_IOV     IOV_MAX
+#else
+#define YOS_MSG_MAX_IOV     1024
+#endif
+#define YOS_MSG_MAX_FDS     64
+/* Generous host control buffer: room for the SCM_RIGHTS fds we cap at. */
+#define YOS_MSG_CTRL_BUF    (CMSG_SPACE(YOS_MSG_MAX_FDS * sizeof(int)))
+
+static inline uint32_t yos_g_u32(struct yos_exec_ctx *ctx, uint32_t off)
+{
+    return *(uint32_t *)(ctx->memory + off);
+}
+static inline void yos_g_set_u32(struct yos_exec_ctx *ctx, uint32_t off,
+                                 uint32_t value)
+{
+    *(uint32_t *)(ctx->memory + off) = value;
+}
+
+/* FreeBSD cmsg alignment is 4 bytes on i386. */
+static inline uint32_t yos_fbsd_cmsg_align(uint32_t n) { return (n + 3u) & ~3u; }
+
+/* Build a host iovec array from the guest msg_iov. Returns the count, or
+ * -1 on a bad pointer. */
+static int yos_msg_build_iov(struct yos_exec_ctx *ctx, uint32_t iov_off,
+                             uint32_t iovlen, struct iovec *hiov)
+{
+    if (iovlen > YOS_MSG_MAX_IOV) return -1;
+    for (uint32_t i = 0; i < iovlen; i++) {
+        uint32_t entry = iov_off + i * 8u;       /* FreeBSD iovec = 8 bytes */
+        if (!posix_wptr_range(ctx, entry, 8)) return -1;
+        uint32_t base = yos_g_u32(ctx, entry);
+        uint32_t len  = yos_g_u32(ctx, entry + 4u);
+        if (len && !posix_wptr_range(ctx, base, len)) return -1;
+        hiov[i].iov_base = len ? (void *)(ctx->memory + base) : NULL;
+        hiov[i].iov_len  = len;
+    }
+    return (int)iovlen;
+}
+
+ssize_t yos_sendmsg(struct yos_exec_ctx *ctx, int32_t fd, uint32_t msg_off,
+                    int32_t flags)
+{
+    int hfd = yos_fd_get(ctx, fd);
+    if (hfd < 0) return hfd;
+    if (!posix_wptr_range(ctx, msg_off, YOS_FBMSG_SIZE))
+        return yos_errno_neg(ctx, EFAULT);
+
+    uint32_t name_off   = yos_g_u32(ctx, msg_off + YOS_FBMSG_NAME);
+    uint32_t name_len   = yos_g_u32(ctx, msg_off + YOS_FBMSG_NAMELEN);
+    uint32_t iov_off    = yos_g_u32(ctx, msg_off + YOS_FBMSG_IOV);
+    uint32_t iov_len    = yos_g_u32(ctx, msg_off + YOS_FBMSG_IOVLEN);
+    uint32_t ctrl_off   = yos_g_u32(ctx, msg_off + YOS_FBMSG_CONTROL);
+    uint32_t ctrl_len   = yos_g_u32(ctx, msg_off + YOS_FBMSG_CONTROLLEN);
+
+    struct iovec hiov[YOS_MSG_MAX_IOV];
+    int niov = yos_msg_build_iov(ctx, iov_off, iov_len, hiov);
+    if (niov < 0) return yos_errno_neg(ctx, EINVAL);
+
+    struct msghdr hmsg;
+    memset(&hmsg, 0, sizeof(hmsg));
+    hmsg.msg_iov = hiov;
+    hmsg.msg_iovlen = (size_t)niov;
+
+    /* Optional destination address (unusual for connected sockets). */
+    uint8_t namebuf[256];
+    if (name_off && name_len && name_len <= sizeof(namebuf)) {
+        if (!posix_wptr_range(ctx, name_off, name_len))
+            return yos_errno_neg(ctx, EFAULT);
+        memcpy(namebuf, ctx->memory + name_off, name_len);
+        freebsd_sockaddr_to_host(namebuf, (socklen_t)name_len);
+        hmsg.msg_name = namebuf;
+        hmsg.msg_namelen = (socklen_t)name_len;
+    }
+
+    /* Translate the SCM_RIGHTS control data (wasm fds → host fds). We
+     * only understand SOL_SOCKET/SCM_RIGHTS; anything else is dropped
+     * (the kernel would reject unknown ancillary data anyway). */
+    uint8_t hctrl[YOS_MSG_CTRL_BUF];
+    if (ctrl_off && ctrl_len >= 12) {
+        if (!posix_wptr_range(ctx, ctrl_off, ctrl_len))
+            return yos_errno_neg(ctx, EFAULT);
+        uint32_t pos = 0;
+        size_t hpos = 0;
+        while (pos + 12u <= ctrl_len) {
+            uint32_t cmsg_len   = yos_g_u32(ctx, ctrl_off + pos);
+            int32_t  cmsg_level = (int32_t)yos_g_u32(ctx, ctrl_off + pos + 4u);
+            int32_t  cmsg_type  = (int32_t)yos_g_u32(ctx, ctrl_off + pos + 8u);
+            if (cmsg_len < 12u || pos + cmsg_len > ctrl_len) break;
+            if (cmsg_level == YOS_FBSD_SOL_SOCKET &&
+                cmsg_type == YOS_FBSD_SCM_RIGHTS) {
+                uint32_t nfds = (cmsg_len - 12u) / 4u;
+                if (nfds > YOS_MSG_MAX_FDS) nfds = YOS_MSG_MAX_FDS;
+                struct cmsghdr *hc = (struct cmsghdr *)(hctrl + hpos);
+                hc->cmsg_level = SOL_SOCKET;
+                hc->cmsg_type  = SCM_RIGHTS;
+                hc->cmsg_len   = CMSG_LEN(nfds * sizeof(int));
+                int *hfds = (int *)CMSG_DATA(hc);
+                for (uint32_t i = 0; i < nfds; i++) {
+                    uint32_t wfd = yos_g_u32(ctx, ctrl_off + pos + 12u + i * 4u);
+                    int real = yos_fd_get(ctx, (int32_t)wfd);
+                    hfds[i] = real;          /* pass the host fd to the peer */
+                }
+                hpos += CMSG_SPACE(nfds * sizeof(int));
+            }
+            pos += yos_fbsd_cmsg_align(cmsg_len);
+        }
+        if (hpos) {
+            hmsg.msg_control = hctrl;
+            hmsg.msg_controllen = (socklen_t)hpos;
+        }
+    }
+
+    ssize_t n = sendmsg(hfd, &hmsg, flags);
+    return yos_errno_check(ctx, (int32_t)n);
+}
+
+ssize_t yos_recvmsg(struct yos_exec_ctx *ctx, int32_t fd, uint32_t msg_off,
+                    int32_t flags)
+{
+    int hfd = yos_fd_get(ctx, fd);
+    if (hfd < 0) return hfd;
+    if (!posix_wptr_range(ctx, msg_off, YOS_FBMSG_SIZE))
+        return yos_errno_neg(ctx, EFAULT);
+
+    uint32_t iov_off  = yos_g_u32(ctx, msg_off + YOS_FBMSG_IOV);
+    uint32_t iov_len  = yos_g_u32(ctx, msg_off + YOS_FBMSG_IOVLEN);
+    uint32_t ctrl_off = yos_g_u32(ctx, msg_off + YOS_FBMSG_CONTROL);
+    uint32_t ctrl_len = yos_g_u32(ctx, msg_off + YOS_FBMSG_CONTROLLEN);
+
+    struct iovec hiov[YOS_MSG_MAX_IOV];
+    int niov = yos_msg_build_iov(ctx, iov_off, iov_len, hiov);
+    if (niov < 0) return yos_errno_neg(ctx, EINVAL);
+
+    struct msghdr hmsg;
+    memset(&hmsg, 0, sizeof(hmsg));
+    hmsg.msg_iov = hiov;
+    hmsg.msg_iovlen = (size_t)niov;
+
+    uint8_t hctrl[YOS_MSG_CTRL_BUF];
+    int want_ctrl = (ctrl_off && ctrl_len >= 12);
+    if (want_ctrl) {
+        if (!posix_wptr_range(ctx, ctrl_off, ctrl_len))
+            return yos_errno_neg(ctx, EFAULT);
+        hmsg.msg_control = hctrl;
+        hmsg.msg_controllen = sizeof(hctrl);
+    }
+
+    ssize_t n = recvmsg(hfd, &hmsg, flags);
+    if (n < 0) return yos_errno_neg(ctx, errno);
+
+    /* Rebuild the guest control buffer from the host cmsgs, translating
+     * any SCM_RIGHTS host fds back into freshly-allocated wasm fds. */
+    uint32_t gpos = 0;
+    if (want_ctrl) {
+        for (struct cmsghdr *hc = CMSG_FIRSTHDR(&hmsg); hc != NULL;
+             hc = CMSG_NXTHDR(&hmsg, hc)) {
+            if (hc->cmsg_level == SOL_SOCKET && hc->cmsg_type == SCM_RIGHTS) {
+                uint32_t nfds = (uint32_t)((hc->cmsg_len - CMSG_LEN(0)) /
+                                           sizeof(int));
+                uint32_t need = 12u + nfds * 4u;
+                if (gpos + need > ctrl_len) break;
+                yos_g_set_u32(ctx, ctrl_off + gpos, need);              /* cmsg_len */
+                yos_g_set_u32(ctx, ctrl_off + gpos + 4u, YOS_FBSD_SOL_SOCKET);
+                yos_g_set_u32(ctx, ctrl_off + gpos + 8u, YOS_FBSD_SCM_RIGHTS);
+                int *hfds = (int *)CMSG_DATA(hc);
+                for (uint32_t i = 0; i < nfds; i++) {
+                    int32_t wfd = yos_fd_alloc(ctx, hfds[i]);
+                    if (wfd < 0) { close(hfds[i]); wfd = -1; }
+                    yos_g_set_u32(ctx, ctrl_off + gpos + 12u + i * 4u,
+                                  (uint32_t)wfd);
+                }
+                gpos += yos_fbsd_cmsg_align(need);
+            }
+        }
+    }
+    if (ctrl_off || ctrl_len)
+        yos_g_set_u32(ctx, msg_off + YOS_FBMSG_CONTROLLEN, gpos);
+    /* Report truncation flags to the guest (MSG_TRUNC/MSG_CTRUNC share
+     * their low-bit values across the ABIs). */
+    yos_g_set_u32(ctx, msg_off + YOS_FBMSG_FLAGS, (uint32_t)hmsg.msg_flags);
+    return n;
+}
+
+/* ── glob / globfree ───────────────────────────────────────────────
+ *
+ * The auto-bridge can't handle glob(3): it turns the NULL errfunc arg
+ * into ctx->memory+0 (a non-NULL host pointer), which host glob calls on
+ * the first read error → jump to a wild address → SIGSEGV. It also lets
+ * host glob fill the guest glob_t with HOST-allocated gl_pathv pointers
+ * the guest can't use.
+ *
+ * Hand bridge: run host glob with errfunc forced NULL, then copy the
+ * matched paths into guest memory (a wasm-offset gl_pathv array + a
+ * yos_malloc'd copy of each string), and write the FreeBSD-shape glob_t.
+ * The glob flag bits and return codes differ between FreeBSD and the host
+ * libc, so both are remapped. tmux globs its config paths this way.
+ *
+ * FreeBSD glob_t (44 B): gl_pathc@0, gl_matchc@4, gl_offs@8, gl_flags@12,
+ * gl_pathv@16, then five alt-function pointers we never populate. */
+enum {
+    YOS_FBGLOB_PATHC = 0, YOS_FBGLOB_MATCHC = 4, YOS_FBGLOB_OFFS = 8,
+    YOS_FBGLOB_FLAGS = 12, YOS_FBGLOB_PATHV = 16, YOS_FBGLOB_SIZE = 44,
+};
+/* FreeBSD glob(3) flag bits (sys glob.h). */
+enum {
+    FB_GLOB_APPEND = 0x0001, FB_GLOB_DOOFFS = 0x0002, FB_GLOB_ERR = 0x0004,
+    FB_GLOB_MARK = 0x0008, FB_GLOB_NOCHECK = 0x0010, FB_GLOB_NOSORT = 0x0020,
+    FB_GLOB_NOESCAPE = 0x2000, FB_GLOB_BRACE = 0x0080, FB_GLOB_NOMAGIC = 0x0100,
+    FB_GLOB_TILDE = 0x0800,
+};
+/* FreeBSD glob(3) return codes. */
+enum { FB_GLOB_NOSPACE = -1, FB_GLOB_ABORTED = -2, FB_GLOB_NOMATCH = -3 };
+
+static int yos_glob_flags_g2h(int fbsd)
+{
+    int h = 0;
+    if (fbsd & FB_GLOB_ERR)      h |= GLOB_ERR;
+    if (fbsd & FB_GLOB_MARK)     h |= GLOB_MARK;
+    if (fbsd & FB_GLOB_NOSORT)   h |= GLOB_NOSORT;
+    if (fbsd & FB_GLOB_NOCHECK)  h |= GLOB_NOCHECK;
+    if (fbsd & FB_GLOB_NOESCAPE) h |= GLOB_NOESCAPE;
+#ifdef GLOB_BRACE
+    if (fbsd & FB_GLOB_BRACE)    h |= GLOB_BRACE;
+#endif
+#ifdef GLOB_NOMAGIC
+    if (fbsd & FB_GLOB_NOMAGIC)  h |= GLOB_NOMAGIC;
+#endif
+#ifdef GLOB_TILDE
+    if (fbsd & FB_GLOB_TILDE)    h |= GLOB_TILDE;
+#endif
+    /* GLOB_APPEND/GLOB_DOOFFS/GLOB_ALTDIRFUNC are intentionally dropped —
+     * we always build a fresh result and never use alt dir functions. */
+    return h;
+}
+
+static int yos_glob_rc_h2g(int host_rc)
+{
+    if (host_rc == 0) return 0;
+#ifdef GLOB_NOSPACE
+    if (host_rc == GLOB_NOSPACE) return FB_GLOB_NOSPACE;
+#endif
+#ifdef GLOB_ABORTED
+    if (host_rc == GLOB_ABORTED) return FB_GLOB_ABORTED;
+#endif
+#ifdef GLOB_NOMATCH
+    if (host_rc == GLOB_NOMATCH) return FB_GLOB_NOMATCH;
+#endif
+    return FB_GLOB_NOMATCH;
+}
+
+int32_t yos_glob(struct yos_exec_ctx *ctx, uint32_t pat_off, int32_t flags,
+                 uint32_t errfunc_off, uint32_t glob_off)
+{
+    (void)errfunc_off;   /* never call a guest function pointer from the host */
+    if (!pat_off || pat_off >= ctx->memory_size)
+        return yos_errno_neg(ctx, EFAULT);
+    if (!posix_wptr_range(ctx, glob_off, YOS_FBGLOB_SIZE))
+        return yos_errno_neg(ctx, EFAULT);
+    const char *pattern = (const char *)(ctx->memory + pat_off);
+
+    glob_t hg;
+    memset(&hg, 0, sizeof(hg));
+    int host_rc = glob(pattern, yos_glob_flags_g2h(flags), NULL, &hg);
+
+    uint32_t count = (host_rc == 0) ? (uint32_t)hg.gl_pathc : 0;
+
+    /* gl_pathv: count path offsets + a trailing NULL slot. */
+    uint32_t arr = yos_malloc(ctx, (count + 1u) * 4u);
+    if (!arr) { globfree(&hg); return FB_GLOB_NOSPACE; }
+    for (uint32_t i = 0; i < count; i++) {
+        size_t len = strlen(hg.gl_pathv[i]) + 1u;
+        uint32_t s = yos_malloc(ctx, (uint32_t)len);
+        if (!s) { globfree(&hg); return FB_GLOB_NOSPACE; }
+        memcpy(ctx->memory + s, hg.gl_pathv[i], len);
+        yos_g_set_u32(ctx, arr + i * 4u, s);
+    }
+    yos_g_set_u32(ctx, arr + count * 4u, 0);
+
+    yos_g_set_u32(ctx, glob_off + YOS_FBGLOB_PATHC, count);
+    yos_g_set_u32(ctx, glob_off + YOS_FBGLOB_MATCHC, count);
+    yos_g_set_u32(ctx, glob_off + YOS_FBGLOB_OFFS, 0);
+    yos_g_set_u32(ctx, glob_off + YOS_FBGLOB_FLAGS, (uint32_t)flags);
+    yos_g_set_u32(ctx, glob_off + YOS_FBGLOB_PATHV, arr);
+
+    globfree(&hg);
+    return yos_glob_rc_h2g(host_rc);
+}
+
+void yos_globfree(struct yos_exec_ctx *ctx, uint32_t glob_off)
+{
+    if (!posix_wptr_range(ctx, glob_off, YOS_FBGLOB_SIZE)) return;
+    uint32_t count = yos_g_u32(ctx, glob_off + YOS_FBGLOB_PATHC);
+    uint32_t arr   = yos_g_u32(ctx, glob_off + YOS_FBGLOB_PATHV);
+    if (arr) {
+        for (uint32_t i = 0; i < count; i++) {
+            uint32_t s = yos_g_u32(ctx, arr + i * 4u);
+            if (s) yos_free(ctx, s);
+        }
+        yos_free(ctx, arr);
+    }
+    yos_g_set_u32(ctx, glob_off + YOS_FBGLOB_PATHC, 0);
+    yos_g_set_u32(ctx, glob_off + YOS_FBGLOB_PATHV, 0);
 }
 
 /* yos_select — fd_set translation across the wasm/host fd boundary.

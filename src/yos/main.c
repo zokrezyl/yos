@@ -1419,6 +1419,17 @@ void yos_link_imports(IM3Module module, struct yos_exec_ctx *ctx)
     yos_liblua_link(module);
 #endif
 
+    /* libarchive — env.archive_*. The host yos links host libarchive;
+     * the wasm guest (bsdtar, or a libarchive driver) imports these
+     * names and yos resolves them via per-ctx handles in
+     * ctx->arc_handles[]. See impl/libc/libarchive.c. When
+     * -Dwith_libarchive=disabled (or the host lacks libarchive), this
+     * is compiled out and archive_* imports trap unresolved. */
+#ifdef YOS_HAVE_LIBARCHIVE
+    extern void yos_libarchive_link(IM3Module mod);
+    yos_libarchive_link(module);
+#endif
+
     /* Auto-generated bridges for the FreeBSD-libc-name import surface.
      * For guests that import each libc fn by name (env.write, env.read,
      * env.exit, …) instead of going through __yos_syscall. Bridges
@@ -2260,6 +2271,17 @@ int main(int argc, char **argv)
             ctx.pthread_host = NULL;
         }
 
+        /* execve replaces the image but keeps ctx: release any archive
+         * handles the old image leaked (frees host archives + their yos
+         * fds/scratch) and reset the table before the new program runs,
+         * while the old linear memory + fd table are still valid. */
+#ifdef YOS_HAVE_LIBARCHIVE
+        {
+            extern void yos_libarchive_ctx_free(struct yos_exec_ctx *);
+            yos_libarchive_ctx_free(&ctx);
+        }
+#endif
+
         m3_FreeRuntime(ctx.runtime);
         free(wasm_bytes);
 
@@ -2281,7 +2303,17 @@ int main(int argc, char **argv)
         }
         ctx.wasm_bytes = wasm_bytes;
         ctx.wasm_bytes_size = wasm_size;
+        /* The mmap/free-list/live-list bookkeeping in impl/mem.c indexes
+         * the OLD linear memory that load_wasm_module just replaced.
+         * Carrying it over lets yos_mmap2 reuse a stale mmap_top and hand
+         * the new image a region the bump allocator already considers
+         * taken, and leaves stale live/free regions pointing at addresses
+         * that no longer mean anything. heap_end was reset inside
+         * load_wasm_module; clear the rest so the new image starts from a
+         * clean memory map. (The alloc.c bookmarks are reset below.) */
         ctx.free_count = 0;
+        ctx.live_count = 0;
+        ctx.mmap_top = 0;
 
         /* execve(2) replaces the process image — update comm and exe
          * on the yos_proc so /proc/<pid>/{stat,comm,exe} reflect the
@@ -2336,6 +2368,15 @@ int main(int argc, char **argv)
         }
         pthread_mutex_unlock(&g_runtime.proc_lock);
     }
+
+    /* Release any archive handles the guest leaked before the runtime
+     * (and the linear memory the read clients point into) is freed. */
+#ifdef YOS_HAVE_LIBARCHIVE
+    {
+        extern void yos_libarchive_ctx_free(struct yos_exec_ctx *);
+        yos_libarchive_ctx_free(&ctx);
+    }
+#endif
 
     m3_FreeRuntime(ctx.runtime);
     m3_FreeEnvironment(env);

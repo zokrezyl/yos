@@ -51,6 +51,12 @@ option('with_liblua',
   description : 'liblua-5.1 host bridges (env.lua_*, env.luaL_*). Requires host liblua-5.1 (pkg-config: lua-5.1 / lua5.1 / lua). Disable to drop the dep; guests calling lua_* get unresolved-import traps at load time.',
 )
 
+option('with_libarchive',
+  type        : 'feature',
+  value       : 'auto',
+  description : 'libarchive host bridges (env.archive_*) for tar/cpio/unzip-class guests. Requires host libarchive (libarchive.so / .dylib). Disable to drop the dep; guests calling archive_* get unresolved-import traps at load time.',
+)
+
 option('ios_unblock',
   type        : 'boolean',
   value       : false,

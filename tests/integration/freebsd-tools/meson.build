@@ -58,6 +58,11 @@ ftools_int_tests = {
   'kill'       : {'src' : files('test_kill.py'),       'xfail' : true},
   'ps'         : {'src' : files('test_ps.py'),         'xfail' : false},
   'ps-tty'     : {'src' : files('test_ps_interactive.py'), 'xfail' : false},
+  'top'        : {'src' : files('test_top.py'),        'xfail' : false},
+  'bsdcat'     : {'src' : files('test_bsdcat.py'),     'xfail' : false},
+  'whois'      : {'src' : files('test_whois.py'),      'xfail' : false},
+  'nc'         : {'src' : files('test_nc.py'),         'xfail' : false},
+  'telnet'     : {'src' : files('test_telnet.py'),     'xfail' : false},
   'backspace'  : {'src' : files('test_backspace.py'),  'xfail' : false},
   'nvim-zsh'   : {'src' : files('test_nvim_from_zsh.py'),'xfail' : false},
 }
@@ -71,6 +76,7 @@ _serial_ftools = {
   'nvim-zsh'  : true,
   'ps-tty'    : true,
   'backspace' : true,
+  'top'       : true,
 }
 
 # Per-platform xfail overrides — see the parallel comment in
@@ -90,7 +96,7 @@ endif
 # strip just those entries from the iteration; the byte-in/byte-out
 # tests still run.
 if host_machine.system() == 'windows'
-  _skip_windows = ['ls-tty', 'ps-tty', 'backspace', 'nvim-zsh']
+  _skip_windows = ['ls-tty', 'ps-tty', 'backspace', 'nvim-zsh', 'top']
   _filtered = {}
   foreach _k, _v : ftools_int_tests
     if not _skip_windows.contains(_k)
