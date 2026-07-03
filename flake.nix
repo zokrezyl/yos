@@ -62,6 +62,10 @@
             meson
             ninja
             pkg-config
+            # Emscripten for the browser-convergence host (epic #33): the yos
+            # C runtime + wasm3 compiled to a browser-targeted wasm module.
+            # `make browser-host-phase0` runs its build under this dev shell.
+            emscripten
             # Host libarchive for the env.archive_* bridges
             # (src/yos/impl/libc/libarchive.c) + the libc unit test.
             # Without it meson's with_libarchive=auto resolves to off

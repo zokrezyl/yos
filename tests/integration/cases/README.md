@@ -42,32 +42,49 @@ The runner is `src/yos/platform/web/browser-parity-suite.mjs`; run it with
 
 ## How a case is classified
 
-The `expect` block is the correctness criterion (the oracle). For each case:
+The `expect` block is the correctness criterion (the oracle). **Both backends
+are always run** and evaluated against it — the native binary is the source of
+truth, so it is never skipped just because the browser already passed (a
+browser-correct-but-native-broken case is a real native bug, and checking native
+only on browser failure would hide it). The two PASS/FAIL results give four
+classes:
 
-1. Run it on the **browser engine**, render its stream to a grid, evaluate
-   `expect`. If it holds → **PASS**.
-2. Otherwise run it on the **native** binary, render + evaluate the same way:
-   - native satisfies `expect` → **BROWSER-GAP** (native works, browser
-     doesn't → a real engine bug; **fails CI**).
-   - native also fails `expect` → **BOTH-FAIL** (broken on native too — a
-     guest/libc gap, e.g. the rune-locale `<_ctype.h>` hole; **does not fail
-     CI**, it's a worklist entry).
+| browser | native | class          | gates CI? |
+|---------|--------|----------------|-----------|
+| pass    | pass   | **PASS**       | —         |
+| fail    | pass   | **BROWSER-GAP**| **yes**   |
+| pass    | fail   | **NATIVE-GAP** | no        |
+| fail    | fail   | **BOTH-FAIL**  | no        |
 
-CI fails **only on a fresh BROWSER-GAP**, so known both-wrong cases
-(grep/sed/tr today) don't block the always-on browser-regression net.
+- **BROWSER-GAP** — native works, the browser engine doesn't → a real engine
+  bug; the only class that **fails CI**.
+- **NATIVE-GAP** — the browser is correct, the native binary is not → a
+  native-side bug the browser is already ahead of (e.g. native `grep`/`sed`
+  under the rune-locale `<_ctype.h>` hole). Reported with a grid diff; a
+  worklist entry, **not** a CI blocker.
+- **BOTH-FAIL** — broken on both → a shared guest/libc gap. Worklist, not CI.
 
-### Documenting a pre-existing browser gap
+CI fails **only on a fresh BROWSER-GAP**, so known-broken-on-native cases
+(grep/sed today) don't block the always-on browser-regression net.
 
-A case may carry `"knownBrowserGap": "<reason>"`. When such a case classifies as
-BROWSER-GAP it is still run and reported — under its own **KNOWN-BROWSER-GAP**
-heading — but it does **not** gate CI. This is for a documented, pre-existing
-engine gap (e.g. `sort` today: the engine models std streams as integer
-sentinels, but the guest's `feof()` macro dereferences the FILE pointer). It
-mirrors `parity_runner.mjs`'s `required:false` KNOWN-GAP entries: reported, not
-hidden; a worklist item, not a CI blocker. A regression on any currently-passing
-case still fails CI. When the engine gap is fixed, drop the flag and the case
-becomes enforced.
+### Documenting a pre-existing gap
+
+A case may carry `"knownBrowserGap": "<reason>"` or `"knownNativeGap": "<reason>"`.
+A case that would classify as BROWSER-GAP / NATIVE-GAP is still run and reported —
+under its own **KNOWN-BROWSER-GAP** / **KNOWN-NATIVE-GAP** heading — but does
+**not** gate CI. This is for a documented, pre-existing gap on that one backend:
+
+- `knownBrowserGap` — a known browser-engine bug (native is correct). Mirrors
+  `parity_runner.mjs`'s `required:false` KNOWN-GAP entries.
+- `knownNativeGap` — a known native bug the browser is already ahead of (e.g.
+  `grep`/`sed` today: native's regex character classes never match under the
+  rune-locale `<_ctype.h>` hole, while the browser engine matches via JS
+  `RegExp`).
+
+Either way: reported, not hidden; a worklist item, not a CI blocker. A
+regression on any currently-passing case still fails CI. When the underlying gap
+is fixed, drop the flag and the case becomes enforced on that backend.
 
 Seed the correct expected output even for commands that are currently broken on
-native — they land in BOTH-FAIL until the guest/libc gap is fixed, then flip to
-PASS on both backends automatically, with no test edit.
+a backend — they land in NATIVE-GAP / BOTH-FAIL until the gap is fixed, then flip
+to PASS automatically, with no test edit.

@@ -59,33 +59,31 @@ static int call_cmp(IM3Runtime rt, IM3Function cmp,
 /* Simple insertion sort over a wasm-side array of `n` elements of
  * `size` bytes each. O(n^2) but fine for the small arrays nvim
  * sorts at startup (option lists, key tables, etc). Replace with
- * qsort/quickersort when a profile says it matters. */
-static m3ApiRawFunction(m3_yos_qsort)
+ * qsort/quickersort when a profile says it matters.
+ *
+ * Shared by qsort (void return) and the BSD mergesort/heapsort (int
+ * return) — all three carry the same (base, nmemb, size, cmp-index)
+ * contract and only differ in the value they hand back. `ctx->memory`
+ * must already point at the current wasm memory. Silently a no-op on
+ * an out-of-range/oversize array, matching qsort's original guard. */
+static void yos_sort_inplace(IM3Runtime runtime, struct yos_exec_ctx *ctx,
+                             uint32_t base, uint32_t n, uint32_t size,
+                             uint32_t cmp_idx, uint32_t mem_size)
 {
-    m3ApiGetArg(uint32_t, base);
-    m3ApiGetArg(uint32_t, n);
-    m3ApiGetArg(uint32_t, size);
-    m3ApiGetArg(uint32_t, cmp_idx);
-
-    struct yos_exec_ctx *ctx = (struct yos_exec_ctx *)m3_GetUserData(runtime);
-    uint32_t mem_size = 0;
-    ctx->memory = m3_GetMemory(runtime, &mem_size, 0);
-    ctx->memory_size = mem_size;
-
     /* Wrap-safe range check. The old form `(uint64_t)n*size > mem_size - base`
      * underflows the subtraction in unsigned 32-bit when base > mem_size,
      * yielding a huge value that passes the comparison; then `ctx->memory +
      * base` is out of bounds. Use additive form, all promoted to uint64. */
     if (!size || n < 2 || base >= mem_size ||
         (uint64_t)base + (uint64_t)n * (uint64_t)size > (uint64_t)mem_size)
-        m3ApiSuccess();
+        return;
 
     IM3Function cmp = lookup_fn(runtime, cmp_idx);
-    if (!cmp) m3ApiSuccess();
+    if (!cmp) return;
 
     /* Scratch slot for swap, host-side. */
     uint8_t scratch[512];
-    if (size > sizeof(scratch)) m3ApiSuccess(); /* skip if elems too big */
+    if (size > sizeof(scratch)) return; /* skip if elems too big */
 
     uint8_t *arr = ctx->memory + base;
     for (uint32_t i = 1; i < n; i++) {
@@ -108,7 +106,47 @@ static m3ApiRawFunction(m3_yos_qsort)
         }
         memcpy(arr + j * size, scratch, size);
     }
+}
+
+static m3ApiRawFunction(m3_yos_qsort)
+{
+    m3ApiGetArg(uint32_t, base);
+    m3ApiGetArg(uint32_t, n);
+    m3ApiGetArg(uint32_t, size);
+    m3ApiGetArg(uint32_t, cmp_idx);
+
+    struct yos_exec_ctx *ctx = (struct yos_exec_ctx *)m3_GetUserData(runtime);
+    uint32_t mem_size = 0;
+    ctx->memory = m3_GetMemory(runtime, &mem_size, 0);
+    ctx->memory_size = mem_size;
+
+    yos_sort_inplace(runtime, ctx, base, n, size, cmp_idx, mem_size);
     m3ApiSuccess();
+}
+
+/* mergesort/heapsort(base, nmemb, size, cmp) — BSD stdlib sorters with
+ * the same argument shape as qsort but an `int` return (0 success,
+ * -1 error). glibc ships neither, so the auto-bridge would ENOSYS-stub
+ * them (return -1 without touching the array). tr's cset builder sorts
+ * its character list with mergesort and then indexes it as if sorted —
+ * an unsorted (or, with the stub, untouched) array walks past the end
+ * and traps. Serve both with the one in-place sort qsort uses and
+ * report success. */
+static m3ApiRawFunction(m3_yos_bsdsort)
+{
+    m3ApiReturnType(int32_t);
+    m3ApiGetArg(uint32_t, base);
+    m3ApiGetArg(uint32_t, n);
+    m3ApiGetArg(uint32_t, size);
+    m3ApiGetArg(uint32_t, cmp_idx);
+
+    struct yos_exec_ctx *ctx = (struct yos_exec_ctx *)m3_GetUserData(runtime);
+    uint32_t mem_size = 0;
+    ctx->memory = m3_GetMemory(runtime, &mem_size, 0);
+    ctx->memory_size = mem_size;
+
+    yos_sort_inplace(runtime, ctx, base, n, size, cmp_idx, mem_size);
+    m3ApiReturn(0);
 }
 
 /* bsearch(key, base, n, size, cmp) — linear-walk with the wasm
@@ -338,6 +376,8 @@ static m3ApiRawFunction(m3_yos_atexit_noop)
 void yos_callback_link(IM3Module mod)
 {
     m3_LinkRawFunction(mod, "env", "qsort",         "v(iiii)",   m3_yos_qsort);
+    m3_LinkRawFunction(mod, "env", "mergesort",     "i(iiii)",   m3_yos_bsdsort);
+    m3_LinkRawFunction(mod, "env", "heapsort",      "i(iiii)",   m3_yos_bsdsort);
     m3_LinkRawFunction(mod, "env", "bsearch",       "i(iiiii)",  m3_yos_bsearch);
     m3_LinkRawFunction(mod, "env", "scandir",       "i(iiii)",   m3_yos_scandir);
     m3_LinkRawFunction(mod, "env", "atexit",        "i(i)",      m3_yos_atexit_noop);

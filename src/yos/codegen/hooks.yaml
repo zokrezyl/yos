@@ -246,6 +246,16 @@ custom_proc:
   - mblen
   - wcrtomb
   - wctomb
+  # impl/io/file.c — wide-char stdio. The auto-bridge casts the guest
+  # stream handle (1/2/3) straight to a host FILE* and SIGSEGVs; these
+  # decode/encode UTF-8 one code point at a time over the fd_map byte
+  # primitives instead (tr reads its input via fgetwc/getwc).
+  - fgetwc
+  - getwc
+  - getwchar
+  - fputwc
+  - putwc
+  - putwchar
   # impl/pwd.c — same static-buffer pattern for the time-string
   # family. Returns wasm offset to a per-ctx slot containing the
   # struct tm / time string.
@@ -920,6 +930,13 @@ runtime_owned:
   - qsort
   - bsearch
   - scandir
+  # mergesort/heapsort: BSD-only (glibc lacks them, so they land in
+  # guest_only and would otherwise ENOSYS-stub). Same (base, nmemb,
+  # size, cmp) fn-pointer contract as qsort — impl/callback.c serves
+  # both with the same in-place sort. Without this tr's cset sort gets
+  # a -1 stub, never sorts, and walks off the end (SIGSEGV).
+  - mergesort
+  - heapsort
   - atexit
   - __cxa_atexit
   - at_quick_exit

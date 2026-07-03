@@ -149,7 +149,7 @@ async function runBrowser(wasm, argv, stdin) {
 console.log(`\nShared case table vs libvterm oracle — native yos vs browser engine`);
 console.log(`cases=${selected.length}${FILTER ? `  filter=${FILTER}` : ""}  tools=${toolsDir}\n`);
 
-const browserGaps = [], knownGaps = [], bothFail = [], missing = [];
+const browserGaps = [], nativeGaps = [], knownGaps = [], knownNativeGaps = [], bothFail = [], missing = [];
 let pass = 0;
 const t0 = Date.now();
 
@@ -173,37 +173,62 @@ for (const c of selected) {
   try { browser = await runBrowser(wasm, c.argv, stdin); }
   catch (e) { browser = { stdout: "", stderr: "", exitCode: 139, error: e.message, unimpl: null }; }
   browser.grid = toGrid(browser.stdout, cols, rows);
-  if (evalExpect(browser, c.expect)) { pass++; if (!quiet) console.log(`  PASS  ${id}`); continue; }
+  const browserOk = evalExpect(browser, c.expect);
 
-  // Browser missed the criterion — classify against the native oracle.
+  // The native binary is the source of truth, so ALWAYS run it — not only
+  // when the browser fails. A browser-PASS + native-FAIL case (the browser
+  // ahead of native) is a genuine native bug that a browser-only check would
+  // silently pass; running native unconditionally is what surfaces it as a
+  // NATIVE-GAP instead of hiding it behind a green PASS.
   const native = runNative(wasm, c.argv, stdin, timeoutMs);
   native.grid = toGrid(native.stdout, cols, rows);
   const nativeOk = evalExpect(native, c.expect);
   const parity = CR(browser.stdout) === CR(native.stdout) && browser.exitCode === native.exitCode;
 
-  const detail = browser.unimpl ? `unimpl:${browser.unimpl}`
+  const bdetail = browser.unimpl ? `unimpl:${browser.unimpl}`
     : browser.error ? `browser ${browser.error}`
     : `browser exit=${browser.exitCode}${parity ? " (==native)" : " (!=native)"}`;
+  const ndetail = `native exit=${native.exitCode}`;
 
-  if (nativeOk) {
-    if (c.knownBrowserGap) {
-      knownGaps.push({ id, detail, reason: String(c.knownBrowserGap) });
-      if (!quiet) console.log(`  gap   ${id}  [KNOWN-BROWSER-GAP]  ${detail}`);
+  if (browserOk && nativeOk) {
+    pass++;
+    if (!quiet) console.log(`  PASS  ${id}`);
+  } else if (browserOk && !nativeOk) {
+    // Browser satisfies the oracle, native does not → a native-side bug the
+    // browser is already ahead of. Reported, never gates CI (it is not a
+    // browser regression) — the mirror image of BOTH-FAIL's worklist status.
+    if (c.knownNativeGap) {
+      knownNativeGaps.push({ id, detail: ndetail, reason: String(c.knownNativeGap) });
+      if (!quiet) console.log(`  gap   ${id}  [KNOWN-NATIVE-GAP]  ${ndetail}`);
     } else {
-      browserGaps.push({ id, detail, c, browser, native, cols });
-      if (!quiet) console.log(`  FAIL  ${id}  [BROWSER-GAP]  ${detail}`);
+      nativeGaps.push({ id, detail: ndetail, c, browser, native, cols });
+      if (!quiet) console.log(`  FAIL  ${id}  [NATIVE-GAP]  ${ndetail}  (browser ahead of native)`);
+    }
+  } else if (!browserOk && nativeOk) {
+    // Native works, browser doesn't → a browser-engine bug. The only class
+    // that gates CI (unless documented as a known gap).
+    if (c.knownBrowserGap) {
+      knownGaps.push({ id, detail: bdetail, reason: String(c.knownBrowserGap) });
+      if (!quiet) console.log(`  gap   ${id}  [KNOWN-BROWSER-GAP]  ${bdetail}`);
+    } else {
+      browserGaps.push({ id, detail: bdetail, c, browser, native, cols });
+      if (!quiet) console.log(`  FAIL  ${id}  [BROWSER-GAP]  ${bdetail}`);
     }
   } else {
-    bothFail.push({ id, detail, parity });
-    if (!quiet) console.log(`  fail  ${id}  [BOTH-FAIL]  ${detail}`);
+    // Neither backend satisfies the oracle → a shared guest/libc gap (e.g. the
+    // rune-locale <_ctype.h> hole). Fix the guest, not the browser.
+    bothFail.push({ id, detail: bdetail, parity });
+    if (!quiet) console.log(`  fail  ${id}  [BOTH-FAIL]  ${bdetail}`);
   }
 }
 
 const secs = Math.round((Date.now() - t0) / 1000);
 console.log(`\n────────────────────────────────────────────────────────`);
-console.log(`PASS (browser matches the oracle)             : ${pass}/${selected.length}`);
+console.log(`PASS (both backends match the oracle)          : ${pass}/${selected.length}`);
 console.log(`BROWSER-GAP (native passes, browser fails)     : ${browserGaps.length}${browserGaps.length ? "  <-- fails CI" : ""}`);
+console.log(`NATIVE-GAP  (browser passes, native fails)     : ${nativeGaps.length}`);
 console.log(`KNOWN-BROWSER-GAP (documented, non-gating)     : ${knownGaps.length}`);
+console.log(`KNOWN-NATIVE-GAP  (documented, non-gating)     : ${knownNativeGaps.length}`);
 console.log(`BOTH-FAIL   (native fails too; guest/libc gap) : ${bothFail.length}`);
 if (missing.length) console.log(`MISSING tool wasm (not built)                 : ${missing.length}`);
 console.log(`elapsed : ${secs}s\n`);
@@ -218,9 +243,24 @@ for (const gap of browserGaps) {
   console.log(frameGrid(gap.browser.grid.rows.slice(0, Math.min(gap.c.rows || 24, 6)), gap.cols));
   console.log("");
 }
+// And the grids for native bugs the browser is ahead of — the browser grid is
+// the one that matches the oracle here, so it is the "expected" side.
+for (const gap of nativeGaps) {
+  console.log(`NATIVE-GAP  ${gap.id}  (argv: ${JSON.stringify(gap.c.argv)})  — native yos is wrong; the browser engine is correct`);
+  console.log(`  browser grid (expected — matches the oracle):`);
+  console.log(frameGrid(gap.browser.grid.rows.slice(0, Math.min(gap.c.rows || 24, 6)), gap.cols));
+  console.log(`  native grid (what the native binary produced):`);
+  console.log(frameGrid(gap.native.grid.rows.slice(0, Math.min(gap.c.rows || 24, 6)), gap.cols));
+  console.log("");
+}
 if (knownGaps.length) {
   console.log("KNOWN-BROWSER-GAP (documented engine gaps — tracked worklist, do not gate CI):");
   for (const g of knownGaps) console.log(`  • ${g.id.padEnd(28)} ${g.detail}\n      ${g.reason}`);
+  console.log("");
+}
+if (knownNativeGaps.length) {
+  console.log("KNOWN-NATIVE-GAP (documented native bugs the browser is already ahead of — worklist, do not gate CI):");
+  for (const g of knownNativeGaps) console.log(`  • ${g.id.padEnd(28)} ${g.detail}\n      ${g.reason}`);
   console.log("");
 }
 if (bothFail.length && !quiet) {
@@ -229,5 +269,7 @@ if (bothFail.length && !quiet) {
   console.log("");
 }
 
-// CI gate: fail ONLY on a genuine browser-engine regression.
+// CI gate: fail ONLY on a genuine browser-engine regression. A NATIVE-GAP is a
+// native-side bug (the browser is already correct), so it is reported but does
+// not gate the always-on browser-regression net — same policy as BOTH-FAIL.
 process.exit(browserGaps.length ? 1 : 0);

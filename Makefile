@@ -39,6 +39,7 @@ NINJA    := $(NIX_DEV) ninja -C $(BUILD)
         test test-libc test-freebsd test-list testlog \
         test-browser test-browser-chrome test-browser-engine test-browser-libc \
         test-browser-parity test-browser-tmux-render test-browser-tmux-xterm serve-zsh \
+        browser-host-phase0 test-browser-host-phase0 \
         nvim-build nvim-deps \
         format check
 
@@ -91,6 +92,9 @@ help:
 	@printf '    make test-browser-tmux-render — assess tmux rendering via libvterm (faithful 80x24 grid)\n'
 	@printf '    make test-browser-tmux-xterm  — assess tmux in real xterm.js at non-24 height (pins status-bar/size bug)\n'
 	@printf '    make serve-zsh           — serve the interactive browser zsh at http://127.0.0.1:8099/zsh.html (PORT=… to override)\n'
+	@printf '\n  Browser convergence host (epic #33 — yos C runtime → wasm via emscripten)\n'
+	@printf '    make browser-host-phase0      — build the Phase 0 wasm3-in-wasm host (#34)\n'
+	@printf '    make test-browser-host-phase0 — build + smoke-test the Phase 0 host\n'
 	@printf '\n  External wasm packages\n'
 	@printf '    make nvim-build     — neovim 0.10.4 → wasm32 (needs nvim-deps first)\n'
 	@printf '    make nvim-deps      — fetch + build all 9 nvim deps\n'
@@ -251,6 +255,21 @@ test-browser-tmux-render:
 # real terminal, status bar on the last row). Needs google-chrome-stable.
 test-browser-tmux-xterm:
 	@node $(WEB)/tmux_xterm_render_test.mjs
+
+# ─── Browser convergence host (epic #33) ───────────────────────────────
+# Compile the yos C runtime to a browser-targeted wasm module with
+# Emscripten (Architecture A: wasm3-in-wasm). Unlike the JS-engine browser
+# tests above, the BUILD needs a working `emcc`, so it runs under
+# `nix develop` (the flake dev shell provides nixpkgs' emscripten); the
+# SMOKE test then runs with system `node`, like the other browser tests.
+#
+# Phase 0 (issue #34): prove wasm3, itself compiled to wasm, can execute a
+# trivial guest — no JS libc. See $(WEB)/host/README.md.
+browser-host-phase0:
+	@$(NIX_DEV) bash $(WEB)/host/build-phase0.sh
+
+test-browser-host-phase0: browser-host-phase0
+	@node $(WEB)/host/phase0_smoke.mjs
 
 # Serve the web dir over HTTP so you can open the interactive zsh terminal
 # (zsh.html → zsh_main.mjs → the long-lived browser zsh) in a real browser.

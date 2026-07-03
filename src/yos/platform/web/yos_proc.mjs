@@ -481,6 +481,17 @@ function buildLibc(state, env_vars, io, mgr, proc) {
   const fpFile = (fp) => proc.pio.files.get(fp);
   const setFlag = (fp, bit) => { if (fp > 3) view().setInt16(fp + SF_FLAGS, view().getInt16(fp + SF_FLAGS, true) | bit, true); };
   const clrFlag = (fp, bit) => { if (fp > 3) view().setInt16(fp + SF_FLAGS, view().getInt16(fp + SF_FLAGS, true) & ~bit, true); };
+  // Mirror a std stream's read-EOF into its sentinel FILE _flags in guest
+  // memory. stdin/stdout/stderr are the small-int handles 1/2/3, not real FILE
+  // structs — but FreeBSD <stdio.h> expands feof(p)/ferror(p) to a MACRO that
+  // reads (p)->_flags directly whenever the guest is single-threaded
+  // (__isthreaded == 0, the common case). For a sentinel that dereferences the
+  // reserved low memory below __global_base (stdin: address 1+SF_FLAGS = 13),
+  // which is dead scratch. Keeping the __SEOF bit there in sync with the fd's
+  // real EOF makes the inlined macro read the right answer — without it a
+  // getline/getdelim loop that returns -1 at EOF looks like a read error
+  // (e.g. sort err(2)s at file.c:684). No effect on real FILE structs.
+  const markStdStreamEof = (fp, atEof) => { if (fp >= 1 && fp <= 3) { const cur = view().getInt16(fp + SF_FLAGS, true); view().setInt16(fp + SF_FLAGS, atEof ? (cur | SF_SEOF) : (cur & ~SF_SEOF), true); } };
   const newFile = (fd, flags) => {
     const sp = state.alloc(FILE_STRUCT, 8); u8().fill(0, sp, sp + FILE_STRUCT);
     const buf = state.alloc(FILE_BUF, 1);
@@ -501,16 +512,39 @@ function buildLibc(state, env_vars, io, mgr, proc) {
   // Refill a fopen'd FILE's buffer from its fd, then consume one byte —
   // the FreeBSD __srget() contract (caller's macro already did --_r < 0).
   const fileRefill = (fp, f) => { const base = view().getUint32(fp + SF_BFBASE, true), size = view().getInt32(fp + SF_BFSIZE, true) || FILE_BUF; const e = fdEntry(f.fd); let n = 0; if (e) { const tmp = new Uint8Array(size); n = ofdRead(e.ofd, tmp, size); u8().set(tmp.subarray(0, n), base); } view().setUint32(fp + SF_P, base, true); view().setInt32(fp + SF_R, n, true); if (n === 0) { setFlag(fp, SF_SEOF); return -1; } return n; };
-  const doSrget = (fp) => { const f = fpFile(fp); if (!f) { const e = fdEntry(fileFd(fp)); if (!e) return -1; const tmp = new Uint8Array(1); if (ofdRead(e.ofd, tmp, 1) === 0) { setFlag(fp, SF_SEOF); return -1; } return tmp[0]; } if (fileRefill(fp, f) < 0) return -1; let p = view().getUint32(fp + SF_P, true), r = view().getInt32(fp + SF_R, true); const byte = u8()[p]; view().setUint32(fp + SF_P, p + 1, true); view().setInt32(fp + SF_R, r - 1, true); return byte; };
+  const doSrget = (fp) => { const f = fpFile(fp); if (!f) { const e = fdEntry(fileFd(fp)); if (!e) return -1; if (e.ofd.unget && e.ofd.unget.length) { markStdStreamEof(fp, false); return e.ofd.unget.pop(); } const tmp = new Uint8Array(1); if (ofdRead(e.ofd, tmp, 1) === 0) { setFlag(fp, SF_SEOF); e.ofd.eof = true; markStdStreamEof(fp, true); return -1; } markStdStreamEof(fp, false); return tmp[0]; } if (fileRefill(fp, f) < 0) return -1; let p = view().getUint32(fp + SF_P, true), r = view().getInt32(fp + SF_R, true); const byte = u8()[p]; view().setUint32(fp + SF_P, p + 1, true); view().setInt32(fp + SF_R, r - 1, true); return byte; };
   // Function-side getc that shares the same _p/_r buffer the inlined macro
   // uses, so getc()/getline()/fread() on one FILE stay consistent.
-  const fileGetc = (fp) => { const f = fpFile(fp); if (!f) { const e = fdEntry(fileFd(fp)); if (!e) return -1; const tmp = new Uint8Array(1); return ofdRead(e.ofd, tmp, 1) === 0 ? -1 : tmp[0]; } let r = view().getInt32(fp + SF_R, true) - 1; if (r >= 0) { let p = view().getUint32(fp + SF_P, true); const byte = u8()[p]; view().setUint32(fp + SF_P, p + 1, true); view().setInt32(fp + SF_R, r, true); return byte; } view().setInt32(fp + SF_R, r, true); return doSrget(fp); };
+  const fileGetc = (fp) => { const f = fpFile(fp); if (!f) { const e = fdEntry(fileFd(fp)); if (!e) return -1; if (e.ofd.unget && e.ofd.unget.length) { markStdStreamEof(fp, false); return e.ofd.unget.pop(); } const tmp = new Uint8Array(1); if (ofdRead(e.ofd, tmp, 1) === 0) { e.ofd.eof = true; markStdStreamEof(fp, true); return -1; } markStdStreamEof(fp, false); return tmp[0]; } let r = view().getInt32(fp + SF_R, true) - 1; if (r >= 0) { let p = view().getUint32(fp + SF_P, true); const byte = u8()[p]; view().setUint32(fp + SF_P, p + 1, true); view().setInt32(fp + SF_R, r, true); return byte; } view().setInt32(fp + SF_R, r, true); return doSrget(fp); };
   // stdio (printf/puts/putchar/…) writes to the real fd through ofdWrite, so it
   // shares the one tty output discipline and honours redirection — not a direct
   // io.onOutput bypass. Falls back to the raw sink only if the fd has no entry.
   const emit = (fd, text) => { const e = fdEntry(fd); if (e) ofdWrite(e.ofd, enc.encode(text)); else io.onOutput(fd, text); };
   const fmt = (f, v) => formatFromGuest(state, f, v);
   const exitWith = (code) => { const e = new Error("exit"); e.isExit = true; e.code = code | 0; throw e; };
+
+  // Translate a POSIX BRE (default) / ERE (REG_EXTENDED) pattern to a JS RegExp
+  // source. Handles the metacharacter-escaping difference — in a BRE, ( ) { } +
+  // ? | are LITERAL unless backslashed, and \( \) \{ \} \+ \? \| are the
+  // special forms; in an ERE (like JS) they are special bare — and expands
+  // POSIX bracket classes [[:alpha:]] etc. Pure string work; no guest state.
+  const posixRegexToJs = (pat, extended) => {
+    const cls = { alpha: "A-Za-z", digit: "0-9", alnum: "A-Za-z0-9", space: "\\s", upper: "A-Z", lower: "a-z", blank: " \\t", punct: "!-/:-@\\[-`{-~", xdigit: "0-9A-Fa-f", cntrl: "\\x00-\\x1f\\x7f", print: "\\x20-\\x7e", graph: "\\x21-\\x7e" };
+    pat = pat.replace(/\[:(\w+):\]/g, (whole, name) => cls[name] || whole);
+    if (extended) return pat; // ERE ~= JS for the common subset
+    let out = "", i = 0;
+    while (i < pat.length) {
+      const ch = pat[i];
+      if (ch === "\\") {
+        const next = pat[i + 1];
+        if (next && "(){}+?|".includes(next)) { out += next; i += 2; continue; } // \( -> ( (special in BRE)
+        out += ch + (next || ""); i += 2; continue;                              // keep \. \1 \< etc.
+      }
+      if ("(){}+?|".includes(ch)) { out += "\\" + ch; i++; continue; }           // bare -> literal in BRE
+      out += ch; i++;
+    }
+    return out;
+  };
 
   // Only the functions the prototype actually implements. Missing imports
   // are hardened by strictImportEnv() at instantiation time (fail loudly),
@@ -589,6 +623,21 @@ function buildLibc(state, env_vars, io, mgr, proc) {
     // does not leak into the parent. ("" means "from environment" -> "C".)
     setlocale: (cat, namePtr) => { if (namePtr) { const name = cstr(namePtr); proc.pio.locale = name || "C"; } return putStr(proc.pio.locale || "C"); },
     nl_langinfo: () => putStr(""), ___mb_cur_max: () => 1,
+    // localeconv(): a pointer to a "C"-locale struct lconv. Layout (FreeBSD
+    // i386/wasm32): 10 char* pointers, then 14 signed-char fields. In the C
+    // locale decimal_point is ".", every other string is "", and every numeric
+    // field is CHAR_MAX (127 = "unspecified"). Cached per process so repeated
+    // calls return the same static object, as the contract requires.
+    localeconv: () => {
+      if (proc.pio.lconv) return proc.pio.lconv;
+      const dot = putStr("."), empty = putStr("");
+      const lconv = state.alloc(10 * 4 + 14, 4);
+      view().setUint32(lconv, dot, true);                       // decimal_point
+      for (let i = 1; i < 10; i++) view().setUint32(lconv + i * 4, empty, true);
+      for (let i = 0; i < 14; i++) u8()[lconv + 40 + i] = 127;  // CHAR_MAX
+      proc.pio.lconv = lconv;
+      return lconv;
+    },
     // FreeBSD sysconf(_SC_*). Returning sane limits matters: getdtablesize()
     // (compiled into tmux) is sysconf(_SC_OPEN_MAX); if that is < 0 tmux's
     // imsg guard `getdtablecount()+overhead+1 >= getdtablesize()` is always
@@ -669,9 +718,45 @@ function buildLibc(state, env_vars, io, mgr, proc) {
     __srget: (fp) => doSrget(fp),
     // ungetc: push the byte back into the buffer so the inlined getc macro
     // re-reads it from _p; the lexer's getc/ungetc pair always has _p>base.
-    ungetc: (c, fp) => { const f = fpFile(fp); if (f && !f.mem) { let p = view().getUint32(fp + SF_P, true); const base = view().getUint32(fp + SF_BFBASE, true); if (p > base) { p--; u8()[p] = c & 0xff; view().setUint32(fp + SF_P, p, true); view().setInt32(fp + SF_R, view().getInt32(fp + SF_R, true) + 1, true); } else { u8()[fp + 64] = c & 0xff; view().setUint32(fp + SF_P, fp + 64, true); view().setInt32(fp + SF_R, 1, true); } clrFlag(fp, SF_SEOF); } return c & 0xff; },
+    ungetc: (c, fp) => { const f = fpFile(fp); if (f && !f.mem) { let p = view().getUint32(fp + SF_P, true); const base = view().getUint32(fp + SF_BFBASE, true); if (p > base) { p--; u8()[p] = c & 0xff; view().setUint32(fp + SF_P, p, true); view().setInt32(fp + SF_R, view().getInt32(fp + SF_R, true) + 1, true); } else { u8()[fp + 64] = c & 0xff; view().setUint32(fp + SF_P, fp + 64, true); view().setInt32(fp + SF_R, 1, true); } clrFlag(fp, SF_SEOF); return c & 0xff; }
+      // Sentinel std streams (1/2/3) have no FILE buffer to push into — keep a
+      // per-fd pushback stack on the open description instead, consulted by
+      // fileGetc/doSrget before the next real read. Without this a getc()+
+      // ungetc()+getline() sequence on stdin silently drops the pushed byte
+      // (sed does exactly this and loses the first char of every line).
+      if (fp >= 1 && fp <= 3) { const e = fdEntry(fp - 1); if (e) { (e.ofd.unget || (e.ofd.unget = [])).push(c & 0xff); e.ofd.eof = false; markStdStreamEof(fp, false); } }
+      return c & 0xff; },
     fgets: (buf, n, fp) => { let i = 0; while (i < n - 1) { const c = fileGetc(fp); if (c < 0) break; u8()[buf + i++] = c; if (c === 10) break; } if (i === 0) return 0; u8()[buf + i] = 0; return buf; },
     getline: (lineptrPtr, capPtr, fp) => { const bytes = []; for (;;) { const c = fileGetc(fp); if (c < 0) break; bytes.push(c); if (c === 10) break; } if (!bytes.length) return -1; const buf = state.alloc(bytes.length + 1, 1); for (let i = 0; i < bytes.length; i++) u8()[buf + i] = bytes[i]; u8()[buf + bytes.length] = 0; view().setUint32(lineptrPtr, buf, true); if (capPtr) view().setUint32(capPtr, bytes.length + 1, true); return bytes.length; },
+    // getdelim(lineptr, cap, delim, fp): getline generalised to any delimiter
+    // byte (getline is getdelim with '\n'). Grows a fresh guest buffer and
+    // NUL-terminates; -1 at EOF with nothing read.
+    getdelim: (lineptrPtr, capPtr, delim, fp) => { const stop = delim & 0xff; const bytes = []; for (;;) { const c = fileGetc(fp); if (c < 0) break; bytes.push(c); if (c === stop) break; } if (!bytes.length) return -1; const buf = state.alloc(bytes.length + 1, 1); for (let i = 0; i < bytes.length; i++) u8()[buf + i] = bytes[i]; u8()[buf + bytes.length] = 0; view().setUint32(lineptrPtr, buf, true); if (capPtr) view().setUint32(capPtr, bytes.length + 1, true); return bytes.length; },
+    // fgetln(fp, lenPtr): BSD line reader. Returns a pointer to the next line
+    // (including its trailing \n if present), NOT NUL-terminated, and writes the
+    // byte count to *lenPtr. NULL at EOF. The buffer is owned by stdio and valid
+    // until the next stream op, so a fresh guest allocation per call is fine
+    // (mirrors getline/fgets above).
+    fgetln: (fp, lenPtr) => { const bytes = []; for (;;) { const c = fileGetc(fp); if (c < 0) break; bytes.push(c); if (c === 10) break; } if (!bytes.length) { if (lenPtr) view().setUint32(lenPtr, 0, true); return 0; } const buf = state.alloc(bytes.length, 1); for (let i = 0; i < bytes.length; i++) u8()[buf + i] = bytes[i]; if (lenPtr) view().setUint32(lenPtr, bytes.length, true); return buf; },
+    // Wide-char stdio: decode/encode one UTF-8 code point over the byte-level
+    // FILE layer. WEOF is -1. (tr reads/writes its stream wide.)
+    fgetwc: (fp) => {
+      const b0 = fileGetc(fp);
+      if (b0 < 0) return -1;
+      if (b0 < 0x80) return b0;
+      let extra, cp;
+      if ((b0 & 0xe0) === 0xc0) { extra = 1; cp = b0 & 0x1f; }
+      else if ((b0 & 0xf0) === 0xe0) { extra = 2; cp = b0 & 0x0f; }
+      else if ((b0 & 0xf8) === 0xf0) { extra = 3; cp = b0 & 0x07; }
+      else return 0xfffd;
+      for (let i = 0; i < extra; i++) { const b = fileGetc(fp); if (b < 0) return -1; cp = (cp << 6) | (b & 0x3f); }
+      return cp >>> 0;
+    },
+    getwc: (fp) => env.fgetwc(fp),
+    getwchar: () => env.fgetwc(1),
+    fputwc: (wc, fp) => { let s; try { s = String.fromCodePoint(wc >>> 0); } catch { s = "�"; } fpWrite(fp, enc.encode(s)); return wc >>> 0; },
+    putwc: (wc, fp) => env.fputwc(wc, fp),
+    putwchar: (wc) => env.fputwc(wc, 2),
     fseek: (fp, off, whence) => { const fd = fileFd(fp); if (fp > 3) { view().setInt32(fp + SF_R, 0, true); view().setUint32(fp + SF_P, view().getUint32(fp + SF_BFBASE, true), true); clrFlag(fp, SF_SEOF); } const e = fdEntry(fd); if (!e || e.ofd.kind !== "file") return -1; const len = e.ofd.node.data.length; e.ofd.off = whence === 2 ? len + off : whence === 1 ? e.ofd.off + off : off; return 0; },
     fseeko: (fp, off, whence) => env.fseek(fp, typeof off === "bigint" ? Number(off) : off, whence),
     ftell: (fp) => { const fd = fileFd(fp); const e = fdEntry(fd); if (!e || e.ofd.kind !== "file") return -1; const buffered = fp > 3 ? Math.max(0, view().getInt32(fp + SF_R, true)) : 0; return e.ofd.off - buffered; },
@@ -681,9 +766,13 @@ function buildLibc(state, env_vars, io, mgr, proc) {
     // stdio putc-overflow handler: the guest's streams are unbuffered, so
     // every putc/putchar char arrives here. Emit it (NOT discard).
     __swbuf: (c, fp) => { fpWrite(fp, String.fromCharCode(c & 0xff)); return c & 0xff; },
-    clearerr: (fp) => { clrFlag(fp, SF_SEOF | SF_SERR); return 0; },
+    clearerr: (fp) => { clrFlag(fp, SF_SEOF | SF_SERR); if (fp >= 1 && fp <= 3) { const e = fdEntry(fp - 1); if (e) e.ofd.eof = false; } return 0; },
     ferror: (fp) => (fp > 3 ? (view().getInt16(fp + SF_FLAGS, true) & SF_SERR ? 1 : 0) : 0),
-    feof: (fp) => (fp > 3 ? (view().getInt16(fp + SF_FLAGS, true) & SF_SEOF ? 1 : 0) : 0),
+    // feof: a real FILE carries the SF_SEOF flag; the sentinel std streams
+    // (1/2/3 -> fd 0/1/2) have no struct, so consult the underlying fd's
+    // read-EOF state instead — otherwise a getline/getdelim loop on stdin that
+    // returns -1 at EOF looks like a read error to the guest (sort err(2)s).
+    feof: (fp) => { if (fp > 3) return view().getInt16(fp + SF_FLAGS, true) & SF_SEOF ? 1 : 0; if (fp >= 1 && fp <= 3) { const e = fdEntry(fp - 1); return e && e.ofd.eof ? 1 : 0; } return 0; },
 
     strlen: (p) => { let n = 0; while (u8()[p + n]) n++; return n; },
     strcmp: (a, b) => { let i = 0; for (;;) { const x = u8()[a + i], y = u8()[b + i]; if (x !== y) return x - y; if (!x) return 0; i++; } },
@@ -771,6 +860,70 @@ function buildLibc(state, env_vars, io, mgr, proc) {
       return 0;
     },
     bsearch: (key, base, nmemb, size, cmpIdx) => { const table = proc.inst.exports.__indirect_function_table; if (!table) return 0; const cmp = table.get(cmpIdx); for (let i = 0; i < nmemb; i++) { const el = base + i * size; if ((cmp(key, el) | 0) === 0) return el; } return 0; },
+    // BSD mergesort/heapsort: same (base, nmemb, size, cmp) contract as qsort
+    // but return 0 on success / -1 on error. JS Array.sort is stable (so this
+    // is a faithful mergesort), and qsort already does the element shuffling —
+    // reuse it and report success.
+    mergesort: (base, nmemb, size, cmpIdx) => { env.qsort(base, nmemb, size, cmpIdx); return 0; },
+    heapsort: (base, nmemb, size, cmpIdx) => { env.qsort(base, nmemb, size, cmpIdx); return 0; },
+    // ---- POSIX regex over JS RegExp (regcomp/regexec/regfree/regerror) ----
+    // grep/sed compile a pattern into a regex_t then match lines. The compiled
+    // JS RegExp lives in a per-process map keyed by the guest regex_t pointer.
+    // regex_t (wasm32): re_magic@0, re_nsub@4 (size_t). regmatch_t: rm_so@0,
+    // rm_eo@8, each a 64-bit regoff_t (== FreeBSD __off_t); offsets are BYTE
+    // offsets into the UTF-8 subject. cflags: EXTENDED=1 ICASE=2 NOSUB=4
+    // NEWLINE=8. The 'd' flag gives per-group match indices for submatches.
+    regcomp: (preg, patternPtr, cflags) => {
+      const src = posixRegexToJs(cstr(patternPtr), !!(cflags & 1));
+      let flags = "d";
+      if (cflags & 2) flags += "i";
+      if (cflags & 8) flags += "m";
+      let re;
+      try { re = new RegExp(src, flags); } catch { return 13; } // REG_BADRPT
+      let nsub = 0;
+      try { nsub = new RegExp(src + "|").exec("").length - 1; } catch { nsub = 0; }
+      (proc.pio.regex || (proc.pio.regex = new Map())).set(preg, { re, nosub: !!(cflags & 4) });
+      view().setUint32(preg + 4, nsub, true); // re_nsub
+      return 0;
+    },
+    regexec: (preg, strPtr, nmatch, pmatch, eflags) => {
+      const entry = proc.pio.regex && proc.pio.regex.get(preg);
+      if (!entry) return 1; // REG_NOMATCH
+      // REG_STARTEND (4): the subject is bytes [strPtr+rm_so, strPtr+rm_eo) and
+      // the returned offsets are relative to strPtr — sed drives its global
+      // substitution by advancing rm_so, so honouring this is what stops an
+      // infinite match-the-same-spot loop. Read the IN bounds BEFORE overwriting.
+      const startend = !!(eflags & 4);
+      let base = 0;
+      let subBytes;
+      if (startend && pmatch) {
+        base = view().getInt32(pmatch, true);
+        const end = view().getInt32(pmatch + 8, true);
+        subBytes = u8().slice(strPtr + base, strPtr + end);
+      } else {
+        let e = strPtr; while (u8()[e]) e++; subBytes = u8().slice(strPtr, e);
+      }
+      const subject = dec.decode(subBytes);
+      const m = entry.re.exec(subject);   // non-global: always the first match
+      if (!m) return 1;
+      if (nmatch > 0 && pmatch && !entry.nosub) {
+        const byteOff = (jsIdx) => base + enc.encode(subject.slice(0, jsIdx)).length;
+        const setOff = (ptr, val) => { view().setInt32(ptr, val, true); view().setInt32(ptr + 4, val < 0 ? -1 : 0, true); };
+        for (let i = 0; i < nmatch; i++) {
+          const cell = pmatch + i * 16;
+          const span = m.indices && m.indices[i];
+          if (span) { setOff(cell, byteOff(span[0])); setOff(cell + 8, byteOff(span[1])); }
+          else { setOff(cell, -1); setOff(cell + 8, -1); }
+        }
+      }
+      return 0;
+    },
+    regfree: (preg) => { if (proc.pio.regex) proc.pio.regex.delete(preg); },
+    regerror: (errcode, preg, errbuf, errbufSize) => {
+      const bytes = enc.encode("regex error");
+      if (errbuf && errbufSize > 0) { const n = Math.min(bytes.length, (errbufSize | 0) - 1); for (let i = 0; i < n; i++) u8()[errbuf + i] = bytes[i]; u8()[errbuf + n] = 0; }
+      return bytes.length + 1;
+    },
     strcasestr: (h, n) => { const needle = cstr(n).toLowerCase(); if (!needle) return h; const hay = cstr(h); const idx = hay.toLowerCase().indexOf(needle); return idx < 0 ? 0 : h + enc.encode(hay.slice(0, idx)).length; },
     strsep: (stringpPtr, delimPtr) => {
       const start = view().getUint32(stringpPtr, true);
@@ -2039,6 +2192,18 @@ export class Manager {
 export function runProgram(mod, argv, onOutput, onUnimpl, opts = {}) {
   const mgr = new Manager({ onOutput, onUnimpl: onUnimpl || (() => {}) }, opts.tools || new Map());
   const root = mgr.spawn(mod, argv, 0, opts.env);
+  // Optional fixed stdin for a non-interactive guest. Back fd 0 with a
+  // pre-filled, write-closed pipe so read()/poll() on stdin returns these bytes
+  // and then EOF — exactly the shape a command sees on the receiving end of a
+  // shell pipe (`printf … | grep …`), and the same pipe a native `yos wasm`
+  // run gets when its stdin is fed. Absent opts.stdin, fd 0 stays the
+  // EOF-on-read char device newPio() wires up, so existing callers are
+  // unaffected.
+  if (opts.stdin != null) {
+    const data = typeof opts.stdin === "string" ? new TextEncoder().encode(opts.stdin) : new Uint8Array(opts.stdin);
+    const pipe = { chunks: data.length ? [data] : [], total: data.length, readClosed: false, writeClosed: true, ancFds: [] };
+    root.pio.fds.set(0, { ofd: { kind: "pipe", end: "r", pipe, refs: 1 }, cloexec: false });
+  }
   try { mgr.run(root); } catch (e) { return { exitCode: "trap", error: e.message, procs: mgr.procs.length }; }
   return { exitCode: typeof root.exitCode === "number" ? root.exitCode : 0, error: root.error, procs: mgr.procs.length };
 }

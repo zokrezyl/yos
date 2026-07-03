@@ -20,6 +20,14 @@ guest.wasm  ──env.write / env.strlen──▶  bridge.wasm        (wasm → 
                                   host.write_bytes            (the ONLY JS)
 ```
 
+> **Convergence host (epic #33).** The files in this directory are the
+> **Architecture B** shared-memory proof slice (guest on the browser's own
+> engine). The **Architecture A** convergence host — the yos C runtime +
+> wasm3 compiled to one browser wasm module, which is the correctness
+> baseline being built out — lives in [`host/`](host/). Phase 0 is done:
+> `make test-browser-host-phase0`. See [`host/README.md`](host/README.md)
+> and `docs/browser.md`.
+
 ## What runs
 
 - `guest.c` → `guest.wasm` — the app. Imports `env.write`, `env.strlen`,

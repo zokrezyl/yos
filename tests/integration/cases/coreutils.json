@@ -20,20 +20,21 @@
     "id": "grep-fixed-match",
     "argv": ["grep", "apple"],
     "stdin": "apple\nbanana\napple\n",
-    "expect": { "exitCode": 0, "rawStdout": "apple\napple\n", "gridContains": ["apple"] }
+    "expect": { "exitCode": 0, "rawStdout": "apple\napple\n", "gridContains": ["apple"] },
+    "knownNativeGap": "Native grep matches nothing (exit 1, empty) because of the rune-locale <_ctype.h> gap: isalpha/isspace/etc. return 0 for every byte, so grep's character classes never match. The browser engine matches via JS RegExp and is correct. Fix is the shared native rune-locale hole (tests/integration/freebsd-tools/test_grep.py), not the browser. Drop this flag once native ctype is fixed."
   },
   {
     "id": "sed-substitute-global",
     "argv": ["sed", "s/foo/BAR/g"],
     "stdin": "foo bar foo\n",
-    "expect": { "exitCode": 0, "rawStdout": "BAR bar BAR\n", "gridContains": ["BAR bar BAR"] }
+    "expect": { "exitCode": 0, "rawStdout": "BAR bar BAR\n", "gridContains": ["BAR bar BAR"] },
+    "knownNativeGap": "Native sed passes input through unchanged (no substitution) due to the same rune-locale <_ctype.h> gap that breaks its regex engine. The browser engine substitutes correctly via JS RegExp. Fix is the shared native rune-locale hole (tests/integration/freebsd-tools/test_sed.py), not the browser. Drop this flag once native ctype is fixed."
   },
   {
     "id": "sort-lexicographic",
     "argv": ["sort"],
     "stdin": "banana\napple\ncherry\n",
-    "expect": { "exitCode": 0, "rawStdout": "apple\nbanana\ncherry\n" },
-    "knownBrowserGap": "The browser engine models std streams as the integer sentinel FILE 1/2/3, but the guest <stdio.h> feof() is a MACRO that dereferences the FILE pointer (fr->file->_flags & __SEOF). feof(1) reads garbage at guest address 13, so at EOF sort takes the !feof branch and err(2)s (file.c:684). Native passes. Fix needs the sysroot to model std streams as real FILE structs (or expose feof as a pure function) — a deeper engine/sysroot change, tracked separately."
+    "expect": { "exitCode": 0, "rawStdout": "apple\nbanana\ncherry\n" }
   },
   {
     "id": "tr-to-upper",

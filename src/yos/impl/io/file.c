@@ -390,6 +390,70 @@ int32_t yos_putc_unlocked (struct yos_exec_ctx *ctx, int32_t c, uint32_t fp) {
 }
 int32_t yos_ungetc(struct yos_exec_ctx *ctx, int32_t c, uint32_t fp) { (void)ctx; FILE *f=handle_to_file(fp); return f?ungetc(c,f):-1; }
 
+/* ── wide-char stdio (fgetwc/fputwc family) ───────────────────────────
+ *
+ * The auto-bridge renders these as a straight host-libc passthrough:
+ * it casts (ctx->memory + fp) to a host FILE* and calls host fgetwc()
+ * — but the guest's `fp` is a small stream handle (1/2/3) or a wasm
+ * FILE offset, never a valid host FILE*, so host fgetwc dereferences
+ * garbage and SIGSEGVs (tr reads its input with getwc/fgetwc and
+ * crashed the moment it hit this).
+ *
+ * Model them the way the byte-level getc/putc family already works:
+ * one code point at a time over the SAME fd_map byte primitives, so a
+ * dup2'd stdin/stdout redirect takes effect and no host-glibc FILE
+ * buffer sits in the path. The multibyte encoding is UTF-8 and is
+ * decoded/encoded here directly (locale-independent), matching the
+ * browser engine's fgetwc/fputwc byte-for-byte. WEOF is (wint_t)-1,
+ * which the bridge hands back to the guest as 0xffffffff. */
+static int wc_getbyte(struct yos_exec_ctx *ctx, uint32_t fp) {
+    int r = stdio_fgetc_via_fdmap(ctx, fp);
+    if (r != -2) return r;                 /* byte, or -1 at EOF/error */
+    FILE *f = handle_to_file(fp); return f ? fgetc(f) : -1;
+}
+static int wc_putbyte(struct yos_exec_ctx *ctx, int c, uint32_t fp) {
+    int r = stdio_fputc_via_fdmap(ctx, c, fp);
+    if (r != -2) return r;
+    FILE *f = handle_to_file(fp); return f ? fputc(c, f) : -1;
+}
+
+int32_t yos_fgetwc(struct yos_exec_ctx *ctx, uint32_t fp) {
+    int b0 = wc_getbyte(ctx, fp);
+    if (b0 < 0) return -1;                  /* WEOF */
+    if (b0 < 0x80) return b0;
+    int extra;
+    uint32_t cp;
+    if ((b0 & 0xe0) == 0xc0)      { extra = 1; cp = b0 & 0x1f; }
+    else if ((b0 & 0xf0) == 0xe0) { extra = 2; cp = b0 & 0x0f; }
+    else if ((b0 & 0xf8) == 0xf0) { extra = 3; cp = b0 & 0x07; }
+    else return 0xfffd;                     /* invalid lead byte */
+    for (int i = 0; i < extra; i++) {
+        int b = wc_getbyte(ctx, fp);
+        if (b < 0) return -1;               /* truncated sequence → WEOF */
+        cp = (cp << 6) | (uint32_t)(b & 0x3f);
+    }
+    return (int32_t)cp;
+}
+int32_t yos_getwc(struct yos_exec_ctx *ctx, uint32_t fp) { return yos_fgetwc(ctx, fp); }
+int32_t yos_getwchar(struct yos_exec_ctx *ctx) { return yos_fgetwc(ctx, 1); }
+
+int32_t yos_fputwc(struct yos_exec_ctx *ctx, int32_t wc, uint32_t fp) {
+    if (fp == 3) ctx->stderr_written_since_exec = 1;
+    uint32_t cp = (uint32_t)wc;
+    unsigned char buf[4];
+    int n;
+    if (cp < 0x80)          { buf[0] = (unsigned char)cp; n = 1; }
+    else if (cp < 0x800)    { buf[0] = 0xc0 | (cp >> 6); buf[1] = 0x80 | (cp & 0x3f); n = 2; }
+    else if (cp < 0x10000)  { buf[0] = 0xe0 | (cp >> 12); buf[1] = 0x80 | ((cp >> 6) & 0x3f); buf[2] = 0x80 | (cp & 0x3f); n = 3; }
+    else if (cp <= 0x10ffff){ buf[0] = 0xf0 | (cp >> 18); buf[1] = 0x80 | ((cp >> 12) & 0x3f); buf[2] = 0x80 | ((cp >> 6) & 0x3f); buf[3] = 0x80 | (cp & 0x3f); n = 4; }
+    else return -1;                         /* not a valid code point → WEOF */
+    for (int i = 0; i < n; i++)
+        if (wc_putbyte(ctx, buf[i], fp) < 0) return -1;
+    return (int32_t)cp;
+}
+int32_t yos_putwc(struct yos_exec_ctx *ctx, int32_t wc, uint32_t fp) { return yos_fputwc(ctx, wc, fp); }
+int32_t yos_putwchar(struct yos_exec_ctx *ctx, int32_t wc) { return yos_fputwc(ctx, wc, 2); }
+
 uint32_t yos_fgets(struct yos_exec_ctx *ctx, uint32_t buf, int32_t n, uint32_t fp)
 {
     FILE *f = handle_to_file(fp);
