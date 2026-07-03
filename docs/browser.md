@@ -269,23 +269,51 @@ layer instead of one "compile yos-host.wasm" cliff.
     gives the same sibling-call dispatch wasm3 needs. (The unrelated dev-profile
     `emcc` 4.0.21 is skewed against its own LLD 21 — `--no-stack-first` — so the
     flake-pinned emscripten is the supported one.)
-- **Phase 1a.** *(folded into Phase 0 above — the trivial guest already runs
-  fully inside the host wasm.)*
-- **Phase 1b.** Add generated bridge wrappers compiled to wasm with one or two
-  imports (`write`, `getpid`) calling **yos C, not JS**.
-- **Phase 1c.** Add enough yos VFS/proc plumbing for `stat`, `readdir`, `/proc`,
-  backed by WASMFS/MEMFS.
-- **Phase 1d.** Run `echo`, `cat`, `ls -alrt`, `ps` from the **same tool artifact
-  desktop uses** (one artifact source; retire `web/tools/`). Success = `ls -alrt`
-  renders correctly with **zero JS libc**.
-- **Phase 2 — shared oracle.** Point `browser-parity-suite.mjs` at the emscripten
-  host instead of `yos_proc.mjs`, running the same guest wasm as desktop. A
-  BROWSER-GAP now means "emscripten host diverges from native," and should trend
-  to zero because it is the same C.
-- **Phase 3 — fork + threads glue.** Land the cooperative process model (fork /
-  exec / wait / pipes / dup-cloexec / pty / socketpair-SCM_RIGHTS / termios /
-  procfs) in the reused C; keep parallelism on Workers+SAB (reuse `mt_*`). Success
-  = `zsh` runs a pipeline, `tmux` splits panes.
+- **Phase 1a — minimal bridge path. ✅ done (issue #35).** A guest that imports
+  `env.write` / `env.getpid` / `env.exit` runs through the host wasm; those
+  imports are served by hand-written C bridge wrappers in the exact desktop
+  shape (`m3_GetUserData(runtime)` → ctx, pop the wasm3 stack slots, translate
+  the guest pointer with `ctx->memory + offset`, call host libc). No JS
+  implements them. `phase1a_host.c` / `bridge_guest.c`;
+  `make test-browser-host-phase1a` is the gate (asserts the guest's write went
+  through pointer translation, getpid returned host state, exit carried its
+  code). These wrappers are the minimal proof of the shape; Phase 1b swaps them
+  for the generated bridge.
+- **Phase 1b — generated bridge + impl/vfs. ✅ core done (issue #36).** The REAL
+  generated `yos_bridge.c` + the yos `impl/` and `vfs/` source trees compile to
+  the host wasm under emcc (all ~40 core files build clean; the bridge links
+  with `-sERROR_ON_UNDEFINED_SYMBOLS=0` so un-compiled leaves become inert
+  stubs). A guest's `echo` (`write`) and `cat` (`open`/`read`/`write`/`close`)
+  run through yos C — pointer translation, `fd_map`, errno remap, VFS — with
+  Emscripten MEMFS as the storage substrate. `phase1b_host.c` / `build-phase1b.sh`;
+  `make test-browser-host-phase1b` is the gate. Scoped-out for now:
+  `impl/io/file.c` (`FILE*` table — six wide-char defaults collide with the
+  bridge; wasm LLD lacks `--allow-multiple-definition`; raw-fd path doesn't need
+  it), and running the real `ls`/`ps` tool wasm (argv + malloc + `struct stat`
+  conversion + procfs/sysctl over a bigger impl surface — folds into Phase 1d /
+  Phase 2 tool-artifact work).
+- **Phase 1c.** *(largely covered by 1b — VFS/io `open`/`read`/`close` + MEMFS
+  work; `stat`/`readdir`/`/proc` breadth lands with the real tool artifacts.)*
+- **Phase 1d / Phase 2 — same artifacts + shared oracle. ✅ core done (issue #37).**
+  A general runner (`yos_host_run.c` → `yos-host.mjs`) executes an arbitrary
+  desktop tool artifact from `result/libexec` (the **same** artifact desktop
+  runs; the stale `web/tools/` copies are no longer the source of truth), and a
+  parity harness (`host_parity.mjs`, `make test-browser-host-parity`) runs each
+  command through **native yos** and the **host wasm** and classifies MATCH /
+  HOST-GAP / NATIVE-GAP / BOTH-FAIL. `echo`/`basename`/`cat`/`wc` MATCH
+  byte-for-byte with zero JS libc; `grep` shows as a **NATIVE-GAP** (the
+  rune-locale bug — host is correct, native diverges, tracked for #40);
+  `sort`/`cut` and `ls`/`ps` remain HOST-GAPs (asprintf/heapsort, `struct stat`
+  conversion, procfs/sysctl breadth). A HOST-GAP means "emscripten host diverges
+  from native" and trends to zero because it is the same C.
+- **Phase 3 — fork + threads glue. ⏳ not yet functional (issue #38).**
+  `impl/proc/proc.c` is compiled into `yos-host.wasm` and `fork`/`waitpid`/`_exit`
+  are linked, so a fork guest runs — but `fork()` returns failure: the
+  single-instance host runner does not yet wire the cooperative snapshot/rewind
+  scheduler (run child inline to completion, then resume parent). See
+  `src/yos/platform/web/host/README.md` (Phase 3 status) for the exact pieces
+  outstanding. Success target unchanged: `zsh` runs a pipeline, `tmux` splits
+  panes.
 - **Phase 4 — freeze, then retire the JS host (test-gated, not intent-gated).**
   1. **Freeze `yos_proc.mjs` now**: it stays as the legacy runner, but **no more
      semantic patches** — only test-harness compatibility. (This means the recent

@@ -40,6 +40,9 @@ NINJA    := $(NIX_DEV) ninja -C $(BUILD)
         test-browser test-browser-chrome test-browser-engine test-browser-libc \
         test-browser-parity test-browser-tmux-render test-browser-tmux-xterm serve-zsh \
         browser-host-phase0 test-browser-host-phase0 \
+        browser-host-phase1a test-browser-host-phase1a \
+        browser-host-phase1b test-browser-host-phase1b \
+        browser-host-runner test-browser-host-parity browser-host-perf \
         nvim-build nvim-deps \
         format check
 
@@ -95,6 +98,9 @@ help:
 	@printf '\n  Browser convergence host (epic #33 — yos C runtime → wasm via emscripten)\n'
 	@printf '    make browser-host-phase0      — build the Phase 0 wasm3-in-wasm host (#34)\n'
 	@printf '    make test-browser-host-phase0 — build + smoke-test the Phase 0 host\n'
+	@printf '    make test-browser-host-phase1a — build + smoke-test the Phase 1a bridge path (#35)\n'
+	@printf '    make test-browser-host-phase1b — build + smoke-test the generated bridge + impl/vfs host (#36)\n'
+	@printf '    make test-browser-host-parity  — run desktop tool artifacts on native + host wasm, classify gaps (#37)\n'
 	@printf '\n  External wasm packages\n'
 	@printf '    make nvim-build     — neovim 0.10.4 → wasm32 (needs nvim-deps first)\n'
 	@printf '    make nvim-deps      — fetch + build all 9 nvim deps\n'
@@ -270,6 +276,37 @@ browser-host-phase0:
 
 test-browser-host-phase0: browser-host-phase0
 	@node $(WEB)/host/phase0_smoke.mjs
+
+# Phase 1a (issue #35): serve a guest's env.write/getpid/exit through C bridge
+# wrappers (pointer translation), not JS. See $(WEB)/host/README.md.
+browser-host-phase1a:
+	@$(NIX_DEV) bash $(WEB)/host/build-phase1a.sh
+
+test-browser-host-phase1a: browser-host-phase1a
+	@node $(WEB)/host/phase1a_smoke.mjs
+
+# Phase 1b (issue #36): the REAL generated bridge + impl/vfs compiled to the
+# host wasm. echo + cat run through yos C code with no JS libc. Needs the
+# generated bridge from `make codegen` (build-$(host)/src/yos/codegen).
+browser-host-phase1b: codegen
+	@$(NIX_DEV) bash $(WEB)/host/build-phase1b.sh
+
+test-browser-host-phase1b: browser-host-phase1b
+	@node $(WEB)/host/phase1b_smoke.mjs
+
+# Phase 2 (issue #37): general yos-host runner + parity harness. yos-host.wasm
+# runs an ARBITRARY desktop tool artifact (result/libexec); the harness runs
+# each command through native yos AND the host wasm and classifies gaps. Needs
+# `make codegen` (generated bridge) and `make all` (native yos + libexec tools).
+browser-host-runner: codegen
+	@$(NIX_DEV) bash $(WEB)/host/build-runner.sh
+
+test-browser-host-parity: browser-host-runner
+	@node $(WEB)/host/host_parity.mjs
+
+# Architecture A perf (issue #41): native yos vs. wasm3-in-wasm host, ms/run.
+browser-host-perf: browser-host-runner
+	@node $(WEB)/host/arch_a_perf.mjs
 
 # Serve the web dir over HTTP so you can open the interactive zsh terminal
 # (zsh.html → zsh_main.mjs → the long-lived browser zsh) in a real browser.

@@ -1,3 +1,20 @@
+// ─────────────────────────────────────────────────────────────────────────
+// LEGACY / FROZEN — hand-written JavaScript libc host (epic #33, issue #39).
+//
+// This is the OLD browser runtime: a JavaScript reimplementation of the
+// FreeBSD libc/syscall surface. The convergence effort (epic #33) replaces it
+// with the yos C runtime compiled to wasm — see src/yos/platform/web/host/
+// (yos-host.wasm) and docs/browser.md.
+//
+// FROZEN: no new *semantic* patches. Only test-harness compatibility changes
+// are allowed here. Every libc behaviour added to this file is future
+// divergence from the C host. New guest-visible semantics belong in the yos C
+// bridge/impl/vfs, not here. This file stays the legacy runner (kept behind an
+// explicit selector — see host-select.mjs) until the parity gates in
+// docs/browser.md §5 pass; only then does the browser default switch to the C
+// host and this is retired.
+// ─────────────────────────────────────────────────────────────────────────
+//
 // Process-aware browser host for asyncified yos wasm guests.
 //
 // Real fork via asyncify, the same dance native yos runs: fork() calls
