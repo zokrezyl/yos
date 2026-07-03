@@ -39,7 +39,8 @@ self.onmessage = (event) => {
   catch (e) { self.postMessage({ error: "pool instantiate: " + e.message }); return; }
   const table = inst.exports.__indirect_function_table;
   const slotI = (POOL_BASE >> 2) + slot * 4;
-  Atomics.add(ia, READY_OFF >> 2, 1);
+  // Signal readiness and wake the engine's synchronous ensurePool() wait.
+  Atomics.add(ia, READY_OFF >> 2, 1); Atomics.notify(ia, READY_OFF >> 2);
 
   for (;;) {
     Atomics.wait(ia, slotI, 0);

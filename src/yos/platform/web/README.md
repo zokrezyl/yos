@@ -176,6 +176,19 @@ once (the cooperative engine runs a forked child to completion before the
 parent resumes — concurrent scheduling is the M3 Worker-backed model in
 `mt_engine.mjs`).
 
+`mt_engine.mjs` is the real-thread engine (Web Workers + SharedArrayBuffer +
+Atomics). Each process — the root and every `fork()` child — owns its linear
+memory and its own worker pool bound to that memory, so a thread created by a
+fork child runs against the child's address space, not the root's (issue #23).
+The root pool boots eagerly (async, event-loop friendly); fork/exec children
+boot lazily on first `pthread_create`. Node runs the full fork-child-thread
+case (`mt_fork_thread_test.mjs`); in the browser a fork child cannot boot its
+pool synchronously (a Web Worker's module load needs an event-loop turn the
+coordinator won't give while blocked in `Atomics.wait`), so today only the
+root threads in-browser and a fork child's `pthread_create` fails loud rather
+than running on the wrong memory (`mt_fork_thread_browser_test.mjs` guards that
+invariant). Fork itself stays cooperative, not concurrent.
+
 ## The gap to real zsh (measured, not guessed)
 
 `nix build .#zsh` produces a 2 MB wasm32 zsh that **imports 169

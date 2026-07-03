@@ -4,7 +4,17 @@
 // variables, history and running jobs persist across commands within a pane
 // and never leak between panes. This is the same persistent-shell model as
 // zsh.html (runInteractive), not one-zsh-per-line.
+//
+// ENGINE CHOICE (issue #23 blocker #2). This interactive path runs on the
+// single-process cooperative engine (yos_proc.mjs). That is CORRECT for zsh:
+// zsh is single-threaded, so it never touches the cooperative pthread stubs.
+// It is NOT a general threaded-guest runner — a real-threads (shared-memory)
+// build must go through mt_engine (Web Workers + SharedArrayBuffer), which
+// this interactive path does not implement. loadShared() therefore refuses a
+// shared-memory module up front rather than silently running its threads on
+// cooperative stubs.
 import { runInteractive } from "./yos_proc.mjs";
+import { wasmWantsRealThreads } from "./yos_run.mjs";
 
 export async function createShell(container, shared, label) {
   const term = new Terminal({
@@ -37,6 +47,15 @@ export async function createShell(container, shared, label) {
 // modules (cheap) but gets its own process/memory via runInteractive.
 export async function loadShared() {
   const mod = await WebAssembly.compile(await (await fetch("./zsh.wasm")).arrayBuffer());
+  if (wasmWantsRealThreads(mod)) {
+    throw new Error(
+      "zsh_shell: this interactive path is the single-process cooperative " +
+        "engine (correct for single-threaded zsh). The loaded module imports " +
+        "its memory (a real-threads / shared-memory build); run it through " +
+        "mt_engine from a coordinator Worker instead (see mt_engine.mjs / " +
+        "mt_coordinator_browser.mjs, issue #23).",
+    );
+  }
   const names = ["pwd", "id", "hostname", "echo", "cat", "ls", "ps", "date", "true", "false", "forkdemo", "forkstress", "perfstress"];
   const tools = new Map();
   await Promise.all(names.map(async (n) => { try { tools.set(n, await WebAssembly.compile(await (await fetch(`./tools/${n}.wasm`)).arrayBuffer())); } catch {} }));

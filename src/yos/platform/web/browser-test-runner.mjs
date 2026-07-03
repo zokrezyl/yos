@@ -34,6 +34,7 @@ const CHROME_TESTS = [
   "tmux_browser_test.mjs",
   "tmux_xterm_render_test.mjs",
   "zsh_paste_test.mjs",
+  "mt_fork_thread_browser_test.mjs", // fork-child thread memory safety via mt_engine
 ];
 // Known gaps — deliberately NOT in the default suite (run them by name):
 //   perfstress_zsh_test.mjs — drives the FULL `perfstress`, whose condvar/
@@ -52,6 +53,7 @@ const ENGINE_TESTS = [
   "onlcr_test.mjs", // terminal output newline cooking (LF->CRLF, no staircase)
   "serve_mime_test.mjs", // serve.sh sends correct Content-Type (css/mjs/wasm)
   "mt_test_node.mjs", // full perf-stress on the real-thread (worker-pool) engine
+  "mt_fork_thread_test.mjs", // fork-child threads run against the child's memory
 ];
 
 const only = process.argv.includes("--chrome") ? "chrome"

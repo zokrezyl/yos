@@ -46,3 +46,26 @@ echo "built guest.wasm ($(wc -c <guest.wasm)) bridge.wasm ($(wc -c <bridge.wasm)
 	-Wl,--export=run_racy -Wl,--export=run_locked -Wl,--export=thread_fn \
 	-o threads_demo.wasm threads_demo.c
 echo "built threads_demo.wasm ($(wc -c <threads_demo.wasm))"
+
+# Fork-child thread-memory regression guests (issue #23). Shared memory +
+# atomics like threads_demo, but they also fork() and create a thread in the
+# CHILD — so they run through mt_engine (which calls __main_argc_argv and
+# drives fork via asyncify) and must be post-processed with
+# `wasm-opt --asyncify`, exactly like the perfstress_mt guest.
+#   fork_thread_demo     — one fork child creates a thread (child memory ownership)
+#   fork_thread_siblings — two sibling children each thread (memPool-reuse safety)
+WASM_OPT=${YOS_WASM_OPT:-wasm-opt}
+build_mt_asyncify() {
+	local src=$1 out=$2 thread_export=$3
+	"$CC" -target wasm32-unknown-unknown -nostdlib -O2 -matomics -mbulk-memory \
+		-Wl,--no-entry -Wl,--import-memory -Wl,--shared-memory \
+		-Wl,--max-memory=67108864 -Wl,--export-table \
+		-Wl,--export=__main_argc_argv -Wl,"--export=$thread_export" \
+		-o "$out.raw.wasm" "$src"
+	"$WASM_OPT" --asyncify --enable-threads --enable-bulk-memory -O2 \
+		"$out.raw.wasm" -o "$out.wasm"
+	rm -f "$out.raw.wasm"
+	echo "built $out.wasm ($(wc -c <"$out.wasm"))"
+}
+build_mt_asyncify fork_thread_demo.c fork_thread_demo child_thread
+build_mt_asyncify fork_thread_siblings.c fork_thread_siblings sib_thread

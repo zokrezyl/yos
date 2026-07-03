@@ -38,7 +38,7 @@ NINJA    := $(NIX_DEV) ninja -C $(BUILD)
         libc-pure yos run \
         test test-libc test-freebsd test-list testlog \
         test-browser test-browser-chrome test-browser-engine test-browser-libc \
-        test-browser-tmux-render test-browser-tmux-xterm serve-zsh \
+        test-browser-parity test-browser-tmux-render test-browser-tmux-xterm serve-zsh \
         nvim-build nvim-deps \
         format check
 
@@ -84,6 +84,7 @@ help:
 	@printf '    make testlog        — tail meson-logs/testlog.txt\n'
 	@printf '\n  Browser-runtime tests (headless; issue #21 — needs node + google-chrome-stable)\n'
 	@printf '    make test-browser-libc   — run the ENTIRE yos:libc unit-test suite through the browser engine\n'
+	@printf '    make test-browser-parity — run the shared command case table (echo/cat/grep/wc/sed/sort/tr/cut) on native + browser, diff libvterm grids (BROWSER-GAP vs BOTH-FAIL)\n'
 	@printf '    make test-browser        — in-page browser suite (headless Chrome + node engine)\n'
 	@printf '    make test-browser-chrome — headless-Chrome page tests only\n'
 	@printf '    make test-browser-engine — node process-engine page tests only (no Chrome)\n'
@@ -214,6 +215,18 @@ WEB := src/yos/platform/web
 # Needs system `node` + `meson` on PATH.
 test-browser-libc:
 	@node $(WEB)/browser-libc-suite.mjs
+
+# Run the shared command case table (tests/integration/cases/*.json) on BOTH
+# backends and diff libvterm grids (issue #25). Each case's tool wasm is run
+# through the native `yos` binary AND the browser process engine; both raw
+# streams are rendered through vterm_grid.c (the tmux oracle) and asserted
+# against the case's `expect`. Classifies failures native-vs-browser:
+# BROWSER-GAP (native passes, browser fails → engine bug; fails CI) vs
+# BOTH-FAIL (native fails too → guest/libc gap; does not fail CI). Runs against
+# the ALREADY-BUILT tools + native yos (build the corpus first: `make all`).
+# Needs system `node`; compiles the libvterm grid tool on first run.
+test-browser-parity:
+	@node $(WEB)/browser-parity-suite.mjs
 
 test-browser:
 	@node $(WEB)/browser-test-runner.mjs

@@ -14,7 +14,8 @@ self.onmessage = async (event) => {
       onUnimpl: () => {},
       spawnPoolWorker: ({ module, memory, slot }) => {
         const w = new Worker(poolURL, { type: "module" });
-        w.onmessage = (e) => { if (e.data.out) self.postMessage({ out: e.data.out }); };
+        // Surface pool-worker failures instead of dropping them silently.
+        w.onmessage = (e) => { if (e.data.out) self.postMessage({ out: e.data.out }); if (e.data.error) self.postMessage({ done: true, error: "pool worker: " + e.data.error }); };
         w.postMessage({ module, memory, slot });
         return w;
       },

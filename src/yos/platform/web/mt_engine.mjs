@@ -1,8 +1,38 @@
-// Multi-thread + fork engine for one process tree. Runs the main process
-// (with asyncify fork, cooperative) and dispatches pthread_create to a
-// pre-spawned pool of worker threads sharing the process's memory.
-// Environment-agnostic: the caller supplies spawnPoolWorker (node
-// worker_threads OR browser Web Worker) and an output sink.
+// Multi-thread + fork engine for one process tree. Environment-agnostic:
+// the caller supplies spawnPoolWorker (node worker_threads OR browser Web
+// Worker) and an output sink.
+//
+// PROCESS MEMORY OWNERSHIP (issue #23). Every process — the root and every
+// fork() child — owns its OWN linear memory. A thread must run against the
+// memory of the process that created it: after fork() the child has a
+// copied address space, so a thread the child spawns has to see the child's
+// bytes, not the root's. We therefore bind a worker pool to EACH process's
+// memory. The pool workers park on futexes in that process's control region;
+// join/mutex/cond/rwlock are Atomics on the same memory.
+//
+// The ROOT pool is booted eagerly, awaiting readiness on the event loop
+// (awaitPoolReady). Fork/exec children boot their pool lazily on the first
+// pthread_create, waiting for readiness synchronously (ensurePool). The sync
+// wait works under node's worker_threads (they boot from workerData on their
+// own threads) but NOT in the browser: a Web Worker's module load needs an
+// event-loop turn the coordinator is not giving it while blocked in
+// Atomics.wait. So today, in the browser, only the eagerly-booted ROOT
+// process threads; a fork child that calls pthread_create in the browser
+// fails loudly ("pool not ready") rather than silently running on the wrong
+// memory. Node runs the full fork-child-thread case correctly. Lifting the
+// browser limitation needs an asyncify-suspend on pthread_create (boot the
+// pool during an async yield, then rewind) — future work, tracked with the
+// mt_fork_thread_browser_test.mjs known-gap harness.
+//
+// FORK IS COOPERATIVE, NOT CONCURRENT (documented limitation, issue #23
+// blocker #3). handleFork() snapshots the parent's memory (asyncify) and runs
+// the child to completion BEFORE the parent resumes; waitpid() only reaps a
+// child that has already exited. This models fork/exec/wait fork-trees and a
+// child that runs to completion, but NOT live parent<->child interaction
+// (pipes written after fork while the child is still alive, event-loop
+// readiness across processes, job-control). A concurrent process model would
+// need Worker-backed, independently-runnable processes and is out of scope
+// here.
 import {
   buildEnv, makeMem, MEM_PAGES, ALLOC_PTR, POOL_BASE, READY_OFF,
   FLAG_BASE, ASYNC_BUF, ASYNC_SZ, POOL_SIZE,
@@ -30,20 +60,13 @@ export async function runMtProgram(module, argv, opts) {
   let nextPid = 1;
   const procs = [];
 
-  // ---- pre-spawn the thread pool (must be ready before any blocking) ----
-  const pool = [];
-  for (let slot = 0; slot < POOL_SIZE; slot++) pool.push(spawnPoolWorker({ module, memory, slot }));
-  for (let i = 0; i < 200 && Atomics.load(ia, READY_OFF >> 2) < POOL_SIZE; i++) await new Promise((r) => setTimeout(r, 25));
-  if (Atomics.load(ia, READY_OFF >> 2) < POOL_SIZE) throw new Error(`pool not ready: ${Atomics.load(ia, READY_OFF >> 2)}/${POOL_SIZE}`);
-
-  let nextTid = 0;
   // The shared build has no crt _start — it exports __main_argc_argv and
   // __wasm_init_memory. fresh procs (root, exec) init memory + ctors and
   // build argv; fork children inherit those via the copied memory.
   const spawnProc = (mod, av, ppid, mem, fresh) => {
     if (procs.length > 1500) throw new Error("runaway fork: " + procs.length + " procs");
     const pid = nextPid++;
-    const proc = { pid, ppid, argv: av, comm: (av[0] || "?").replace(/.*\//, ""), exited: false, reaped: false, exitCode: 0, mem, forkReturn: 0, forkPending: false, pendingRewind: false, argc: 0, argvPtr: 0 };
+    const proc = { pid, ppid, argv: av, comm: (av[0] || "?").replace(/.*\//, ""), exited: false, reaped: false, exitCode: 0, mem, mod, pool: null, nextTid: 0, pia: null, forkReturn: 0, forkPending: false, pendingRewind: false, argc: 0, argvPtr: 0 };
     procs.push(proc);
     proc.ctx = makeCtx(proc, mod);
     const { env } = strictImportEnv(buildEnv(proc.mem, proc.ctx), mod, { label: "mt", onCall: proc.ctx.unimpl });
@@ -67,9 +90,58 @@ export async function runMtProgram(module, argv, opts) {
     for (;;) { const cur = Atomics.load(a, ALLOC_PTR >> 2); const base = (cur + (align - 1)) & ~(align - 1); if (Atomics.compareExchange(a, ALLOC_PTR >> 2, cur, base + n) === cur) return base; }
   };
 
+  // Spawn a worker pool bound to THIS process's memory. A fork child inherits
+  // the parent's copied control region, so reset the readiness counter + slot
+  // words before its own workers boot.
+  function spawnPoolWorkers(proc) {
+    const pia = new Int32Array(proc.mem.buffer);
+    Atomics.store(pia, READY_OFF >> 2, 0);
+    for (let slot = 0; slot < POOL_SIZE; slot++) Atomics.store(pia, (POOL_BASE >> 2) + slot * 4, 0);
+    proc.pool = [];
+    for (let slot = 0; slot < POOL_SIZE; slot++) proc.pool.push(spawnPoolWorker({ module: proc.mod, memory: proc.mem, slot }));
+  }
+  // Async readiness wait — yields to the event loop so a browser Web Worker
+  // can actually load + boot. Used for the ROOT pool, booted eagerly before
+  // the synchronous run starts.
+  async function awaitPoolReady(proc) {
+    const pia = new Int32Array(proc.mem.buffer);
+    const idx = READY_OFF >> 2;
+    for (let i = 0; i < 400 && Atomics.load(pia, idx) < POOL_SIZE; i++) await new Promise((r) => setTimeout(r, 25));
+    if (Atomics.load(pia, idx) < POOL_SIZE) throw new Error(`pool not ready: ${Atomics.load(pia, idx)}/${POOL_SIZE}`);
+  }
+  // Ensure THIS process has a pool, booting it lazily on the first
+  // pthread_create (most fork children never thread, so they pay nothing).
+  // Readiness is a synchronous Atomics wait: node worker_threads boot from
+  // workerData on their own threads and bump READY_OFF (with an
+  // Atomics.notify), so blocking here does not deadlock. NOTE: a browser Web
+  // Worker cannot boot while the coordinator is blocked in Atomics.wait (its
+  // module load needs an event-loop turn), so this lazy path serves the node
+  // engine; in the browser only the eagerly-booted root pool threads today
+  // (see the file header). The root already has a pool, so ensurePool() is a
+  // no-op for it and the sync wait is reached only by fork/exec children.
+  function ensurePool(proc) {
+    if (proc.pool) return;
+    spawnPoolWorkers(proc);
+    const pia = new Int32Array(proc.mem.buffer);
+    const idx = READY_OFF >> 2;
+    for (let guard = 0; Atomics.load(pia, idx) < POOL_SIZE; guard++) {
+      if (guard > 800) throw new Error(`pool not ready: ${Atomics.load(pia, idx)}/${POOL_SIZE}`);
+      Atomics.wait(pia, idx, Atomics.load(pia, idx), 25);
+    }
+  }
+  // Tear down a process's pool once it has exited (its threads are joined, so
+  // the workers are parked). Frees the workers and lets a pooled child memory
+  // be reused by the next sibling without two pools racing on one region.
+  function killPool(proc) {
+    if (!proc.pool) return;
+    for (const worker of proc.pool) { try { worker.terminate(); } catch { /* best effort */ } }
+    proc.pool = null;
+  }
+
   function makeCtx(proc, mod) {
     const mem = proc.mem;
     const v = new DataView(mem.buffer), u8 = new Uint8Array(mem.buffer), pia = new Int32Array(mem.buffer);
+    proc.pia = pia; // this process's atomics view, used by fork/thread bookkeeping
     const cstr = (p) => { if (!p) return ""; let e = p; while (u8[e]) e++; return dec.decode(u8.slice(p, e)); };
     const ctx = {
       pid: proc.pid, ppid: proc.ppid, argv: proc.argv, envp: ["PATH=/bin", "HOME=/", "TERM=xterm", "PWD=/", "TMPDIR=/tmp"],
@@ -105,7 +177,7 @@ export async function runMtProgram(module, argv, opts) {
       opendir: (path) => { const names = [...vfs.files.keys()].filter((p) => p.startsWith((path === "/" ? "/" : path + "/")) && !p.slice((path === "/" ? 1 : path.length + 1)).includes("/")).map((p) => p.slice(path === "/" ? 1 : path.length + 1)); const h = vfs.nextFd++; vfs.dirs.set(h, { names: [".", "..", ...names], idx: 0, buf: 0 }); return h; },
       fdopendir: (fd) => fd,
       readdir: (h) => { const d = vfs.dirs.get(h); if (!d || d.idx >= d.names.length) return 0; if (!d.buf) d.buf = ctx.alloc280(); const name = d.names[d.idx++]; u8.fill(0, d.buf, d.buf + 280); v.setUint16(d.buf + 16, 280, true); u8[d.buf + 18] = 0; const nb = enc.encode(name); v.setUint16(d.buf + 20, nb.length, true); u8.set(nb, d.buf + 24); return d.buf; },
-      alloc280: () => { for (;;) { const cur = Atomics.load(ia, ALLOC_PTR >> 2); const base = (cur + 7) & ~7; if (Atomics.compareExchange(ia, ALLOC_PTR >> 2, cur, base + 280) === cur) return base; } },
+      alloc280: () => { for (;;) { const cur = Atomics.load(pia, ALLOC_PTR >> 2); const base = (cur + 7) & ~7; if (Atomics.compareExchange(pia, ALLOC_PTR >> 2, cur, base + 280) === cur) return base; } },
       sysctl: (namePtr, namelen, oldp, oldlenp) => {
         const mib = []; for (let i = 0; i < namelen; i++) mib.push(v.getInt32(namePtr + i * 4, true));
         if (mib[0] === 1 && mib[1] === 14) {
@@ -121,20 +193,24 @@ export async function runMtProgram(module, argv, opts) {
       // ---- process ----
       fork: () => doFork(proc),
       waitpid: (pid, st) => { const k = procs.find((p) => p.ppid === proc.pid && p.exited && !p.reaped && (pid <= 0 || p.pid === pid)); if (!k) return -1; k.reaped = true; if (st) v.setUint32(st, (k.exitCode & 0xff) << 8, true); return k.pid; },
-      execve: (path, argvPtr) => { const name = path.replace(/.*\//, ""); const m = opts.tools && opts.tools.get(name); if (!m) { v.setUint32(ctx.errnoPtr, 2, true); return -1; } const args = []; for (let p = argvPtr; ; p += 4) { const sp = v.getUint32(p, true); if (!sp) break; args.push(cstr(sp)); } const em = makeMem(); Atomics.store(new Int32Array(em.buffer), ALLOC_PTR >> 2, HEAP_START); const child = spawnProc(m, args.length ? args : [name], proc.pid, em, true); runProc(child, 100); child.reaped = true; child.inst = null; const e = new Error("exec"); e.isExit = true; e.code = child.exitCode; throw e; },
+      execve: (path, argvPtr) => { const name = path.replace(/.*\//, ""); const m = opts.tools && opts.tools.get(name); if (!m) { v.setUint32(ctx.errnoPtr, 2, true); return -1; } const args = []; for (let p = argvPtr; ; p += 4) { const sp = v.getUint32(p, true); if (!sp) break; args.push(cstr(sp)); } const em = makeMem(); Atomics.store(new Int32Array(em.buffer), ALLOC_PTR >> 2, HEAP_START); const child = spawnProc(m, args.length ? args : [name], proc.pid, em, true); runProc(child, 100); killPool(child); child.reaped = true; child.inst = null; const e = new Error("exec"); e.isExit = true; e.code = child.exitCode; throw e; },
       kill: (pid, sig) => { const p = procs.find((q) => q.pid === pid); if (p && !p.exited) { p.exited = true; p.exitCode = 128 + sig; } return 0; },
       // ---- threads ----
+      // All slot/flag words live in THIS process's memory (pia), and the pool
+      // is bound to THIS process's memory — so a thread the process creates
+      // runs against the right address space even after fork() (issue #23).
       threadCreate: (out, fnIdx, arg) => {
+        ensurePool(proc);
         // 8 bytes per thread in the flag region: [done flag @0, return value @4]
         // so pthread_join can hand the thread's return value back to the guest.
-        const tid = ++nextTid; const slot = (tid - 1) % POOL_SIZE; const flagAddr = FLAG_BASE + tid * 8;
-        Atomics.store(ia, flagAddr >> 2, 0); Atomics.store(ia, (flagAddr >> 2) + 1, 0); v.setUint32(out, tid, true);
+        const tid = ++proc.nextTid; const slot = (tid - 1) % POOL_SIZE; const flagAddr = FLAG_BASE + tid * 8;
+        Atomics.store(pia, flagAddr >> 2, 0); Atomics.store(pia, (flagAddr >> 2) + 1, 0); v.setUint32(out, tid, true);
         const slotI = (POOL_BASE >> 2) + slot * 4;
-        Atomics.store(ia, slotI + 1, fnIdx); Atomics.store(ia, slotI + 2, arg); Atomics.store(ia, slotI + 3, flagAddr);
-        Atomics.store(ia, slotI, 1); Atomics.notify(ia, slotI);
+        Atomics.store(pia, slotI + 1, fnIdx); Atomics.store(pia, slotI + 2, arg); Atomics.store(pia, slotI + 3, flagAddr);
+        Atomics.store(pia, slotI, 1); Atomics.notify(pia, slotI);
         proc.threads = proc.threads || new Map(); proc.threads.set(tid, flagAddr); return 0;
       },
-      threadJoin: (tid, retvalPtr) => { const fa = proc.threads && proc.threads.get(tid); if (fa == null) return -1; const idx = fa >> 2; let n = 0; while (Atomics.load(ia, idx) === 0) { Atomics.wait(ia, idx, 0, 4000); if (++n > 4) break; } if (retvalPtr) v.setUint32(retvalPtr, Atomics.load(ia, idx + 1) >>> 0, true); proc.threads.delete(tid); return 0; },
+      threadJoin: (tid, retvalPtr) => { const fa = proc.threads && proc.threads.get(tid); if (fa == null) return -1; const idx = fa >> 2; let n = 0; while (Atomics.load(pia, idx) === 0) { Atomics.wait(pia, idx, 0, 4000); if (++n > 4) break; } if (retvalPtr) v.setUint32(retvalPtr, Atomics.load(pia, idx + 1) >>> 0, true); proc.threads.delete(tid); return 0; },
     };
     return ctx;
   }
@@ -144,8 +220,9 @@ export async function runMtProgram(module, argv, opts) {
   // A process's threads are "live" until joined. Used to keep fork() safe.
   function liveThreadCount(proc) {
     if (!proc.threads) return 0;
+    const pia = proc.pia;
     let n = 0;
-    for (const fa of proc.threads.values()) if (Atomics.load(ia, fa >> 2) === 0) n++;
+    for (const fa of proc.threads.values()) if (Atomics.load(pia, fa >> 2) === 0) n++;
     return n;
   }
 
@@ -186,6 +263,16 @@ export async function runMtProgram(module, argv, opts) {
     child.argc = parent.argc; child.argvPtr = parent.argvPtr;
     child.forkReturn = 0; child.pendingRewind = true;
     runProc(child, depth + 1);
+    const childThreaded = !!child.pool;
+    killPool(child); // free the child's workers before its memory is reused
+    // If the child ran threads, DON'T let the next sibling reuse this memory:
+    // the child's pool workers are parked on this memory's control region and
+    // worker.terminate() is asynchronous, so a sibling booting a fresh pool on
+    // the SAME control region could double-wake a not-yet-dead worker on a
+    // shared slot. Dropping the pooled memory gives the next sibling an
+    // isolated address space (threading fork children are rare, so this costs
+    // at most a few extra live memories in one synchronous burst).
+    if (childThreaded) memPool[depth] = null;
     child.inst = null; // memory is pooled (reused by the next sibling)
     parent.forkReturn = child.pid; parent.pendingRewind = true;
   }
@@ -202,6 +289,13 @@ export async function runMtProgram(module, argv, opts) {
   }
 
   const root = spawnProc(module, argv, 0, memory, true);
+  // Boot the root pool eagerly, awaiting readiness on the event loop — this is
+  // the only spawn point with an async context, so it is the one that works in
+  // the browser too (a Web Worker needs an event-loop turn to load). Fork/exec
+  // children boot lazily and synchronously (node only; see ensurePool).
+  spawnPoolWorkers(root);
+  await awaitPoolReady(root);
   runProc(root, 0);
-  return { exitCode: typeof root.exitCode === "number" ? root.exitCode : 0, error: root.error, procs: procs.length, pool };
+  for (const proc of procs) killPool(proc); // release any remaining pool workers
+  return { exitCode: typeof root.exitCode === "number" ? root.exitCode : 0, error: root.error, procs: procs.length };
 }
