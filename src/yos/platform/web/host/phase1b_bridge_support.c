@@ -13,6 +13,7 @@
  */
 
 #include <stdint.h>
+#include <stdio.h>
 
 #include "yos/types.h"
 
@@ -32,13 +33,13 @@ void yos_brg_record_args(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3)
 	(void)a3;
 }
 
-/* Return-value formatter for ytrace lines. Trace is off by default, so an
- * empty string is fine; the real bridge return values are untouched. */
+/* Return-value formatter for ytrace lines. Shows the numeric return + errno so
+ * converged-host traces are useful (the desktop main.c version is richer). */
 const char *yos_brg_retstr(long long ret, int host_errno)
 {
-	(void)ret;
-	(void)host_errno;
-	return "";
+	static char buf[64];
+	snprintf(buf, sizeof(buf), "%lld (errno=%d)", ret, host_errno);
+	return buf;
 }
 
 /* String-argument formatter for ytrace lines. */

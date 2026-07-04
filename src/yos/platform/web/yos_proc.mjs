@@ -1333,24 +1333,41 @@ function buildLibc(state, env_vars, io, mgr, proc) {
     fstatfs: (fd, buf) => { u8().fill(0, buf, buf + 256); return 0; },
     statfs: (p, buf) => { u8().fill(0, buf, buf + 256); return 0; },
     unlink: (pathPtr) => { const raw = cstrBounded(pathPtr); if (raw === null) { setErrno(14); return -1; } const path = mgr.vfsPath(raw, proc.pio.cwd); if (!mgr.vfs[path]) { setErrno(2); return -1; } delete mgr.vfs[path]; const slash = path.lastIndexOf("/"); const parent = mgr.vfs[slash === 0 ? "/" : path.slice(0, slash)]; const name = path.slice(slash + 1); if (parent && parent.entries) { const i = parent.entries.indexOf(name); if (i >= 0) parent.entries.splice(i, 1); } return 0; },
+    // opendir/fdopendir return a real guest DIR* (a small guest-memory struct
+    // whose dd_fd at offset 0 is a valid directory fd). The FreeBSD dirfd() is
+    // an inline macro that reads dirp->dd_fd directly from guest memory, so
+    // returning a bare integer handle made _dirfd() read garbage — which broke
+    // fts (ls -alrt, find, du): fts_safe_changedir fstats _dirfd(dirp) and
+    // compares st_dev/st_ino, so a garbage fd made every entry FTS_NS ("Error
+    // 2"). Backing the DIR* with a real fd (kind "dir") makes fstat()/fchdir()
+    // on dd_fd resolve to this directory with matching dev/ino.
     opendir: (pathPtr) => {
       const path = mgr.vfsPath(cstr(pathPtr), proc.pio.cwd); const node = mgr.vfs[path];
       if (!node || node.type !== "dir") { setErrno(2); return 0; }
-      const handle = allocFd();
-      proc.pio.dirs.set(handle, { node, names: [".", "..", ...node.entries], idx: 0, direntBuf: state.alloc(280, 8), path });
-      return handle;
+      const fd = installFd(allocFd(), { kind: "dir", node, path, refs: 1 }, false);
+      const dirp = state.alloc(16, 4); view().setInt32(dirp, fd, true); // dd_fd @ 0
+      const d = { node, names: [".", "..", ...node.entries], idx: 0, direntBuf: state.alloc(280, 8), path, fd, dirp };
+      proc.pio.dirs.set(dirp, d); proc.pio.dirs.set(fd, d);
+      return dirp;
     },
-    fdopendir: (fd) => { const e = fdEntry(fd); if (e && e.ofd.kind === "dir") proc.pio.dirs.set(fd, { node: e.ofd.node, names: [".", "..", ...e.ofd.node.entries], idx: 0, direntBuf: state.alloc(280, 8), path: e.ofd.path }); return fd; },
-    readdir: (handle) => {
-      const d = proc.pio.dirs.get(handle);
+    fdopendir: (fd) => {
+      const e = fdEntry(fd);
+      if (!e || e.ofd.kind !== "dir") { setErrno(9); return 0; }
+      const dirp = state.alloc(16, 4); view().setInt32(dirp, fd, true); // reuse caller's fd as dd_fd
+      const d = { node: e.ofd.node, names: [".", "..", ...e.ofd.node.entries], idx: 0, direntBuf: state.alloc(280, 8), path: e.ofd.path, fd, dirp };
+      proc.pio.dirs.set(dirp, d); proc.pio.dirs.set(fd, d);
+      return dirp;
+    },
+    readdir: (dirp) => {
+      const d = proc.pio.dirs.get(dirp);
       if (!d || d.idx >= d.names.length) return 0;
       const name = d.names[d.idx++];
       const child = name === "." || name === ".." ? d.node : mgr.vfs[(d.path === "/" ? "" : d.path) + "/" + name];
       fillDirent(state, d.direntBuf, name, child && child.type === "dir", child && child.ino);
       return d.direntBuf;
     },
-    closedir: (handle) => { proc.pio.dirs.delete(handle); return 0; },
-    dirfd: (handle) => handle,
+    closedir: (dirp) => { const d = proc.pio.dirs.get(dirp); if (d) { proc.pio.dirs.delete(d.dirp); proc.pio.dirs.delete(d.fd); proc.pio.fds.delete(d.fd); } else proc.pio.dirs.delete(dirp); return 0; },
+    dirfd: (dirp) => { const d = proc.pio.dirs.get(dirp); return d ? d.fd : view().getInt32(dirp, true); },
     umask: (m) => { const old = proc.pio.umask; proc.pio.umask = m & 0o777; return old; }, getcwd: (buf, n) => { u8().set(enc.encode(proc.pio.cwd + "\0"), buf); return buf; },
     chdir: (pathPtr) => { const p = mgr.vfsPath(cstr(pathPtr), proc.pio.cwd); if (mgr.vfs[p] && mgr.vfs[p].type === "dir") { proc.pio.cwd = p; return 0; } setErrno(2); return -1; },
     // fts descends via fchdir(dirfd) then lstats entries by relative name,

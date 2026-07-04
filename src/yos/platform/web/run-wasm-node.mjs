@@ -15,13 +15,14 @@
 // directory as <prog.wasm> by basename (best-effort; most unit tests are
 // self-contained and fork the same image, which needs no tool map).
 import { runYos } from "./yos_run.mjs";
+import { compileGuest } from "./wasm_patch.mjs";
 import { readFileSync, readdirSync } from "node:fs";
 import { dirname, basename, join } from "node:path";
 
 const wasmPath = process.argv[2];
 if (!wasmPath) { process.stderr.write("usage: run-wasm-node.mjs <prog.wasm> [args...]\n"); process.exit(2); }
 
-const mod = await WebAssembly.compile(readFileSync(wasmPath));
+const mod = await compileGuest(readFileSync(wasmPath));
 
 // Tool map for execve()/fork-exec of OTHER programs. Unit tests are
 // self-contained (they fork the SAME image, which needs no tool map), so this
@@ -34,7 +35,7 @@ if (process.env.YOS_TOOLS === "1") {
     const dir = dirname(wasmPath);
     for (const f of readdirSync(dir)) {
       if (f.endsWith(".wasm") && !f.endsWith("-raw.wasm")) {
-        try { tools.set(f.replace(/\.wasm$/, ""), await WebAssembly.compile(readFileSync(join(dir, f)))); } catch {}
+        try { tools.set(f.replace(/\.wasm$/, ""), await compileGuest(readFileSync(join(dir, f)))); } catch {}
       }
     }
   } catch {}

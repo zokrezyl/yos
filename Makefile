@@ -43,6 +43,7 @@ NINJA    := $(NIX_DEV) ninja -C $(BUILD)
         browser-host-phase1a test-browser-host-phase1a \
         browser-host-phase1b test-browser-host-phase1b \
         browser-host-runner test-browser-host-parity browser-host-perf \
+        test-browser-ls test-browser-callbacks \
         nvim-build nvim-deps \
         format check
 
@@ -237,6 +238,16 @@ test-browser-libc:
 # Needs system `node`; compiles the libvterm grid tool on first run.
 test-browser-parity:
 	@node $(WEB)/browser-parity-suite.mjs
+
+# Directory-listing regression (epic #32): ls / ls -l / ls -alrt through the
+# browser engine — guards the opendir DIR*/dd_fd fix that unbroke fts.
+test-browser-ls:
+	@node $(WEB)/ls_dir_test.mjs
+
+# Callback regression (epic #32): ps/qsort/bsearch through the browser engine —
+# guards the wasm table-export patch (wasm_patch.mjs).
+test-browser-callbacks:
+	@node $(WEB)/callback_test.mjs
 
 test-browser:
 	@node $(WEB)/browser-test-runner.mjs

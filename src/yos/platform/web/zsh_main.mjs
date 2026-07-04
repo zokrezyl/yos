@@ -6,6 +6,7 @@
 // state — cwd, variables, history, pipelines — persists across commands,
 // because it is one continuous zsh process, not one-zsh-per-line.
 import { runInteractive } from "./yos_proc.mjs";
+import { compileGuest } from "./wasm_patch.mjs";
 
 const term = new Terminal({
   fontFamily: "ui-monospace, monospace", fontSize: 14,
@@ -38,13 +39,13 @@ renderDiag();
 const bumpDiag = (k) => { keyCount++; lastKey = JSON.stringify(k); renderDiag(); };
 
 term.write("\x1b[38;2;107;168;146mloading universal zsh.wasm …\x1b[0m\r\n");
-const mod = await WebAssembly.compile(await (await fetch("./zsh.wasm")).arrayBuffer());
+const mod = await compileGuest(await (await fetch("./zsh.wasm")).arrayBuffer());
 
 // Load the freebsd-tool wasms so zsh can exec external commands.
 const TOOL_NAMES = ["pwd", "id", "hostname", "echo", "cat", "ls", "ps", "date", "true", "false", "tmux", "forkdemo", "forkstress", "perfstress"];
 const tools = new Map();
 await Promise.all(TOOL_NAMES.map(async (name) => {
-  try { tools.set(name, await WebAssembly.compile(await (await fetch(`./tools/${name}.wasm`)).arrayBuffer())); } catch {}
+  try { tools.set(name, await compileGuest(await (await fetch(`./tools/${name}.wasm`)).arrayBuffer())); } catch {}
 }));
 // zsh.wasm IS the shell: wire it as `sh`/`zsh` too so a tmux you launch from
 // this prompt can spawn a real shell in its pane (tmux's default-shell is

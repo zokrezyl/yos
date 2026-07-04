@@ -25,6 +25,7 @@
 // Usage:
 //   node browser-parity-suite.mjs [--filter <substr>] [--build build-linux] [--quiet]
 import { runProgram } from "./yos_proc.mjs";
+import { compileGuest } from "./wasm_patch.mjs";
 import { renderStreamToGrid, frameGrid } from "./vterm_render.mjs";
 import { readFileSync, readdirSync, existsSync, statSync } from "node:fs";
 import { spawnSync } from "node:child_process";
@@ -132,7 +133,7 @@ function runNative(wasm, argv, stdin, timeoutMs) {
 
 // Browser: the cooperative process engine. The same wasm, argv, and stdin pipe.
 async function runBrowser(wasm, argv, stdin) {
-  const mod = await WebAssembly.compile(readFileSync(wasm));
+  const mod = await compileGuest(readFileSync(wasm));
   let stdout = "", stderr = "", unimpl = null;
   const r = runProgram(mod, argv,
     (fd, t) => { if (fd === 2) stderr += t; else stdout += t; },
