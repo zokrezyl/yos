@@ -779,7 +779,8 @@ function buildLibc(state, env_vars, io, mgr, proc) {
     ftell: (fp) => { const fd = fileFd(fp); const e = fdEntry(fd); if (!e || e.ofd.kind !== "file") return -1; const buffered = fp > 3 ? Math.max(0, view().getInt32(fp + SF_R, true)) : 0; return e.ofd.off - buffered; },
     ftello: (fp) => BigInt(env.ftell(fp)),
     rewind: (fp) => { env.fseek(fp, 0, 0); },
-    fflush: (fp) => { const f = fpFile(fp); if (f && f.mem) syncMem(f); return 0; }, fileno: (fp) => fileFd(fp), setvbuf: () => 0, setbuf: () => 0,
+    fflush: (fp) => { const f = fpFile(fp); if (f && f.mem) syncMem(f); return 0; }, fileno: (fp) => fileFd(fp), setvbuf: () => 0, setbuf: () => 0, setbuffer: () => 0, setlinebuf: () => 0,
+    getloadavg: (avgPtr, nelem) => { const n = Math.max(0, Math.min(nelem|0, 3)); for (let i=0;i<n;i++) view().setFloat64(avgPtr + i*8, 0, true); return n; },
     // stdio putc-overflow handler: the guest's streams are unbuffered, so
     // every putc/putchar char arrives here. Emit it (NOT discard).
     __swbuf: (c, fp) => { fpWrite(fp, String.fromCharCode(c & 0xff)); return c & 0xff; },
@@ -801,6 +802,11 @@ function buildLibc(state, env_vars, io, mgr, proc) {
     strrchr: (s, c) => { c &= 0xff; let hit = 0; for (let p = s; ; p++) { if (u8()[p] === c) hit = p; if (!u8()[p]) return c === 0 ? p : hit; } },
     strstr: (h, n) => { const needle = cstr(n); if (!needle) return h; const hay = cstr(h); const idx = hay.indexOf(needle); return idx < 0 ? 0 : h + enc.encode(hay.slice(0, idx)).length; },
     strcpy: (d, s) => { let i = 0; do { u8()[d + i] = u8()[s + i]; } while (u8()[s + i++]); return d; },
+    // stpcpy/stpncpy return a pointer to the copied NUL (unlike strcpy). top and
+    // other BSD tools use that return as a write cursor; a missing import made
+    // them scribble at address 0 and SIGSEGV.
+    stpcpy: (d, s) => { const u = u8(); let i = 0; while (u[s + i]) { u[d + i] = u[s + i]; i++; } u[d + i] = 0; return d + i; },
+    stpncpy: (d, s, n) => { const u = u8(); let i = 0; for (; i < n && u[s + i]; i++) u[d + i] = u[s + i]; const end = d + i; for (; i < n; i++) u[d + i] = 0; return end; },
     strncpy: (d, s, n) => { let i = 0; for (; i < n && u8()[s + i]; i++) u8()[d + i] = u8()[s + i]; for (; i < n; i++) u8()[d + i] = 0; return d; },
     strlcpy: (d, s, n) => { const len = env.strlen(s); if (n) { const c = Math.min(len, n - 1); u8().copyWithin(d, s, s + c); u8()[d + c] = 0; } return len; },
     strlcat: (d, s, n) => { let dl = 0; while (dl < n && u8()[d + dl]) dl++; const sl = env.strlen(s); if (dl === n) return n + sl; let i = 0; while (u8()[s + i] && dl + i < n - 1) { u8()[d + dl + i] = u8()[s + i]; i++; } u8()[d + dl + i] = 0; return dl + sl; },

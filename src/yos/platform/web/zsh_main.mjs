@@ -41,12 +41,30 @@ const bumpDiag = (k) => { keyCount++; lastKey = JSON.stringify(k); renderDiag();
 term.write("\x1b[38;2;107;168;146mloading universal zsh.wasm …\x1b[0m\r\n");
 const mod = await compileGuest(await (await fetch("./zsh.wasm")).arrayBuffer());
 
-// Load the freebsd-tool wasms so zsh can exec external commands.
-const TOOL_NAMES = ["pwd", "id", "hostname", "echo", "cat", "ls", "ps", "date", "true", "false", "tmux", "forkdemo", "forkstress", "perfstress"];
+// Load the tool wasms so zsh can exec external commands. The set comes
+// DYNAMICALLY from the server's /tools/list.json (the nix bin directory), so
+// the browser has exactly the desktop command set and any newly-built tool
+// appears with no code change. execve() is synchronous, so every tool is
+// compiled up front (that includes nvim at ~14 MB — expect a few seconds on
+// first load). The tiny fallback list only applies if the listing endpoint is
+// unavailable (e.g. served by a plain static server).
+const FALLBACK_TOOLS = ["pwd", "id", "hostname", "echo", "cat", "ls", "ps", "date", "true", "false", "tmux"];
+let TOOL_NAMES;
+try {
+  TOOL_NAMES = await (await fetch("./tools/list.json")).json();
+} catch {
+  TOOL_NAMES = FALLBACK_TOOLS;
+}
 const tools = new Map();
+let loaded = 0;
 await Promise.all(TOOL_NAMES.map(async (name) => {
-  try { tools.set(name, await compileGuest(await (await fetch(`./tools/${name}.wasm`)).arrayBuffer())); } catch {}
+  try {
+    tools.set(name, await compileGuest(await (await fetch(`./tools/${name}.wasm`)).arrayBuffer()));
+  } catch { /* a tool that fails to fetch/compile is simply absent from /bin */ }
+  loaded++;
+  term.write(`\r\x1b[38;2;85;97;98mloading tools ${loaded}/${TOOL_NAMES.length} …\x1b[0m`);
 }));
+term.write("\r\x1b[2K");
 // zsh.wasm IS the shell: wire it as `sh`/`zsh` too so a tmux you launch from
 // this prompt can spawn a real shell in its pane (tmux's default-shell is
 // /bin/sh → basename `sh`). Without this, `tmux` opens but its pane is dead.
