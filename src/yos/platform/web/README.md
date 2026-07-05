@@ -104,13 +104,64 @@ the socket); `isatty` over the SCM_RIGHTS-passed tty fd; bidirectional tty
 char writes; and a virtual clock so libevent's redraw timers fire under the
 synchronous scheduler.
 
-What does NOT run interactively yet: **nvim**. The universal binary imports
-405 functions including the whole Lua 5.1 C API (~120 `lua_*`/`luaL_*` — the
-guest carries no Lua bodies and expects the host to supply a Lua VM; desktop
-yos bridges to native liblua, which the browser has no equivalent for), plus
-`kqueue`/`kevent` (libuv's event loop), `forkpty`, `scandir`, `dlopen`. It
-instantiates and reaches libuv init (`kqueue`) today; the Lua-VM bridge is
-the remaining wall and a milestone of its own.
+## Real interactive nvim (and top) in the browser
+
+**nvim runs.** Typing `nvim` at the zsh.html prompt boots the full editor:
+the TUI client uv_spawns the embedded server (`nvim --embed`), the two talk
+msgpack-RPC over a socketpair, the intro screen paints, insert-mode
+keystrokes round-trip, and `:q!` tears both processes down and hands the tty
+back to zsh. `top` runs full-screen the same way (paint → select() sleep →
+repaint → `q`). `make test-browser-nvim`, `make test-browser-top` and
+`make test-browser-fullscreen` prove all of it headlessly; the from-zsh test
+is the exact keystroke path the page uses.
+
+What made it work, layer by layer:
+
+- **Lua**: nvim imports the whole Lua 5.1 C API (~85 `lua_*`/`luaL_*`) and
+  expects the host to provide the VM (desktop bridges to native liblua).
+  The browser equivalent is `lua/liblua.wasm` — Lua 5.1 compiled from source
+  (C++ + native wasm exceptions for pcall/error, yos sysroot) sharing the
+  guest's linear memory AND function table. Its static data parks at a fixed
+  `--global-base` (256 MiB) and its element segment at a fixed
+  `--table-base` (65536), both above anything the guest owns; the engine
+  reserves the data window so the guest heap/mmap can never cross it, and
+  `wasm_patch.mjs` lifts the guest table's max so it can grow past the table
+  base. Lua's stdio binds the sentinel std streams (fd resolved per call, so
+  io.stdout follows nvim's dup2 remap instead of corrupting the RPC socket).
+- **Runtime files**: `$VIMRUNTIME` (vim/_defaults.lua, syntax, ftplugin, …)
+  mounts into the VFS from `result/share` — one `/fs/pack.bin` blob in the
+  browser (serve.sh packs it, `fs_mount.mjs` parses it, file data are
+  zero-copy views), lazy per-file reads in node.
+- **Engine**: pipe2 O_CLOEXEC honored across exec (libuv's uv_spawn status
+  pipe must EOF); fcntl(F_GETFL) reports real access modes (libuv derives
+  stream writability from it); kevent grew EVFILT_PROC (how libuv on kqueue
+  learns a spawned child died — that's what makes `:q` exit); stat/open on
+  the empty path are ENOENT (isdirectory("") == true had netrw hijacking the
+  startup buffer); and a module past Chrome's main-thread sync-instantiation
+  size limit (nvim is 14 MB) boots asynchronously — the process parks in a
+  "booting" state and the scheduler resumes it when the instance resolves.
+- **top** needed none of that — just asyncify: the freebsd-tools binaries
+  are now wasm-opt --asyncify instrumented like every other universal
+  binary, so a tool that blocks in select()/read() suspends instead of
+  trapping.
+
+**`:terminal` works too — the full nested chain runs.** `zsh → tmux → nvim
+in the pane → :terminal → live shell`, eight processes deep, verified in
+node and real Chrome (`make test-browser-nested`; nvim-only :terminal is in
+the fullscreen/top suites). What it took: a real `forkpty` (openpty + fork +
+login_tty composed in one bridge over the asyncify fork — both sides rewind
+through it and each does its own fixup); real `/bin/<tool>` VFS nodes with
+exec bits (nvim stats `$SHELL` and refused `:terminal` with "'/bin/sh' is
+not executable" when only the exec tool-map knew the name); `getrlimit`
+actually filling rlim_cur (nvim's pty spawn loops `fcntl(F_SETFD)` to
+RLIMIT_NOFILE — reading stack garbage it spun 2.9M fds into the runaway
+guard) with fcntl now EBADF on nonexistent fds; SIGCHLD delivery for forkpty
+children (no EVFILT_PROC watches a hand-rolled fork — the parent's sigaction
+is how nvim reaps the shell and paints "[Process exited]"); and dup2-style
+release of the child's inherited stdio in forkpty/login_tty (a leaked outer
+pty slave kept tmux from ever seeing its pane EOF).
+
+Still deferred: `dlopen` (native plugins), `scandir` fills.
 
 ## Prototype boundary (issue #21, milestone 1)
 

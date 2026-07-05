@@ -14,16 +14,25 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 [ -f guest.wasm ] || ./build.sh
+# Build liblua.wasm (the Lua C API for nvim) if missing — served at ./lua/.
+[ -f lua/liblua.wasm ] || ./lua/build-liblua.sh || echo "warn: liblua build failed; nvim will lack Lua" >&2
 
 BIN_DIR=${YOS_BIN_DIR:-"$(cd ../../../.. && pwd)/result/libexec"}
+SHARE_DIR=${YOS_SHARE_DIR:-"$(cd ../../../.. && pwd)/result/share"}
 PORT=${1:-8099}
-echo "serving on http://127.0.0.1:${PORT}/  (tools: $BIN_DIR)  (Ctrl-C to stop)"
-exec env PORT="$PORT" BIN_DIR="$BIN_DIR" node --input-type=module -e '
+echo "serving on http://127.0.0.1:${PORT}/  (tools: $BIN_DIR)  (share: $SHARE_DIR)  (Ctrl-C to stop)"
+exec env PORT="$PORT" BIN_DIR="$BIN_DIR" SHARE_DIR="$SHARE_DIR" node --input-type=module -e '
 import { createServer } from "node:http";
 import { readFile, readdir } from "node:fs/promises";
 import { extname, join, basename } from "node:path";
+import { packFromDir } from "./fs_mount.mjs";
 const port = Number(process.env.PORT || 8099);
 const binDir = process.env.BIN_DIR;
+const shareDir = process.env.SHARE_DIR;
+// /fs/pack.bin — the guest /usr/share tree (nvim runtime, zsh functions) as
+// ONE fetchable blob (see fs_mount.mjs). Built lazily, cached for the
+// server lifetime.
+let sharePack = null;
 // .css MUST be served as text/css — browsers refuse to apply a stylesheet sent
 // with any other MIME type, which leaves xterm.css unapplied.
 const types = { ".html": "text/html", ".wasm": "application/wasm", ".mjs": "text/javascript", ".css": "text/css", ".js": "text/javascript", ".json": "application/json", ".svg": "image/svg+xml" };
@@ -49,6 +58,10 @@ createServer(async (req, res) => {
       const name = basename(url).replace(/\.wasm$/, "");
       const body = await readFile(join(binDir, name));
       isolate(res); res.setHeader("Content-Type", "application/wasm"); res.end(body); return;
+    }
+    if (url === "/fs/pack.bin") {
+      if (!sharePack) sharePack = await packFromDir(shareDir);
+      isolate(res); res.setHeader("Content-Type", "application/octet-stream"); res.end(sharePack); return;
     }
     const path = "." + (url === "/" ? "/index.html" : url);
     const body = await readFile(path);

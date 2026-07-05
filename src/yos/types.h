@@ -179,6 +179,23 @@ struct yos_exec_ctx {
     int fork_pending;
     int32_t fork_return;
     int is_child;
+    /* forkpty stash (impl/libc/syslog_extras.c m3_forkpty). The bridge
+     * opens the pty pair BEFORE unwinding through yos_fork; both sides
+     * re-execute the bridge on rewind and finish their half — the child
+     * wires the slave onto fds 0/1/2 (login_tty recipe), the parent
+     * keeps only the master. The guest fd NUMBERS are stashed here and
+     * copied to the child ctx by the fork pump (host fds transfer via
+     * the ordinary parent_fd_map dup path). */
+    int forkpty_pending;
+    int32_t forkpty_master_wfd;
+    int32_t forkpty_slave_wfd;
+    /* Set on the CHILD side of forkpty. On exit, the parent gets a
+     * SIGCHLD: a pty child is a hand-rolled fork, so no EVFILT_PROC
+     * filter watches it — the parent's sigaction (nvim's libuv SIGCHLD
+     * watcher) is the only way it learns the exit and can waitpid.
+     * Scoped to forkpty children so ordinary fork/wait flows (zsh,
+     * tmux) keep their existing wait/sigsuspend-driven delivery. */
+    int is_forkpty_child;
 
     /* AUTO-isolated libc globals — bridge.py emits the per-ctx
      * field definitions for everything marked auto_save_restore in

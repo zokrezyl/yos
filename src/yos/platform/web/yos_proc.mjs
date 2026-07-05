@@ -33,6 +33,7 @@
 // not the production yos surface. Imports it does not implement fail loudly
 // via strictImportEnv, never via a catch-all return-0 fallback.
 
+import { loadLiblua, installLuaForwarders } from "./lua/lua_bridge.mjs";
 import { strictImportEnv } from "./import_manifest.mjs";
 
 const ASYNCIFY_NORMAL = 0, ASYNCIFY_UNWINDING = 1, ASYNCIFY_REWINDING = 2;
@@ -52,7 +53,20 @@ function makeState() {
   // very deep recursive tree (100+) still pushes the browser's wasm
   // budget, so use a smaller fanout in-browser.
   state.grow = (need) => { while (state.brk + need > state.u8.length) { const before = state.u8.length; state.mem.grow(64); state.refresh(); if (state.u8.length === before) throw new Error("out of wasm memory"); } };
-  state.alloc = (n, align = 8) => { state.brk = (state.brk + (align - 1)) & ~(align - 1); state.grow(n); const p = state.brk; state.brk += n; return p; };
+  // Address windows the bump allocator must never hand out — a shared-library
+  // companion module (liblua.wasm) parks its static data + stack at a fixed
+  // --global-base in the SAME linear memory (lua_bridge.mjs registers the
+  // window). Without the skip, a guest heap that grows past the window
+  // allocates straight through the library's data and corrupts it: from-zsh
+  // nvim's server heap crossed 256 MiB and Lua state shredded into
+  // "unreachable" traps. null until something registers; costs nothing then.
+  state.reserved = null;
+  state.reserve = (lo, hi) => { (state.reserved = state.reserved || []).push({ lo, hi }); };
+  state.alloc = (n, align = 8) => {
+    state.brk = (state.brk + (align - 1)) & ~(align - 1);
+    if (state.reserved) for (const r of state.reserved) if (state.brk < r.hi && state.brk + n > r.lo) state.brk = (r.hi + (align - 1)) & ~(align - 1);
+    state.grow(n); const p = state.brk; state.brk += n; return p;
+  };
   state.putStr = (s) => { const b = enc.encode(s + "\0"); const p = state.alloc(b.length, 1); state.u8.set(b, p); return p; };
   state.cstr = (ptr) => { if (!ptr) return ""; let e = ptr; while (state.u8[e]) e++; return dec.decode(state.u8.subarray(ptr, e)); };
   return state;
@@ -364,6 +378,7 @@ function buildLibc(state, env_vars, io, mgr, proc) {
     if (ofd.kind === "file") { const node = ofd.node; const at = ofd.append ? node.data.length : ofd.off; const merged = new Uint8Array(Math.max(node.data.length, at + bytes.length)); merged.set(node.data); merged.set(bytes, at); node.data = merged; ofd.off = at + bytes.length; return bytes.length; }
     if (ofd.kind === "pipe") return (ofd.end === "w" && !ofd.pipe.readClosed) ? (bufPush(ofd.pipe, bytes), bytes.length) : -32;
     if (ofd.kind === "sock") {
+      if (mgr.tap) mgr.tap(proc.pid, "sock-write", ofd, bytes);
       if (ofd.pty && ofd.ptyMaster) return ptyMasterWrite(ofd.pty, bytes);
       // A pty SLAVE write is the pane program's output flowing toward the master
       // (tmux). Apply the pty's OWN output discipline (OPOST/ONLCR) so a bare LF
@@ -381,7 +396,7 @@ function buildLibc(state, env_vars, io, mgr, proc) {
     if (ofd.kind === "char") return 0; // stdin / /dev/null → EOF
     if (ofd.kind === "file") { const data = ofd.node.data, end = Math.min(ofd.off + n, data.length); dst.set(data.subarray(ofd.off, end), 0); const got = end - ofd.off; ofd.off = end; return got; }
     if (ofd.kind === "pipe") return ofd.end === "r" ? bufDrain(ofd.pipe, dst, n) : 0;
-    if (ofd.kind === "sock") return bufDrain(ofd.rx, dst, n);
+    if (ofd.kind === "sock") { const got = bufDrain(ofd.rx, dst, n); if (mgr.tap && got > 0) mgr.tap(proc.pid, "sock-read", ofd, dst.slice(0, got)); return got; }
     return 0;
   };
   const newPipeBuf = () => ({ chunks: [], total: 0, readClosed: false, writeClosed: false, ancFds: [] });
@@ -451,6 +466,13 @@ function buildLibc(state, env_vars, io, mgr, proc) {
   // polls to know when to resume this process (data arrived, child exited,
   // key typed). `kind` is for diagnostics. Mirrors the fork unwind path.
   const beginBlock = (kind, ready, deadline) => {
+    // Blocking needs the asyncify unwind/rewind exports. A guest built
+    // without `wasm-opt --asyncify` cannot suspend — fail with a diagnosis
+    // instead of the bare TypeError ("asyncify_start_unwind is not a
+    // function") that top produced before its build was instrumented.
+    if (typeof proc.inst.exports.asyncify_start_unwind !== "function") {
+      throw new Error(`'${proc.comm}' blocked in ${kind}() but its wasm is not asyncify-instrumented — rebuild it with wasm-opt --asyncify (see nixpkgs/lib/build-yos-package.nix)`);
+    }
     if (proc.asyncifyPtr === 0) proc.asyncifyPtr = state.alloc(ASYNCIFY_BUF_SIZE, 8);
     const b = proc.asyncifyPtr;
     view().setUint32(b, b + 8, true);
@@ -605,7 +627,14 @@ function buildLibc(state, env_vars, io, mgr, proc) {
         return addr;
       }
       let region = mmFreeTake(mm, len);
-      if (region < 0) { region = mm.top; if (!mmGrow(region + len)) { setErrno(12); return -12; } mm.top = region + len; }
+      if (region < 0) {
+        region = mm.top;
+        // Skip reserved companion-library windows (see state.reserve) — the
+        // mmap arena bumps upward just like brk and must not cross them.
+        if (state.reserved) for (const r of state.reserved) if (region < r.hi && region + len > r.lo) region = (r.hi + MMAP_PAGE - 1) & ~(MMAP_PAGE - 1);
+        if (!mmGrow(region + len)) { setErrno(12); return -12; }
+        mm.top = region + len;
+      }
       mm.live.push({ addr: region, len });
       u8().fill(0, region, region + len);
       return region;
@@ -819,7 +848,9 @@ function buildLibc(state, env_vars, io, mgr, proc) {
     memcmp: (a, b, n) => { for (let i = 0; i < n; i++) { const x = u8()[a + i], y = u8()[b + i]; if (x !== y) return x - y; } return 0; },
     strtoul: (s, endp, base) => { const str = cstr(s); const m = str.match(/^\s*[+-]?(0x[0-9a-fA-F]+|[0-9]+)/); const v = m ? parseInt(m[0], base || (m[0].includes("0x") ? 16 : 10)) >>> 0 : 0; if (endp) view().setUint32(endp, s + (m ? m[0].length : 0), true); return v; },
     strtol: (s, e, b) => env.strtoul(s, e, b) | 0,
-    strtod: (s) => { const v = parseFloat(cstr(s)); return isNaN(v) ? 0 : v; },
+    // MUST write endptr: callers (Lua's luaO_str2d) read *endptr right after,
+    // so leaving it uninitialised makes them dereference a garbage pointer.
+    strtod: (s, endp) => { const str = cstr(s); const m = str.match(/^\s*[+-]?(0[xX][0-9a-fA-F]*\.?[0-9a-fA-F]*([pP][+-]?\d+)?|\d+\.?\d*([eE][+-]?\d+)?|\.\d+([eE][+-]?\d+)?|inf(inity)?|nan)/i); const t = m ? m[0] : ""; const v = t ? parseFloat(t) : 0; if (endp) view().setUint32(endp, s + t.length, true); return isNaN(v) ? 0 : v; },
     strtonum: (s) => { const v = parseInt(cstr(s), 10); return isNaN(v) ? 0 : v; },
     atoi: (s) => parseInt(cstr(s), 10) || 0,
     strtoll: (s, e, b) => { const str = cstr(s); const m = str.match(/^\s*[+-]?(0[xX][0-9a-fA-F]+|[0-9]+)/); if (e) view().setUint32(e, s + (m ? m[0].length : 0), true); return m ? BigInt(m[0].trim()) : 0n; },
@@ -976,7 +1007,7 @@ function buildLibc(state, env_vars, io, mgr, proc) {
     waitpid: (pid, statusPtr, opts) => doWait(pid, statusPtr, opts),
     wait3: (statusPtr, opts) => doWait(-1, statusPtr, opts),
     wait4: (pid, statusPtr, opts) => doWait(pid, statusPtr, opts),
-    access: (pathPtr) => { const raw = cstrBounded(pathPtr); if (raw === null) { setErrno(14); return -1; } const p = mgr.vfsPath(raw, proc.pio.cwd); return (mgr.tools.has(basename(raw)) || mgr.vfs[p]) ? 0 : (setErrno(2), -1); },
+    access: (pathPtr) => { const raw = cstrBounded(pathPtr); if (raw === null) { setErrno(14); return -1; } if (raw === "") { setErrno(2); return -1; } const p = mgr.vfsPath(raw, proc.pio.cwd); return (mgr.tools.has(basename(raw)) || mgr.vfs[p]) ? 0 : (setErrno(2), -1); },
     execve: (pathPtr, argvPtr) => {
       const name = basename(cstr(pathPtr));
       if (!mgr.tools.has(name)) { if (state.errnoPtr) view().setUint32(state.errnoPtr, 2, true); return -1; }
@@ -986,7 +1017,15 @@ function buildLibc(state, env_vars, io, mgr, proc) {
       if (proc.interactive) {
         // true exec: replace this process's image in place (same pid, same fd
         // table / cwd / env), then unwind so the scheduler runs the new image.
-        mgr.prepareExec(proc, mgr.tools.get(name), av);
+        // A module past Chrome's main-thread sync-instantiation size limit
+        // (nvim) boots asynchronously instead — the process parks in
+        // "booting" and the scheduler picks it up when the instance resolves.
+        try {
+          mgr.prepareExec(proc, mgr.tools.get(name), av);
+        } catch (err) {
+          if (!mgr.isSyncInstantiationLimit(err)) throw err;
+          mgr.prepareExecAsync(proc, mgr.tools.get(name), av);
+        }
         const e = new Error("exec"); e.isExec = true; throw e;
       }
       const res = mgr.runChildProgram(mgr.tools.get(name), av, proc.pid);
@@ -999,6 +1038,7 @@ function buildLibc(state, env_vars, io, mgr, proc) {
     // O_CLOEXEC=0x100000.
     open: (pathPtr, flags, modePtr) => {
       const raw = cstrBounded(pathPtr); if (raw === null) { setErrno(14); return -1; } // EFAULT — unterminated path
+      if (raw === "") { setErrno(2); return -1; } // POSIX: empty path is ENOENT, not the cwd
       const path = mgr.vfsPath(raw, proc.pio.cwd);
       const cloexec = !!(flags & 0x100000);
       // open() is variadic: with O_CREAT the mode arrives via clang's wasm32
@@ -1056,11 +1096,26 @@ function buildLibc(state, env_vars, io, mgr, proc) {
     // shadow-stack vararg pack, not as the value — dereference it to the int
     // the guest actually passed (F_DUPFD minfd, F_SETFD/F_SETFL flags). The
     // native m3 bridge does the same; without it F_SETFL stored the pointer.
-    fcntl: (fd, cmd, argPtr) => { const e = fdEntry(fd); const arg = argPtr ? view().getInt32(argPtr, true) : 0; if (cmd === 0 || cmd === 17) { if (!e) { setErrno(9); return -1; } e.ofd.refs++; const nf = installFd(allocFd(arg | 0), e.ofd, cmd === 17); proc.pio.fds.get(nf).flags = e.flags | 0; return nf; } if (cmd === 1) return e ? (e.cloexec ? 1 : 0) : (setErrno(9), -1); if (cmd === 2) { if (e) e.cloexec = !!(arg & 1); return 0; } if (cmd === 3) return e ? (e.flags | 0) : (setErrno(9), -1); if (cmd === 4) { if (!e) { setErrno(9); return -1; } e.flags = arg | 0; return 0; } return 0; },
+    // F_GETFL must report the fd's ACCESS MODE (O_ACCMODE bits), not just the
+    // status flags open() stashed: libuv's uv_tty_init/uv__stream_open derives
+    // its READABLE/WRITABLE stream flags from `fcntl(F_GETFL) & O_ACCMODE`. A
+    // bare 0 reads as O_RDONLY, the stream never gets UV_HANDLE_WRITABLE, and
+    // every uv_write() on it fails UV_EPIPE with no syscall — nvim's TUI died
+    // exactly there ("flush_buf: uv_write failed: broken pipe"). Terminal char
+    // devices and sockets are bidirectional; pipe ends are directional; files
+    // report what open() stored.
+    // Every command on a nonexistent fd is EBADF (a sloppy return-0 on
+    // F_SETFD let close-all-fds loops walk the whole fd space believing
+    // every fd exists).
+    fcntl: (fd, cmd, argPtr) => { const e = fdEntry(fd); if (!e) { setErrno(9); return -1; } const arg = argPtr ? view().getInt32(argPtr, true) : 0; if (cmd === 0 || cmd === 17) { e.ofd.refs++; const nf = installFd(allocFd(arg | 0), e.ofd, cmd === 17); proc.pio.fds.get(nf).flags = e.flags | 0; return nf; } if (cmd === 1) return e.cloexec ? 1 : 0; if (cmd === 2) { e.cloexec = !!(arg & 1); return 0; } if (cmd === 3) { const kind = e.ofd.kind; const acc = (kind === "char" || kind === "sock" || kind === "usock") ? 2 : kind === "pipe" ? (e.ofd.end === "r" ? 0 : 1) : ((e.flags | 0) & 3); return ((e.flags | 0) & ~3) | acc; } if (cmd === 4) { e.flags = arg | 0; return 0; } return 0; },
     dup: (fd) => { const e = fdEntry(fd); if (!e) { setErrno(9); return -1; } e.ofd.refs++; return installFd(allocFd(), e.ofd, false); },
     dup2: (oldfd, newfd) => { const e = fdEntry(oldfd); if (!e) { setErrno(9); return -1; } if (oldfd === newfd) return newfd; if (proc.pio.fds.has(newfd)) closeFd(newfd); e.ofd.refs++; return installFd(newfd, e.ofd, false); },
     pipe: (ptr) => { const p = newPipeBuf(); const rfd = installFd(allocFd(), { kind: "pipe", pipe: p, end: "r", refs: 1 }); const wfd = installFd(allocFd(), { kind: "pipe", pipe: p, end: "w", refs: 1 }); view().setUint32(ptr, rfd, true); view().setUint32(ptr + 4, wfd, true); return 0; },
-    pipe2: (ptr, fl) => env.pipe(ptr),
+    // pipe2 flags MUST be honored: libuv's uv_spawn signals "exec succeeded"
+    // by the O_CLOEXEC status pipe closing in the child — if the flag is
+    // dropped the parent blocks forever in read() on that pipe (nvim's
+    // client/server handshake deadlocked exactly there).
+    pipe2: (ptr, fl) => { const r = env.pipe(ptr); if (r === 0 && fl) { const cl = !!(fl & 0x100000); const nb = (fl & 0x4) ? 0x4 : 0; for (const off of [0, 4]) { const e = fdEntry(view().getUint32(ptr + off, true)); if (e) { if (cl) e.cloexec = true; if (nb) e.flags = (e.flags | 0) | nb; } } } return r; },
     socketpair: (dom, type, proto, svPtr) => {
       // FreeBSD folds SOCK_NONBLOCK (0x20000000) / SOCK_CLOEXEC (0x10000000)
       // into the type argument; strip them and re-apply as O_NONBLOCK (0x4) /
@@ -1186,7 +1241,10 @@ function buildLibc(state, env_vars, io, mgr, proc) {
     grantpt: () => 0, unlockpt: () => 0,
     ptsname: (fd) => { const e = fdEntry(fd); return putStr("/dev/pts/" + ((e && e.ofd.ptyId) || 0)); },
     ptsname_r: (fd, buf, n) => { const e = fdEntry(fd); u8().set(enc.encode("/dev/pts/" + ((e && e.ofd.ptyId) || 0) + "\0"), buf); return 0; },
-    login_tty: (fd) => { const e = fdEntry(fd); if (e) { proc.sid = proc.pid; e.ofd.refs += 3; proc.pio.fds.set(0, { ofd: e.ofd, cloexec: false }); proc.pio.fds.set(1, { ofd: e.ofd, cloexec: false }); proc.pio.fds.set(2, { ofd: e.ofd, cloexec: false }); } return 0; },
+    // login_tty: release the old 0/1/2 first (dup2 semantics) — plain map
+    // overwrite leaks their refcounts and an inherited outer-pty slave then
+    // never EOFs its master (same bug forkpty's child fixup had).
+    login_tty: (fd) => { const e = fdEntry(fd); if (e) { proc.sid = proc.pid; e.ofd.refs += 3; for (const stdFd of [0, 1, 2]) { if (proc.pio.fds.has(stdFd)) closeFd(stdFd); proc.pio.fds.set(stdFd, { ofd: e.ofd, cloexec: false }); } } return 0; },
     glob: (pat, flags, errfn, pglob) => { if (pglob) { view().setUint32(pglob, 0, true); view().setUint32(pglob + 16, 0, true); } return -3; /* GLOB_NOMATCH */ }, globfree: () => 0,
     fnmatch: (patPtr, strPtr) => { const pat = cstr(patPtr), str = cstr(strPtr); const re = new RegExp("^" + pat.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*").replace(/\?/g, ".") + "$"); return re.test(str) ? 0 : 1; },
     poll: (fdsPtr, nfds, timeout) => {
@@ -1244,6 +1302,7 @@ function buildLibc(state, env_vars, io, mgr, proc) {
       const fired = () => { const out = []; for (const f of filters.values()) { if (!f.enabled) continue;
         if (f.filter === -1) { const fe = fdEntry(f.ident); if (fe && ofdReadable(fe.ofd)) out.push(f); }        // EVFILT_READ
         else if (f.filter === -2) { const fe = fdEntry(f.ident); if (fe && ofdWritable(fe.ofd)) out.push(f); }   // EVFILT_WRITE
+        else if (f.filter === -5) { const t = mgr.procs.find((q) => q.pid === f.ident); if (t && t.exited) out.push(f); } // EVFILT_PROC — how libuv on kqueue learns a spawned child died (NOTE_EXIT); without it nvim's TUI never notices the embedded server exiting on :q
         else if (f.filter === -7) { if (mgr.now() >= f.deadline) out.push(f); }                                  // EVFILT_TIMER
         else if (f.filter === -11) { if (f.triggered) out.push(f); }                                             // EVFILT_USER
       } return out; };
@@ -1259,10 +1318,64 @@ function buildLibc(state, env_vars, io, mgr, proc) {
       if (proc.interactive) { beginBlock("kevent", () => fired().length > 0, Math.min(deadline, nearestTimer())); return 0; }
       return 0;
     },
-    // forkpty: nvim only needs it for :terminal; defer it (ENOSYS) so the
-    // editor itself starts. The fork+pty+login_tty combo can't unwind cleanly
-    // from a single JS bridge under asyncify fork — that's its own task.
-    forkpty: () => { setErrno(78); return -1; },
+    // forkpty = openpty + fork + login_tty in one bridge (nvim's :terminal).
+    // First entry (asyncify NORMAL): create the pty pair, write *amaster and
+    // the slave name, stash the two fds, then unwind through the ordinary
+    // fork path. BOTH sides re-execute this bridge while REWINDING (the wasm
+    // replays down to the call); mgr.fork() stops the rewind and returns
+    // which side we are, and each side runs its own fixup exactly once — the
+    // child wires the slave as stdio + controlling tty (login_tty semantics)
+    // and drops both original fds, the parent drops the slave and keeps the
+    // master. doForkSched hands the child its copy of the stash.
+    forkpty: (amasterPtr, namePtr, termPtr, winPtr) => {
+      if (!proc.interactive) { setErrno(78); return -1; } // needs the scheduler's fork
+      const wasResuming = resuming();
+      if (!wasResuming) {
+        const pty = newPty();
+        const id = mgr.nextIno++;
+        if (!mgr.ptys) mgr.ptys = new Map();
+        mgr.ptys.set(id, pty);
+        // caller-supplied termios/winsize apply to the slave, like a real
+        // forkpty. FreeBSD termios: c_oflag@4, c_lflag@12; winsize: rows@0
+        // cols@2 (u16). The size lives on the SHARED pty object so the
+        // child's TIOCGWINSZ on the slave sees what the master set.
+        if (termPtr) { pty.termios.oflag = view().getUint32(termPtr + 4, true); pty.termios.lflag = view().getUint32(termPtr + 12, true); }
+        if (winPtr) pty.winsize = { rows: view().getUint16(winPtr, true), cols: view().getUint16(winPtr + 2, true) };
+        const masterFd = installFd(allocFd(), { kind: "sock", rx: pty.toMaster, tx: pty.toSlave, refs: 1, isPty: true, ptyId: id, pty, ptyMaster: true });
+        const slaveFd = installFd(allocFd(), { kind: "sock", rx: pty.toSlave, tx: pty.toMaster, refs: 1, isPty: true, ptyId: id, pty, ptyMaster: false });
+        if (amasterPtr) view().setUint32(amasterPtr, masterFd, true);
+        if (namePtr) u8().set(enc.encode("/dev/pts/" + id + "\0"), namePtr);
+        proc.forkPtyPending = { masterFd, slaveFd };
+      }
+      const r = mgr.fork(proc);
+      if (!wasResuming) { if (r < 0) proc.forkPtyPending = null; return r; } // unwinding (0, ignored) or fork failed
+      const fp = proc.forkPtyPending; proc.forkPtyPending = null;
+      if (fp) {
+        if (r === 0) {
+          // child: new session, slave is the controlling tty on fds 0/1/2.
+          // RELEASE the inherited 0/1/2 first (dup2 semantics) — overwriting
+          // the map entries leaks their refcounts, and a leaked outer pty
+          // slave (nvim in a tmux pane inherits the PANE's slave as stderr)
+          // keeps that pane's master from ever seeing EOF, so tmux never
+          // tears the pane down after its shell exits.
+          proc.sid = proc.pid; proc.pgid = proc.pid;
+          const slaveEntry = proc.pio.fds.get(fp.slaveFd);
+          if (slaveEntry) {
+            slaveEntry.ofd.refs += 3;
+            for (const stdFd of [0, 1, 2]) {
+              if (proc.pio.fds.has(stdFd)) closeFd(stdFd);
+              proc.pio.fds.set(stdFd, { ofd: slaveEntry.ofd, cloexec: false });
+            }
+          }
+          closeFd(fp.slaveFd);
+          closeFd(fp.masterFd);
+          proc.viaForkpty = true;
+        } else if (r > 0) {
+          closeFd(fp.slaveFd); // parent keeps only the master
+        }
+      }
+      return r;
+    },
     ttyname: () => 0, ttyname_r: (fd, buf, n) => { u8().set(enc.encode("/dev/tty\0"), buf); return 0; },
     // termios: report success so zsh/curses set raw mode; we always deliver
     // exactly the bytes xterm sends, so cooked/raw distinction is a no-op.
@@ -1300,17 +1413,26 @@ function buildLibc(state, env_vars, io, mgr, proc) {
         // every other terminal fd reports the real terminal (mgr.tty). This
         // consistency matters: tmux sets a pane's winsize then reads it back,
         // and returning the main terminal size for a pane confused its sizing.
-        const e = fdEntry(fd); const ws = e && e.ofd && e.ofd.winsize; const t = ws || mgr.tty || { rows: 24, cols: 80 };
+        // winsize resolution: this fd's own record, else the SHARED pty
+        // record (so a forkpty child's TIOCGWINSZ on the slave sees the size
+        // the master set — nvim resizes its :terminal via the master), else
+        // the real terminal.
+        const e = fdEntry(fd); const ws = (e && e.ofd && e.ofd.winsize) || (e && e.ofd && e.ofd.pty && e.ofd.pty.winsize); const t = ws || mgr.tty || { rows: 24, cols: 80 };
         if (arg) { view().setUint16(arg, t.rows, true); view().setUint16(arg + 2, t.cols, true); view().setUint16(arg + 4, 0, true); view().setUint16(arg + 6, 0, true); }
         return 0;
       }
       if ((req >>> 0) === 0x80087467) { // TIOCSWINSZ — remember the size on this fd's ofd (e.g. a pane pty)
-        const e = fdEntry(fd); if (e && e.ofd && arg) e.ofd.winsize = { rows: view().getUint16(arg, true), cols: view().getUint16(arg + 2, true) };
+        const e = fdEntry(fd); if (e && e.ofd && arg) { const ws = { rows: view().getUint16(arg, true), cols: view().getUint16(arg + 2, true) }; e.ofd.winsize = ws; if (e.ofd.pty) e.ofd.pty.winsize = ws; }
         return 0;
       }
       return 0;
     },
-    stat: (pathPtr, statBuf) => { const p = mgr.vfsPath(cstr(pathPtr), proc.pio.cwd); if (p === "/dev/null") { fillStat(state, statBuf, { type: "char" }); return 0; } const node = mgr.vfs[p]; if (!node) { setErrno(2); return -1; } fillStat(state, statBuf, node); return 0; },
+    // POSIX: the EMPTY path is ENOENT, never the cwd. vfsPath("") resolves to
+    // the cwd, and stat("") == "a directory" made netrw's FileExplorer autocmd
+    // treat nvim's unnamed startup buffer (isdirectory(expand("<amatch>")) ==
+    // isdirectory("")) as a directory — bare `nvim` opened a netrw listing of
+    // / instead of the intro screen.
+    stat: (pathPtr, statBuf) => { const raw = cstr(pathPtr); if (!raw) { setErrno(2); return -1; } const p = mgr.vfsPath(raw, proc.pio.cwd); if (p === "/dev/null") { fillStat(state, statBuf, { type: "char" }); return 0; } const node = mgr.vfs[p]; if (!node) { setErrno(2); return -1; } fillStat(state, statBuf, node); return 0; },
     lstat: (pathPtr, statBuf) => env.stat(pathPtr, statBuf),
     fstatat: (dfd, pathPtr, statBuf) => {
       const name = cstr(pathPtr);
@@ -1448,7 +1570,13 @@ function buildLibc(state, env_vars, io, mgr, proc) {
       return 0;
     },
     killpg: () => 0, setpgid: (pid, pgid) => { const p = pid ? mgr.procs.find((q) => q.pid === pid) : proc; if (p) p.pgid = pgid || p.pid; return 0; }, getlogin: () => 0,
-    getrlimit: () => 0, setrlimit: () => 0,
+    // getrlimit MUST fill the struct (rlim_cur@0, rlim_max@8 — rlim_t is 64-bit
+    // even on wasm32/i386). Returning 0 without writing left the caller reading
+    // stack garbage as the limit: nvim's pty spawn loops fcntl(F_SETFD) up to
+    // RLIMIT_NOFILE and span 2.9 MILLION fds before the runaway guard killed
+    // it. NOFILE matches sysconf(_SC_OPEN_MAX); everything else is "infinity".
+    getrlimit: (resource, rlp) => { if (rlp) { const v = resource === 8 ? 1024n : 0x7fffffffffffffffn; view().setBigUint64(rlp, v, true); view().setBigUint64(rlp + 8, v, true); } return 0; },
+    setrlimit: () => 0,
     // getrusage: fill ru_utime (tv_sec@0, tv_usec@4). The single-thread engine
     // has no real CPU accounting, but callers expect usage to be MONOTONIC
     // (utime-after-work > utime-before), so advance a per-process counter each
@@ -1637,7 +1765,7 @@ function buildLibc(state, env_vars, io, mgr, proc) {
     // dynamic loading: no .so support in the engine — fail cleanly. nvim only
     // needs this for C lua modules / treesitter parsers, not core startup.
     dlopen: () => 0, dlsym: () => 0, dlclose: () => 0, dlerror: () => putStr("dlopen unsupported"),
-    dup3: (oldfd, newfd, flags) => env.dup2(oldfd, newfd),
+    dup3: (oldfd, newfd, flags) => { const r = env.dup2(oldfd, newfd); if (r >= 0 && (flags & 0x100000)) { const e = fdEntry(r); if (e) e.cloexec = true; } return r; },
     // scandir(path, namelist, filter, compar): read the dir, malloc an array
     // of struct dirent* (via the guest's malloc), fill, return the count.
     scandir: (pathPtr, namelistPtr, filterIdx, comparIdx) => {
@@ -1765,6 +1893,9 @@ function buildLibc(state, env_vars, io, mgr, proc) {
 
     // math
     pow: (a, b) => Math.pow(a, b), fmod: (a, b) => a % b, __isinf: (x) => (x === Infinity || x === -Infinity ? 1 : 0), __isnan: (x) => (x !== x ? 1 : 0), __isfinite: (x) => (Number.isFinite(x) ? 1 : 0),
+    // math helpers liblua.wasm needs (shared memory: view() is the guest's).
+    frexp: (x, eptr) => { let ex = 0, m = x; if (x !== 0 && isFinite(x)) { while (Math.abs(m) >= 1) { m /= 2; ex++; } while (Math.abs(m) < 0.5) { m *= 2; ex--; } } if (eptr) view().setInt32(eptr, ex, true); return m; },
+    ldexp: (x, e) => x * 2 ** e, modf: (x, iptr) => { const i = x < 0 ? Math.ceil(x) : Math.floor(x); if (iptr) view().setFloat64(iptr, i, true); return x - i; },
 
     // ids / creds — single user (root); setters are accepted no-ops.
     setuid: () => 0, seteuid: () => 0, setgid: () => 0, setegid: () => 0, setreuid: () => 0, setregid: () => 0, setgroups: () => 0, setpriority: () => 0, getpriority: () => 0, nice: () => 0, setproctitle: () => 0, issetugid: () => 0,
@@ -1791,8 +1922,13 @@ function buildLibc(state, env_vars, io, mgr, proc) {
   // with an error instead of freezing the synchronous main thread forever.
   for (const key of Object.keys(env)) {
     const fn = env[key];
-    if (typeof fn === "function") env[key] = (...args) => { mgr.tick(key); if (mgr.trace) { mgr.trace.push(key + "(" + args.join(",") + ")"); if (mgr.trace.length > 40) mgr.trace.shift(); } return fn(...args); };
+    if (typeof fn === "function") env[key] = (...args) => { mgr.tick(key); if (!mgr.trace) return fn(...args); const ret = fn(...args); mgr.trace.push("pid" + proc.pid + " " + key + "(" + args.join(",") + ")=" + ret); if (!mgr.traceAll && mgr.trace.length > 40) mgr.trace.shift(); return ret; };
   }
+  // Provide the Lua C API to lua_*-importing guests (nvim) by sharing this
+  // guest's memory + table with liblua.wasm. Lazy: liblua only instantiates if
+  // the guest actually calls a lua_* function — but the data+stack window is
+  // reserved up-front so guest heap and Lua state can never overlap.
+  try { installLuaForwarders(env, () => proc.inst, env, (n) => { while (state.u8.length < n) { state.mem.grow(Math.ceil((n - state.u8.length) / 65536)); state.refresh(); } }, state.reserve); } catch { /* liblua not loaded */ }
   return env;
 }
 
@@ -1803,7 +1939,7 @@ function buildVfs(toolNames) {
   let ino = 2;
   const dir = (entries) => ({ type: "dir", entries, mtime: now, ino: ino++ });
   const file = (text) => ({ type: "file", data: new TextEncoder().encode(text), mtime: now, ino: ino++ });
-  return {
+  const vfs = {
     "/": dir(["bin", "etc", "home", "README"]),
     "/bin": dir(toolNames.slice().sort()),
     "/etc": dir(["motd", "hostname"]),
@@ -1815,6 +1951,15 @@ function buildVfs(toolNames) {
     "/home/user/.profile": file("export PATH=/bin\n"),
     "/tmp": dir([]),
   };
+  // Every tool gets a REAL executable file node, not just a name in the /bin
+  // listing: programs check a command's execute bits via stat() before
+  // spawning it (nvim's os_can_exe stats $SHELL and refuses :terminal with
+  // "'/bin/sh' is not executable" when the node is missing — access() alone
+  // special-cases the tool map, stat() resolves VFS nodes).
+  for (const name of toolNames) {
+    vfs["/bin/" + name] = { type: "file", data: new Uint8Array(0), mode: 0o755, mtime: now, ino: ino++ };
+  }
+  return vfs;
 }
 
 const S_IFDIR = 0o040000, S_IFREG = 0o100000, S_IFCHR = 0o020000;
@@ -1923,6 +2068,50 @@ export class Manager {
     return "/" + stack.join("/");
   }
   vfsResolve(path, cwd = "/") { return this.vfs[this.vfsPath(path, cwd)] || null; }
+  // Mount a read-only external file tree into the VFS at `at` (e.g. nvim's
+  // $VIMRUNTIME). entries: [{ path: "lua/vim/termcap.lua", data?: Uint8Array,
+  // read?: () => Uint8Array|null }]. File bytes load LAZILY on first access
+  // through a caching `data` getter (node: readFileSync; browser: a slice of
+  // the prefetched /fs/pack.bin), so mounting ~2000 runtime files costs
+  // nothing until a file is actually opened. Intermediate directories are
+  // created; existing VFS nodes are never overwritten.
+  mountFiles(at, entries) {
+    const base = this.vfsPath(at);
+    const now = Math.floor(this.now() / 1000);
+    const ensureDir = (path) => {
+      if (this.vfs[path]) return;
+      this.vfs[path] = { type: "dir", entries: [], mtime: now, ino: this.nextIno++ };
+      const slash = path.lastIndexOf("/");
+      const parentPath = slash === 0 ? "/" : path.slice(0, slash);
+      ensureDir(parentPath);
+      const parent = this.vfs[parentPath];
+      const name = path.slice(slash + 1);
+      if (parent && parent.entries && !parent.entries.includes(name)) parent.entries.push(name);
+    };
+    ensureDir(base);
+    for (const entry of entries) {
+      const full = this.vfsPath(base + "/" + entry.path);
+      if (this.vfs[full]) continue;
+      const slash = full.lastIndexOf("/");
+      const dirPath = slash === 0 ? "/" : full.slice(0, slash);
+      ensureDir(dirPath);
+      const node = { type: "file", mtime: now, ino: this.nextIno++ };
+      if (entry.data) node.data = entry.data;
+      else {
+        const load = entry.read;
+        let cached = null;
+        Object.defineProperty(node, "data", {
+          get() { if (cached === null) cached = load() || new Uint8Array(0); return cached; },
+          set(value) { cached = value; },
+          enumerable: true, configurable: true,
+        });
+      }
+      this.vfs[full] = node;
+      const parent = this.vfs[dirPath];
+      const name = full.slice(slash + 1);
+      if (parent.entries && !parent.entries.includes(name)) parent.entries.push(name);
+    }
+  }
   vfsCreateFile(path, mode) {
     const node = { type: "file", data: new Uint8Array(0), mtime: Math.floor(Date.now() / 1000), ino: this.nextIno++ };
     if (typeof mode === "number") node.mode = mode & 0o777;
@@ -1935,6 +2124,17 @@ export class Manager {
   }
 
   spawn(mod, argv, ppid, env_vars) {
+    const { proc, env } = this.spawnShell(mod, argv, ppid, env_vars);
+    this.attachInstance(proc, new WebAssembly.Instance(mod, { env }));
+    return proc;
+  }
+
+  // Everything spawn() does short of instantiating the wasm — split out so a
+  // module past Chrome's main-thread SYNC instantiation size limit (nvim is
+  // 14 MB; the limit bites somewhere above ~6 MB) can boot ASYNCHRONOUSLY:
+  // build the shell now, `await WebAssembly.instantiate` later, attach on
+  // resolve. Node and small modules keep the synchronous path.
+  spawnShell(mod, argv, ppid, env_vars) {
     const pid = this.nextPid++;
     const comm = (argv[0] || "?").replace(/^.*\//, "").slice(0, 19);
     const proc = { pid, ppid, pgid: pid, sid: pid, comm, mod, argv, exited: false, reaped: false, exitCode: 0, signal: 0, forkReturn: 0, forkPending: false, pendingRewind: false, asyncifyPtr: 0, state: null, inst: null, pio: newPio(), sched: "new", blocked: null, pendingSignals: [] };
@@ -1943,15 +2143,42 @@ export class Manager {
     proc.state = state;
     const env = buildLibc(state, env_vars || DEFAULT_ENV, this.io, this, proc);
     strictImportEnv(env, mod, { label: "proc", onCall: this.io.onUnimpl });
-    proc.inst = new WebAssembly.Instance(mod, { env });
-    state.mem = proc.inst.exports.memory;
-    state.main = proc.inst.exports.main;
+    this.procs.push(proc);
+    return { proc, env };
+  }
+
+  attachInstance(proc, inst) {
+    proc.inst = inst;
+    const state = proc.state;
+    state.mem = inst.exports.memory;
+    state.main = inst.exports.main;
     state.refresh();
-    const hb = proc.inst.exports.__heap_base;
+    const hb = inst.exports.__heap_base;
     state.brk = (typeof hb === "object" ? hb.value : hb) ?? (1 << 20);
     state.errnoPtr = state.alloc(4);
-    this.procs.push(proc);
     return proc;
+  }
+
+  // Chrome (V8) refuses `new WebAssembly.Instance` on the main thread for
+  // large modules — the async `WebAssembly.instantiate` is the only route.
+  isSyncInstantiationLimit(err) {
+    return !!(err && typeof err.message === "string" && /disallowed on the main thread/i.test(err.message));
+  }
+
+  // A process is booting: its wasm instance is resolving asynchronously. It
+  // is neither runnable nor blocked; when the promise settles it becomes
+  // runnable and onAsyncBoot (wired to the page's runSched) re-enters the
+  // scheduler.
+  finishAsyncBoot(proc, ready) {
+    proc.sched = "booting";
+    (async () => {
+      await ready();
+      proc.sched = "runnable";
+      if (!this.runQueue.includes(proc)) this.runQueue.push(proc);
+    })().catch((err) => {
+      proc.exited = true; proc.sched = "zombie"; proc.exitCode = 139; proc.error = err && err.message;
+      this.onProcExit(proc);
+    }).finally(() => { if (this.onAsyncBoot) this.onAsyncBoot(); });
   }
 
   asyncifyState(proc) { const f = proc.inst.exports.asyncify_get_state; return f ? f() : -1; }
@@ -2038,6 +2265,15 @@ export class Manager {
   schedule() {
     this.turnStart = Date.now(); // wall-clock budget spans the whole turn
     let guard = 0, fastForwards = 0;
+    // Virtual time the fast-forward path may burn in THIS turn. A burst-settle
+    // timer chain (tmux: 10ms render kick → repeat-timeout → status refresh)
+    // finishes well inside this; a PERIODIC timer that re-arms itself every
+    // fire (top's 2s select loop) exhausts it after one or two firings instead
+    // of spinning 5000 repaints per keystroke and racing the virtual clock
+    // hours ahead. Once idle, real wall-clock pacing takes over (the
+    // deadline tick in runInteractive re-enters the scheduler when the
+    // nearest timeout actually elapses).
+    let fastForwardTimeBudget = 3000;
     for (;;) {
       if (++guard > 5_000_000) throw Object.assign(new Error("scheduler runaway"), { runaway: true });
       // wake blocked procs whose I/O is now ready
@@ -2056,11 +2292,15 @@ export class Manager {
         // status redraw) are left for real wall-clock to reach on the next
         // interaction — otherwise we'd spin through days of virtual ticks.
         const FASTFWD_HORIZON_MS = 2000;
-        if (soonest && soonest.blocked.deadline - this.now() <= FASTFWD_HORIZON_MS && fastForwards++ < 5000) {
-          this.clockSkew += Math.max(0, soonest.blocked.deadline - this.now());
-          soonest.timedOut = true;
-          this.wake(soonest);
-          continue;
+        if (soonest) {
+          const advance = Math.max(0, soonest.blocked.deadline - this.now());
+          if (advance <= FASTFWD_HORIZON_MS && advance <= fastForwardTimeBudget && fastForwards++ < 5000) {
+            fastForwardTimeBudget -= advance;
+            this.clockSkew += advance;
+            soonest.timedOut = true;
+            this.wake(soonest);
+            continue;
+          }
         }
         if (this.debug) { const b = this.procs.filter((p) => p.sched === "blocked"); if (b.length) console.error("SCHED-IDLE: " + b.map((p) => `pid${p.pid}(ppid${p.ppid},${p.comm}):${p.blocked && p.blocked.kind}`).join(" | ")); }
         break; // everyone is blocked (idle) or done — yield to the page
@@ -2068,6 +2308,17 @@ export class Manager {
       if (proc.sched !== "runnable" || proc.exited) continue;
       this.pumpProc(proc);
     }
+  }
+  // The nearest finite deadline any blocked process is waiting on, or
+  // Infinity. runInteractive uses this to arm a REAL timer so a periodic
+  // guest timeout (top's 2s refresh, tmux's status clock) elapses at real
+  // wall-clock pace while the page is idle — the virtual clock stays frozen
+  // between events, so without the tick an idle full-screen tool never
+  // repaints and its clock never moves.
+  nearestDeadline() {
+    let d = Infinity;
+    for (const p of this.procs) if (p.sched === "blocked" && p.blocked && isFinite(p.blocked.deadline)) d = Math.min(d, p.blocked.deadline);
+    return d;
   }
 
   pumpProc(proc) {
@@ -2079,7 +2330,7 @@ export class Manager {
         if (proc.pendingRewind) { proc.pendingRewind = false; proc.inst.exports.asyncify_start_rewind(proc.asyncifyPtr); }
         proc.inst.exports._start();
       } catch (e) {
-        if (e && e.isExec) continue; // execve replaced the image in place — run the new _start
+        if (e && e.isExec) { if (proc.sched === "booting") return; continue; } // execve replaced the image in place — run the new _start (async boot: resume when the instance resolves)
         // A runaway (or any trap) aborts ONLY this process, never the whole
         // scheduler — so a misbehaving command (e.g. tmux's spin loop) can't
         // take the interactive shell down with it.
@@ -2101,19 +2352,48 @@ export class Manager {
   // later (fork → 0). Both are independently schedulable.
   doForkSched(parent) {
     parent.forkPending = false;
-    const child = this.spawn(parent.mod, parent.argv, parent.pid, undefined);
-    const src = parent.state.u8;
-    while (child.state.u8.length < src.length) { const before = child.state.u8.length; child.state.mem.grow(64); child.state.refresh(); if (child.state.u8.length === before) throw new Error("out of wasm memory (fork)"); }
-    child.state.u8.set(src);
-    child.state.brk = parent.state.brk;
-    child.state.errnoPtr = parent.state.errnoPtr;
+    // One shell, then try the sync instantiation; if the module is past
+    // Chrome's main-thread sync-instantiation limit (a 14 MB nvim forking its
+    // embedded server), boot the same shell asynchronously instead.
+    const { proc: child, env: childEnv0 } = this.spawnShell(parent.mod, parent.argv, parent.pid, undefined);
+    let childEnv = null;
+    try {
+      this.attachInstance(child, new WebAssembly.Instance(parent.mod, { env: childEnv0 }));
+    } catch (err) {
+      if (!this.isSyncInstantiationLimit(err)) throw err;
+      childEnv = childEnv0;
+    }
+    // Fork state is snapshotted NOW — the parent resumes immediately and
+    // keeps mutating its memory/fd table, so an async-booting child must not
+    // read them later.
+    const src = childEnv ? parent.state.u8.slice() : parent.state.u8;
+    const savedBrk = parent.state.brk, savedErrnoPtr = parent.state.errnoPtr;
     child.asyncifyPtr = parent.asyncifyPtr;
     child.pio = clonePio(parent.pio);
     child.pgid = parent.pgid; child.sid = parent.sid;
     child.sigHandlers = parent.sigHandlers ? { ...parent.sigHandlers } : undefined; child.sigMask = parent.sigMask ? [...parent.sigMask] : undefined;
     child.interactive = parent.interactive;
-    child.forkReturn = 0; child.pendingRewind = true; child.sched = "runnable";
-    this.runQueue.push(child);
+    // forkpty: the child's rewound bridge needs the pty fd stash too (the
+    // parent clears only its own copy on its rewind).
+    child.forkPtyPending = parent.forkPtyPending;
+    child.forkReturn = 0; child.pendingRewind = true;
+    const copyIntoChild = () => {
+      while (child.state.u8.length < src.length) { const before = child.state.u8.length; child.state.mem.grow(64); child.state.refresh(); if (child.state.u8.length === before) throw new Error("out of wasm memory (fork)"); }
+      child.state.u8.set(src);
+      child.state.brk = savedBrk;
+      child.state.errnoPtr = savedErrnoPtr;
+    };
+    if (childEnv) {
+      this.finishAsyncBoot(child, async () => {
+        const instance = await WebAssembly.instantiate(parent.mod, { env: childEnv });
+        this.attachInstance(child, instance);
+        copyIntoChild();
+      });
+    } else {
+      copyIntoChild();
+      child.sched = "runnable";
+      this.runQueue.push(child);
+    }
     // parent continues now, fork returns the child pid
     parent.forkReturn = child.pid; parent.pendingRewind = true;
   }
@@ -2137,37 +2417,77 @@ export class Manager {
     // close all fds so pipe/socket peers see EOF / EPIPE and unblock.
     this.releaseProcFds(proc);
     proc.inst = null; proc.state = null;
+    // NOTE: no GENERAL SIGCHLD push here. A kqueue-based parent (libuv)
+    // learns of the exit via EVFILT_PROC (see kevent's fired()); a wait-based
+    // parent (zsh) via its wait/sigsuspend predicates. Queueing SIGCHLD for
+    // every child EINTRs unrelated blocked syscalls and broke tmux's detach.
+    //
+    // The ONE exception is a forkpty child (nvim's :terminal shell): it is a
+    // hand-rolled fork, not a uv_spawn, so no EVFILT_PROC filter watches it —
+    // SIGCHLD → waitpid is the only way its parent (which registered a
+    // sigaction for it) learns the exit status and can paint
+    // "[Process exited N]". Only nvim imports forkpty, so this cannot
+    // perturb tmux/zsh child handling.
+    if (proc.viaForkpty) {
+      const parent = this.procs.find((p) => p.pid === proc.ppid && !p.exited);
+      if (parent && parent.interactive && parent.sigHandlers && parent.sigHandlers[20] > 1) {
+        (parent.pendingSignals = parent.pendingSignals || []).push(20);
+        this.wake(parent);
+      }
+    }
   }
 
   // True execve: replace a process's wasm image in place. pid, fd table, cwd
   // and env (all in pio) are inherited; only the program (instance + memory)
   // is swapped. The scheduler then runs the new image's _start.
   prepareExec(proc, mod, argv) {
-    // POSIX execve closes every descriptor marked close-on-exec before the new
-    // image runs (O_CLOEXEC / F_DUPFD_CLOEXEC / F_SETFD(FD_CLOEXEC)); the rest
-    // of the fd table, cwd and env carry across the exec. Release each such
-    // descriptor's open file description so its refcount drops — a pipe/socket
-    // end held only through a cloexec fd then closes (peer sees EOF/EPIPE) and a
-    // saved fd cannot leak into the exec'd program. Snapshot the entries first
-    // since we mutate the map while iterating.
+    // Build the new image FIRST — a large module makes the sync
+    // instantiation throw on Chrome's main thread (caller falls back to
+    // prepareExecAsync), and nothing of the old process may be mutated yet.
+    const state = makeState();
+    const env = buildLibc(state, proc.pio.env, this.io, this, proc);
+    strictImportEnv(env, mod, { label: "exec", onCall: this.io.onUnimpl });
+    const inst = new WebAssembly.Instance(mod, { env });
+    this.commitExec(proc, mod, argv, state, inst);
+  }
+
+  // The exec-image swap, shared by the sync and async paths. POSIX execve
+  // closes every descriptor marked close-on-exec before the new image runs
+  // (O_CLOEXEC / F_DUPFD_CLOEXEC / F_SETFD(FD_CLOEXEC)); the rest of the fd
+  // table, cwd and env carry across the exec. Release each such descriptor's
+  // open file description so its refcount drops — a pipe/socket end held only
+  // through a cloexec fd then closes (peer sees EOF/EPIPE) and a saved fd
+  // cannot leak into the exec'd program. Snapshot the entries first since we
+  // mutate the map while iterating.
+  commitExec(proc, mod, argv, state, inst) {
     for (const [fd, entry] of [...proc.pio.fds]) {
       if (entry.cloexec) { proc.pio.fds.delete(fd); releaseOfd(entry.ofd); }
     }
     proc.mod = mod;
     proc.argv = argv;
     proc.comm = (argv[0] || "?").replace(/^.*\//, "").slice(0, 19);
-    const state = makeState();
     proc.state = state;
-    const env = buildLibc(state, proc.pio.env, this.io, this, proc);
-    strictImportEnv(env, mod, { label: "exec", onCall: this.io.onUnimpl });
-    proc.inst = new WebAssembly.Instance(mod, { env });
-    state.mem = proc.inst.exports.memory;
-    state.main = proc.inst.exports.main;
+    proc.inst = inst;
+    state.mem = inst.exports.memory;
+    state.main = inst.exports.main;
     state.refresh();
-    const hb = proc.inst.exports.__heap_base;
+    const hb = inst.exports.__heap_base;
     state.brk = (typeof hb === "object" ? hb.value : hb) ?? (1 << 20);
     state.errnoPtr = state.alloc(4);
     proc.asyncifyPtr = 0; proc.forkPending = false; proc.blocked = null; proc.pendingRewind = false;
+  }
+
+  // execve of a module past the sync-instantiation limit: the process goes
+  // into "booting" and the image swap happens when the instance resolves.
+  prepareExecAsync(proc, mod, argv) {
+    const state = makeState();
+    const env = buildLibc(state, proc.pio.env, this.io, this, proc);
+    strictImportEnv(env, mod, { label: "exec", onCall: this.io.onUnimpl });
+    this.finishAsyncBoot(proc, async () => {
+      // (module, imports) form: resolves to the Instance itself.
+      const instance = await WebAssembly.instantiate(mod, { env });
+      this.commitExec(proc, mod, argv, state, instance);
+    });
   }
 
   doFork(parent) {
@@ -2231,6 +2551,7 @@ export class Manager {
 // Same signature shape as the simple runner so callers swap easily.
 export function runProgram(mod, argv, onOutput, onUnimpl, opts = {}) {
   const mgr = new Manager({ onOutput, onUnimpl: onUnimpl || (() => {}) }, opts.tools || new Map());
+  for (const m of opts.mounts || []) mgr.mountFiles(m.at, m.entries);
   const root = mgr.spawn(mod, argv, 0, opts.env);
   // Optional fixed stdin for a non-interactive guest. Back fd 0 with a
   // pre-filled, write-closed pipe so read()/poll() on stdin returns these bytes
@@ -2263,6 +2584,7 @@ export function runInteractive(mod, argv, opts = {}) {
   mgr.interactive = true;
   mgr.debug = !!opts.debug;
   if (opts.trace) mgr.trace = [];
+  for (const m of opts.mounts || []) mgr.mountFiles(m.at, m.entries);
   // Shared terminal line discipline (one tty for the whole session, used by
   // every process). lflag defaults to a cooked terminal
   // (ECHO|ECHOE|ICANON|ISIG|IEXTEN); the guest's editor clears bits via
@@ -2278,7 +2600,42 @@ export function runInteractive(mod, argv, opts = {}) {
   const runSched = () => {
     try { mgr.schedule(); }
     catch (e) { if (!root.exited) { root.exited = true; root.onExit(e && e.runaway ? 137 : 139, e && e.message); } }
-    if (root.exited) { stopSettle(); if (root.onExit && !root._notified) root._notified = true; }
+    if (root.exited) { stopSettle(); stopTick(); if (root.onExit && !root._notified) root._notified = true; }
+    else armTick();
+  };
+  // An async-booting process (module past Chrome's sync-instantiation limit)
+  // became runnable — re-enter the scheduler exactly like a keystroke does.
+  mgr.onAsyncBoot = () => { if (!root.exited) runSched(); };
+
+  // DEADLINE TICK — real-time pacing for periodic guest timers while IDLE.
+  // The virtual clock is frozen between events, so a full-screen tool that
+  // sleeps in select()/kevent with a timeout (top's 2s refresh, tmux's status
+  // clock) would repaint only on keystrokes. After each scheduler turn, arm
+  // ONE real timer for the nearest finite guest deadline; when it fires
+  // (input has been quiet — every keystroke cancels it, the settle timer
+  // re-arms it), advance the clock by the real elapsed time and run the
+  // scheduler: the due timeout elapses at wall-clock pace, top repaints once,
+  // blocks again, and the next tick is armed for its next deadline. No finite
+  // deadlines → no timer → the page stays fully frozen as before.
+  let tickTimer = null;
+  const stopTick = () => { if (tickTimer) { clearTimeout(tickTimer); tickTimer = null; } };
+  const armTick = () => {
+    stopTick();
+    if (root.exited) return;
+    const deadline = mgr.nearestDeadline();
+    if (!isFinite(deadline)) return;
+    const delay = Math.min(Math.max(deadline - mgr.now(), 200), 60_000);
+    tickTimer = setTimeout(onTick, delay);
+    if (tickTimer && tickTimer.unref) tickTimer.unref();
+  };
+  const onTick = () => {
+    tickTimer = null;
+    if (root.exited) return;
+    const wall = Date.now();
+    const gap = wall - lastWall;
+    lastWall = wall;
+    if (gap > 0) mgr.clockSkew += gap;
+    runSched(); // re-arms the next tick
   };
 
   // One-shot SETTLE timer. While the user types at speed the clock stays FROZEN:
@@ -2316,6 +2673,10 @@ export function runInteractive(mod, argv, opts = {}) {
     if (root.exited) return;
     lastWall = Date.now();
     stopSettle();
+    // Typing burst: the deadline tick must not fire (a clock advance between
+    // burst keystrokes desyncs tmux's incremental render). The settle timer
+    // takes over and its runSched re-arms the tick once input is quiet.
+    stopTick();
     settleTimer = setTimeout(onSettle, SETTLE_MS);
     if (settleTimer && settleTimer.unref) settleTimer.unref();
   };
@@ -2360,8 +2721,10 @@ export function runInteractive(mod, argv, opts = {}) {
       armSettle();
     },
     running: () => !root.exited,
-    dispose: () => stopSettle(),
+    dispose: () => { stopSettle(); stopTick(); },
     proc: root,
     mgr,
   };
 }
+
+export { loadLiblua };

@@ -5,8 +5,9 @@
 // the asyncify suspend/rewind the binary already carries for fork. Shell
 // state — cwd, variables, history, pipelines — persists across commands,
 // because it is one continuous zsh process, not one-zsh-per-line.
-import { runInteractive } from "./yos_proc.mjs";
+import { runInteractive, loadLiblua } from "./yos_proc.mjs";
 import { compileGuest } from "./wasm_patch.mjs";
+import { parsePack } from "./fs_mount.mjs";
 
 const term = new Terminal({
   fontFamily: "ui-monospace, monospace", fontSize: 14,
@@ -71,6 +72,20 @@ term.write("\r\x1b[2K");
 tools.set("sh", mod);
 tools.set("zsh", mod);
 
+// The Lua C API for nvim (liblua.wasm, served at ./lua/): without it nvim's
+// 85 lua_*/luaL_* imports have no provider and instantiation fails loud.
+await loadLiblua().catch(() => {});
+
+// Mount the guest /usr/share tree (nvim's $VIMRUNTIME, zsh functions) from
+// the server's single-blob pack. Entry data are zero-copy views into the
+// fetched buffer; without this nvim boots but dies loading vim/_defaults.lua
+// (its Lua runtime files live under /usr/share/nvim/runtime).
+let mounts = [];
+try {
+  const pack = await (await fetch("./fs/pack.bin")).arrayBuffer();
+  mounts = [{ at: "/usr/share", entries: parsePack(pack) }];
+} catch { /* plain static server: no /usr/share; nvim will lack its runtime */ }
+
 let exited = false;
 let raw = "";
 const ctl = runInteractive(mod, ["zsh", "-f", "+o", "promptsp"], {
@@ -78,7 +93,8 @@ const ctl = runInteractive(mod, ["zsh", "-f", "+o", "promptsp"], {
   onExit: (code) => { exited = true; term.write(`\r\n\x1b[38;2;85;97;98m[zsh exited ${code}] — reload to restart\x1b[0m\r\n`); },
   onUnimpl: () => {},
   tools,
-  env: ["PATH=/bin:/usr/bin", "HOME=/", "TERM=xterm-256color", "PWD=/", "SHELL=/bin/sh"],
+  mounts,
+  env: ["PATH=/bin:/usr/bin", "HOME=/", "TERM=xterm-256color", "PWD=/", "SHELL=/bin/sh", "VIMRUNTIME=/usr/share/nvim/runtime"],
   cols: term.cols, rows: term.rows,
 });
 

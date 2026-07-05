@@ -54,6 +54,16 @@ static int get_asyncify_state(IM3Runtime rt)
     return state;
 }
 
+/* Is this ctx currently REWINDING out of an asyncify fork? A composite
+ * fork bridge (forkpty) needs to know whether it is on its first entry
+ * (set up the pty, then unwind through yos_fork) or replaying on the
+ * rewind (finish the parent/child half). */
+int yos_fork_rewinding(struct yos_exec_ctx *ctx)
+{
+    IM3Runtime wrt = ctx ? (IM3Runtime)ctx->runtime : NULL;
+    return wrt && get_asyncify_state(wrt) == ASYNCIFY_REWINDING;
+}
+
 /* ============================================================================
  * Process Table Operations
  * ============================================================================ */
@@ -225,6 +235,20 @@ void yos_proc_post_exit_cleanup(struct yos_exec_ctx *ctx)
         int rc = yos_proc_kill_by_pid(ctx->rt, hup_pids[i], FBSD_SIGHUP);
         ydebug("post_exit_cleanup: SIGHUP -> orphan pid=%d (rc=%d)\n",
                hup_pids[i], rc);
+    }
+
+    /* A forkpty child's exit is announced to the parent via SIGCHLD: a
+     * pty child is a hand-rolled fork, so no EVFILT_PROC filter watches
+     * it — the parent's sigaction (nvim's libuv SIGCHLD watcher) is how
+     * it learns the exit and waitpid()s ("[Process exited N]", jobwait,
+     * on_exit callbacks). Default SIGCHLD disposition is ignore, so a
+     * parent without a handler is unaffected. Scoped to forkpty
+     * children so ordinary fork/wait flows (zsh, tmux) keep their
+     * existing wait/sigsuspend-driven delivery. */
+    if (ctx->is_forkpty_child) {
+        int rc = yos_proc_kill_by_pid(ctx->rt, parent_pid, FBSD_SIGCHLD);
+        ydebug("post_exit_cleanup: SIGCHLD -> forkpty parent pid=%d (rc=%d)\n",
+               parent_pid, rc);
     }
 }
 
@@ -593,6 +617,11 @@ typedef struct {
      * across every yos guest (they're host pthreads of one process),
      * so child's umask() would leak back into parent without this. */
     unsigned short parent_umask;
+    /* forkpty stash (see types.h): the child's rewound forkpty bridge
+     * wires the slave onto its stdio using these guest fd numbers. */
+    int forkpty_pending;
+    int32_t forkpty_master_wfd;
+    int32_t forkpty_slave_wfd;
 } fork_thread_arg_t;
 
 /* Release every dup the parent thread stashed in fork_thread_arg.
@@ -706,6 +735,9 @@ static void *fork_thread_func(void *arg)
     /* TODO(setjmp-refactor): copy parent's sj_slots[] into child. */
     child_ctx->fork_return = 0;  /* child gets 0 from fork */
     child_ctx->is_child = 1;
+    child_ctx->forkpty_pending    = fork_thread_arg->forkpty_pending;
+    child_ctx->forkpty_master_wfd = fork_thread_arg->forkpty_master_wfd;
+    child_ctx->forkpty_slave_wfd  = fork_thread_arg->forkpty_slave_wfd;
     /* errno_off MUST match the parent's (set in main.c::load_wasm_module).
      * Without this child_ctx->errno_off stays at calloc'd 0, env.__error
      * returns 0, and the wasm guest reads/writes errno through
@@ -1561,6 +1593,9 @@ void yos_fork_pump(struct yos_exec_ctx *ctx)
         memcpy(&fork_thread_arg->parent_env_store, &ctx->env_store,
                sizeof(fork_thread_arg->parent_env_store));
         fork_thread_arg->parent_umask = ctx->umask;
+        fork_thread_arg->forkpty_pending    = ctx->forkpty_pending;
+        fork_thread_arg->forkpty_master_wfd = ctx->forkpty_master_wfd;
+        fork_thread_arg->forkpty_slave_wfd  = ctx->forkpty_slave_wfd;
 
         /* Spawn child thread detached so the parent resumes concurrently.
          * Child lifetime is tracked via yos_proc state (RUNNING/ZOMBIE);
@@ -2223,10 +2258,17 @@ static int deliver_to_proc(struct yos_proc *p, int sig)
         case 18: /* SIGTSTP   */
         case 19: /* SIGCONT (FreeBSD) — Linux's SIGSTOP is 19, ambiguous;
                   *           filtering both numbers is safest. */
-        case 20: /* SIGCHLD on FreeBSD — handled separately */
         case 21: /* SIGTTIN  */
         case 22: /* SIGTTOU  */
             return 0;
+        /* SIGCHLD (FreeBSD 20) is NOT filtered: delivery goes through
+         * the per-ctx sig_pending channel below (never a raw host
+         * pthread_kill of 20, which on Linux would be SIGTSTP), the
+         * pump ignores it when no handler is installed (not in
+         * default_action_is_terminate), and a registered handler is
+         * exactly what the sender wants to run — nvim's libuv SIGCHLD
+         * watcher reaps its forkpty :terminal child through it. The
+         * sigsuspend-synthesised SIGCHLD path is unaffected. */
     }
     /* SIGKILL: route through the same per-ctx pending-signal channel
      * as every other signal. yos_signal_pump in the target's host
@@ -2818,6 +2860,9 @@ void yos_vfork_pump(struct yos_exec_ctx *ctx)
         memcpy(&fork_thread_arg->parent_env_store, &ctx->env_store,
                sizeof(fork_thread_arg->parent_env_store));
         fork_thread_arg->parent_umask = ctx->umask;
+        fork_thread_arg->forkpty_pending    = ctx->forkpty_pending;
+        fork_thread_arg->forkpty_master_wfd = ctx->forkpty_master_wfd;
+        fork_thread_arg->forkpty_slave_wfd  = ctx->forkpty_slave_wfd;
 
         /* Spawn child thread */
         child_proc->state = YOS_PROC_RUNNING;
