@@ -204,6 +204,15 @@ custom_proc:
   # to confirm the host key). Hand-bridge opens /dev/tty, turns off
   # echo, reads the line, restores termios.
   - readpassphrase
+  # impl/libc/iconv.c — the iconv trio needs hand bridges: iconv()'s
+  # char** in/out args carry guest OFFSETS behind the outer pointer (a
+  # passthrough made host iconv dereference a wasm offset as a host
+  # address — SIGSEGV in glibc the moment nvim's :terminal converted
+  # its first typed byte), and iconv_open()'s host iconv_t return
+  # cannot fit the guest's 32 bits (handle table instead).
+  - iconv
+  - iconv_open
+  - iconv_close
   # impl/posix.c — timingsafe_bcmp(3) / timingsafe_memcmp(3) are
   # OpenBSD constant-time comparison primitives. glibc has neither;
   # darwin libSystem has bcmp but not memcmp. Codegen stubs both with

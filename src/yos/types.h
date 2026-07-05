@@ -197,6 +197,17 @@ struct yos_exec_ctx {
      * tmux) keep their existing wait/sigsuspend-driven delivery. */
     int is_forkpty_child;
 
+    /* Hand-bridged iconv(3) handles (impl/libc/iconv.c). The guest sees
+     * a small handle (slot index + 1); the host iconv_t lives here. A
+     * codegen passthrough CANNOT work for iconv: its char** in/out
+     * arguments carry guest OFFSETS behind the outer pointer (host
+     * iconv would dereference a wasm offset as a host address — SIGSEGV
+     * in glibc, hit by nvim's :terminal input-encoding conversion), and
+     * iconv_open's iconv_t return would truncate a host pointer into
+     * the guest's 32-bit world. NOT inherited across fork (host
+     * iconv_t is not shareable); freed via yos_iconv_ctx_free at exit. */
+    void *iconv_slots[16];
+
     /* AUTO-isolated libc globals — bridge.py emits the per-ctx
      * field definitions for everything marked auto_save_restore in
      * the policy file. yos_autoglobals.h is generated; if you don't

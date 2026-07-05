@@ -270,6 +270,11 @@ int32_t yos_exit(struct yos_exec_ctx *ctx, int32_t code)
         yos_libarchive_ctx_free(ctx);
     }
 #endif
+    {
+        /* Host iconv_t handles the guest leaked (impl/libc/iconv.c). */
+        extern void yos_iconv_ctx_free(struct yos_exec_ctx *);
+        yos_iconv_ctx_free(ctx);
+    }
 
     /* Asyncify-fork-child silence workaround.
      *
@@ -1002,9 +1007,14 @@ static void *fork_thread_func(void *arg)
             extern void yos_env_post_execve_reset(struct yos_exec_ctx *);
             extern void yos_pwd_post_execve_reset(struct yos_exec_ctx *);
             extern void yos_freebsd_userland_post_execve_reset(struct yos_exec_ctx *);
+            extern void yos_iconv_ctx_free(struct yos_exec_ctx *);
             yos_env_post_execve_reset(child_ctx);
             yos_pwd_post_execve_reset(child_ctx);
             yos_freebsd_userland_post_execve_reset(child_ctx);
+            /* exec replaces the image: any iconv handles the old image
+             * opened are meaningless to the new one — release the host
+             * iconv_t objects behind them. */
+            yos_iconv_ctx_free(child_ctx);
         }
 
         child_ctx->argc = child_ctx->exec_argc;
@@ -1941,8 +1951,29 @@ int32_t yos_execve(struct yos_exec_ctx *ctx, uint32_t filename, uint32_t argv_pt
         is_script = 1;
         extra_args = shebang_arg[0] ? 2 : 1;  /* interp [arg] script */
     } else {
-        ydebug("execve: %s: unknown format\n", fn);
-        return host_execve_fallback(fn, ctx, argv_ptr);
+        /* Not wasm, no shebang — typically a HOST binary path leaked in
+         * from the inherited environment: nvim's :terminal execs
+         * $SHELL=/bin/zsh, which passed the os_can_exe() pre-check
+         * against the REAL host fs, and then lands here as an ELF. The
+         * browser engine resolves exec targets by BASENAME in its tool
+         * map; mirror that — walk the guest $PATH for the basename and
+         * exec the wasm sibling (…/libexec/zsh) when there is one.
+         * argv[0] is left untouched, so a shell exec'd as "/bin/sh"
+         * still sees basename sh and enters sh-emulation. Only when the
+         * basename resolves to nothing wasm do we fall through to the
+         * host-exec fallback (ENOEXEC unless YOS_ALLOW_HOST_EXEC). */
+        const char *slash = strrchr(fn, '/');
+        char resolved_alias[PATH_MAX];
+        if (slash && slash[1] &&
+            execvp_path_search(ctx, slash + 1, resolved_alias) &&
+            check_wasm_magic(resolved_alias)) {
+            ydebug("execve: host-format %s → PATH-resolved wasm %s\n",
+                   fn, resolved_alias);
+            strcpy(exec_path, resolved_alias);
+        } else {
+            ydebug("execve: %s: unknown format\n", fn);
+            return host_execve_fallback(fn, ctx, argv_ptr);
+        }
     }
 
     /* Count original argv entries.

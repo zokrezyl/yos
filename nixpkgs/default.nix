@@ -231,6 +231,13 @@ let
     name = "yos-all";
     paths = [ yos zsh tmux nvim freebsd-tools openssh perf-stress runit telnetd yos-tcpserver ytrace-wasm yperf-wasm yctl-wasm yctl-host ];  # cpython disabled — see above
     postBuild = ''
+      # `sh` alias for zsh: guests exec "/bin/sh" constantly (tmux's
+      # default-shell, $SHELL fallbacks, scripts). yos's execve resolves
+      # a non-wasm absolute path by BASENAME on the guest $PATH, so this
+      # symlink makes /bin/sh land on the wasm zsh — which sees
+      # basename(argv[0]) == "sh" and enters sh-emulation.
+      ln -sfn zsh $out/libexec/sh
+'' + ''
       cat > $out/bin/yos-shell <<RUNNER_EOF
       #!/usr/bin/env bash
       # yos-shell — pristine wasm-zsh sandbox under yos.
