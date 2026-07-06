@@ -72,6 +72,7 @@ int            yos_clone_thread        (yos_pthread_host *h,
                                          uint32_t arg,
                                          uint32_t ctid_addr,
                                          uint32_t tls,
+                                         uint32_t child_stack,
                                          uint8_t *memory_base,
                                          uint32_t *out_tid);
 

@@ -1585,8 +1585,39 @@ int32_t yos_sync(struct yos_exec_ctx *ctx)
  * table here. */
 int32_t yos_sysconf(struct yos_exec_ctx *ctx, int32_t name)
 {
+    /* The guest's _SC_* numbers are FreeBSD's (sysroot sys/unistd.h)
+     * and DO NOT match the host's: e.g. _SC_NPROCESSORS_ONLN is 58 on
+     * FreeBSD but 84 on glibc — passing 58 through asked the host for
+     * an unrelated limit, and fzy sized its worker pool from the
+     * garbage (pthread_join on never-created threads). Translate the
+     * names we can express with the host's own symbolic constants;
+     * anything unmapped is reported honestly as "no limit" instead of
+     * silently querying the wrong knob. */
+    int host_name;
+    switch (name) {
+        case   1: host_name = _SC_ARG_MAX;            break;
+        case   2: host_name = _SC_CHILD_MAX;          break;
+        case   3: host_name = _SC_CLK_TCK;            break;
+        case   4: host_name = _SC_NGROUPS_MAX;        break;
+        case   5: host_name = _SC_OPEN_MAX;           break;
+        case  15: host_name = _SC_LINE_MAX;           break;
+        case  47: host_name = _SC_PAGESIZE;           break;
+        case  56: host_name = _SC_IOV_MAX;            break;
+        case  57: host_name = _SC_NPROCESSORS_CONF;   break;
+        case  58: host_name = _SC_NPROCESSORS_ONLN;   break;
+        case  70: host_name = _SC_GETGR_R_SIZE_MAX;   break;
+        case  71: host_name = _SC_GETPW_R_SIZE_MAX;   break;
+        case  72: host_name = _SC_HOST_NAME_MAX;      break;
+        case 101: host_name = _SC_TTY_NAME_MAX;       break;
+        case 120: host_name = _SC_SYMLOOP_MAX;        break;
+        case 121: host_name = _SC_PHYS_PAGES;         break;
+        default:
+            ydebug("sysconf: unmapped FreeBSD name %d -> -1 (no limit)\n",
+                   (int)name);
+            return -1;
+    }
     errno = 0;
-    long r = sysconf((int)name);
+    long r = sysconf(host_name);
     if (r < 0) {
         /* sysconf returns -1 with errno=0 to mean "unlimited / not
          * specifically configured", and -1 with errno != 0 for a

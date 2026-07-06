@@ -284,9 +284,29 @@ int32_t yos_fclose(struct yos_exec_ctx *ctx, uint32_t fp)
 uint32_t yos_fread(struct yos_exec_ctx *ctx, uint32_t buf, uint32_t size,
                    uint32_t nmemb, uint32_t fp)
 {
-    FILE *f = handle_to_file(fp);
-    if (!f || !size) return 0;
+    if (!size || !nmemb) return 0;
     if (buf + (uint64_t)size * nmemb > ctx->memory_size) return 0;
+    /* Route stream handles through the per-ctx host fd so a dup2'd
+     * stdin actually takes effect — the exact mirror of yos_fwrite
+     * below. Without this, sentinel-stdin reads went to the HOST's
+     * stdin FILE (the terminal): correct for a root process (guest
+     * fd 0 == host stdin) but wrong the moment a shell pipeline
+     * redirects the guest's fd 0 — `printf … | fzy` hung forever
+     * reading the tty while its drained pipe sat ignored. Loop toward
+     * fread's full-count contract; a short read means EOF/error. */
+    int hfd = std_handle_hfd(ctx, fp);
+    if (hfd >= 0) {
+        size_t total = (size_t)size * nmemb;
+        size_t got = 0;
+        while (got < total) {
+            ssize_t r = yos_plat_read(hfd, ctx->memory + buf + got, total - got);
+            if (r <= 0) break;
+            got += (size_t)r;
+        }
+        return (uint32_t)(got / size);
+    }
+    FILE *f = handle_to_file(fp);
+    if (!f) return 0;
     return (uint32_t)fread(ctx->memory + buf, size, nmemb, f);
 }
 
@@ -456,8 +476,26 @@ int32_t yos_putwchar(struct yos_exec_ctx *ctx, int32_t wc) { return yos_fputwc(c
 
 uint32_t yos_fgets(struct yos_exec_ctx *ctx, uint32_t buf, int32_t n, uint32_t fp)
 {
+    if (n <= 0 || buf + (uint32_t)n > ctx->memory_size) return 0;
+    /* Same dup2-honouring routing as yos_fread/yos_fwrite: a sentinel
+     * stream reads the guest's fd 0, not the host's stdin FILE. */
+    int hfd = std_handle_hfd(ctx, fp);
+    if (hfd >= 0) {
+        char *dst = (char *)(ctx->memory + buf);
+        int got = 0;
+        while (got < n - 1) {
+            unsigned char ch;
+            ssize_t r = yos_plat_read(hfd, &ch, 1);
+            if (r <= 0) break;
+            dst[got++] = (char)ch;
+            if (ch == '\n') break;
+        }
+        if (got == 0) return 0;
+        dst[got] = 0;
+        return buf;
+    }
     FILE *f = handle_to_file(fp);
-    if (!f || n <= 0 || buf + (uint32_t)n > ctx->memory_size) return 0;
+    if (!f) return 0;
     char *r = fgets((char *)(ctx->memory + buf), n, f);
     return r ? buf : 0;
 }

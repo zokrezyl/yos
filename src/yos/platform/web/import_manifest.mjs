@@ -32,7 +32,7 @@ export const PROTOTYPE_PARTIAL = new Set([
   // fd plumbing with no real backing
   "pipe", "dup", "dup2", "fcntl",
   // readiness — always reports "nothing ready"
-  "poll", "select",
+  "poll", "select", "pselect",
   // memory mapping — no real mapping, advisory no-ops
   "mmap", "munmap", "mprotect", "madvise",
   // tty / ioctl — no pty

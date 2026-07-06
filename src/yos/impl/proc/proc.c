@@ -2610,6 +2610,7 @@ int32_t yos_proc_clone(struct yos_exec_ctx *ctx,
                               fn, arg,
                               (flags & CLONE_CHILD_CLEARTID) ? ctid_addr : 0,
                               (flags & CLONE_SETTLS) ? tls : 0,
+                              child_stack,
                               ctx->memory,
                               &spawned_tid);
     if (rc != 0) {

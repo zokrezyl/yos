@@ -1052,6 +1052,11 @@ function buildLibc(state, env_vars, io, mgr, proc) {
       const statusFlags = flags & (0x3 | 0x4 | 0x8);
       const ret = (fd) => { if (fd >= 0) { const fe = proc.pio.fds.get(fd); if (fe) fe.flags = statusFlags; } return fd; };
       if (path === "/dev/null" || path === "/dev/zero") return ret(installFd(allocFd(), { kind: "char", dev: "null", refs: 1 }, cloexec));
+      // /dev/tty — the process's controlling terminal: the shared session
+      // tty, bidirectional (reads pull the key buffer, writes paint).
+      // fzy opens it for its picker UI while stdin carries the piped
+      // choices; dev:"in" is the readable-terminal char device.
+      if (path === "/dev/tty") return ret(installFd(allocFd(), { kind: "char", dev: "in", refs: 1 }, cloexec));
       if (path.startsWith("/dev/pts/") && mgr.ptys) { const id = parseInt(path.slice(9), 10); const pty = mgr.ptys.get(id); if (pty) return ret(installFd(allocFd(), { kind: "sock", rx: pty.toSlave, tx: pty.toMaster, refs: 1, isPty: true, pty, ptyMaster: false }, cloexec)); }
       let node = mgr.vfs[path];
       if (!node) { if (flags & 0x200) node = mgr.vfsCreateFile(path, createMode); else { setErrno(2); return -1; } }
@@ -1258,6 +1263,22 @@ function buildLibc(state, env_vars, io, mgr, proc) {
       return 0;
     },
     ppoll: (fdsPtr, nfds) => env.poll(fdsPtr, nfds, -1),
+    // pselect = select with a timespec + sigmask. The engine delivers
+    // signals at safe points regardless of the mask, so only the
+    // timeout needs translating (nsec → usec into a cached scratch
+    // timeval — fzy calls this per keystroke). fzy's picker waits for
+    // /dev/tty input here.
+    pselect: (nfds, rPtr, wPtr, ePtr, tsPtr, maskPtr) => {
+      let tvPtr = 0;
+      if (tsPtr) {
+        if (!proc.pselectScratch) proc.pselectScratch = state.alloc(8);
+        tvPtr = proc.pselectScratch;
+        const sec = view().getUint32(tsPtr, true), nsec = view().getUint32(tsPtr + 4, true);
+        view().setUint32(tvPtr, sec, true);
+        view().setUint32(tvPtr + 4, Math.floor(nsec / 1000), true);
+      }
+      return env.select(nfds, rPtr, wPtr, ePtr, tvPtr);
+    },
     select: (nfds, rPtr, wPtr, ePtr, tvPtr) => {
       const reqRead = [], reqWrite = [];
       const collect = (setPtr, arr) => { if (!setPtr) return; for (let fd = 0; fd < nfds; fd++) { const word = setPtr + (fd >> 5) * 4; if (view().getUint32(word, true) & (1 << (fd & 31))) arr.push(fd); } };
@@ -2689,9 +2710,13 @@ export function runInteractive(mod, argv, opts = {}) {
   const feed = (code) => {
     if (root.exited) return;
     const tty = mgr.tty;
-    if (code === 13) code = 10; // ICRNL: terminals send CR for Enter
     const echo = !!(tty.lflag & ECHO);
     const canon = !!(tty.lflag & ICANON);
+    // ICRNL belongs to the COOKED input discipline: terminals send CR
+    // for Enter and canonical mode maps it to NL. A raw-mode app gets
+    // the real 0x0d — fzy binds its accept key to '\r' and a blanket
+    // translation made Enter a no-op in its picker.
+    if (code === 13 && canon) code = 10;
     if (!canon) { // raw: the guest's editor echoes + edits
       tty.inbuf.push(code);
       if (echo) onOut(1, code === 10 ? "\r\n" : String.fromCharCode(code));

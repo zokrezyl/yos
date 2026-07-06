@@ -44,7 +44,7 @@ NINJA    := $(NIX_DEV) ninja -C $(BUILD)
         browser-host-phase1b test-browser-host-phase1b \
         browser-host-runner test-browser-host-parity browser-host-perf \
         test-browser-ls test-browser-callbacks browser-liblua test-browser-nvim \
-        test-browser-top test-browser-fullscreen test-browser-nested \
+        test-browser-top test-browser-fullscreen test-browser-nested test-browser-fzy \
         nvim-build nvim-deps \
         format check
 
@@ -277,6 +277,11 @@ test-browser-fullscreen:
 # (forkpty) → live shell → command → unwind to the outer prompt. 8 processes.
 test-browser-nested:
 	@node $(WEB)/nested_chain_test.mjs
+
+# fzy fuzzy finder from the browser zsh: batch -e filter through a pipe,
+# then the interactive picker (/dev/tty UI + pselect + raw-mode Enter).
+test-browser-fzy:
+	@node $(WEB)/fzy_from_zsh_test.mjs
 
 test-browser:
 	@node $(WEB)/browser-test-runner.mjs
