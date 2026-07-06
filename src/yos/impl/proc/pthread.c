@@ -99,6 +99,18 @@ struct host_thread
      * to know join was even called. */
     uint32_t         ctid_addr;
     uint8_t *        memory_base;
+    /* Guest stack TOP for this thread (the child_stack the guest's
+     * pthread_create/clone shim allocated). worker_main points the
+     * sibling runtime's __stack_pointer here BEFORE dispatching the
+     * entry — without it every thread inherits the module's INITIAL
+     * stack pointer and runs on the MAIN thread's stack, silently
+     * corrupting it (fzy's 32 KB match() frames turned that into
+     * option-flag flips and OOB traps). 0 = legacy L1 spawn, keep the
+     * (broken-by-design) old behaviour rather than guess an address. */
+    uint32_t         child_stack;
+    /* Guest offset of a HOST-provisioned stack region (L1 import path);
+     * freed at join. 0 when the guest supplied its own stack. */
+    uint32_t         owned_stack_base;
 
     // POSIX TLS values, indexed by pthread_key_t. NULL = unset.
     void *           tls [WASM3MT_MAX_TLS_KEYS];
@@ -304,6 +316,27 @@ worker_main (void * arg)
     }
     IM3Function entry = mod->table0[ht->fn_idx];
 
+    /* Point this thread's guest stack at the child_stack the guest's
+     * clone shim allocated. __stack_pointer is not exported (lld only
+     * exports mutable globals behind a feature flag), but lld always
+     * emits it as the FIRST mutable i32 global — the same internals
+     * access as table0 above. Skipping this ran the thread on the
+     * module's initial stack == the MAIN thread's stack. */
+    if (ht->child_stack) {
+        bool sp_set = false;
+        for (u32 gi = 0; gi < mod->numGlobals; ++gi) {
+            if (mod->globals[gi].isMutable
+                && mod->globals[gi].type == c_m3Type_i32) {
+                mod->globals[gi].intValue = (i64) ht->child_stack;
+                sp_set = true;
+                break;
+            }
+        }
+        if (!sp_set)
+            fprintf (stderr, "wasm3mt: thread %u: no mutable i32 global — "
+                     "cannot relocate guest stack\n", ht->tid);
+    }
+
     /* Call fn(arg) — single i32 arg as the wasm signature requires. */
     int32_t a0 = (int32_t) ht->arg;
     const void * argp [1] = { &a0 };
@@ -379,6 +412,7 @@ yos_clone_thread (yos_pthread_host *h,
                   uint32_t arg,
                   uint32_t ctid_addr,
                   uint32_t tls,
+                  uint32_t child_stack,
                   uint8_t *memory_base,
                   uint32_t *out_tid)
 {
@@ -392,6 +426,7 @@ yos_clone_thread (yos_pthread_host *h,
     ht->arg         = arg;
     ht->ctid_addr   = ctid_addr;
     ht->memory_base = memory_base;
+    ht->child_stack = child_stack;
 
     int tid = host_alloc_tid (h, ht);
     if (tid < 0) { free (ht); return -EAGAIN; }
@@ -442,11 +477,49 @@ static m3ApiRawFunction (host_pthread_create)
 
     yos_pthread_host * h = (yos_pthread_host *) _ctx->userdata;
 
+    /* The L1 import has no guest-allocated stack (the sysroot wrapper
+     * never makes one), so provision it HOST-side from the guest
+     * allocator — the host owns that allocator (impl/mem/alloc.c), so
+     * a plain yos_malloc hands back a guest region no other allocation
+     * will overlap. Without this the new thread inherited the module's
+     * INITIAL __stack_pointer and ran on the MAIN thread's stack: fzy's
+     * ~32 KB match() frames flipped option flags and walked off into
+     * OOB traps. 256 KB matches the comfortable end of what the
+     * interpreted guests need; the region is freed on join via
+     * ht->owned_stack_base. */
+    enum { YOS_L1_THREAD_STACK = 256 * 1024 };
+    uint32_t stack_base = 0, stack_top = 0;
+    {
+        extern uint32_t yos_malloc(struct yos_exec_ctx *, uint32_t);
+        struct yos_exec_ctx *ctx =
+            (struct yos_exec_ctx *) m3_GetUserData (runtime);
+        if (ctx) {
+            stack_base = yos_malloc (ctx, YOS_L1_THREAD_STACK);
+            if (stack_base) {
+                /* Top, 16-byte aligned downward (wasm32 C ABI). */
+                stack_top = (stack_base + YOS_L1_THREAD_STACK) & ~15u;
+            }
+        }
+    }
+
     uint32_t tid = 0;
     int rc = yos_clone_thread (h, fn_idx, arg,
                                /*ctid_addr=*/0, /*tls=*/0,
+                               /*child_stack=*/stack_top,
                                /*memory_base=*/NULL, &tid);
-    if (rc != 0) m3ApiReturn (-1);
+    if (rc != 0) {
+        if (stack_base) {
+            extern void yos_free(struct yos_exec_ctx *, uint32_t);
+            struct yos_exec_ctx *ctx =
+                (struct yos_exec_ctx *) m3_GetUserData (runtime);
+            if (ctx) yos_free (ctx, stack_base);
+        }
+        m3ApiReturn (-1);
+    }
+    if (stack_base) {
+        struct host_thread * ht = host_lookup_thread (h, tid);
+        if (ht) ht->owned_stack_base = stack_base;
+    }
 
     if (t_ptr) *t_ptr = tid;
     m3ApiReturn (0);
@@ -472,6 +545,14 @@ static m3ApiRawFunction (host_pthread_join)
                  (const char *) ht->trap);
 
     if (retval_ptr) *retval_ptr = (uint32_t) ht->retval;
+
+    /* Release a host-provisioned L1 stack region (see host_pthread_create). */
+    if (ht->owned_stack_base) {
+        extern void yos_free(struct yos_exec_ctx *, uint32_t);
+        struct yos_exec_ctx *jctx =
+            (struct yos_exec_ctx *) m3_GetUserData (runtime);
+        if (jctx) yos_free (jctx, ht->owned_stack_base);
+    }
 
     host_free_thread_slot (h, tid);
     free (ht);

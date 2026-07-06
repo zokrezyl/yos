@@ -5,6 +5,7 @@
 
 int32_t yos_exit(struct yos_exec_ctx *ctx, int32_t code);
 int32_t yos_fork(struct yos_exec_ctx *ctx);
+int yos_fork_rewinding(struct yos_exec_ctx *ctx);
 int32_t yos_waitpid(struct yos_exec_ctx *ctx, int32_t pid, uint32_t stat_addr, int32_t options);
 int32_t yos_execve(struct yos_exec_ctx *ctx, uint32_t filename, uint32_t argv, uint32_t envp);
 int32_t yos_kill(struct yos_exec_ctx *ctx, int32_t pid, int32_t sig);

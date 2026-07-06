@@ -106,12 +106,57 @@ export function patchWasmTableExport(input) {
 	return bytes; // no export section (unusual) — leave unchanged
 }
 
+// The tools link their function table with max == initial (lld default), so
+// the JS host cannot table.grow() it. That blocks the shared-library pattern
+// (lua_bridge.mjs): a companion wasm like liblua parks its element segment at
+// a high --table-base and the host must grow the guest's table to cover it
+// before instantiating. Lift table 0's max to this. Costs nothing until grown.
+const TABLE_MAX_LIFTED = 1 << 20;
+
+export function patchWasmTableMax(input) {
+	const bytes = input instanceof Uint8Array ? input : new Uint8Array(input);
+	if (bytes.length < 8 || bytes[0] !== 0x00 || bytes[1] !== 0x61 || bytes[2] !== 0x73 || bytes[3] !== 0x6d)
+		return bytes;
+	let off = 8;
+	while (off < bytes.length) {
+		const id = bytes[off];
+		const [size, after] = decodeLEB(bytes, off + 1);
+		const contentEnd = after + size;
+		if (id === 4) { // table section: count, then per table reftype + limits
+			let [count, p] = decodeLEB(bytes, after);
+			if (count === 0) return bytes;
+			const reftype = bytes[p++];
+			const flags = bytes[p++];
+			const [min, afterMin] = decodeLEB(bytes, p); p = afterMin;
+			let max = min;
+			if (flags & 0x01) { const [m, r] = decodeLEB(bytes, p); max = m; p = r; }
+			if (max >= TABLE_MAX_LIFTED) return bytes; // already roomy
+			const rest = bytes.slice(p, contentEnd); // any further tables, unchanged
+			const entry = [reftype, 0x01, ...encodeLEB(min), ...encodeLEB(TABLE_MAX_LIFTED)];
+			const newContent = new Uint8Array([...encodeLEB(count), ...entry, ...rest]);
+			const newSize = encodeLEB(newContent.length);
+			const head = bytes.slice(0, off);
+			const tail = bytes.slice(contentEnd);
+			const out = new Uint8Array(head.length + 1 + newSize.length + newContent.length + tail.length);
+			let w = 0;
+			out.set(head, w); w += head.length;
+			out[w++] = 4;
+			out.set(newSize, w); w += newSize.length;
+			out.set(newContent, w); w += newContent.length;
+			out.set(tail, w);
+			return out;
+		}
+		off = contentEnd;
+	}
+	return bytes; // no table section (table imported or absent) — leave unchanged
+}
+
 // Drop-in for `WebAssembly.compile(bytes)` that patches first, with a fallback
 // to the unpatched bytes if the patched module fails to compile.
 export async function compileGuest(input) {
 	const bytes = input instanceof Uint8Array ? input : new Uint8Array(input);
 	try {
-		return await WebAssembly.compile(patchWasmTableExport(bytes));
+		return await WebAssembly.compile(patchWasmTableMax(patchWasmTableExport(bytes)));
 	} catch {
 		return WebAssembly.compile(bytes);
 	}

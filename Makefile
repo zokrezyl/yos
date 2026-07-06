@@ -43,7 +43,8 @@ NINJA    := $(NIX_DEV) ninja -C $(BUILD)
         browser-host-phase1a test-browser-host-phase1a \
         browser-host-phase1b test-browser-host-phase1b \
         browser-host-runner test-browser-host-parity browser-host-perf \
-        test-browser-ls test-browser-callbacks \
+        test-browser-ls test-browser-callbacks browser-liblua test-browser-nvim \
+        test-browser-top test-browser-fullscreen test-browser-nested test-browser-fzy \
         nvim-build nvim-deps \
         format check
 
@@ -248,6 +249,39 @@ test-browser-ls:
 # guards the wasm table-export patch (wasm_patch.mjs).
 test-browser-callbacks:
 	@node $(WEB)/callback_test.mjs
+
+# Lua library for nvim (epic #33): build liblua.wasm from source (C++ + wasm
+# exceptions, yos sysroot) so the browser gives nvim the same Lua as desktop.
+browser-liblua:
+	@$(NIX_DEV) bash $(WEB)/lua/build-liblua.sh
+
+# nvim in the browser (Lua via shared-memory liblua.wasm). Needs `make all`.
+# Batch (--version) + full interactive editor (TUI client + embedded server,
+# runtime files mounted from result/share, insert round-trip, :q! teardown).
+test-browser-nvim: browser-liblua
+	@node $(WEB)/lua/nvim_test.mjs
+	@node $(WEB)/lua/nvim_interactive_test.mjs
+
+# Interactive top in the browser — guards the asyncify instrumentation of the
+# freebsd-tools binaries (a tool that blocks in select() must suspend, not trap).
+test-browser-top:
+	@node $(WEB)/top_test.mjs
+
+# Full-screen tools launched FROM the browser zsh (fork+exec+tty handover):
+# top and nvim, ending back at a working prompt. Guards empty-path ENOENT
+# (netrw hijack) and the liblua heap-window reservation.
+test-browser-fullscreen:
+	@node $(WEB)/fullscreen_from_zsh_test.mjs
+
+# The deepest interactive chain: zsh → tmux → nvim in the pane → :terminal
+# (forkpty) → live shell → command → unwind to the outer prompt. 8 processes.
+test-browser-nested:
+	@node $(WEB)/nested_chain_test.mjs
+
+# fzy fuzzy finder from the browser zsh: batch -e filter through a pipe,
+# then the interactive picker (/dev/tty UI + pselect + raw-mode Enter).
+test-browser-fzy:
+	@node $(WEB)/fzy_from_zsh_test.mjs
 
 test-browser:
 	@node $(WEB)/browser-test-runner.mjs

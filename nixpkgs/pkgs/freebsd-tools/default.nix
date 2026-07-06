@@ -506,6 +506,16 @@ stdenv.mkDerivation {
         "''${objs[@]}" \
         -lc -lyos_stubs
 
+      # Asyncify, like every other universal binary (zsh, tmux, nvim, the
+      # openssh tools). The cooperative engines suspend a guest by unwinding
+      # its stack — native yos for fork(), the browser engine additionally
+      # for ANY blocking syscall. Without the instrumentation an interactive
+      # tool traps the moment it blocks: browser `top` died on its first
+      # select() with "asyncify_start_unwind is not a function", and
+      # fork-using tools (find -exec, xargs) can't fork under native yos.
+      wasm-opt --asyncify -O2 "out/libexec/$pname" -o "out/libexec/$pname.async"
+      mv "out/libexec/$pname.async" "out/libexec/$pname"
+
       # Runner — `exec yos <libexec-path> "$@"`. yos store path is
       # baked in when the .#yos derivation is wired (yos != null);
       # otherwise we fall back to looking up `yos` on PATH.
@@ -970,6 +980,17 @@ stdenv.mkDerivation {
         swap_stats[nitems(swapnames) - 1] = -1;
         si->swap = swap_stats;
     
+        /* last_pid must be valid from the VERY FIRST sample. The display
+         * layer paints the "last pid: N;" header label only on the initial
+         * screen (i_loadave); later refreshes write just the number at its
+         * fixed column. When the first sample reported -1 ("unavailable")
+         * and a later one reported a pid — this was seeded only by the proc
+         * scan in get_process_info — the number landed on top of the
+         * "load averages" text and the header rendered mangled. Seed with
+         * our own pid: top is the most recently spawned process, so its pid
+         * IS the last allocated one until a scan learns better. */
+        if (lastpid < 0)
+            lastpid = getpid();
         si->last_pid = lastpid;
         si->boottime.tv_sec = -1;
         si->battery = 0;

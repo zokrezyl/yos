@@ -40,6 +40,12 @@ nvim_int_tests = {
   # Pins the user-reported "no text input" symptom. Drives nvim with
   # 'iHELLO<Esc>:q!<CR>' and verifies HELLO appears in the pty output.
   'input'        : {'src' : files('test_input.py'),        'xfail' : false},
+  # :terminal round trip — forkpty, $SHELL host-path basename exec
+  # resolution, iconv, embedded-shell I/O, SIGCHLD reap, clean :q!.
+  # Generous timeout: the embedded shell is a SECOND interpreted guest
+  # and its cold boot has been observed north of 2 minutes under load.
+  'terminal'     : {'src' : files('test_terminal.py'),     'xfail' : false,
+                    'timeout' : 480},
 }
 
 # The harness uses Python's `pty` module (Unix-only). Windows would
@@ -65,5 +71,8 @@ foreach name, cfg : nvim_int_tests
        depends : [yos_exe],
        should_fail : cfg['xfail'],
        is_parallel : false,
-       timeout : 30)
+       # :terminal boots a SECOND interpreted guest (the embedded zsh)
+       # inside nvim, so its timed driver needs ~1 min of wall clock;
+       # the darwin timing multiplier can triple that.
+       timeout : cfg.get('timeout', 30))
 endforeach

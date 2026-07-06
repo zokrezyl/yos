@@ -15,7 +15,7 @@
 // Detection: a memory IMPORT is the signal (every shared-memory build in this
 // tree links `--import-memory --shared-memory`; the `.type.shared` flag isn't
 // exposed by WebAssembly.Module.imports, but the import's presence is enough).
-import { runProgram } from "./yos_proc.mjs";
+import { runProgram, loadLiblua } from "./yos_proc.mjs";
 import { runMtProgram } from "./mt_engine.mjs";
 
 const isNode = typeof process !== "undefined" && !!(process.versions && process.versions.node);
@@ -31,6 +31,7 @@ export function wasmWantsRealThreads(module) {
 //   opts: { onOutput(fd,text), onUnimpl(name), tools, env, spawnPoolWorker }
 export async function runYos(module, argv = ["prog"], opts = {}) {
   if (!wasmWantsRealThreads(module)) {
+    await loadLiblua().catch(() => {}); // Lua C API for nvim (shared-memory liblua.wasm)
     return runProgram(module, argv, opts.onOutput, opts.onUnimpl, opts);
   }
   let spawnPoolWorker = opts.spawnPoolWorker;

@@ -164,6 +164,133 @@ static m3ApiRawFunction(m3_login_tty)
     m3ApiSuccess();
 }
 
+/* ── env.forkpty(int *amaster, char *name, termios *termp, winsize *winp)
+ *
+ * openpty + fork + login_tty composed over the asyncify fork, exactly
+ * like the browser engine's bridge (yos_proc.mjs). nvim's :terminal is
+ * the consumer: it forkpty()s and execs $SHELL in the child.
+ *
+ * First entry (asyncify NORMAL): open a REAL host pty pair, apply the
+ * caller's winsize, publish both ends in the guest fd table, write
+ * *amaster, stash the guest fd numbers on the ctx, then unwind through
+ * yos_fork. BOTH sides re-execute this bridge while REWINDING (the
+ * wasm replays down to the call); yos_fork returns which side we are:
+ * the child runs the login_tty recipe on the slave (dup onto fds
+ * 0/1/2, drop the high slots AND the master), the parent drops the
+ * slave and keeps only the master. The stash reaches the child ctx via
+ * the fork pump (types.h forkpty_* fields); the host fds themselves
+ * travel through the ordinary parent_fd_map dup path.
+ *
+ * termp is intentionally ignored: the host kernel hands a fresh pty
+ * sane cooked defaults, which is what nvim's :terminal asks for. */
+static m3ApiRawFunction(m3_forkpty)
+{
+    m3ApiReturnType (int32_t);
+    m3ApiGetArg     (uint32_t, amaster_w);
+    m3ApiGetArg     (uint32_t, name_w);
+    m3ApiGetArg     (uint32_t, termp_w);
+    m3ApiGetArg     (uint32_t, winp_w);
+    (void)name_w; (void)termp_w;
+    /* Guest NULL must stay NULL — a raw m3ApiGetArgMem would alias the
+     * linear-memory base for offset 0. */
+    int32_t  *amaster = amaster_w ? (int32_t *)m3ApiOffsetToPtr(amaster_w) : NULL;
+    uint16_t *winp    = winp_w    ? (uint16_t *)m3ApiOffsetToPtr(winp_w)   : NULL;
+
+    struct yos_exec_ctx *ctx =
+        (struct yos_exec_ctx *)m3_GetUserData(runtime);
+#if defined(_WIN32)
+    (void)amaster; (void)winp; (void)ctx;
+    m3ApiReturn(-ENOSYS);
+#else
+    extern int32_t yos_fork(struct yos_exec_ctx *);
+    extern int yos_fork_rewinding(struct yos_exec_ctx *);
+    extern int yos_fd_alloc(struct yos_exec_ctx *, int);
+
+    const int rewinding = yos_fork_rewinding(ctx);
+    if (!rewinding) {
+        int master_hfd = -1, slave_hfd = -1;
+        struct winsize wsz = { 0 };
+        struct winsize *wszp = NULL;
+        if (winp) {
+            wsz.ws_row = winp[0];
+            wsz.ws_col = winp[1];
+            wszp = &wsz;
+        }
+        if (openpty(&master_hfd, &slave_hfd, NULL, NULL, wszp) < 0) {
+            ydebug("forkpty: openpty failed errno=%d\n", errno);
+            m3ApiReturn(yos_errno_neg(ctx, errno));
+        }
+        ctx->forkpty_master_wfd = yos_fd_alloc(ctx, master_hfd);
+        ctx->forkpty_slave_wfd  = yos_fd_alloc(ctx, slave_hfd);
+        if (ctx->forkpty_master_wfd < 0 || ctx->forkpty_slave_wfd < 0) {
+            close(master_hfd);
+            close(slave_hfd);
+            m3ApiReturn(yos_errno_neg(ctx, EMFILE));
+        }
+        if (amaster)
+            *amaster = ctx->forkpty_master_wfd;
+        ctx->forkpty_pending = 1;
+        ydebug("forkpty: pty master wfd=%d slave wfd=%d, unwinding\n",
+               ctx->forkpty_master_wfd, ctx->forkpty_slave_wfd);
+    }
+
+    int32_t side = yos_fork(ctx);
+    if (!rewinding) {
+        /* Unwinding (value ignored) — or the fork itself failed. */
+        if (side < 0) {
+            int mh = yos_fd_get(ctx, ctx->forkpty_master_wfd);
+            int sh = yos_fd_get(ctx, ctx->forkpty_slave_wfd);
+            if (mh >= 0) close(mh);
+            if (sh >= 0) close(sh);
+            ctx->fd_map[ctx->forkpty_master_wfd] = -1;
+            ctx->fd_map[ctx->forkpty_slave_wfd]  = -1;
+            ctx->forkpty_pending = 0;
+        }
+        m3ApiReturn(side);
+    }
+
+    if (ctx->forkpty_pending) {
+        ctx->forkpty_pending = 0;
+        const int32_t master_wfd = ctx->forkpty_master_wfd;
+        const int32_t slave_wfd  = ctx->forkpty_slave_wfd;
+        if (side == 0) {
+            /* child: slave becomes stdio (login_tty recipe), master and
+             * the high slave slot are dropped. */
+            int slave_hfd = yos_fd_get(ctx, slave_wfd);
+            for (int slot = 0; slot < 3 && slave_hfd >= 0; slot++) {
+                int dup_fd = dup(slave_hfd);
+                if (dup_fd < 0) break;
+                if (ctx->fd_map[slot] >= 0)
+                    close(ctx->fd_map[slot]);
+                ctx->fd_map[slot] = dup_fd;
+            }
+            if (slave_hfd >= 0) {
+                close(slave_hfd);
+                ctx->fd_map[slave_wfd] = -1;
+            }
+            int master_hfd = yos_fd_get(ctx, master_wfd);
+            if (master_hfd >= 0) {
+                close(master_hfd);
+                ctx->fd_map[master_wfd] = -1;
+            }
+            ctx->is_forkpty_child = 1;
+            ydebug("forkpty child: slave on fds 0/1/2\n");
+        } else if (side > 0) {
+            /* parent: keep only the master. */
+            int slave_hfd = yos_fd_get(ctx, slave_wfd);
+            if (slave_hfd >= 0) {
+                close(slave_hfd);
+                ctx->fd_map[slave_wfd] = -1;
+            }
+            ydebug("forkpty parent: child pid=%d, master wfd=%d\n",
+                   side, master_wfd);
+        }
+    }
+    m3ApiReturn(side);
+#endif
+    m3ApiSuccess();
+}
+
 /* ── env.realhostname_sa(char *host, size_t hsize,
  *                        const struct sockaddr *sa, int salen)
  *
@@ -209,6 +336,9 @@ void yos_syslog_extras_link_imports(IM3Module mod)
     r = m3_LinkRawFunction(mod, "env", "login_tty", "i(i)",   m3_login_tty);
     if (r && r != m3Err_functionLookupFailed)
         fprintf(stderr, "yos: link login_tty: %s\n", r);
+    r = m3_LinkRawFunction(mod, "env", "forkpty",  "i(iiii)", m3_forkpty);
+    if (r && r != m3Err_functionLookupFailed)
+        fprintf(stderr, "yos: link forkpty: %s\n", r);
     r = m3_LinkRawFunction(mod, "env", "realhostname_sa", "i(iiii)",
                            m3_realhostname_sa);
     if (r && r != m3Err_functionLookupFailed)

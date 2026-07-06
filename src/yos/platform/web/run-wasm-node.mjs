@@ -41,6 +41,16 @@ if (process.env.YOS_TOOLS === "1") {
   } catch {}
 }
 
+// Optional /usr/share mount (nvim runtime, zsh functions): point YOS_SHARE_DIR
+// at a share tree (e.g. result/share) to expose it to the guest. Lazy file
+// loads, so the directory walk is the only up-front cost — still opt-in to
+// keep the per-test overhead of the unit-test suite at zero.
+const mounts = [];
+if (process.env.YOS_SHARE_DIR) {
+  const { entriesFromDir } = await import("./fs_mount.mjs");
+  mounts.push({ at: "/usr/share", entries: await entriesFromDir(process.env.YOS_SHARE_DIR) });
+}
+
 // Buffer per fd; flush at the end (keeps stdout/stderr ordering stable for the
 // substring checks run_libc_test.py performs on captured stdout).
 let outBuf = "", errBuf = "";
@@ -51,7 +61,7 @@ const onUnimpl = (name) => unimpl.add(name);
 // Route by memory model: shared-memory wasm → real threads (mt_engine), else
 // the cooperative single-process engine. Unit-test wasm exports its own memory,
 // so it lands on the cooperative engine exactly as before.
-const r = await runYos(mod, [basename(wasmPath)], { onOutput, onUnimpl, tools });
+const r = await runYos(mod, [basename(wasmPath)], { onOutput, onUnimpl, tools, mounts });
 
 if (outBuf) process.stdout.write(outBuf);
 if (errBuf) process.stderr.write(errBuf);

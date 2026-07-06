@@ -54,6 +54,16 @@ static int get_asyncify_state(IM3Runtime rt)
     return state;
 }
 
+/* Is this ctx currently REWINDING out of an asyncify fork? A composite
+ * fork bridge (forkpty) needs to know whether it is on its first entry
+ * (set up the pty, then unwind through yos_fork) or replaying on the
+ * rewind (finish the parent/child half). */
+int yos_fork_rewinding(struct yos_exec_ctx *ctx)
+{
+    IM3Runtime wrt = ctx ? (IM3Runtime)ctx->runtime : NULL;
+    return wrt && get_asyncify_state(wrt) == ASYNCIFY_REWINDING;
+}
+
 /* ============================================================================
  * Process Table Operations
  * ============================================================================ */
@@ -226,6 +236,20 @@ void yos_proc_post_exit_cleanup(struct yos_exec_ctx *ctx)
         ydebug("post_exit_cleanup: SIGHUP -> orphan pid=%d (rc=%d)\n",
                hup_pids[i], rc);
     }
+
+    /* A forkpty child's exit is announced to the parent via SIGCHLD: a
+     * pty child is a hand-rolled fork, so no EVFILT_PROC filter watches
+     * it — the parent's sigaction (nvim's libuv SIGCHLD watcher) is how
+     * it learns the exit and waitpid()s ("[Process exited N]", jobwait,
+     * on_exit callbacks). Default SIGCHLD disposition is ignore, so a
+     * parent without a handler is unaffected. Scoped to forkpty
+     * children so ordinary fork/wait flows (zsh, tmux) keep their
+     * existing wait/sigsuspend-driven delivery. */
+    if (ctx->is_forkpty_child) {
+        int rc = yos_proc_kill_by_pid(ctx->rt, parent_pid, FBSD_SIGCHLD);
+        ydebug("post_exit_cleanup: SIGCHLD -> forkpty parent pid=%d (rc=%d)\n",
+               parent_pid, rc);
+    }
 }
 
 int32_t yos_exit(struct yos_exec_ctx *ctx, int32_t code)
@@ -246,6 +270,11 @@ int32_t yos_exit(struct yos_exec_ctx *ctx, int32_t code)
         yos_libarchive_ctx_free(ctx);
     }
 #endif
+    {
+        /* Host iconv_t handles the guest leaked (impl/libc/iconv.c). */
+        extern void yos_iconv_ctx_free(struct yos_exec_ctx *);
+        yos_iconv_ctx_free(ctx);
+    }
 
     /* Asyncify-fork-child silence workaround.
      *
@@ -593,6 +622,11 @@ typedef struct {
      * across every yos guest (they're host pthreads of one process),
      * so child's umask() would leak back into parent without this. */
     unsigned short parent_umask;
+    /* forkpty stash (see types.h): the child's rewound forkpty bridge
+     * wires the slave onto its stdio using these guest fd numbers. */
+    int forkpty_pending;
+    int32_t forkpty_master_wfd;
+    int32_t forkpty_slave_wfd;
 } fork_thread_arg_t;
 
 /* Release every dup the parent thread stashed in fork_thread_arg.
@@ -706,6 +740,9 @@ static void *fork_thread_func(void *arg)
     /* TODO(setjmp-refactor): copy parent's sj_slots[] into child. */
     child_ctx->fork_return = 0;  /* child gets 0 from fork */
     child_ctx->is_child = 1;
+    child_ctx->forkpty_pending    = fork_thread_arg->forkpty_pending;
+    child_ctx->forkpty_master_wfd = fork_thread_arg->forkpty_master_wfd;
+    child_ctx->forkpty_slave_wfd  = fork_thread_arg->forkpty_slave_wfd;
     /* errno_off MUST match the parent's (set in main.c::load_wasm_module).
      * Without this child_ctx->errno_off stays at calloc'd 0, env.__error
      * returns 0, and the wasm guest reads/writes errno through
@@ -970,9 +1007,14 @@ static void *fork_thread_func(void *arg)
             extern void yos_env_post_execve_reset(struct yos_exec_ctx *);
             extern void yos_pwd_post_execve_reset(struct yos_exec_ctx *);
             extern void yos_freebsd_userland_post_execve_reset(struct yos_exec_ctx *);
+            extern void yos_iconv_ctx_free(struct yos_exec_ctx *);
             yos_env_post_execve_reset(child_ctx);
             yos_pwd_post_execve_reset(child_ctx);
             yos_freebsd_userland_post_execve_reset(child_ctx);
+            /* exec replaces the image: any iconv handles the old image
+             * opened are meaningless to the new one — release the host
+             * iconv_t objects behind them. */
+            yos_iconv_ctx_free(child_ctx);
         }
 
         child_ctx->argc = child_ctx->exec_argc;
@@ -1561,6 +1603,9 @@ void yos_fork_pump(struct yos_exec_ctx *ctx)
         memcpy(&fork_thread_arg->parent_env_store, &ctx->env_store,
                sizeof(fork_thread_arg->parent_env_store));
         fork_thread_arg->parent_umask = ctx->umask;
+        fork_thread_arg->forkpty_pending    = ctx->forkpty_pending;
+        fork_thread_arg->forkpty_master_wfd = ctx->forkpty_master_wfd;
+        fork_thread_arg->forkpty_slave_wfd  = ctx->forkpty_slave_wfd;
 
         /* Spawn child thread detached so the parent resumes concurrently.
          * Child lifetime is tracked via yos_proc state (RUNNING/ZOMBIE);
@@ -1906,8 +1951,29 @@ int32_t yos_execve(struct yos_exec_ctx *ctx, uint32_t filename, uint32_t argv_pt
         is_script = 1;
         extra_args = shebang_arg[0] ? 2 : 1;  /* interp [arg] script */
     } else {
-        ydebug("execve: %s: unknown format\n", fn);
-        return host_execve_fallback(fn, ctx, argv_ptr);
+        /* Not wasm, no shebang — typically a HOST binary path leaked in
+         * from the inherited environment: nvim's :terminal execs
+         * $SHELL=/bin/zsh, which passed the os_can_exe() pre-check
+         * against the REAL host fs, and then lands here as an ELF. The
+         * browser engine resolves exec targets by BASENAME in its tool
+         * map; mirror that — walk the guest $PATH for the basename and
+         * exec the wasm sibling (…/libexec/zsh) when there is one.
+         * argv[0] is left untouched, so a shell exec'd as "/bin/sh"
+         * still sees basename sh and enters sh-emulation. Only when the
+         * basename resolves to nothing wasm do we fall through to the
+         * host-exec fallback (ENOEXEC unless YOS_ALLOW_HOST_EXEC). */
+        const char *slash = strrchr(fn, '/');
+        char resolved_alias[PATH_MAX];
+        if (slash && slash[1] &&
+            execvp_path_search(ctx, slash + 1, resolved_alias) &&
+            check_wasm_magic(resolved_alias)) {
+            ydebug("execve: host-format %s → PATH-resolved wasm %s\n",
+                   fn, resolved_alias);
+            strcpy(exec_path, resolved_alias);
+        } else {
+            ydebug("execve: %s: unknown format\n", fn);
+            return host_execve_fallback(fn, ctx, argv_ptr);
+        }
     }
 
     /* Count original argv entries.
@@ -2223,10 +2289,17 @@ static int deliver_to_proc(struct yos_proc *p, int sig)
         case 18: /* SIGTSTP   */
         case 19: /* SIGCONT (FreeBSD) — Linux's SIGSTOP is 19, ambiguous;
                   *           filtering both numbers is safest. */
-        case 20: /* SIGCHLD on FreeBSD — handled separately */
         case 21: /* SIGTTIN  */
         case 22: /* SIGTTOU  */
             return 0;
+        /* SIGCHLD (FreeBSD 20) is NOT filtered: delivery goes through
+         * the per-ctx sig_pending channel below (never a raw host
+         * pthread_kill of 20, which on Linux would be SIGTSTP), the
+         * pump ignores it when no handler is installed (not in
+         * default_action_is_terminate), and a registered handler is
+         * exactly what the sender wants to run — nvim's libuv SIGCHLD
+         * watcher reaps its forkpty :terminal child through it. The
+         * sigsuspend-synthesised SIGCHLD path is unaffected. */
     }
     /* SIGKILL: route through the same per-ctx pending-signal channel
      * as every other signal. yos_signal_pump in the target's host
@@ -2537,6 +2610,7 @@ int32_t yos_proc_clone(struct yos_exec_ctx *ctx,
                               fn, arg,
                               (flags & CLONE_CHILD_CLEARTID) ? ctid_addr : 0,
                               (flags & CLONE_SETTLS) ? tls : 0,
+                              child_stack,
                               ctx->memory,
                               &spawned_tid);
     if (rc != 0) {
@@ -2818,6 +2892,9 @@ void yos_vfork_pump(struct yos_exec_ctx *ctx)
         memcpy(&fork_thread_arg->parent_env_store, &ctx->env_store,
                sizeof(fork_thread_arg->parent_env_store));
         fork_thread_arg->parent_umask = ctx->umask;
+        fork_thread_arg->forkpty_pending    = ctx->forkpty_pending;
+        fork_thread_arg->forkpty_master_wfd = ctx->forkpty_master_wfd;
+        fork_thread_arg->forkpty_slave_wfd  = ctx->forkpty_slave_wfd;
 
         /* Spawn child thread */
         child_proc->state = YOS_PROC_RUNNING;

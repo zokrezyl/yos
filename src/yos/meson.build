@@ -262,6 +262,7 @@ yos_runtime_sources = files(
   'impl/libc/i128.c',
   'impl/libc/freebsd_userland.c',
   'impl/libc/fmtcheck_freebsd.c',
+  'impl/libc/iconv.c',
   'impl/libc/kqueue.c',
   'impl/libc/mbwc.c',
   'impl/libc/pwd.c',

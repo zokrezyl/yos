@@ -56,6 +56,14 @@
 const char *yos_path_resolve(struct yos_exec_ctx *ctx, const char *p)
 {
     if (!p) return NULL;
+    /* POSIX: the EMPTY path is ENOENT, never the cwd. Joining "" onto
+     * ctx->cwd produced "<cwd>/", so stat("")/access("") reported the
+     * current directory — netrw's `isdirectory(expand("<amatch>"))` on
+     * nvim's unnamed startup buffer then browsed the cwd instead of
+     * leaving the buffer alone (same bug fixed in the browser engine's
+     * stat/open/access). Pass "" through untouched: every host syscall
+     * already returns ENOENT for it. */
+    if (p[0] == 0) return p;
     /* Treat as already-absolute. POSIX hosts accept only "/foo";
      * Windows additionally accepts drive-letter and UNC forms. On
      * POSIX the relaxed pattern would match legitimate relative

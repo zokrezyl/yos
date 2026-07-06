@@ -182,6 +182,14 @@ let
   # telnet client into a wasm program (e.g. zsh) under runit.
   telnetd = pkgs.callPackage ./pkgs/telnetd { inherit toolchain sysroot; };
 
+  # fzy — the fuzzy finder: C port on the native yos ABI, fully
+  # interactive on both runtimes. (fzf was evaluated and dropped: it is
+  # Go, whose only wasm target is wasip1 — an ABI with no process
+  # model, no termios, and nothing in yos that executes it. Not worth
+  # a second import dialect for a gutted picker; revisit only if
+  # genuinely-needed wasip1-only tools pile up.)
+  fzy = pkgs.callPackage ./pkgs/fzy { inherit toolchain sysroot freebsd-src; };
+
   # Minimal TCP super-server. Each accept forks a wasm child + execve's
   # the configured program with the connection on stdin/stdout/stderr.
   # Pair with /libexec/zsh for "telnet → fresh shell per session"; pair
@@ -229,8 +237,15 @@ let
   # sandbox boundary.
   all = pkgs.symlinkJoin {
     name = "yos-all";
-    paths = [ yos zsh tmux nvim freebsd-tools openssh perf-stress runit telnetd yos-tcpserver ytrace-wasm yperf-wasm yctl-wasm yctl-host ];  # cpython disabled — see above
+    paths = [ yos zsh tmux nvim freebsd-tools openssh perf-stress runit telnetd fzy yos-tcpserver ytrace-wasm yperf-wasm yctl-wasm yctl-host ];  # cpython disabled — see above
     postBuild = ''
+      # `sh` alias for zsh: guests exec "/bin/sh" constantly (tmux's
+      # default-shell, $SHELL fallbacks, scripts). yos's execve resolves
+      # a non-wasm absolute path by BASENAME on the guest $PATH, so this
+      # symlink makes /bin/sh land on the wasm zsh — which sees
+      # basename(argv[0]) == "sh" and enters sh-emulation.
+      ln -sfn zsh $out/libexec/sh
+'' + ''
       cat > $out/bin/yos-shell <<RUNNER_EOF
       #!/usr/bin/env bash
       # yos-shell — pristine wasm-zsh sandbox under yos.
@@ -314,6 +329,7 @@ in {
           perf-stress
           runit
           telnetd
+          fzy
           yos-tcpserver
           ytrace-wasm
           yperf-wasm
