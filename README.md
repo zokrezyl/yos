@@ -10,6 +10,13 @@
   <img src="https://img.shields.io/badge/hosts-Linux%20%C2%B7%20macOS%20%C2%B7%20iOS%20%C2%B7%20tvOS%20%C2%B7%20FreeBSD%20%C2%B7%20Windows-6BA892" alt="Hosts">
 </p>
 
+> [!IMPORTANT]
+> **yos has been merged into [yetty](https://github.com/zokrezyl/yetty).**
+> Development continues in the
+> [`yos/` subtree of the yetty repository](https://github.com/zokrezyl/yetty/tree/main/yos);
+> this repository is an archive. Please file issues and pull requests
+> against [zokrezyl/yetty](https://github.com/zokrezyl/yetty).
+
 yos runs unmodified wasm32 binaries — built against FreeBSD libc headers — on
 Linux, macOS / iOS / tvOS, FreeBSD, and Windows. The wasm guest only ever sees a
 FreeBSD-shaped userspace; yos translates each libc call into the host's native
